@@ -496,6 +496,45 @@ class GraphStore:
             return json.loads(row["value"])
         return None
 
+    def set_metadata(self, key: str, value) -> None:
+        """Set a single metadata value without a full save."""
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            (key, json.dumps(value)),
+        )
+        conn.commit()
+
+    def delete_file_data(self, file_path: str) -> None:
+        """Remove a file node, its symbol nodes, and all related edges."""
+        conn = self._get_conn()
+        pid_row = conn.execute(
+            "SELECT pid FROM path_map WHERE path = ?", (file_path,)
+        ).fetchone()
+        if not pid_row:
+            return
+        pid = pid_row["pid"]
+        nids = [
+            r["nid"]
+            for r in conn.execute(
+                "SELECT nid FROM nodes WHERE path_id = ?", (pid,)
+            ).fetchall()
+        ]
+        if not nids:
+            return
+        placeholders = ",".join("?" * len(nids))
+        conn.execute(
+            f"DELETE FROM edges WHERE source_nid IN ({placeholders})"  # noqa: S608
+            f" OR target_nid IN ({placeholders})",
+            nids + nids,
+        )
+        conn.execute(
+            f"DELETE FROM nodes WHERE nid IN ({placeholders})",  # noqa: S608
+            nids,
+        )
+        conn.execute("DELETE FROM path_map WHERE pid = ?", (pid,))
+        conn.commit()
+
     def close(self) -> None:
         """Close the database connection."""
         if self._conn:

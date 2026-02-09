@@ -8,7 +8,7 @@ from pathlib import Path
 import networkx as nx
 
 from cegraph.config import IndexerConfig, ProjectConfig
-from cegraph.parser.core import parse_directory
+from cegraph.parser.core import collect_files, parse_directory, parse_files
 from cegraph.parser.models import FileSymbols, Relationship
 
 
@@ -62,6 +62,94 @@ class GraphBuilder:
         self._resolve_references()
 
         return self.graph
+
+    def incremental_build(
+        self,
+        root: str | Path,
+        graph: nx.DiGraph,
+        old_hashes: dict[str, str],
+        config: ProjectConfig | None = None,
+        progress_callback: callable | None = None,
+    ) -> tuple[nx.DiGraph, list[str]]:
+        """Rebuild only changed files, reusing the existing graph.
+
+        Args:
+            root: Project root directory.
+            graph: Previously built graph to update.
+            old_hashes: File path -> SHA256 hash from previous build.
+            config: Project configuration.
+            progress_callback: Optional callback.
+
+        Returns:
+            (updated_graph, list_of_changed_file_paths)
+        """
+        root = Path(root).resolve()
+        indexer_config = config.indexer if config else IndexerConfig()
+
+        self.graph = graph
+        self._file_hashes = dict(old_hashes)
+        self._unresolved = []
+
+        # Discover current files and compute hashes
+        current_files = collect_files(root, indexer_config)
+        current_rel = {}
+        for f in current_files:
+            rel = str(f.relative_to(root))
+            try:
+                content = f.read_bytes()
+                current_rel[rel] = hashlib.sha256(content).hexdigest()[:16]
+            except OSError:
+                continue
+
+        # Diff: find added, changed, deleted
+        old_set = set(old_hashes.keys())
+        new_set = set(current_rel.keys())
+        deleted = old_set - new_set
+        added = new_set - old_set
+        changed = {
+            f for f in old_set & new_set
+            if old_hashes[f] != current_rel[f]
+        }
+        dirty = added | changed
+
+        if not dirty and not deleted:
+            return self.graph, []
+
+        # Remove nodes/edges for deleted and changed files
+        for fp in deleted | changed:
+            self._remove_file_from_graph(fp)
+            self._file_hashes.pop(fp, None)
+
+        # Parse only dirty files
+        if dirty:
+            parsed = parse_files(root, sorted(dirty), indexer_config,
+                                 progress_callback)
+            for fs in parsed:
+                self._add_file(fs, root)
+
+        # Update hashes
+        for fp in dirty:
+            if fp in current_rel:
+                self._file_hashes[fp] = current_rel[fp]
+
+        # Re-resolve all unresolved references
+        self._resolve_references()
+
+        return self.graph, sorted(deleted | dirty)
+
+    def _remove_file_from_graph(self, file_path: str) -> None:
+        """Remove a file and all its symbols from the in-memory graph."""
+        file_node = f"file::{file_path}"
+        if not self.graph.has_node(file_node):
+            return
+        # Collect symbol nodes belonging to this file
+        to_remove = [file_node]
+        for succ in list(self.graph.successors(file_node)):
+            data = self.graph.nodes.get(succ, {})
+            if data.get("type") == "symbol":
+                to_remove.append(succ)
+        for node in to_remove:
+            self.graph.remove_node(node)  # also removes all edges
 
     def _add_file(self, fs: FileSymbols, root: Path) -> None:
         """Add a file and its symbols to the graph."""

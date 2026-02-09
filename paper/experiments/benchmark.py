@@ -60,8 +60,6 @@ from cegraph.llm.factory import create_provider
 
 from paper.experiments.baselines import (
     baseline_bm25,
-    baseline_grep,
-    baseline_repo_map,
 )
 
 
@@ -112,8 +110,11 @@ def assemble_bca(
     assembler = ContextAssembler(repo_path, graph, query)
     package = assembler.assemble(task=task, token_budget=budget, strategy=ContextStrategy.SMART)
     elapsed = (time.time() - start) * 1000
+    # Use lean rendering: no metadata annotations or line-number prefixes.
+    # This matches the format of other methods (just file headers + source code)
+    # and avoids wasting budget tokens on annotations the LLM doesn't need.
     return (
-        package.render(),
+        package.render(include_metadata=False, include_line_numbers=False),
         package.total_tokens,
         package.symbols_included,
         package.files_included,
@@ -131,7 +132,7 @@ def assemble_bca_no_closure(
     package = assembler.assemble(task=task, token_budget=budget, strategy=ContextStrategy.SMART)
     elapsed = (time.time() - start) * 1000
     return (
-        package.render(),
+        package.render(include_metadata=False, include_line_numbers=False),
         package.total_tokens,
         package.symbols_included,
         package.files_included,
@@ -147,7 +148,6 @@ def assemble_bm25(
     result = baseline_bm25(repo_path, task, budget, graph)
     # BM25 gives us symbol names; we need to render their source
     content_parts = []
-    tokens_used = 0
     for sym_qname in result.selected_symbols:
         for node_id, data in graph.nodes(data=True):
             if data.get("type") != "symbol":
@@ -233,10 +233,15 @@ def assemble_grep(
 def assemble_repo_map(
     repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
 ) -> tuple[str, int, int, int, float]:
-    """Repo map (structural summary + relevant file content)."""
+    """Repo map (compact file tree + relevant symbol source code).
+
+    Mimics aider's approach: provide structural overview for navigation,
+    then fill remaining budget with actual source code of relevant symbols.
+    The LLM needs real source code to produce valid SEARCH/REPLACE blocks.
+    """
     start = time.time()
 
-    # Build structural map
+    # Phase 1: Build compact file tree (just paths, ~1 token per line)
     files_by_path: dict[str, list[dict]] = {}
     for node_id, data in graph.nodes(data=True):
         if data.get("type") != "symbol":
@@ -245,59 +250,81 @@ def assemble_repo_map(
         if fp:
             files_by_path.setdefault(fp, []).append(data)
 
-    map_lines = []
+    tree_lines = ["# Repository structure"]
     for fp in sorted(files_by_path):
-        map_lines.append(fp)
-        symbols = sorted(files_by_path[fp], key=lambda d: d.get("line_start", 0))
-        for sym in symbols:
-            kind = sym.get("kind", "")
-            name = sym.get("name", "")
-            sig = sym.get("signature", "")
-            if kind in ("class", "function", "method"):
-                indent = "    " if kind == "method" else "  "
-                display = sig if sig else f"{kind} {name}"
-                map_lines.append(f"{indent}{display}")
+        tree_lines.append(fp)
 
-    struct_map = "\n".join(map_lines)
-    map_tokens = TokenEstimator.estimate(struct_map)
-    if map_tokens > budget:
-        chars_allowed = int(budget * TokenEstimator.CHARS_PER_TOKEN)
-        struct_map = struct_map[:chars_allowed]
-        map_tokens = budget
+    file_tree = "\n".join(tree_lines)
+    tree_tokens = TokenEstimator.estimate(file_tree)
+    if tree_tokens > budget // 4:
+        # Cap tree at 25% of budget
+        chars_allowed = int((budget // 4) * TokenEstimator.CHARS_PER_TOKEN)
+        file_tree = file_tree[:chars_allowed]
+        tree_tokens = budget // 4
 
-    # Fill remaining budget with relevant file content
-    remaining = budget - map_tokens
+    # Phase 2: Fill remaining budget with actual source code of relevant symbols
+    remaining = budget - tree_tokens
     keywords = set(re.findall(r"\b([A-Za-z_]\w{2,})\b", task))
     stop = {"the", "and", "for", "that", "this", "with", "from", "fix", "bug", "add"}
     keywords -= stop
 
-    file_content = []
+    # Score symbols by keyword relevance
+    scored_symbols: list[tuple[int, dict]] = []
+    for fp, syms in files_by_path.items():
+        for sym in syms:
+            name = sym.get("name", "").lower()
+            qname = sym.get("qualified_name", "").lower()
+            doc = sym.get("docstring", "").lower()
+            sig = sym.get("signature", "").lower()
+            text = f"{name} {qname} {doc} {sig}"
+            hits = sum(1 for kw in keywords if kw.lower() in text)
+            if hits > 0:
+                scored_symbols.append((hits, sym))
+
+    scored_symbols.sort(key=lambda x: x[0], reverse=True)
+
+    # Greedy pack source code from highest-relevance symbols
+    source_parts = []
     content_tokens = 0
     files_used = set()
-    if remaining > 0:
-        for fp in sorted(files_by_path):
-            full_path = repo_path / fp
-            if not full_path.exists():
-                continue
-            try:
-                content = full_path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            if not any(kw.lower() in content.lower() for kw in keywords):
-                continue
-            ft = TokenEstimator.estimate(content)
-            if content_tokens + ft > remaining:
-                continue
-            file_content.append(f"# {fp}\n{content}")
-            content_tokens += ft
-            files_used.add(fp)
+    syms_selected = 0
 
-    context = struct_map + "\n\n" + "\n\n".join(file_content) if file_content else struct_map
+    for _score, sym in scored_symbols:
+        fp = sym.get("file_path", "")
+        line_start = sym.get("line_start", 0)
+        line_end = sym.get("line_end", 0)
+        if not fp or not line_start or not line_end:
+            continue
+        line_count = max(1, line_end - line_start + 1)
+        cost = TokenEstimator.estimate_lines(line_count)
+        if content_tokens + cost > remaining:
+            continue
+        full_path = repo_path / fp
+        if not full_path.exists():
+            continue
+        try:
+            lines = full_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+            source = "\n".join(lines[max(0, line_start - 1):line_end])
+            source_parts.append(f"# {fp}:{line_start}-{line_end}\n{source}")
+            content_tokens += cost
+            syms_selected += 1
+            files_used.add(fp)
+        except OSError:
+            continue
+
+    context_parts = [file_tree]
+    if source_parts:
+        context_parts.append("\n# Relevant source code\n")
+        context_parts.append("\n\n".join(source_parts))
+    context = "\n\n".join(context_parts)
+
     elapsed = (time.time() - start) * 1000
     return (
         context,
-        map_tokens + content_tokens,
-        0,
+        tree_tokens + content_tokens,
+        syms_selected,
         len(files_used),
         round(elapsed, 1),
     )
@@ -425,7 +452,6 @@ def _vector_score_dense(query: str, symbols: list[dict]) -> list[float]:
     """Dense embedding scoring using sentence-transformers."""
     try:
         from sentence_transformers import SentenceTransformer
-        import numpy as np
     except ImportError:
         print("sentence-transformers not installed, falling back to TF-IDF")
         return _vector_score_tfidf(query, symbols)
@@ -568,24 +594,29 @@ METHODS: dict[str, callable] = {
 # LLM interaction
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a coding assistant. You will be given source code context and a bug description.
-Your job is to produce a SEARCH/REPLACE edit that fixes the bug.
-
-Output format — one or more blocks like this:
-
-```
-FILE: path/to/file.py
-SEARCH:
-<exact lines from the buggy file>
-REPLACE:
-<corrected lines>
-```
-
-Rules:
-- The SEARCH block must contain the EXACT lines from the file (copy-paste, including indentation).
-- Only change the minimum lines needed to fix the bug.
-- You may output multiple FILE/SEARCH/REPLACE blocks if the fix spans multiple files.
-- Output ONLY the edit blocks, no explanation before or after."""
+SYSTEM_PROMPT = (
+    "You are a coding assistant. You will be given source code context "
+    "and a bug description.\n"
+    "Your job is to produce a SEARCH/REPLACE edit that fixes the bug.\n\n"
+    "Output format — one or more blocks like this:\n\n"
+    "```\n"
+    "FILE: path/to/file.py\n"
+    "SEARCH:\n"
+    "<exact lines from the buggy file>\n"
+    "REPLACE:\n"
+    "<corrected lines>\n"
+    "```\n\n"
+    "Rules:\n"
+    "- The FILE path must be the EXACT path shown in the context\n"
+    "  (e.g. 'src/cegraph/foo.py', not 'cegraph/foo.py').\n"
+    "- The SEARCH block must contain the EXACT lines from the file\n"
+    "  (copy-paste, including indentation).\n"
+    "- Do NOT include line numbers or prefixes in SEARCH/REPLACE.\n"
+    "- Only change the minimum lines needed to fix the bug.\n"
+    "- You may output multiple FILE/SEARCH/REPLACE blocks if the fix\n"
+    "  spans multiple files.\n"
+    "- Output ONLY the edit blocks, no explanation before or after."
+)
 
 
 def build_prompt(context: str, task: str) -> str:
@@ -605,25 +636,52 @@ Produce SEARCH/REPLACE blocks to fix this bug."""
 
 async def call_llm(
     provider, context: str, task: str,
+    max_retries: int = 3,
 ) -> tuple[str, float, int, int]:
-    """Call the LLM and return (response_text, time_ms, input_tokens, output_tokens)."""
+    """Call the LLM with retry on rate limits.
+
+    Returns (response_text, time_ms, input_tokens, output_tokens).
+    Retries up to max_retries times on 429/rate-limit errors with exponential backoff.
+    """
     messages = [
         Message(role="system", content=SYSTEM_PROMPT),
         Message(role="user", content=build_prompt(context, task)),
     ]
 
-    start = time.time()
-    response: LLMResponse = await provider.complete(
-        messages=messages,
-        temperature=0.0,
-        max_tokens=4096,
-    )
-    elapsed = (time.time() - start) * 1000
+    last_error = None
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            wait = 2 ** attempt  # 2s, 4s, 8s
+            print(f"    retry {attempt}/{max_retries} after {wait}s...")
+            await asyncio.sleep(wait)
 
-    input_tokens = response.usage.get("prompt_tokens", 0) or response.usage.get("input_tokens", 0)
-    output_tokens = response.usage.get("completion_tokens", 0) or response.usage.get("output_tokens", 0)
+        try:
+            start = time.time()
+            response: LLMResponse = await provider.complete(
+                messages=messages,
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            elapsed = (time.time() - start) * 1000
 
-    return (response.content, round(elapsed, 1), input_tokens, output_tokens)
+            input_tokens = (
+                response.usage.get("prompt_tokens", 0)
+                or response.usage.get("input_tokens", 0)
+            )
+            output_tokens = (
+                response.usage.get("completion_tokens", 0)
+                or response.usage.get("output_tokens", 0)
+            )
+
+            return (response.content, round(elapsed, 1), input_tokens, output_tokens)
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "rate" in err_str.lower():
+                last_error = e
+                continue
+            raise  # Non-rate-limit errors propagate immediately
+
+    raise last_error  # All retries exhausted
 
 
 # ---------------------------------------------------------------------------
@@ -643,15 +701,15 @@ def _strip_line_prefixes(text: str) -> str:
     lines = text.splitlines()
     # Check if most lines have the pattern: optional_spaces digits space pipe space
     prefix_re = re.compile(r"^\s*\d+\s*\|\s?")
-    has_prefix = sum(1 for l in lines if prefix_re.match(l) or l.strip() == "")
+    has_prefix = sum(1 for ln in lines if prefix_re.match(ln) or ln.strip() == "")
     if has_prefix >= len(lines) * 0.5 and len(lines) > 0:
         stripped = []
-        for l in lines:
-            m = prefix_re.match(l)
+        for ln in lines:
+            m = prefix_re.match(ln)
             if m:
-                stripped.append(l[m.end():])
+                stripped.append(ln[m.end():])
             else:
-                stripped.append(l)
+                stripped.append(ln)
         return "\n".join(stripped)
     return text
 
@@ -737,6 +795,31 @@ def extract_patch(llm_output: str) -> str:
     return "\n".join(parts)
 
 
+def _resolve_file_path(work_dir: Path, fp: str) -> Path | None:
+    """Try to find a file when the LLM outputs a wrong path.
+
+    Common issue: LLM writes 'cegraph/foo.py' instead of 'src/cegraph/foo.py'.
+    """
+    # Try adding common prefixes
+    for prefix in ("src/", "lib/", "pkg/"):
+        candidate = work_dir / prefix / fp
+        if candidate.exists():
+            return candidate
+
+    # Try matching by filename anywhere in the tree
+    name = Path(fp).name
+    matches = list(work_dir.rglob(name))
+    # Filter to matches whose path ends with the given fp
+    for m in matches:
+        try:
+            rel = m.relative_to(work_dir)
+            if str(rel).endswith(fp):
+                return m
+        except ValueError:
+            continue
+    return None
+
+
 def apply_and_test(
     repo_path: Path,
     llm_output: str,
@@ -769,7 +852,12 @@ def apply_and_test(
 
             target = work_dir / fp
             if not target.exists():
-                return False, f"file not found: {fp}"
+                # Try common prefix corrections (LLM often drops src/)
+                resolved = _resolve_file_path(work_dir, fp)
+                if resolved:
+                    target = resolved
+                else:
+                    return False, f"file not found: {fp}"
 
             content = target.read_text()
             if edit.search in content:
@@ -778,8 +866,8 @@ def apply_and_test(
                 applied += 1
             else:
                 # Try with normalized whitespace (strip trailing spaces per line)
-                search_norm = "\n".join(l.rstrip() for l in edit.search.splitlines())
-                content_norm = "\n".join(l.rstrip() for l in content.splitlines())
+                search_norm = "\n".join(s.rstrip() for s in edit.search.splitlines())
+                content_norm = "\n".join(s.rstrip() for s in content.splitlines())
                 if search_norm in content_norm:
                     content = content_norm.replace(search_norm, edit.replace, 1)
                     target.write_text(content)
@@ -907,9 +995,14 @@ async def run_benchmark(
                         ))
                         continue
 
-                    print(f"    context: {tokens_used} tokens, {syms} symbols, {files} files ({asm_time}ms)")
+                    print(
+                        f"    context: {tokens_used} tokens, {syms} symbols, "
+                        f"{files} files ({asm_time}ms)"
+                    )
 
-                    # 2. Call LLM
+                    # 2. Call LLM (with throttle to avoid rate limits)
+                    if run_idx > 1:
+                        await asyncio.sleep(1.0)  # 1s between calls
                     try:
                         llm_response, llm_time, in_tok, out_tok = await call_llm(
                             provider, context, task.description,
@@ -1049,7 +1142,7 @@ def main():
     parser = argparse.ArgumentParser(description="BCA end-to-end benchmark")
     parser.add_argument("--tasks-file", required=True, help="JSONL file with eval tasks")
     parser.add_argument(
-        "--budgets", default="1000,2000,4000,8000",
+        "--budgets", default="1000,2000,4000,8000,10000",
         help="Comma-separated budget values",
     )
     parser.add_argument(
@@ -1076,8 +1169,8 @@ def main():
     llm_config = LLMConfig(provider=args.provider, model=args.model)
     if not llm_config.api_key:
         parser.error(
-            f"No API key found. Set the appropriate environment variable "
-            f"(e.g., ANTHROPIC_API_KEY or OPENAI_API_KEY)."
+            "No API key found. Set the appropriate environment variable "
+            "(e.g., ANTHROPIC_API_KEY or OPENAI_API_KEY)."
         )
 
     with open(args.tasks_file) as f:

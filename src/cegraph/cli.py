@@ -97,11 +97,15 @@ def init(path: str | None, provider: str | None, model: str | None):
 
 @main.command()
 @click.option("--path", "-p", default=None, help="Path to the project root.")
-def reindex(path: str | None):
-    """Rebuild the knowledge graph from scratch."""
+@click.option("--full", is_flag=True, help="Full rebuild instead of incremental.")
+def reindex(path: str | None, full: bool):
+    """Rebuild the knowledge graph (incremental by default)."""
     root = _get_project_root(path)
     config = load_config(root)
-    _do_index(root, config)
+    if full:
+        _do_index(root, config)
+    else:
+        _do_incremental_index(root, config)
 
 
 def _do_index(root: Path, config: ProjectConfig):
@@ -138,9 +142,63 @@ def _do_index(root: Path, config: ProjectConfig):
     db_path = get_cegraph_dir(root) / GRAPH_DB_FILE
     store = GraphStore(db_path)
     store.save(graph, metadata={"stats": stats, "root": str(root)})
+    store.set_metadata("file_hashes", builder._file_hashes)
+    store.set_metadata("built_at", time.time())
     store.close()
 
     console.success("Knowledge graph saved to .cegraph/")
+
+
+def _do_incremental_index(root: Path, config: ProjectConfig):
+    """Incrementally update the knowledge graph (only re-parse changed files)."""
+    from cegraph.graph.builder import GraphBuilder
+    from cegraph.graph.store import GraphStore
+
+    db_path = get_cegraph_dir(root) / GRAPH_DB_FILE
+    store = GraphStore(db_path)
+    graph = store.load()
+    old_hashes = store.get_metadata("file_hashes")
+
+    if graph is None or old_hashes is None:
+        console.info("No previous index found, doing full rebuild...")
+        store.close()
+        return _do_index(root, config)
+
+    builder = GraphBuilder()
+    start_time = time.time()
+
+    with console.indexing_progress() as progress:
+        task = progress.add_task("Checking for changes...", total=None)
+
+        def on_progress(file_path: str, current: int, total: int):
+            progress.update(
+                task, total=total, completed=current,
+                description=f"Re-parsing {file_path}",
+            )
+
+        graph, changed = builder.incremental_build(
+            root, graph, old_hashes, config, on_progress,
+        )
+
+    elapsed = time.time() - start_time
+
+    if not changed:
+        console.success("Already up to date (no files changed)")
+        store.close()
+        return
+
+    stats = builder.get_stats()
+    console.success(
+        f"Updated {len(changed)} file(s) in {elapsed:.1f}s"
+    )
+    console.show_stats(stats)
+
+    store.save(graph, metadata={"stats": stats, "root": str(root)})
+    store.set_metadata("file_hashes", builder._file_hashes)
+    store.set_metadata("built_at", time.time())
+    store.close()
+
+    console.success("Knowledge graph updated")
 
 
 @main.command()

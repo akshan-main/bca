@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/pypi/v/cegraph?color=blue" alt="PyPI">
   <img src="https://img.shields.io/pypi/pyversions/cegraph" alt="Python">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
-  <img src="https://github.com/cegraph-ai/cegraph/actions/workflows/ci.yml/badge.svg" alt="CI">
+  <img src="https://github.com/akshan-main/CeGraph/actions/workflows/ci.yml/badge.svg" alt="CI">
 </p>
 
 ---

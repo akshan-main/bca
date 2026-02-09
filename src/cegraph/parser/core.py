@@ -79,6 +79,46 @@ def parse_directory(
     return results
 
 
+def collect_files(root: str | Path, config: IndexerConfig | None = None) -> list[Path]:
+    """Public API: collect all parseable files in a directory."""
+    root = Path(root).resolve()
+    if config is None:
+        config = IndexerConfig()
+    return _collect_files(root, config)
+
+
+def parse_files(
+    root: str | Path,
+    file_paths: list[str],
+    config: IndexerConfig | None = None,
+    progress_callback: callable | None = None,
+) -> list[FileSymbols]:
+    """Parse a specific set of files (by relative path).
+
+    Like parse_directory but only processes the listed files.
+    """
+    root = Path(root).resolve()
+    if config is None:
+        config = IndexerConfig()
+
+    results = []
+    total = len(file_paths)
+    for i, rel_path in enumerate(file_paths):
+        if progress_callback:
+            progress_callback(rel_path, i + 1, total)
+        full_path = root / rel_path
+        if not full_path.exists():
+            continue
+        try:
+            source = full_path.read_text(encoding="utf-8", errors="replace")
+            parsed = parse_file(rel_path, source)
+            if parsed:
+                results.append(parsed)
+        except Exception:
+            continue
+    return results
+
+
 def _collect_files(root: Path, config: IndexerConfig) -> list[Path]:
     """Collect all parseable files, respecting exclusion patterns."""
     files = []

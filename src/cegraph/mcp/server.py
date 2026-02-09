@@ -42,13 +42,11 @@ class MCPServer:
         self._store = None
         self._query = None
         self._assembler = None
+        self._db_mtime: float = 0
         self._tools = self._define_tools()
 
     def _ensure_graph(self):
-        """Lazy-load the knowledge graph."""
-        if self._graph is not None:
-            return
-
+        """Load or reload the knowledge graph if the DB changed."""
         from cegraph.graph.query import GraphQuery
         from cegraph.graph.store import GraphStore
 
@@ -59,11 +57,20 @@ class MCPServer:
                 "Run 'cegraph init' first."
             )
 
+        current_mtime = db_path.stat().st_mtime
+        if self._graph is not None and current_mtime == self._db_mtime:
+            return  # Graph is still fresh
+
+        # (Re)load from DB
+        if self._store:
+            self._store.close()
         self._store = GraphStore(db_path)
         self._graph = self._store.load()
         if self._graph is None:
             raise RuntimeError("Failed to load knowledge graph")
         self._query = GraphQuery(self._graph, self._store)
+        self._assembler = None  # Reset so it picks up new graph
+        self._db_mtime = current_mtime
 
     def _ensure_cag(self):
         """Lazy-load the context assembler."""
