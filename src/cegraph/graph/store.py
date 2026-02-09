@@ -84,6 +84,8 @@ class GraphStore:
             CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
             CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_nid);
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_nid);
+            CREATE INDEX IF NOT EXISTS idx_edges_target_kind ON edges(target_nid, kind);
+            CREATE INDEX IF NOT EXISTS idx_edges_source_kind ON edges(source_nid, kind);
         """)
         conn.commit()
 

@@ -276,6 +276,33 @@ class GraphBuilder:
 
         self._unresolved = still_unresolved
 
+    def get_file_mtimes(self, root: Path) -> dict[str, float]:
+        """Collect current mtimes for all tracked files."""
+        mtimes = {}
+        for rel_path in self._file_hashes:
+            try:
+                mtimes[rel_path] = (root / rel_path).stat().st_mtime
+            except OSError:
+                pass
+        return mtimes
+
+    def get_dir_mtimes(self, root: Path) -> dict[str, float]:
+        """Collect mtimes for directories containing tracked files."""
+        dirs: set[str] = set()
+        for fp in self._file_hashes:
+            p = Path(fp).parent
+            while str(p) != ".":
+                dirs.add(str(p))
+                p = p.parent
+            dirs.add(".")
+        mtimes = {}
+        for d in dirs:
+            try:
+                mtimes[d] = (root / d).stat().st_mtime
+            except OSError:
+                pass
+        return mtimes
+
     def get_stats(self) -> dict:
         """Get graph statistics."""
         node_types: dict[str, int] = {}

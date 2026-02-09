@@ -101,6 +101,8 @@ class MCPServer:
             store = GraphStore(db_path)
             store.save(graph, metadata={"stats": stats, "root": str(self.root)})
             store.set_metadata("file_hashes", builder._file_hashes)
+            store.set_metadata("file_mtimes", builder.get_file_mtimes(self.root))
+            store.set_metadata("dir_mtimes", builder.get_dir_mtimes(self.root))
             store.set_metadata("built_at", _time.time())
             store.close()
             logger.info(
@@ -112,7 +114,38 @@ class MCPServer:
             logger.error("Auto-init failed: %s", e)
 
     def _is_stale(self, db_mtime: float) -> bool:
-        """Check if any source file is newer than the graph DB."""
+        """Check if any source file is newer than the graph DB.
+
+        Uses cached file/directory mtimes when available to avoid
+        a full os.walk() on every MCP tool call.  Falls back to
+        collect_files() if no cached mtimes exist (first run).
+        """
+        # Fast path: use stored mtimes (no os.walk needed)
+        if self._store:
+            file_mtimes = self._store.get_metadata("file_mtimes")
+            if file_mtimes:
+                for rel_path, old_mtime in file_mtimes.items():
+                    try:
+                        current = (self.root / rel_path).stat().st_mtime
+                        if current != old_mtime:
+                            return True
+                    except FileNotFoundError:
+                        return True  # File was deleted
+
+                # Check directories for new files (dirs update mtime
+                # when children are added or removed)
+                dir_mtimes = self._store.get_metadata("dir_mtimes")
+                if dir_mtimes:
+                    for rel_dir, old_mtime in dir_mtimes.items():
+                        try:
+                            current = (self.root / rel_dir).stat().st_mtime
+                            if current != old_mtime:
+                                return True
+                        except FileNotFoundError:
+                            return True
+                return False
+
+        # Fallback: full scan (no cached mtimes available)
         from cegraph.parser.core import collect_files
 
         try:
@@ -150,6 +183,8 @@ class MCPServer:
                 stats = builder.get_stats()
                 store.save(graph, metadata={"stats": stats, "root": str(self.root)})
                 store.set_metadata("file_hashes", builder._file_hashes)
+                store.set_metadata("file_mtimes", builder.get_file_mtimes(self.root))
+                store.set_metadata("dir_mtimes", builder.get_dir_mtimes(self.root))
                 store.set_metadata("built_at", time.time())
                 logger.info("Auto-reindexed %d file(s)", len(changed))
             store.close()

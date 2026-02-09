@@ -143,6 +143,8 @@ def _do_index(root: Path, config: ProjectConfig):
     store = GraphStore(db_path)
     store.save(graph, metadata={"stats": stats, "root": str(root)})
     store.set_metadata("file_hashes", builder._file_hashes)
+    store.set_metadata("file_mtimes", builder.get_file_mtimes(root))
+    store.set_metadata("dir_mtimes", builder.get_dir_mtimes(root))
     store.set_metadata("built_at", time.time())
     store.close()
 
@@ -195,6 +197,8 @@ def _do_incremental_index(root: Path, config: ProjectConfig):
 
     store.save(graph, metadata={"stats": stats, "root": str(root)})
     store.set_metadata("file_hashes", builder._file_hashes)
+    store.set_metadata("file_mtimes", builder.get_file_mtimes(root))
+    store.set_metadata("dir_mtimes", builder.get_dir_mtimes(root))
     store.set_metadata("built_at", time.time())
     store.close()
 
