@@ -9,9 +9,9 @@ pass@1 vs token-budget plots that constitute evidence.
 Usage:
     python -m paper.experiments.benchmark \
         --tasks-file paper/experiments/eval_tasks.jsonl \
-        --budgets 1000,2000,4000,8000 \
-        --provider anthropic \
-        --model claude-sonnet-4-5-20250929 \
+        --budgets 1000,4000,8000,10000 \
+        --provider openai \
+        --model gpt-4o \
         --output-dir paper/results/
 
 Task JSONL format:
@@ -1176,11 +1176,48 @@ def format_results(results: list[EvalResult], budgets: list[int]) -> str:
     return "\n".join(lines)
 
 
+def _collect_run_metadata(args, tasks, budgets, methods, results):
+    """Collect metadata for reproducibility."""
+    import datetime
+    import platform
+    import sys as _sys
+
+    git_hash = "unknown"
+    try:
+        git_result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if git_result.returncode == 0:
+            git_hash = git_result.stdout.strip()
+    except Exception:
+        pass
+
+    total_pass = sum(1 for r in results if r.tests_passed)
+    total_runs = len(results)
+
+    return {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "git_commit": git_hash,
+        "python_version": _sys.version,
+        "platform": platform.platform(),
+        "llm_provider": args.provider,
+        "llm_model": args.model,
+        "budgets": budgets,
+        "methods": methods,
+        "num_tasks": len(tasks),
+        "total_runs": total_runs,
+        "total_pass": total_pass,
+        "pass_rate": round(total_pass / total_runs, 4) if total_runs else 0,
+        "tasks_file": args.tasks_file,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="BCA end-to-end benchmark")
     parser.add_argument("--tasks-file", required=True, help="JSONL file with eval tasks")
     parser.add_argument(
-        "--budgets", default="1000,2000,4000,8000,10000",
+        "--budgets", default="1000,4000,8000,10000",
         help="Comma-separated budget values",
     )
     parser.add_argument(
@@ -1230,6 +1267,11 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(output_dir / "results.json", "w") as f:
         json.dump([asdict(r) for r in results], f, indent=2)
+
+    # Save reproducibility metadata
+    metadata = _collect_run_metadata(args, tasks, budgets, methods, results)
+    with open(output_dir / "run_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
 
     summary = format_results(results, budgets)
     print(summary)

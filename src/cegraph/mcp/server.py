@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from cegraph.config import GRAPH_DB_FILE, find_project_root, get_cegraph_dir
+from cegraph.config import GRAPH_DB_FILE, find_project_root, get_cegraph_dir, load_config
 
 logger = logging.getLogger("cegraph.mcp")
 
@@ -46,7 +46,7 @@ class MCPServer:
         self._tools = self._define_tools()
 
     def _ensure_graph(self):
-        """Load or reload the knowledge graph if the DB changed."""
+        """Load or reload the knowledge graph, auto-reindexing if stale."""
         from cegraph.graph.query import GraphQuery
         from cegraph.graph.store import GraphStore
 
@@ -57,9 +57,16 @@ class MCPServer:
                 "Run 'cegraph init' first."
             )
 
+        # Check if source files are newer than the DB (staleness check)
         current_mtime = db_path.stat().st_mtime
         if self._graph is not None and current_mtime == self._db_mtime:
-            return  # Graph is still fresh
+            if not self._is_stale(current_mtime):
+                return  # Graph is still fresh
+
+            # Source files changed — incremental reindex
+            logger.info("Source files changed, running incremental reindex...")
+            self._auto_reindex()
+            current_mtime = db_path.stat().st_mtime
 
         # (Re)load from DB
         if self._store:
@@ -71,6 +78,51 @@ class MCPServer:
         self._query = GraphQuery(self._graph, self._store)
         self._assembler = None  # Reset so it picks up new graph
         self._db_mtime = current_mtime
+
+    def _is_stale(self, db_mtime: float) -> bool:
+        """Check if any source file is newer than the graph DB."""
+        from cegraph.parser.core import collect_files
+
+        try:
+            files = collect_files(self.root)
+            for f in files:
+                if f.stat().st_mtime > db_mtime:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _auto_reindex(self) -> None:
+        """Run incremental reindex to pick up source file changes."""
+        from cegraph.graph.builder import GraphBuilder
+        from cegraph.graph.store import GraphStore
+
+        try:
+            db_path = get_cegraph_dir(self.root) / GRAPH_DB_FILE
+            config = load_config(self.root)
+            store = GraphStore(db_path)
+            graph = store.load()
+            old_hashes = store.get_metadata("file_hashes")
+
+            if graph is None or old_hashes is None:
+                store.close()
+                return  # Can't do incremental without previous state
+
+            builder = GraphBuilder()
+            graph, changed = builder.incremental_build(
+                self.root, graph, old_hashes, config,
+            )
+
+            if changed:
+                import time
+                stats = builder.get_stats()
+                store.save(graph, metadata={"stats": stats, "root": str(self.root)})
+                store.set_metadata("file_hashes", builder._file_hashes)
+                store.set_metadata("built_at", time.time())
+                logger.info("Auto-reindexed %d file(s)", len(changed))
+            store.close()
+        except Exception as e:
+            logger.warning("Auto-reindex failed: %s", e)
 
     def _ensure_cag(self):
         """Lazy-load the context assembler."""
