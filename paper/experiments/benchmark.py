@@ -634,14 +634,16 @@ def build_prompt(context: str, task: str) -> str:
 Produce SEARCH/REPLACE blocks to fix this bug."""
 
 
+_RETRY_DELAYS = [8, 20, 42, 50]  # seconds between retries, then skip
+
+
 async def call_llm(
     provider, context: str, task: str,
-    max_retries: int = 3,
 ) -> tuple[str, float, int, int]:
     """Call the LLM with retry on rate limits.
 
     Returns (response_text, time_ms, input_tokens, output_tokens).
-    Retries up to max_retries times on 429/rate-limit errors with exponential backoff.
+    Retries with fixed delays on 429/rate-limit errors, then skips.
     """
     messages = [
         Message(role="system", content=SYSTEM_PROMPT),
@@ -649,10 +651,11 @@ async def call_llm(
     ]
 
     last_error = None
-    for attempt in range(max_retries + 1):
+    max_attempts = len(_RETRY_DELAYS) + 1
+    for attempt in range(max_attempts):
         if attempt > 0:
-            wait = 2 ** attempt  # 2s, 4s, 8s
-            print(f"    retry {attempt}/{max_retries} after {wait}s...")
+            wait = _RETRY_DELAYS[attempt - 1]
+            print(f"    retry {attempt}/{len(_RETRY_DELAYS)} after {wait}s...")
             await asyncio.sleep(wait)
 
         try:
@@ -714,6 +717,28 @@ def _strip_line_prefixes(text: str) -> str:
     return text
 
 
+_FILE_LINE_RE = re.compile(
+    r"^([a-zA-Z0-9_./-]+\.\w+)(?::(\d+)(?:-(\d+))?)?$"
+)
+
+
+def _parse_file_marker(line: str) -> str | None:
+    """Try to parse a file path from various LLM output formats.
+
+    Handles:
+      FILE: path/to/file.py
+      path/to/file.py:10-20
+      path/to/file.py
+    """
+    stripped = line.strip()
+    if stripped.startswith("FILE:"):
+        return stripped[5:].strip()
+    m = _FILE_LINE_RE.match(stripped)
+    if m and "/" in m.group(1):
+        return m.group(1)
+    return None
+
+
 def extract_edits(llm_output: str) -> list[SearchReplaceEdit]:
     """Extract SEARCH/REPLACE edit blocks from LLM output."""
     edits: list[SearchReplaceEdit] = []
@@ -721,9 +746,7 @@ def extract_edits(llm_output: str) -> list[SearchReplaceEdit]:
     # Strip code fences if present
     text = llm_output
     if "```" in text:
-        # Remove outer code fences
         parts = text.split("```")
-        # Take content between fences
         text = "\n".join(parts[1::2]) if len(parts) > 1 else text
 
     lines = text.splitlines()
@@ -731,28 +754,46 @@ def extract_edits(llm_output: str) -> list[SearchReplaceEdit]:
     while i < len(lines):
         line = lines[i].strip()
 
-        # Look for FILE: marker
-        if line.startswith("FILE:"):
-            file_path = line[5:].strip()
+        # Look for FILE: marker or path:line pattern
+        file_path = _parse_file_marker(line)
+        if file_path:
             search_lines: list[str] = []
             replace_lines: list[str] = []
             i += 1
 
-            # Find SEARCH:
-            while i < len(lines) and not lines[i].strip().startswith("SEARCH:"):
+            # Find SEARCH: (or treat lines before REPLACE: as search)
+            has_search = False
+            while i < len(lines):
+                s = lines[i].strip()
+                if s.startswith("SEARCH:"):
+                    has_search = True
+                    i += 1
+                    break
+                if s.startswith("REPLACE:"):
+                    break
                 i += 1
-            i += 1  # skip SEARCH: line
 
             # Collect search content until REPLACE:
-            while i < len(lines) and not lines[i].strip().startswith("REPLACE:"):
-                search_lines.append(lines[i])
-                i += 1
-            i += 1  # skip REPLACE: line
+            if has_search:
+                while i < len(lines) and not lines[i].strip().startswith("REPLACE:"):
+                    search_lines.append(lines[i])
+                    i += 1
+            else:
+                # No SEARCH: marker — use lines before REPLACE: as search
+                # (some LLMs output path\ncode\nREPLACE:\ncode)
+                j = i
+                while j < len(lines) and not lines[j].strip().startswith("REPLACE:"):
+                    search_lines.append(lines[j])
+                    j += 1
+                i = j
 
-            # Collect replace content until next FILE: or end or ```
+            if i < len(lines) and lines[i].strip().startswith("REPLACE:"):
+                i += 1  # skip REPLACE: line
+
+            # Collect replace content until next file marker or end
             while i < len(lines):
                 stripped = lines[i].strip()
-                if stripped.startswith("FILE:") or stripped == "```":
+                if _parse_file_marker(stripped) or stripped == "```":
                     break
                 replace_lines.append(lines[i])
                 i += 1
@@ -760,12 +801,9 @@ def extract_edits(llm_output: str) -> list[SearchReplaceEdit]:
             search_text = "\n".join(search_lines)
             replace_text = "\n".join(replace_lines)
 
-            # Strip line-number prefixes the LLM copies from context
-            # Pattern: optional spaces, digits, space, pipe, space (e.g. "  13 | ")
             search_text = _strip_line_prefixes(search_text)
             replace_text = _strip_line_prefixes(replace_text)
 
-            # Strip trailing empty lines
             search_text = search_text.rstrip("\n")
             replace_text = replace_text.rstrip("\n")
 

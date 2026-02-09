@@ -250,12 +250,25 @@ class ContextAssembler:
         # Phase 7: Load source code
         items = self._load_source(selected)
 
+        # Phase 7b: Enforce budget after actual token counts are known
+        # (selection uses line-count estimates; actual source may differ)
+        total_tokens = sum(item.token_estimate for item in items)
+        if total_tokens > token_budget and len(items) > 1:
+            items.sort(key=lambda x: x.relevance_score, reverse=True)
+            trimmed: list[ContextItem] = []
+            running = 0
+            for item in items:
+                if running + item.token_estimate <= token_budget:
+                    trimmed.append(item)
+                    running += item.token_estimate
+            items = trimmed
+            total_tokens = running
+
         # Phase 8: Dependency-safe ordering
         if self.ablation.dependency_ordering:
             items = self._dependency_order(items)
 
         elapsed_ms = (time.time() - start_time) * 1000
-        total_tokens = sum(item.token_estimate for item in items)
         files = set(item.file_path for item in items)
 
         return ContextPackage(
