@@ -9,7 +9,7 @@ import networkx as nx
 
 from cegraph.config import IndexerConfig, ProjectConfig
 from cegraph.parser.core import parse_directory
-from cegraph.parser.models import FileSymbols, RelKind, Relationship, Symbol, SymbolKind
+from cegraph.parser.models import FileSymbols, Relationship
 
 
 class GraphBuilder:
@@ -47,9 +47,9 @@ class GraphBuilder:
         indexer_config = config.indexer if config else IndexerConfig()
 
         # Reset state so reusing a builder doesn't accumulate stale data
-        # self.graph = nx.DiGraph()
-        # self._file_hashes = {}
-        # self._unresolved = []
+        self.graph = nx.DiGraph()
+        self._file_hashes = {}
+        self._unresolved = []
 
         # Parse all files
         all_parsed = parse_directory(root, indexer_config, progress_callback)

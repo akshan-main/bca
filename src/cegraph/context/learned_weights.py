@@ -8,8 +8,8 @@ This replaces the hand-tuned _EDGE_WEIGHTS dict with empirically derived values.
 
 from __future__ import annotations
 
-import subprocess
 import re
+import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 

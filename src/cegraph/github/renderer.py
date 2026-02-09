@@ -10,8 +10,6 @@ Generates beautiful GitHub-flavored markdown comments with:
 
 from __future__ import annotations
 
-from typing import Any
-
 from cegraph.github.diff_parser import ChangedSymbol
 
 
@@ -89,7 +87,7 @@ def render_impact_comment(
         for sym, impact in high_impact:
             risk = impact.get("risk_score", 0)
             emoji, _, _ = _risk_badge(risk)
-            sections.append(f"<details>")
+            sections.append("<details>")
             sections.append(
                 f"<summary>{emoji} <code>{sym.qualified_name or sym.name}</code> "
                 f"— {len(impact.get('affected_files', []))} files affected</summary>"

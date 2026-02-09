@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
 
 try:
     from textual.app import App, ComposeResult
@@ -21,13 +20,10 @@ try:
     from textual.widgets import (
         Footer,
         Header,
-        Static,
-        Tree,
         Input,
         RichLog,
-        ListView,
-        ListItem,
-        Label,
+        Static,
+        Tree,
     )
     from textual.widgets.tree import TreeNode
 
@@ -79,12 +75,12 @@ if HAS_TEXTUAL:
             ]
 
             if sig:
-                lines.append(f"[bold]Signature:[/bold]")
+                lines.append("[bold]Signature:[/bold]")
                 lines.append(f"  [cyan]{sig}[/cyan]")
                 lines.append("")
 
             if doc:
-                lines.append(f"[bold]Docstring:[/bold]")
+                lines.append("[bold]Docstring:[/bold]")
                 for doc_line in doc.split("\n")[:5]:
                     lines.append(f"  [dim]{doc_line}[/dim]")
                 lines.append("")
@@ -144,7 +140,7 @@ if HAS_TEXTUAL:
                 risk_label = "HIGH"
 
             lines = [
-                f"[bold]Impact Analysis[/bold]",
+                "[bold]Impact Analysis[/bold]",
                 f"Risk: [{risk_style}]{risk_label} ({risk:.0%})[/{risk_style}]",
                 f"Direct callers: {len(impact.get('direct_callers', []))}",
                 f"Transitive: {len(impact.get('transitive_callers', []))}",

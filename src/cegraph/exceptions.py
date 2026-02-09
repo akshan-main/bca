@@ -29,7 +29,7 @@ class IndexError(CeGraphError):
     """Indexing errors."""
 
 
-class ProviderNotAvailable(LLMError):
+class ProviderNotAvailableError(LLMError):
     """Raised when an LLM provider's SDK is not installed."""
 
     def __init__(self, provider: str, package: str):

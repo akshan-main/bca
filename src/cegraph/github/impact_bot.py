@@ -19,13 +19,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
-from typing import Any
 
 from cegraph.github.diff_parser import (
-    ChangedSymbol,
-    FileDiff,
     get_changed_symbols,
     get_git_diff,
     get_pr_diff,
@@ -45,9 +41,9 @@ def run_impact_analysis(
         Dict with 'comment' (markdown), 'risk_score', 'changed_symbols', etc.
     """
     # Load the knowledge graph
-    from cegraph.config import get_cegraph_dir, GRAPH_DB_FILE
-    from cegraph.graph.store import GraphStore
+    from cegraph.config import GRAPH_DB_FILE, get_cegraph_dir
     from cegraph.graph.query import GraphQuery
+    from cegraph.graph.store import GraphStore
 
     db_path = get_cegraph_dir(root) / GRAPH_DB_FILE
     store = GraphStore(db_path)

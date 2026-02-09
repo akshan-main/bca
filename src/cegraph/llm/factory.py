@@ -17,7 +17,7 @@ def create_provider(config: LLMConfig) -> LLMProvider:
 
     Raises:
         ValueError: If the provider is unknown.
-        ProviderNotAvailable: If the provider's SDK is not installed.
+        ProviderNotAvailableError: If the provider's SDK is not installed.
     """
     provider = config.provider.lower()
 

@@ -7,8 +7,8 @@ from pathlib import Path
 
 from cegraph.parser.models import (
     FileSymbols,
-    RelKind,
     Relationship,
+    RelKind,
     Symbol,
     SymbolKind,
 )

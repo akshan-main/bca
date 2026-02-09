@@ -9,12 +9,11 @@ Implements the core agentic pattern:
 
 from __future__ import annotations
 
-import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable
 
 from cegraph.agent.prompts import get_system_prompt
-from cegraph.llm.base import LLMProvider, LLMResponse, Message, ToolCall, ToolResult
+from cegraph.llm.base import LLMProvider, Message, ToolCall, ToolResult
 from cegraph.tools.registry import ToolRegistry
 
 
@@ -174,7 +173,10 @@ class AgentLoop:
 
         # Max iterations reached
         return AgentResult(
-            answer="I reached the maximum number of iterations. Here's what I've found so far based on my analysis.",
+            answer=(
+                "I reached the maximum number of iterations. "
+                "Here's what I've found so far based on my analysis."
+            ),
             steps=steps,
             total_iterations=self.max_iterations,
             total_tokens=total_tokens,

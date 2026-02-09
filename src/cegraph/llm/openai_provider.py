@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 from cegraph.llm.base import (
     LLMProvider,
@@ -29,8 +30,8 @@ class OpenAIProvider(LLMProvider):
             try:
                 from openai import AsyncOpenAI
             except ImportError:
-                from cegraph.exceptions import ProviderNotAvailable
-                raise ProviderNotAvailable("openai", "openai")
+                from cegraph.exceptions import ProviderNotAvailableError
+                raise ProviderNotAvailableError("openai", "openai")
 
             kwargs: dict[str, Any] = {}
             if self.api_key:

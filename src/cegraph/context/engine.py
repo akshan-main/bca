@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import networkx as nx
@@ -60,7 +60,8 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Edge weights for graph traversal — how much relevance transfers along each edge type
+# Edge weights for graph traversal -- how much relevance
+# transfers along each edge type
 _EDGE_WEIGHTS: dict[str, float] = {
     "calls": 0.85,
     "imports": 0.5,
@@ -874,7 +875,6 @@ class ContextAssembler:
                 if dep_id in cand_by_id:
                     dep_cand = dict(cand_by_id[dep_id])
                 else:
-                    dep_data = self.graph.nodes.get(dep_id, {})
                     dep_cand = {
                         "symbol_id": dep_id,
                         "score": cand["score"] * 0.5,

@@ -17,11 +17,10 @@ import asyncio
 import json
 import logging
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
-from cegraph.config import find_project_root, load_config, get_cegraph_dir, GRAPH_DB_FILE
+from cegraph.config import GRAPH_DB_FILE, find_project_root, get_cegraph_dir
 
 logger = logging.getLogger("cegraph.mcp")
 
@@ -50,8 +49,8 @@ class MCPServer:
         if self._graph is not None:
             return
 
-        from cegraph.graph.store import GraphStore
         from cegraph.graph.query import GraphQuery
+        from cegraph.graph.store import GraphStore
 
         db_path = get_cegraph_dir(self.root) / GRAPH_DB_FILE
         if not db_path.exists():
@@ -354,7 +353,10 @@ class MCPServer:
         writer_transport, writer_protocol = await asyncio.get_event_loop().connect_write_pipe(
             asyncio.streams.FlowControlMixin, sys.stdout.buffer
         )
-        writer = asyncio.StreamWriter(writer_transport, writer_protocol, None, asyncio.get_event_loop())
+        writer = asyncio.StreamWriter(
+            writer_transport, writer_protocol,
+            None, asyncio.get_event_loop(),
+        )
 
         logger.info("CeGraph MCP server started (stdio transport)")
 
@@ -396,7 +398,7 @@ class MCPServer:
     async def _write_message(self, writer: asyncio.StreamWriter, message: dict) -> None:
         """Write a JSON-RPC response with Content-Length header."""
         body = json.dumps(message).encode("utf-8")
-        header = f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8")
+        header = f"Content-Length: {len(body)}\r\n\r\n".encode()
         writer.write(header + body)
         await writer.drain()
 
@@ -509,7 +511,8 @@ class MCPServer:
         try:
             full_path.resolve().relative_to(self.root.resolve())
         except ValueError:
-            return {"contents": [{"uri": uri, "text": f"Access denied: {fp} is outside the project root"}]}
+            msg = f"Access denied: {fp} is outside the project root"
+            return {"contents": [{"uri": uri, "text": msg}]}
 
         if not full_path.exists():
             return {"contents": [{"uri": uri, "text": f"File not found: {fp}"}]}

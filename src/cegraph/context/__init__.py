@@ -12,6 +12,6 @@ Usage:
 """
 
 from cegraph.context.engine import ContextAssembler
-from cegraph.context.models import ContextPackage, ContextItem, ContextStrategy
+from cegraph.context.models import ContextItem, ContextPackage, ContextStrategy
 
 __all__ = ["ContextAssembler", "ContextPackage", "ContextItem", "ContextStrategy"]

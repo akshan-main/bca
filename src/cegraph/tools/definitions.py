@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
-from typing import Any
 
 import networkx as nx
 
@@ -186,7 +184,10 @@ class CeGraphTools:
 
         count = content.count(old_text)
         if count > 1:
-            return f"Text to replace found {count} times. Please provide more context to make it unique."
+            return (
+                f"Text to replace found {count} times. "
+                "Please provide more context to make it unique."
+            )
 
         new_content = content.replace(old_text, new_text, 1)
         full_path.write_text(new_content, encoding="utf-8")
@@ -251,11 +252,24 @@ class CeGraphTools:
 
             # Show relationships
             if info.callers:
-                output.append(f"\n**Called by:** {', '.join(c.split('::')[-1] for c in info.callers[:5])}")
+                callers_str = ', '.join(
+                    c.split('::')[-1] for c in info.callers[:5]
+                )
+                output.append(
+                    f"\n**Called by:** {callers_str}"
+                )
             if info.callees:
-                output.append(f"**Calls:** {', '.join(c.split('::')[-1] for c in info.callees[:5])}")
+                callees_str = ', '.join(
+                    c.split('::')[-1] for c in info.callees[:5]
+                )
+                output.append(f"**Calls:** {callees_str}")
             if info.children:
-                output.append(f"**Contains:** {', '.join(c.split('::')[-1] for c in info.children[:5])}")
+                children_str = ', '.join(
+                    c.split('::')[-1] for c in info.children[:5]
+                )
+                output.append(
+                    f"**Contains:** {children_str}"
+                )
 
             output.append("")
 
@@ -287,12 +301,22 @@ class CeGraphTools:
 
         exe = argv[0].lower()
         if exe not in allowed_executables:
-            return f"Command not allowed for safety. Allowed executables: {', '.join(sorted(allowed_executables))}"
+            allowed = ', '.join(sorted(allowed_executables))
+            return (
+                "Command not allowed for safety. "
+                f"Allowed executables: {allowed}"
+            )
 
         if exe == "git":
             subcommand = argv[1].lower() if len(argv) > 1 else ""
             if subcommand not in _git_safe_subcommands:
-                return f"Only read-only git subcommands are allowed: {', '.join(sorted(_git_safe_subcommands))}"
+                allowed_git = ', '.join(
+                    sorted(_git_safe_subcommands)
+                )
+                return (
+                    "Only read-only git subcommands "
+                    f"are allowed: {allowed_git}"
+                )
 
         try:
             result = subprocess.run(
@@ -323,25 +347,45 @@ class CeGraphTools:
 _TOOL_DEFINITIONS = [
     ToolDefinition(
         name="search_code",
-        description="Search for code in the repository matching a text query. Returns matching lines with context and enclosing symbol information.",
+        description=(
+            "Search for code in the repository matching a text "
+            "query. Returns matching lines with context and "
+            "enclosing symbol information."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query text"},
-                "file_pattern": {"type": "string", "description": "Glob pattern to filter files (e.g., '*.py')", "default": ""},
-                "max_results": {"type": "integer", "description": "Maximum number of results", "default": 10},
+                "file_pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to filter files (e.g., '*.py')",
+                    "default": "",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results",
+                    "default": 10,
+                },
             },
             "required": ["query"],
         },
     ),
     ToolDefinition(
         name="search_symbols",
-        description="Search for symbol definitions (functions, classes, methods, etc.) by name. More precise than search_code for finding definitions.",
+        description=(
+            "Search for symbol definitions (functions, classes, "
+            "methods, etc.) by name. More precise than "
+            "search_code for finding definitions."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Symbol name to search for"},
-                "kind": {"type": "string", "description": "Filter by symbol kind: function, class, method, variable", "default": ""},
+                "kind": {
+                    "type": "string",
+                    "description": "Filter by symbol kind: function, class, method, variable",
+                    "default": "",
+                },
                 "max_results": {"type": "integer", "description": "Maximum results", "default": 10},
             },
             "required": ["query"],
@@ -354,14 +398,21 @@ _TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "symbol_name": {"type": "string", "description": "Name of the function/method"},
-                "max_depth": {"type": "integer", "description": "How many levels of callers to traverse", "default": 2},
+                "max_depth": {
+                    "type": "integer",
+                    "description": "How many levels of callers to traverse",
+                    "default": 2,
+                },
             },
             "required": ["symbol_name"],
         },
     ),
     ToolDefinition(
         name="what_calls",
-        description="Find all functions/methods called by a given function. Answers: 'What does this function call?'",
+        description=(
+            "Find all functions/methods called by a given "
+            "function. Answers: 'What does this function call?'"
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -372,7 +423,11 @@ _TOOL_DEFINITIONS = [
     ),
     ToolDefinition(
         name="impact_of",
-        description="Analyze the blast radius of changing a symbol. Shows direct callers, transitive callers, affected files, and risk score.",
+        description=(
+            "Analyze the blast radius of changing a symbol. "
+            "Shows direct callers, transitive callers, "
+            "affected files, and risk score."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -388,7 +443,11 @@ _TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "Relative path to the file"},
-                "start_line": {"type": "integer", "description": "Start line number (1-indexed)", "default": 0},
+                "start_line": {
+                    "type": "integer",
+                    "description": "Start line number (1-indexed)",
+                    "default": 0,
+                },
                 "end_line": {"type": "integer", "description": "End line number", "default": 0},
             },
             "required": ["file_path"],
@@ -396,7 +455,11 @@ _TOOL_DEFINITIONS = [
     ),
     ToolDefinition(
         name="edit_file",
-        description="Make a targeted edit to a file by replacing specific text. Use this for precise changes instead of rewriting entire files.",
+        description=(
+            "Make a targeted edit to a file by replacing "
+            "specific text. Use this for precise changes "
+            "instead of rewriting entire files."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -425,14 +488,27 @@ _TOOL_DEFINITIONS = [
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Subdirectory to list (empty for root)", "default": ""},
-                "pattern": {"type": "string", "description": "Filter by filename pattern (e.g., '*.py')", "default": ""},
+                "path": {
+                    "type": "string",
+                    "description": "Subdirectory to list (empty for root)",
+                    "default": "",
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Filter by filename pattern (e.g., '*.py')",
+                    "default": "",
+                },
             },
         },
     ),
     ToolDefinition(
         name="get_context",
-        description="Get comprehensive context for a symbol: source code, relationships (callers, callees), and metadata. Use this before making changes to understand the full picture.",
+        description=(
+            "Get comprehensive context for a symbol: source "
+            "code, relationships (callers, callees), and "
+            "metadata. Use this before making changes to "
+            "understand the full picture."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -447,13 +523,21 @@ _TOOL_DEFINITIONS = [
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Subdirectory to show (empty for full project)", "default": ""},
+                "path": {
+                    "type": "string",
+                    "description": "Subdirectory to show (empty for full project)",
+                    "default": "",
+                },
             },
         },
     ),
     ToolDefinition(
         name="run_command",
-        description="Run a shell command in the project root. Use for running tests, linters, and build commands. Limited to safe commands only.",
+        description=(
+            "Run a shell command in the project root. Use for "
+            "running tests, linters, and build commands. "
+            "Limited to safe commands only."
+        ),
         parameters={
             "type": "object",
             "properties": {

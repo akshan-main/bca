@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 from cegraph.llm.base import (
     LLMProvider,
@@ -31,8 +31,8 @@ class AnthropicProvider(LLMProvider):
             try:
                 from anthropic import AsyncAnthropic
             except ImportError:
-                from cegraph.exceptions import ProviderNotAvailable
-                raise ProviderNotAvailable("anthropic", "anthropic")
+                from cegraph.exceptions import ProviderNotAvailableError
+                raise ProviderNotAvailableError("anthropic", "anthropic")
 
             kwargs: dict[str, Any] = {}
             if self.api_key:

@@ -121,7 +121,10 @@ def _do_index(root: Path, config: ProjectConfig):
         def on_progress(file_path: str, current: int, total: int):
             nonlocal file_count
             file_count = total
-            progress.update(task, total=total, completed=current, description=f"Parsing {file_path}")
+            progress.update(
+                task, total=total, completed=current,
+                description=f"Parsing {file_path}",
+            )
 
         graph = builder.build_from_directory(root, config, on_progress)
 
@@ -137,7 +140,7 @@ def _do_index(root: Path, config: ProjectConfig):
     store.save(graph, metadata={"stats": stats, "root": str(root)})
     store.close()
 
-    console.success(f"Knowledge graph saved to .cegraph/")
+    console.success("Knowledge graph saved to .cegraph/")
 
 
 @main.command()
@@ -249,7 +252,10 @@ def impact(symbol_name: str, path: str | None):
     default="smart",
     help="Context strategy (default: smart).",
 )
-@click.option("--compact", is_flag=True, help="Use compact rendering (signatures only for deep symbols).")
+@click.option(
+    "--compact", is_flag=True,
+    help="Use compact rendering (signatures only for deep symbols).",
+)
 @click.option("--savings", is_flag=True, help="Show token savings comparison.")
 @click.option("--focus", "-f", multiple=True, help="Focus files (can specify multiple).")
 def context(
@@ -321,7 +327,7 @@ def context(
 
         # Show summary
         console.console.print()
-        console.console.print(f"[bold]CAG Context Package[/bold]")
+        console.console.print("[bold]CAG Context Package[/bold]")
         console.console.print(f"  Strategy: {strategy}")
         accel = assembler.is_accelerated
         accel_str = "[green]C++ accelerated[/green]" if accel else "Python"
@@ -330,7 +336,10 @@ def context(
             f"  Tokens: {package.total_tokens:,} / {package.token_budget:,} "
             f"({package.budget_used_pct:.0f}%)"
         )
-        console.console.print(f"  Symbols: {package.symbols_included} (from {package.symbols_available} candidates)")
+        console.console.print(
+            f"  Symbols: {package.symbols_included} "
+            f"(from {package.symbols_available} candidates)"
+        )
         console.console.print(f"  Files: {package.files_included}")
         console.console.print(f"  Time: {package.assembly_time_ms:.1f}ms")
         console.console.print()
@@ -436,9 +445,9 @@ def impact_pr(path: str | None, base: str, output_format: str):
     """
     root = _get_project_root(path)
 
-    from cegraph.github.impact_bot import run_impact_analysis, post_github_comment
-
     import os
+
+    from cegraph.github.impact_bot import post_github_comment, run_impact_analysis
     is_pr = bool(os.environ.get("GITHUB_EVENT_PATH"))
 
     result = run_impact_analysis(root, base=base, is_pr=is_pr)
@@ -642,9 +651,16 @@ def benchmark(path: str | None):
     console.console.print("[bold]CeGraph Benchmark[/bold]")
     console.console.print(f"  Project: {root.name}")
     console.console.print(f"  Source files: {file_count} ({total_src / 1024:.0f} KB)")
-    console.console.print(f"  graph.db: {db_size / 1024:.0f} KB ({db_size / max(total_src, 1) * 100:.0f}% of source)")
+    pct = db_size / max(total_src, 1) * 100
+    console.console.print(
+        f"  graph.db: {db_size / 1024:.0f} KB "
+        f"({pct:.0f}% of source)"
+    )
     if stats:
-        console.console.print(f"  Nodes: {stats.get('total_nodes', '?')}  Edges: {stats.get('total_edges', '?')}")
+        console.console.print(
+            f"  Nodes: {stats.get('total_nodes', '?')}  "
+            f"Edges: {stats.get('total_edges', '?')}"
+        )
     console.console.print()
 
     # Build realistic tasks from actual class + function names
@@ -704,7 +720,11 @@ def benchmark(path: str | None):
     cag_t = result["cag_tokens"]
     grep_t = result["grep_tokens"]
     all_t = result["all_files_tokens"]
-    console.console.print(f"  CAG:       {cag_t:>7,} tokens ({result['cag_symbols']} symbols, {result['cag_files']} files)")
+    console.console.print(
+        f"  CAG:       {cag_t:>7,} tokens "
+        f"({result['cag_symbols']} symbols, "
+        f"{result['cag_files']} files)"
+    )
     console.console.print(f"  grep:      {grep_t:>7,} tokens ({result['grep_files']} files)")
     console.console.print(f"  all files: {all_t:>7,} tokens")
     if grep_t > 0 and cag_t < grep_t:

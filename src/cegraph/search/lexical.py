@@ -194,7 +194,10 @@ class LexicalSearch:
         stripped = line.strip()
         if any(
             stripped.startswith(kw)
-            for kw in ("def ", "class ", "function ", "const ", "let ", "var ", "fn ", "func ", "pub ")
+            for kw in (
+                "def ", "class ", "function ", "const ",
+                "let ", "var ", "fn ", "func ", "pub ",
+            )
         ):
             score += 1.0
 

@@ -13,11 +13,8 @@ The native implementation provides 10-50x speedup for:
 from __future__ import annotations
 
 import ctypes
-import os
 import platform
-import struct
 from pathlib import Path
-from typing import Any
 
 # Attempt to load the native library
 _lib = None
@@ -87,13 +84,19 @@ def _setup_signatures(lib):
     lib.cag_graph_create.argtypes = [ctypes.c_int32]
     lib.cag_graph_create.restype = ctypes.c_void_p
 
-    lib.cag_graph_add_edge.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_float]
+    lib.cag_graph_add_edge.argtypes = [
+        ctypes.c_void_p, ctypes.c_int32,
+        ctypes.c_int32, ctypes.c_float,
+    ]
     lib.cag_graph_add_edge.restype = None
 
     lib.cag_graph_set_node_weight.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_float]
     lib.cag_graph_set_node_weight.restype = None
 
-    lib.cag_graph_set_lines.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+    lib.cag_graph_set_lines.argtypes = [
+        ctypes.c_void_p, ctypes.c_int32,
+        ctypes.c_int32, ctypes.c_int32,
+    ]
     lib.cag_graph_set_lines.restype = None
 
     # Weighted BFS
