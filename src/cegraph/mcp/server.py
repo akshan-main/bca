@@ -52,10 +52,14 @@ class MCPServer:
 
         db_path = get_cegraph_dir(self.root) / GRAPH_DB_FILE
         if not db_path.exists():
-            raise RuntimeError(
-                f"No CeGraph index found at {db_path}. "
-                "Run 'cegraph init' first."
-            )
+            # Auto-init: build the graph on first use
+            logger.info("No index found, building graph for %s...", self.root)
+            self._auto_init()
+            if not db_path.exists():
+                raise RuntimeError(
+                    f"Failed to build index at {db_path}. "
+                    "Try running 'cegraph init' manually."
+                )
 
         # Check if source files are newer than the DB (staleness check)
         current_mtime = db_path.stat().st_mtime
@@ -78,6 +82,34 @@ class MCPServer:
         self._query = GraphQuery(self._graph, self._store)
         self._assembler = None  # Reset so it picks up new graph
         self._db_mtime = current_mtime
+
+    def _auto_init(self) -> None:
+        """Build the knowledge graph from scratch on first MCP use."""
+        import time as _time
+
+        from cegraph.graph.builder import GraphBuilder
+        from cegraph.graph.store import GraphStore
+
+        try:
+            config = load_config(self.root)
+            builder = GraphBuilder()
+            graph = builder.build_from_directory(self.root, config)
+            stats = builder.get_stats()
+
+            db_path = get_cegraph_dir(self.root) / GRAPH_DB_FILE
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            store = GraphStore(db_path)
+            store.save(graph, metadata={"stats": stats, "root": str(self.root)})
+            store.set_metadata("file_hashes", builder._file_hashes)
+            store.set_metadata("built_at", _time.time())
+            store.close()
+            logger.info(
+                "Auto-initialized: %d files, %d symbols",
+                stats.get("files", 0),
+                stats.get("total_nodes", 0) - stats.get("files", 0),
+            )
+        except Exception as e:
+            logger.error("Auto-init failed: %s", e)
 
     def _is_stale(self, db_mtime: float) -> bool:
         """Check if any source file is newer than the graph DB."""
