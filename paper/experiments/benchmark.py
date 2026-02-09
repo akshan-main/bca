@@ -1238,7 +1238,7 @@ def main():
     methods = [m.strip() for m in args.methods.split(",")]
 
     if args.quick:
-        budgets = [2000, 4000]
+        budgets = [1000, 4000]
         methods = ["grep", "bm25", "bca"]
 
     llm_config = LLMConfig(provider=args.provider, model=args.model)
