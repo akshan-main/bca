@@ -1,0 +1,408 @@
+# src/cegraph/cli.py:517-523
+def agent(task: str, path: str | None, auto: bool):
+    """Run an agentic task (coding, debugging, refactoring)."""
+    root = _get_project_root(path)
+    config = load_config(root)
+    graph, store = _load_graph(root)
+
+    _run_agent(root, config, graph, store, task, agent_mode=True, auto_approve=auto)
+
+# src/cegraph/tools/registry.py:11-58
+class ToolRegistry:
+    """Registry that manages available agent tools.
+
+    Tools are functions decorated with @tool that the LLM agent can call.
+    """
+
+    def __init__(self) -> None:
+        self._tools: dict[str, Callable] = {}
+        self._definitions: dict[str, ToolDefinition] = {}
+
+    def register(self, func: Callable, definition: ToolDefinition) -> None:
+        """Register a tool function with its definition."""
+        self._tools[definition.name] = func
+        self._definitions[definition.name] = definition
+
+    def get(self, name: str) -> Callable | None:
+        """Get a tool function by name."""
+        return self._tools.get(name)
+
+    def get_definition(self, name: str) -> ToolDefinition | None:
+        """Get a tool definition by name."""
+        return self._definitions.get(name)
+
+    def list_tools(self) -> list[str]:
+        """List all registered tool names."""
+        return list(self._tools.keys())
+
+    def get_definitions(self) -> list[ToolDefinition]:
+        """Get all tool definitions (for passing to LLM)."""
+        return list(self._definitions.values())
+
+    async def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        """Execute a tool by name with the given arguments.
+
+        Returns the result as a string.
+        """
+        func = self._tools.get(name)
+        if func is None:
+            return f"Error: Unknown tool '{name}'"
+
+        try:
+            if inspect.iscoroutinefunction(func):
+                result = await func(**arguments)
+            else:
+                result = func(**arguments)
+            return str(result) if result is not None else "Done."
+        except Exception as e:
+            return f"Error executing tool '{name}': {e}"
+
+# src/cegraph/tools/definitions.py:19-318
+class CeGraphTools:
+    """Collection of built-in tools for the CeGraph agent.
+
+    Each tool interacts with the knowledge graph, search engine,
+    and/or the filesystem to provide the agent with accurate information.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        graph: nx.DiGraph,
+        query: GraphQuery,
+        search: HybridSearch,
+    ) -> None:
+        self.root = root
+        self.graph = graph
+        self.query = query
+        self.search = search
+
+    def search_code(self, query: str, file_pattern: str = "", max_results: int = 10) -> str:
+        """Search for code in the repository matching a query."""
+        results = self.search.search(query, file_pattern, max_results=max_results)
+        if not results:
+            return f"No results found for '{query}'"
+
+        output = []
+        for r in results:
+            header = f"**{r.file_path}:{r.line_number}**"
+            if r.symbol_name:
+                header += f" (in `{r.symbol_name}`)"
+            output.append(header)
+
+            if r.context_before:
+                for line in r.context_before:
+                    output.append(f"  {line}")
+            output.append(f"→ {r.line_content}")
+            if r.context_after:
+                for line in r.context_after:
+                    output.append(f"  {line}")
+            output.append("")
+
+        return "\n".join(output)
+
+    def search_symbols(self, query: str, kind: str = "", max_results: int = 10) -> str:
+        """Search for symbol definitions (functions, classes, etc.)."""
+        results = self.search.search_symbols(query, kind, max_results)
+        if not results:
+            return f"No symbols found matching '{query}'"
+
+        output = []
+        for r in results:
+            output.append(
+                f"- **{r['qualified_name']}** ({r['kind']}) at {r['file_path']}:{r['line']}"
+            )
+            if r.get("signature"):
+                output.append(f"  `{r['signature']}`")
+        return "\n".join(output)
+
+    def who_calls(self, symbol_name: str, max_depth: int = 2) -> str:
+        """Find all callers of a function/method."""
+        results = self.query.who_calls(symbol_name, max_depth=max_depth)
+        if not results:
+            return f"No callers found for '{symbol_name}'"
+
+        output = [f"Callers of `{symbol_name}`:"]
+        for r in results:
+            indent = "  " * r["depth"]
+            output.append(
+                f"{indent}← **{r['name']}** ({r['kind']}) at {r['file_path']}:{r['line']}"
+            )
+        return "\n".join(output)
+
+    def what_calls(self, symbol_name: str) -> str:
+        """Find all symbols called by a function/method."""
+        results = self.query.what_calls(symbol_name)
+        if not results:
+            return f"No callees found for '{symbol_name}'"
+
+        output = [f"`{symbol_name}` calls:"]
+        for r in results:
+            output.append(
+                f"→ **{r['name']}** ({r['kind']}) at {r['file_path']}:{r['line']}"
+            )
+        return "\n".join(output)
+
+    def impact_of(self, symbol_name: str) -> str:
+        """Analyze the impact of changing a symbol."""
+        result = self.query.impact_of(symbol_name)
+        if not result.get("found"):
+            return f"Symbol '{symbol_name}' not found in the knowledge graph"
+
+        output = [f"Impact analysis for `{symbol_name}`:"]
+        output.append(f"Risk score: {result['risk_score']:.1%}")
+        output.append(f"Direct callers: {len(result['direct_callers'])}")
+        output.append(f"Transitive callers: {len(result['transitive_callers'])}")
+        output.append(f"Affected files ({len(result['affected_files'])}):")
+        for f in result["affected_files"]:
+            output.append(f"  - {f}")
+        return "\n".join(output)
+
+    def read_file(self, file_path: str, start_line: int = 0, end_line: int = 0) -> str:
+        """Read a file from the repository."""
+        full_path = self.root / file_path
+        if not full_path.exists():
+            return f"File not found: {file_path}"
+        if not full_path.is_file():
+            return f"Not a file: {file_path}"
+
+        # Security: ensure we're within the project root
+        try:
+            full_path.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            return f"Access denied: {file_path} is outside the project root"
+
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return f"Error reading file: {e}"
+
+        lines = content.splitlines()
+        if start_line or end_line:
+            start = max(0, start_line - 1)
+            end = end_line if end_line else len(lines)
+            lines = lines[start:end]
+            # Add line numbers
+            numbered = [
+                f"{i + start + 1:4d} | {line}" for i, line in enumerate(lines)
+            ]
+            return "\n".join(numbered)
+
+        # If file is too long, truncate with message
+        if len(lines) > 200:
+            numbered = [f"{i + 1:4d} | {line}" for i, line in enumerate(lines[:200])]
+            numbered.append(f"\n... ({len(lines) - 200} more lines)")
+            return "\n".join(numbered)
+
+        numbered = [f"{i + 1:4d} | {line}" for i, line in enumerate(lines)]
+        return "\n".join(numbered)
+
+    def write_file(self, file_path: str, content: str) -> str:
+        """Write content to a file (creates or overwrites)."""
+        full_path = self.root / file_path
+        try:
+            full_path.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            return f"Access denied: {file_path} is outside the project root"
+
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content, encoding="utf-8")
+        return f"Successfully wrote {len(content)} bytes to {file_path}"
+
+    def edit_file(
+        self, file_path: str, old_text: str, new_text: str
+    ) -> str:
+        """Replace specific text in a file (targeted edit, not full rewrite)."""
+        full_path = self.root / file_path
+        if not full_path.exists():
+            return f"File not found: {file_path}"
+
+        try:
+            full_path.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            return f"Access denied: {file_path} is outside the project root"
+
+        content = full_path.read_text(encoding="utf-8", errors="replace")
+        if old_text not in content:
+            return f"Text to replace not found in {file_path}"
+
+        count = content.count(old_text)
+        if count > 1:
+            return f"Text to replace found {count} times. Please provide more context to make it unique."
+
+        new_content = content.replace(old_text, new_text, 1)
+        full_path.write_text(new_content, encoding="utf-8")
+        return f"Successfully edited {file_path}"
+
+    def list_files(self, path: str = "", pattern: str = "") -> str:
+        """List files in the repository."""
+        target = self.root / path if path else self.root
+        if not target.exists():
+            return f"Path not found: {path}"
+
+        try:
+            target.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            return f"Access denied: {path} is outside the project root"
+
+        files = []
+        if pattern:
+            import fnmatch
+
+            for p in sorted(target.rglob("*")):
+                if p.is_file() and fnmatch.fnmatch(p.name, pattern):
+                    files.append(str(p.relative_to(self.root)))
+        else:
+            for p in sorted(target.iterdir()):
+                prefix = "d " if p.is_dir() else "f "
+                files.append(prefix + str(p.relative_to(self.root)))
+
+        return "\n".join(files) if files else "No files found"
+
+    def get_structure(self, path: str = "") -> str:
+        """Get the project structure with symbol counts."""
+        structure = self.query.get_structure(path)
+        return json.dumps(structure, indent=2) if structure else "No structure data"
+
+    def get_context(self, symbol_name: str) -> str:
+        """Get full context for a symbol including its source code and relationships."""
+        symbol_ids = self.query.find_symbol(symbol_name)
+        if not symbol_ids:
+            return f"Symbol '{symbol_name}' not found"
+
+        output = []
+        for sid in symbol_ids[:3]:  # Limit to 3 matches
+            info = self.query.get_symbol_info(sid)
+            if not info:
+                continue
+
+            output.append(f"## {info.qualified_name} ({info.kind})")
+            output.append(f"**File:** {info.file_path}:{info.line_start}-{info.line_end}")
+            if info.signature:
+                output.append(f"**Signature:** `{info.signature}`")
+            if info.docstring:
+                output.append(f"**Docstring:** {info.docstring[:200]}")
+
+            # Show source code
+            file_content = self.read_file(
+                info.file_path,
+                start_line=info.line_start,
+                end_line=info.line_end,
+            )
+            output.append(f"\n```\n{file_content}\n```")
+
+            # Show relationships
+            if info.callers:
+                output.append(f"\n**Called by:** {', '.join(c.split('::')[-1] for c in info.callers[:5])}")
+            if info.callees:
+                output.append(f"**Calls:** {', '.join(c.split('::')[-1] for c in info.callees[:5])}")
+            if info.children:
+                output.append(f"**Contains:** {', '.join(c.split('::')[-1] for c in info.children[:5])}")
+
+            output.append("")
+
+        return "\n".join(output)
+
+    def run_command(self, command: str) -> str:
+        """Run a shell command in the project root (for tests, lint, etc.)."""
+        import shlex
+
+        # Parse into argv — this prevents injection via shell metacharacters
+        try:
+            argv = shlex.split(command)
+        except ValueError as e:
+            return f"Invalid command syntax: {e}"
+
+        if not argv:
+            return "Empty command"
+
+        # Security: only allow specific executables (check first token only)
+        allowed_executables = {
+            "python", "python3", "pytest", "pip", "pip3",
+            "npm", "node", "npx", "yarn", "pnpm",
+            "go", "cargo", "make", "gradle", "mvn",
+            "ruff", "black", "mypy", "flake8", "eslint", "prettier",
+            "git", "ls", "cat", "head", "tail", "wc", "find", "grep",
+        }
+        # For git, only allow safe read-only subcommands
+        _git_safe_subcommands = {"status", "diff", "log", "show", "branch", "tag"}
+
+        exe = argv[0].lower()
+        if exe not in allowed_executables:
+            return f"Command not allowed for safety. Allowed executables: {', '.join(sorted(allowed_executables))}"
+
+        if exe == "git":
+            subcommand = argv[1].lower() if len(argv) > 1 else ""
+            if subcommand not in _git_safe_subcommands:
+                return f"Only read-only git subcommands are allowed: {', '.join(sorted(_git_safe_subcommands))}"
+
+        try:
+            result = subprocess.run(
+                argv,
+                shell=False,
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            output = result.stdout
+            if result.stderr:
+                output += "\n[stderr]\n" + result.stderr
+            if result.returncode != 0:
+                output += f"\n[exit code: {result.returncode}]"
+            # Truncate very long output
+            if len(output) > 5000:
+                output = output[:5000] + "\n... (truncated)"
+            return output or "(no output)"
+        except subprocess.TimeoutExpired:
+            return "Command timed out after 60 seconds"
+        except Exception as e:
+            return f"Error running command: {e}"
+
+# src/cegraph/context/engine.py:706-743
+    def _closure_of(self, symbol_id: str, candidate_ids: set[str]) -> set[str]:
+        """Compute D(v): the transitive set of hard dependencies for symbol v."""
+        deps: set[str] = set()
+        stack = [symbol_id]
+        visited = {symbol_id}
+
+        while stack:
+            current = stack.pop()
+            data = self.graph.nodes.get(current, {})
+
+            # Forward edges: inherits, implements
+            for succ in self.graph.successors(current):
+                edge_data = self.graph.edges[current, succ]
+                edge_kind = edge_data.get("kind", "")
+
+                if edge_kind in _HARD_DEP_EDGES:
+                    succ_data = self.graph.nodes.get(succ, {})
+                    if succ_data.get("type") == "symbol" and succ not in visited:
+                        deps.add(succ)
+                        visited.add(succ)
+                        stack.append(succ)
+
+            # Upward containment: if this is a method, its parent class is needed
+            if data.get("kind") in ("method", "function"):
+                for pred in self.graph.predecessors(current):
+                    edge_data = self.graph.edges[pred, current]
+                    if edge_data.get("kind") == "contains":
+                        pred_data = self.graph.nodes.get(pred, {})
+                        if (
+                            pred_data.get("type") == "symbol"
+                            and pred_data.get("kind") == "class"
+                            and pred not in visited
+                        ):
+                            deps.add(pred)
+                            visited.add(pred)
+                            stack.append(pred)
+
+        return deps
+
+# src/cegraph/config.py:41-46
+class AgentConfig(BaseModel):
+    """Agent behavior configuration."""
+
+    max_iterations: int = 150
+    auto_verify: bool = True
+    require_approval: bool = True

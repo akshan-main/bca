@@ -1,0 +1,835 @@
+# src/cegraph/cli.py:517-523
+def agent(task: str, path: str | None, auto: bool):
+    """Run an agentic task (coding, debugging, refactoring)."""
+    root = _get_project_root(path)
+    config = load_config(root)
+    graph, store = _load_graph(root)
+
+    _run_agent(root, config, graph, store, task, agent_mode=True, auto_approve=auto)
+
+# src/cegraph/tools/registry.py:11-58
+class ToolRegistry:
+    """Registry that manages available agent tools.
+
+    Tools are functions decorated with @tool that the LLM agent can call.
+    """
+
+    def __init__(self) -> None:
+        self._tools: dict[str, Callable] = {}
+        self._definitions: dict[str, ToolDefinition] = {}
+
+    def register(self, func: Callable, definition: ToolDefinition) -> None:
+        """Register a tool function with its definition."""
+        self._tools[definition.name] = func
+        self._definitions[definition.name] = definition
+
+    def get(self, name: str) -> Callable | None:
+        """Get a tool function by name."""
+        return self._tools.get(name)
+
+    def get_definition(self, name: str) -> ToolDefinition | None:
+        """Get a tool definition by name."""
+        return self._definitions.get(name)
+
+    def list_tools(self) -> list[str]:
+        """List all registered tool names."""
+        return list(self._tools.keys())
+
+    def get_definitions(self) -> list[ToolDefinition]:
+        """Get all tool definitions (for passing to LLM)."""
+        return list(self._definitions.values())
+
+    async def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        """Execute a tool by name with the given arguments.
+
+        Returns the result as a string.
+        """
+        func = self._tools.get(name)
+        if func is None:
+            return f"Error: Unknown tool '{name}'"
+
+        try:
+            if inspect.iscoroutinefunction(func):
+                result = await func(**arguments)
+            else:
+                result = func(**arguments)
+            return str(result) if result is not None else "Done."
+        except Exception as e:
+            return f"Error executing tool '{name}': {e}"
+
+# src/cegraph/tools/definitions.py:19-318
+class CeGraphTools:
+    """Collection of built-in tools for the CeGraph agent.
+
+    Each tool interacts with the knowledge graph, search engine,
+    and/or the filesystem to provide the agent with accurate information.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        graph: nx.DiGraph,
+        query: GraphQuery,
+        search: HybridSearch,
+    ) -> None:
+        self.root = root
+        self.graph = graph
+        self.query = query
+        self.search = search
+
+    def search_code(self, query: str, file_pattern: str = "", max_results: int = 10) -> str:
+        """Search for code in the repository matching a query."""
+        results = self.search.search(query, file_pattern, max_results=max_results)
+        if not results:
+            return f"No results found for '{query}'"
+
+        output = []
+        for r in results:
+            header = f"**{r.file_path}:{r.line_number}**"
+            if r.symbol_name:
+                header += f" (in `{r.symbol_name}`)"
+            output.append(header)
+
+            if r.context_before:
+                for line in r.context_before:
+                    output.append(f"  {line}")
+            output.append(f"→ {r.line_content}")
+            if r.context_after:
+                for line in r.context_after:
+                    output.append(f"  {line}")
+            output.append("")
+
+        return "\n".join(output)
+
+    def search_symbols(self, query: str, kind: str = "", max_results: int = 10) -> str:
+        """Search for symbol definitions (functions, classes, etc.)."""
+        results = self.search.search_symbols(query, kind, max_results)
+        if not results:
+            return f"No symbols found matching '{query}'"
+
+        output = []
+        for r in results:
+            output.append(
+                f"- **{r['qualified_name']}** ({r['kind']}) at {r['file_path']}:{r['line']}"
+            )
+            if r.get("signature"):
+                output.append(f"  `{r['signature']}`")
+        return "\n".join(output)
+
+    def who_calls(self, symbol_name: str, max_depth: int = 2) -> str:
+        """Find all callers of a function/method."""
+        results = self.query.who_calls(symbol_name, max_depth=max_depth)
+        if not results:
+            return f"No callers found for '{symbol_name}'"
+
+        output = [f"Callers of `{symbol_name}`:"]
+        for r in results:
+            indent = "  " * r["depth"]
+            output.append(
+                f"{indent}← **{r['name']}** ({r['kind']}) at {r['file_path']}:{r['line']}"
+            )
+        return "\n".join(output)
+
+    def what_calls(self, symbol_name: str) -> str:
+        """Find all symbols called by a function/method."""
+        results = self.query.what_calls(symbol_name)
+        if not results:
+            return f"No callees found for '{symbol_name}'"
+
+        output = [f"`{symbol_name}` calls:"]
+        for r in results:
+            output.append(
+                f"→ **{r['name']}** ({r['kind']}) at {r['file_path']}:{r['line']}"
+            )
+        return "\n".join(output)
+
+    def impact_of(self, symbol_name: str) -> str:
+        """Analyze the impact of changing a symbol."""
+        result = self.query.impact_of(symbol_name)
+        if not result.get("found"):
+            return f"Symbol '{symbol_name}' not found in the knowledge graph"
+
+        output = [f"Impact analysis for `{symbol_name}`:"]
+        output.append(f"Risk score: {result['risk_score']:.1%}")
+        output.append(f"Direct callers: {len(result['direct_callers'])}")
+        output.append(f"Transitive callers: {len(result['transitive_callers'])}")
+        output.append(f"Affected files ({len(result['affected_files'])}):")
+        for f in result["affected_files"]:
+            output.append(f"  - {f}")
+        return "\n".join(output)
+
+    def read_file(self, file_path: str, start_line: int = 0, end_line: int = 0) -> str:
+        """Read a file from the repository."""
+        full_path = self.root / file_path
+        if not full_path.exists():
+            return f"File not found: {file_path}"
+        if not full_path.is_file():
+            return f"Not a file: {file_path}"
+
+        # Security: ensure we're within the project root
+        try:
+            full_path.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            return f"Access denied: {file_path} is outside the project root"
+
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return f"Error reading file: {e}"
+
+        lines = content.splitlines()
+        if start_line or end_line:
+            start = max(0, start_line - 1)
+            end = end_line if end_line else len(lines)
+            lines = lines[start:end]
+            # Add line numbers
+            numbered = [
+                f"{i + start + 1:4d} | {line}" for i, line in enumerate(lines)
+            ]
+            return "\n".join(numbered)
+
+        # If file is too long, truncate with message
+        if len(lines) > 200:
+            numbered = [f"{i + 1:4d} | {line}" for i, line in enumerate(lines[:200])]
+            numbered.append(f"\n... ({len(lines) - 200} more lines)")
+            return "\n".join(numbered)
+
+        numbered = [f"{i + 1:4d} | {line}" for i, line in enumerate(lines)]
+        return "\n".join(numbered)
+
+    def write_file(self, file_path: str, content: str) -> str:
+        """Write content to a file (creates or overwrites)."""
+        full_path = self.root / file_path
+        try:
+            full_path.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            return f"Access denied: {file_path} is outside the project root"
+
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content, encoding="utf-8")
+        return f"Successfully wrote {len(content)} bytes to {file_path}"
+
+    def edit_file(
+        self, file_path: str, old_text: str, new_text: str
+    ) -> str:
+        """Replace specific text in a file (targeted edit, not full rewrite)."""
+        full_path = self.root / file_path
+        if not full_path.exists():
+            return f"File not found: {file_path}"
+
+        try:
+            full_path.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            return f"Access denied: {file_path} is outside the project root"
+
+        content = full_path.read_text(encoding="utf-8", errors="replace")
+        if old_text not in content:
+            return f"Text to replace not found in {file_path}"
+
+        count = content.count(old_text)
+        if count > 1:
+            return f"Text to replace found {count} times. Please provide more context to make it unique."
+
+        new_content = content.replace(old_text, new_text, 1)
+        full_path.write_text(new_content, encoding="utf-8")
+        return f"Successfully edited {file_path}"
+
+    def list_files(self, path: str = "", pattern: str = "") -> str:
+        """List files in the repository."""
+        target = self.root / path if path else self.root
+        if not target.exists():
+            return f"Path not found: {path}"
+
+        try:
+            target.resolve().relative_to(self.root.resolve())
+        except ValueError:
+            return f"Access denied: {path} is outside the project root"
+
+        files = []
+        if pattern:
+            import fnmatch
+
+            for p in sorted(target.rglob("*")):
+                if p.is_file() and fnmatch.fnmatch(p.name, pattern):
+                    files.append(str(p.relative_to(self.root)))
+        else:
+            for p in sorted(target.iterdir()):
+                prefix = "d " if p.is_dir() else "f "
+                files.append(prefix + str(p.relative_to(self.root)))
+
+        return "\n".join(files) if files else "No files found"
+
+    def get_structure(self, path: str = "") -> str:
+        """Get the project structure with symbol counts."""
+        structure = self.query.get_structure(path)
+        return json.dumps(structure, indent=2) if structure else "No structure data"
+
+    def get_context(self, symbol_name: str) -> str:
+        """Get full context for a symbol including its source code and relationships."""
+        symbol_ids = self.query.find_symbol(symbol_name)
+        if not symbol_ids:
+            return f"Symbol '{symbol_name}' not found"
+
+        output = []
+        for sid in symbol_ids[:3]:  # Limit to 3 matches
+            info = self.query.get_symbol_info(sid)
+            if not info:
+                continue
+
+            output.append(f"## {info.qualified_name} ({info.kind})")
+            output.append(f"**File:** {info.file_path}:{info.line_start}-{info.line_end}")
+            if info.signature:
+                output.append(f"**Signature:** `{info.signature}`")
+            if info.docstring:
+                output.append(f"**Docstring:** {info.docstring[:200]}")
+
+            # Show source code
+            file_content = self.read_file(
+                info.file_path,
+                start_line=info.line_start,
+                end_line=info.line_end,
+            )
+            output.append(f"\n```\n{file_content}\n```")
+
+            # Show relationships
+            if info.callers:
+                output.append(f"\n**Called by:** {', '.join(c.split('::')[-1] for c in info.callers[:5])}")
+            if info.callees:
+                output.append(f"**Calls:** {', '.join(c.split('::')[-1] for c in info.callees[:5])}")
+            if info.children:
+                output.append(f"**Contains:** {', '.join(c.split('::')[-1] for c in info.children[:5])}")
+
+            output.append("")
+
+        return "\n".join(output)
+
+    def run_command(self, command: str) -> str:
+        """Run a shell command in the project root (for tests, lint, etc.)."""
+        import shlex
+
+        # Parse into argv — this prevents injection via shell metacharacters
+        try:
+            argv = shlex.split(command)
+        except ValueError as e:
+            return f"Invalid command syntax: {e}"
+
+        if not argv:
+            return "Empty command"
+
+        # Security: only allow specific executables (check first token only)
+        allowed_executables = {
+            "python", "python3", "pytest", "pip", "pip3",
+            "npm", "node", "npx", "yarn", "pnpm",
+            "go", "cargo", "make", "gradle", "mvn",
+            "ruff", "black", "mypy", "flake8", "eslint", "prettier",
+            "git", "ls", "cat", "head", "tail", "wc", "find", "grep",
+        }
+        # For git, only allow safe read-only subcommands
+        _git_safe_subcommands = {"status", "diff", "log", "show", "branch", "tag"}
+
+        exe = argv[0].lower()
+        if exe not in allowed_executables:
+            return f"Command not allowed for safety. Allowed executables: {', '.join(sorted(allowed_executables))}"
+
+        if exe == "git":
+            subcommand = argv[1].lower() if len(argv) > 1 else ""
+            if subcommand not in _git_safe_subcommands:
+                return f"Only read-only git subcommands are allowed: {', '.join(sorted(_git_safe_subcommands))}"
+
+        try:
+            result = subprocess.run(
+                argv,
+                shell=False,
+                cwd=str(self.root),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            output = result.stdout
+            if result.stderr:
+                output += "\n[stderr]\n" + result.stderr
+            if result.returncode != 0:
+                output += f"\n[exit code: {result.returncode}]"
+            # Truncate very long output
+            if len(output) > 5000:
+                output = output[:5000] + "\n... (truncated)"
+            return output or "(no output)"
+        except subprocess.TimeoutExpired:
+            return "Command timed out after 60 seconds"
+        except Exception as e:
+            return f"Error running command: {e}"
+
+# src/cegraph/agent/loop.py:45-191
+class AgentLoop:
+    """ReAct agent loop that iteratively uses tools to complete tasks.
+
+    The agent:
+    1. Receives a task from the user
+    2. Reasons about what to do next
+    3. Calls tools to gather information or make changes
+    4. Processes tool results
+    5. Repeats until it has enough info to give a final answer
+    6. Presents the answer/changes for user approval
+    """
+
+    def __init__(
+        self,
+        llm: LLMProvider,
+        tools: ToolRegistry,
+        project_name: str = "",
+        max_iterations: int = 15,
+        on_step: Callable[[AgentStep], None] | None = None,
+        on_approval_needed: Callable[[str], bool] | None = None,
+    ) -> None:
+        self.llm = llm
+        self.tools = tools
+        self.project_name = project_name
+        self.max_iterations = max_iterations
+        self.on_step = on_step
+        self.on_approval_needed = on_approval_needed
+
+    async def run(self, task: str, context: str = "") -> AgentResult:
+        """Run the agent loop for a given task.
+
+        Args:
+            task: The user's request/task.
+            context: Additional context (e.g., file content, error messages).
+
+        Returns:
+            AgentResult with the final answer and step history.
+        """
+        messages: list[Message] = [
+            Message(role="system", content=get_system_prompt(self.project_name)),
+        ]
+
+        # Add context if provided
+        user_content = task
+        if context:
+            user_content = f"{task}\n\nContext:\n{context}"
+        messages.append(Message(role="user", content=user_content))
+
+        steps: list[AgentStep] = []
+        total_tokens = 0
+
+        for iteration in range(self.max_iterations):
+            step = AgentStep(iteration=iteration + 1)
+
+            try:
+                response = await self.llm.complete(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    temperature=0.0,
+                )
+            except Exception as e:
+                return AgentResult(
+                    answer="",
+                    steps=steps,
+                    total_iterations=iteration + 1,
+                    total_tokens=total_tokens,
+                    success=False,
+                    error=f"LLM error: {e}",
+                )
+
+            step.usage = response.usage
+            total_tokens += sum(response.usage.values())
+
+            if response.has_tool_calls:
+                # Agent wants to use tools
+                step.thought = response.content
+                step.tool_calls = response.tool_calls
+
+                # Add assistant message with tool calls
+                messages.append(
+                    Message(
+                        role="assistant",
+                        content=response.content,
+                        tool_calls=response.tool_calls,
+                    )
+                )
+
+                # Execute each tool call
+                for tc in response.tool_calls:
+                    result = await self.tools.execute(tc.name, tc.arguments)
+                    tool_result = ToolResult(
+                        tool_call_id=tc.id,
+                        name=tc.name,
+                        content=result,
+                    )
+                    step.tool_results.append(tool_result)
+
+                    # Add tool result message
+                    messages.append(
+                        Message(
+                            role="tool",
+                            content=result,
+                            tool_call_id=tc.id,
+                            name=tc.name,
+                        )
+                    )
+
+                # Notify step callback
+                if self.on_step:
+                    self.on_step(step)
+
+                steps.append(step)
+
+            else:
+                # Agent is done - final answer
+                step.response = response.content
+
+                if self.on_step:
+                    self.on_step(step)
+
+                steps.append(step)
+
+                return AgentResult(
+                    answer=response.content,
+                    steps=steps,
+                    total_iterations=iteration + 1,
+                    total_tokens=total_tokens,
+                    success=True,
+                )
+
+        # Max iterations reached
+        return AgentResult(
+            answer="I reached the maximum number of iterations. Here's what I've found so far based on my analysis.",
+            steps=steps,
+            total_iterations=self.max_iterations,
+            total_tokens=total_tokens,
+            success=False,
+            error="Max iterations reached",
+        )
+
+    async def ask(self, question: str) -> str:
+        """Simple Q&A mode - ask a question about the codebase.
+
+        Returns just the answer string.
+        """
+        result = await self.run(question)
+        return result.answer
+
+# src/cegraph/context/engine.py:706-743
+    def _closure_of(self, symbol_id: str, candidate_ids: set[str]) -> set[str]:
+        """Compute D(v): the transitive set of hard dependencies for symbol v."""
+        deps: set[str] = set()
+        stack = [symbol_id]
+        visited = {symbol_id}
+
+        while stack:
+            current = stack.pop()
+            data = self.graph.nodes.get(current, {})
+
+            # Forward edges: inherits, implements
+            for succ in self.graph.successors(current):
+                edge_data = self.graph.edges[current, succ]
+                edge_kind = edge_data.get("kind", "")
+
+                if edge_kind in _HARD_DEP_EDGES:
+                    succ_data = self.graph.nodes.get(succ, {})
+                    if succ_data.get("type") == "symbol" and succ not in visited:
+                        deps.add(succ)
+                        visited.add(succ)
+                        stack.append(succ)
+
+            # Upward containment: if this is a method, its parent class is needed
+            if data.get("kind") in ("method", "function"):
+                for pred in self.graph.predecessors(current):
+                    edge_data = self.graph.edges[pred, current]
+                    if edge_data.get("kind") == "contains":
+                        pred_data = self.graph.nodes.get(pred, {})
+                        if (
+                            pred_data.get("type") == "symbol"
+                            and pred_data.get("kind") == "class"
+                            and pred not in visited
+                        ):
+                            deps.add(pred)
+                            visited.add(pred)
+                            stack.append(pred)
+
+        return deps
+
+# src/cegraph/agent/loop.py:57-71
+    def __init__(
+        self,
+        llm: LLMProvider,
+        tools: ToolRegistry,
+        project_name: str = "",
+        max_iterations: int = 15,
+        on_step: Callable[[AgentStep], None] | None = None,
+        on_approval_needed: Callable[[str], bool] | None = None,
+    ) -> None:
+        self.llm = llm
+        self.tools = tools
+        self.project_name = project_name
+        self.max_iterations = max_iterations
+        self.on_step = on_step
+        self.on_approval_needed = on_approval_needed
+
+# src/cegraph/context/engine.py:567-630
+    def _expand_context_pagerank(
+        self, seeds: list[dict], config: dict
+    ) -> list[dict]:
+        """Expand context via personalized PageRank from seeds.
+
+        Instead of BFS, compute PPR with the seed set as the personalization
+        vector.  This gives a global relevance score that accounts for the
+        full graph structure, not just local neighborhoods.
+        """
+        min_score = config["min_score"]
+
+        # Build personalization vector (seed nodes get their scores)
+        personalization: dict[str, float] = {}
+        for s in seeds:
+            personalization[s["symbol_id"]] = s["score"]
+
+        # Ensure all seed nodes exist in graph
+        personalization = {
+            k: v for k, v in personalization.items()
+            if self.graph.has_node(k)
+        }
+        if not personalization:
+            return []
+
+        # Normalize
+        total = sum(personalization.values())
+        personalization = {k: v / total for k, v in personalization.items()}
+
+        try:
+            ppr = nx.pagerank(
+                self.graph,
+                alpha=0.85,
+                personalization=personalization,
+                max_iter=100,
+                tol=1e-6,
+            )
+        except nx.NetworkXError:
+            return self._expand_context(seeds, config)
+
+        seed_reason = {s["symbol_id"]: s["reason"] for s in seeds}
+        candidates: list[dict] = []
+
+        for node_id, score in ppr.items():
+            if score < min_score * 0.01:
+                continue
+            data = self.graph.nodes.get(node_id, {})
+            if data.get("type") != "symbol":
+                continue
+
+            # Scale PPR scores to be comparable with BFS scores
+            scaled_score = score * 100
+
+            reason = seed_reason.get(node_id, "pagerank expansion")
+            depth = 0 if node_id in personalization else 1
+            candidates.append({
+                "symbol_id": node_id,
+                "score": scaled_score,
+                "depth": depth,
+                "reason": reason,
+                "via": [],
+            })
+
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates
+
+# src/cegraph/graph/query.py:185-229
+    def impact_of(self, name: str, max_depth: int = 3) -> dict:
+        """Analyze the impact of changing a symbol.
+
+        Returns a dict with:
+        - direct_callers: immediate callers
+        - transitive_callers: all callers up to max_depth
+        - affected_files: set of files that could be affected
+        - risk_score: rough risk assessment (0-1)
+        """
+        symbol_ids = self.find_symbol(name)
+        if not symbol_ids:
+            return {
+                "symbol": name,
+                "found": False,
+                "direct_callers": [],
+                "transitive_callers": [],
+                "affected_files": [],
+                "risk_score": 0.0,
+            }
+
+        direct = self.who_calls(name, max_depth=1)
+        transitive = self.who_calls(name, max_depth=max_depth)
+
+        affected_files = set()
+        for item in transitive:
+            if item.get("file_path"):
+                affected_files.add(item["file_path"])
+        # Also include the symbol's own file
+        for sid in symbol_ids:
+            data = self.graph.nodes.get(sid, {})
+            if data.get("file_path"):
+                affected_files.add(data["file_path"])
+
+        # Risk score based on impact breadth
+        total_files = sum(1 for _, d in self.graph.nodes(data=True) if d.get("type") == "file")
+        risk_score = min(len(affected_files) / max(total_files, 1), 1.0)
+
+        return {
+            "symbol": name,
+            "found": True,
+            "direct_callers": direct,
+            "transitive_callers": transitive,
+            "affected_files": sorted(affected_files),
+            "risk_score": round(risk_score, 3),
+        }
+
+# src/cegraph/agent/loop.py:22-30
+class AgentStep:
+    """A single step in the agent loop."""
+
+    iteration: int
+    thought: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_results: list[ToolResult] = field(default_factory=list)
+    response: str = ""
+    usage: dict[str, int] = field(default_factory=dict)
+
+# src/cegraph/agent/loop.py:34-42
+class AgentResult:
+    """Final result from the agent loop."""
+
+    answer: str
+    steps: list[AgentStep]
+    total_iterations: int
+    total_tokens: int
+    success: bool = True
+    error: str = ""
+
+# src/cegraph/config.py:41-46
+class AgentConfig(BaseModel):
+    """Agent behavior configuration."""
+
+    max_iterations: int = 150
+    auto_verify: bool = True
+    require_approval: bool = True
+
+# src/cegraph/exceptions.py:24-25
+class ToolError(CeGraphError):
+    """Agent tool execution errors."""
+
+# src/cegraph/agent/prompts.py:6-41
+def get_system_prompt(project_name: str = "") -> str:
+    """Get the system prompt for the agent."""
+    project_str = f" for the '{project_name}' project" if project_name else ""
+
+    return f"""You are CeGraph, an AI coding assistant{project_str} with deep understanding of the codebase through a knowledge graph.
+
+## Your Capabilities
+You have access to tools that let you:
+- **Search** the codebase (text and symbol search)
+- **Understand** code relationships (who calls what, impact analysis)
+- **Read** and **edit** specific files with targeted changes
+- **Run** tests and commands to verify your work
+- **Navigate** the project structure
+
+## How You Work
+1. **Understand first**: Before making changes, use `get_context`, `who_calls`, and `search_code` to fully understand the relevant code and its relationships.
+2. **Plan changes**: Think through the blast radius. Use `impact_of` to see what could break.
+3. **Make targeted edits**: Use `edit_file` for precise changes instead of rewriting entire files.
+4. **Verify**: After changes, use `run_command` to run tests and ensure nothing broke.
+
+## Rules
+- ALWAYS understand the code before changing it. Read the relevant files and check relationships.
+- NEVER rewrite entire files when a targeted edit will do. Use `edit_file` with specific old_text/new_text.
+- ALWAYS check the impact of changes with `impact_of` before editing shared/core code.
+- When fixing bugs, first reproduce and understand the issue, then fix the root cause.
+- When adding features, check existing patterns in the codebase and follow them.
+- If you're unsure about something, say so. Don't guess.
+- Keep your responses focused and actionable.
+
+## Response Format
+- Be concise but thorough
+- Show your reasoning when making decisions
+- Reference specific files and line numbers
+- When proposing changes, show the exact edits you'll make
+- After making changes, summarize what was done and how to verify
+"""
+
+# src/cegraph/context/engine.py:116-128
+class AblationConfig:
+    """Toggle individual components for ablation studies.
+
+    All features enabled by default. Disable to measure their contribution.
+    """
+    dependency_closure: bool = True    # Enforce D(v) ⊆ X constraint
+    centrality_scoring: bool = True    # Boost high-connectivity symbols
+    file_proximity: bool = True        # Boost symbols in same file as seeds
+    kind_weights: bool = True          # Weight by symbol kind
+    submodular_coverage: bool = True   # Diminishing returns scoring
+    dependency_ordering: bool = True   # Topological sort output
+    learned_weights: bool = False      # Learn edge weights from git history
+    use_pagerank: bool = False         # Personalized PageRank instead of BFS
+
+# tests/test_context.py:297-300
+    def test_assembly_time_tracked(self, cag_engine: ContextAssembler):
+        """Test that assembly time is tracked."""
+        package = cag_engine.assemble("fix main", token_budget=8000)
+        assert package.assembly_time_ms >= 0
+
+# tests/test_context.py:302-305
+    def test_is_not_accelerated(self, cag_engine: ContextAssembler):
+        """Test that C++ acceleration is reported correctly."""
+        # In tests, C++ extension is typically not compiled
+        assert isinstance(cag_engine.is_accelerated, bool)
+
+# src/cegraph/ui/console.py:86-118
+    def show_agent_step(self, step: AgentStep) -> None:
+        """Display an agent step with tool calls and results."""
+        if step.thought:
+            self.console.print(
+                Panel(
+                    Markdown(step.thought),
+                    title=f"[bold]Step {step.iteration}[/bold] - Thinking",
+                    border_style="blue",
+                )
+            )
+
+        for tc in step.tool_calls:
+            args_str = ", ".join(f"{k}={repr(v)}" for k, v in tc.arguments.items())
+            self.console.print(
+                f"  [yellow]→[/yellow] [bold]{tc.name}[/bold]({args_str})"
+            )
+
+        for tr in step.tool_results:
+            # Truncate long results
+            content = tr.content
+            if len(content) > 500:
+                content = content[:500] + "\n... (truncated)"
+            style = "red" if tr.is_error else "dim"
+            self.console.print(f"  [{style}]{content}[/{style}]")
+
+        if step.response:
+            self.console.print(
+                Panel(
+                    Markdown(step.response),
+                    title="[bold green]Answer[/bold green]",
+                    border_style="green",
+                )
+            )
+
+# src/cegraph/context/engine.py:940-950
+    def _update_coverage(
+        self, symbol_id: str, covered_edges: set[tuple[str, str]]
+    ) -> None:
+        """Mark edges incident to symbol_id as covered."""
+        for succ in self.graph.successors(symbol_id):
+            if self.graph.nodes.get(succ, {}).get("type") == "symbol":
+                covered_edges.add((symbol_id, succ))
+
+        for pred in self.graph.predecessors(symbol_id):
+            if self.graph.nodes.get(pred, {}).get("type") == "symbol":
+                covered_edges.add((pred, symbol_id))
+
+# src/cegraph/map/app.py:39-45
+def check_textual():
+    """Check if Textual is available."""
+    if not HAS_TEXTUAL:
+        print("Live Code Map requires Textual. Install it with:")
+        print("  pip install cegraph[map]")
+        print("  # or: pip install textual")
+        sys.exit(1)

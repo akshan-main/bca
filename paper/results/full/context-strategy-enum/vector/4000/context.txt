@@ -1,0 +1,450 @@
+# src/cegraph/context/models.py:15-15
+    SMART = "balanced"  # Graph-expanded with relevance scoring (default)
+
+# src/cegraph/context/models.py:11-16
+class ContextStrategy(str, Enum):
+    """Strategy for assembling context."""
+
+    PRECISE = "precise"  # Only directly relevant symbols
+    SMART = "balanced"  # Graph-expanded with relevance scoring (default)
+    THOROUGH = "thorough"  # Deep expansion, all related code
+
+# paper/experiments/ablation.py:21-21
+from cegraph.context.models import ContextStrategy
+
+# paper/experiments/baselines.py:28-28
+from cegraph.context.models import ContextStrategy, TokenEstimator
+
+# paper/experiments/benchmark.py:55-55
+from cegraph.context.models import ContextStrategy, TokenEstimator
+
+# src/cegraph/context/__init__.py:15-15
+from cegraph.context.models import ContextPackage, ContextItem, ContextStrategy
+
+# src/cegraph/context/engine.py:43-48
+from cegraph.context.models import (
+    ContextItem,
+    ContextPackage,
+    ContextStrategy,
+    TokenEstimator,
+)
+
+# tests/test_context.py:10-15
+from cegraph.context.models import (
+    ContextItem,
+    ContextPackage,
+    ContextStrategy,
+    TokenEstimator,
+)
+
+# src/cegraph/context/engine.py:204-272
+    def assemble(
+        self,
+        task: str,
+        token_budget: int = 8000,
+        strategy: ContextStrategy = ContextStrategy.SMART,
+        focus_files: list[str] | None = None,
+    ) -> ContextPackage:
+        """Assemble a budgeted context package for a given task.
+
+        Args:
+            task: Natural language description of the task.
+            token_budget: Maximum tokens to include (budget B).
+            strategy: How aggressively to expand context.
+            focus_files: Optional list of files to prioritize.
+
+        Returns:
+            A ContextPackage with the selected symbols and their source code,
+            ordered by dependency (definitions before usage).
+        """
+        start_time = time.time()
+        config = _STRATEGY_CONFIG[strategy]
+
+        # Phase 1: Extract entities from the task
+        entities = self._extract_entities(task)
+
+        # Phase 2: Find seed symbols in the graph
+        seeds = self._find_seeds(entities, focus_files)
+
+        # Phase 3: Expand context via graph traversal
+        if self.ablation.use_pagerank and seeds:
+            candidates = self._expand_context_pagerank(seeds, config)
+        elif self._native_graph and seeds:
+            candidates = self._expand_context_native(seeds, config)
+        else:
+            candidates = self._expand_context(seeds, config)
+
+        # Phase 4: Score candidates
+        scored = self._score_candidates(candidates, entities, seeds)
+
+        # Phase 5: Compute dependency closures
+        closures = self._compute_closures(scored)
+
+        # Phase 6: Budgeted selection with closure constraints
+        selected = self._budget_select(scored, closures, token_budget)
+
+        # Phase 7: Load source code
+        items = self._load_source(selected)
+
+        # Phase 8: Dependency-safe ordering
+        if self.ablation.dependency_ordering:
+            items = self._dependency_order(items)
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        total_tokens = sum(item.token_estimate for item in items)
+        files = set(item.file_path for item in items)
+
+        return ContextPackage(
+            task=task,
+            strategy=strategy,
+            items=items,
+            seed_symbols=[s["symbol_id"] for s in seeds],
+            total_tokens=total_tokens,
+            token_budget=token_budget,
+            files_included=len(files),
+            symbols_included=len(items),
+            symbols_available=len(scored),
+            budget_used_pct=round(total_tokens / max(token_budget, 1) * 100, 1),
+            assembly_time_ms=round(elapsed_ms, 1),
+        )
+
+# src/cegraph/ui/console.py:49-51
+    def code(self, text: str, language: str = "python") -> None:
+        """Render syntax-highlighted code."""
+        self.console.print(Syntax(text, language, theme="monokai", line_numbers=True))
+
+# src/cegraph/context/models.py:54-102
+    def render(self, include_line_numbers: bool = True, include_metadata: bool = True) -> str:
+        """Render the context package as a string for LLM consumption.
+
+        This is the key output - a carefully structured text that gives the LLM
+        exactly what it needs to understand the relevant code.
+        """
+        sections: list[str] = []
+
+        if include_metadata:
+            sections.append(f"# Codebase Context for: {self.task}")
+            sections.append(
+                f"# {self.symbols_included} symbols from {self.files_included} files "
+                f"(~{self.total_tokens:,} tokens, {self.budget_used_pct:.0f}% of budget)"
+            )
+            sections.append("")
+
+        # Group items by file
+        by_file: dict[str, list[ContextItem]] = {}
+        for item in self.items:
+            by_file.setdefault(item.file_path, []).append(item)
+
+        for file_path, items in sorted(by_file.items()):
+            sections.append(f"## {file_path}")
+            if include_metadata:
+                reasons = set(i.reason for i in items if i.reason)
+                if reasons:
+                    sections.append(f"# Included because: {'; '.join(reasons)}")
+            sections.append("")
+
+            # Sort items by line number
+            items.sort(key=lambda x: x.line_start)
+
+            for item in items:
+                if include_metadata:
+                    sections.append(
+                        f"# [{item.kind}] {item.qualified_name} "
+                        f"(relevance: {item.relevance_score:.2f}, depth: {item.depth})"
+                    )
+
+                if include_line_numbers:
+                    lines = item.source_code.splitlines()
+                    for i, line in enumerate(lines):
+                        sections.append(f"{item.line_start + i:4d} | {line}")
+                else:
+                    sections.append(item.source_code)
+
+                sections.append("")
+
+        return "\n".join(sections)
+
+# tests/test_cli.py:19-24
+def indexed_project(tmp_project: Path) -> Path:
+    """Create a tmp_project that has been indexed."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["init", "--path", str(tmp_project)])
+    assert result.exit_code == 0, f"Init failed: {result.output}"
+    return tmp_project
+
+# src/cegraph/cli.py:255-352
+def context(
+    task: str, path: str | None, budget: int, strategy: str,
+    compact: bool, savings: bool, focus: tuple[str, ...]
+):
+    """Assemble budgeted code context for a task using CAG.
+
+    Given a natural language task description, assembles relevant code from the
+    knowledge graph -- scored, ranked, and dependency-ordered within a token
+    budget.
+
+    Examples:
+
+        cegraph context "fix the login bug in AuthService"
+
+        cegraph context "add pagination to the user list API" --budget 4000
+
+        cegraph context "refactor calculate_total" --strategy thorough --savings
+    """
+    root = _get_project_root(path)
+    graph, store = _load_graph(root)
+
+    from cegraph.context.engine import ContextAssembler
+    from cegraph.context.models import ContextStrategy
+    from cegraph.graph.query import GraphQuery
+
+    query = GraphQuery(graph, store)
+    assembler = ContextAssembler(root, graph, query)
+
+    strategy_map = {
+        "precise": ContextStrategy.PRECISE,
+        "smart": ContextStrategy.SMART,
+        "thorough": ContextStrategy.THOROUGH,
+    }
+
+    if savings:
+        console.info("Computing token savings comparison...")
+        result = assembler.estimate_savings(task, budget)
+        console.console.print()
+        console.console.print("[bold]CAG Token Savings Analysis[/bold]")
+        console.console.print(f"  Task: {task}")
+        accel_str = "[green]C++ accelerated[/green]" if result["accelerated"] else "Python"
+        console.console.print(f"  Backend: {accel_str}")
+        console.console.print()
+
+        if result["cag_symbols"] == 0:
+            console.warning(
+                "CAG found no matching symbols in the knowledge graph. "
+                "Check that the symbol names in your task match actual code in this project."
+            )
+            console.console.print()
+
+        console.console.print(f"  [bold cyan]CAG:[/bold cyan] {result['cag_tokens']:,} tokens "
+                            f"({result['cag_symbols']} symbols, {result['cag_files']} files)")
+        console.console.print(f"  [dim]grep:[/dim] {result['grep_tokens']:,} tokens "
+                            f"({result['grep_files']} files)")
+        console.console.print(f"  [dim]all files:[/dim] {result['all_files_tokens']:,} tokens")
+        console.console.print()
+        console.console.print(f"  Savings vs grep: [green]{result['savings_vs_grep']}[/green]")
+        console.console.print(f"  Savings vs all:  [green]{result['savings_vs_all']}[/green]")
+    else:
+        package = assembler.assemble(
+            task=task,
+            token_budget=budget,
+            strategy=strategy_map[strategy],
+            focus_files=list(focus) if focus else None,
+        )
+
+        # Show summary
+        console.console.print()
+        console.console.print(f"[bold]CAG Context Package[/bold]")
+        console.console.print(f"  Strategy: {strategy}")
+        accel = assembler.is_accelerated
+        accel_str = "[green]C++ accelerated[/green]" if accel else "Python"
+        console.console.print(f"  Backend: {accel_str}")
+        console.console.print(
+            f"  Tokens: {package.total_tokens:,} / {package.token_budget:,} "
+            f"({package.budget_used_pct:.0f}%)"
+        )
+        console.console.print(f"  Symbols: {package.symbols_included} (from {package.symbols_available} candidates)")
+        console.console.print(f"  Files: {package.files_included}")
+        console.console.print(f"  Time: {package.assembly_time_ms:.1f}ms")
+        console.console.print()
+
+        if package.symbols_included == 0:
+            console.warning(
+                "No matching symbols found. The names in your task description "
+                "must match actual symbols in this codebase.\n"
+                "  Try: cegraph search <name> to find valid symbol names."
+            )
+            console.console.print()
+
+        # Output the context
+        if compact:
+            console.console.print(package.render_compact())
+        else:
+            console.console.print(package.render())
+
+    store.close()
+
+# src/cegraph/config.py:125-137
+def set_config_value(config: ProjectConfig, key: str, value: Any) -> ProjectConfig:
+    """Set a nested config value using dot notation (e.g., 'llm.provider')."""
+    parts = key.split(".")
+    data = config.model_dump()
+    target = data
+    for part in parts[:-1]:
+        if part not in target or not isinstance(target[part], dict):
+            raise KeyError(f"Invalid config key: {key}")
+        target = target[part]
+    if parts[-1] not in target:
+        raise KeyError(f"Invalid config key: {key}")
+    target[parts[-1]] = value
+    return ProjectConfig(**data)
+
+# src/cegraph/context/models.py:16-16
+    THOROUGH = "thorough"  # Deep expansion, all related code
+
+# src/cegraph/context/models.py:14-14
+    PRECISE = "precise"  # Only directly relevant symbols
+
+# src/cegraph/tools/registry.py:11-58
+class ToolRegistry:
+    """Registry that manages available agent tools.
+
+    Tools are functions decorated with @tool that the LLM agent can call.
+    """
+
+    def __init__(self) -> None:
+        self._tools: dict[str, Callable] = {}
+        self._definitions: dict[str, ToolDefinition] = {}
+
+    def register(self, func: Callable, definition: ToolDefinition) -> None:
+        """Register a tool function with its definition."""
+        self._tools[definition.name] = func
+        self._definitions[definition.name] = definition
+
+    def get(self, name: str) -> Callable | None:
+        """Get a tool function by name."""
+        return self._tools.get(name)
+
+    def get_definition(self, name: str) -> ToolDefinition | None:
+        """Get a tool definition by name."""
+        return self._definitions.get(name)
+
+    def list_tools(self) -> list[str]:
+        """List all registered tool names."""
+        return list(self._tools.keys())
+
+    def get_definitions(self) -> list[ToolDefinition]:
+        """Get all tool definitions (for passing to LLM)."""
+        return list(self._definitions.values())
+
+    async def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        """Execute a tool by name with the given arguments.
+
+        Returns the result as a string.
+        """
+        func = self._tools.get(name)
+        if func is None:
+            return f"Error: Unknown tool '{name}'"
+
+        try:
+            if inspect.iscoroutinefunction(func):
+                result = await func(**arguments)
+            else:
+                result = func(**arguments)
+            return str(result) if result is not None else "Done."
+        except Exception as e:
+            return f"Error executing tool '{name}': {e}"
+
+# src/cegraph/agent/loop.py:185-191
+    async def ask(self, question: str) -> str:
+        """Simple Q&A mode - ask a question about the codebase.
+
+        Returns just the answer string.
+        """
+        result = await self.run(question)
+        return result.answer
+
+# src/cegraph/tools/registry.py:42-58
+    async def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        """Execute a tool by name with the given arguments.
+
+        Returns the result as a string.
+        """
+        func = self._tools.get(name)
+        if func is None:
+            return f"Error: Unknown tool '{name}'"
+
+        try:
+            if inspect.iscoroutinefunction(func):
+                result = await func(**arguments)
+            else:
+                result = func(**arguments)
+            return str(result) if result is not None else "Done."
+        except Exception as e:
+            return f"Error executing tool '{name}': {e}"
+
+# src/cegraph/github/diff_parser.py:47-56
+class ChangedSymbol:
+    """A symbol that was affected by the diff."""
+    name: str
+    qualified_name: str
+    kind: str
+    file_path: str
+    line_start: int
+    line_end: int
+    change_type: str  # 'modified', 'added', 'deleted'
+    lines_changed: int = 0
+
+# src/cegraph/graph/store.py:491-497
+    def get_metadata(self, key: str) -> str | None:
+        """Get a metadata value."""
+        conn = self._get_conn()
+        row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
+        if row:
+            return json.loads(row["value"])
+        return None
+
+# tests/test_mcp.py:198-208
+    def test_handle_request(self, mcp_server: MCPServer):
+        """Test request handling (has id, gets response)."""
+        result = mcp_server._handle_message({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping",
+            "params": {},
+        })
+        assert result is not None
+        assert result["jsonrpc"] == "2.0"
+        assert result["id"] == 1
+
+# src/cegraph/graph/store.py:447-467
+    def get_callers(self, symbol_id: str) -> list[dict]:
+        """Get all symbols that call the given symbol."""
+        conn = self._get_conn()
+        target_nid = self._resolve_text_id(conn, symbol_id)
+        if target_nid is None:
+            return []
+
+        rows = conn.execute(
+            """SELECT (sp.path || '::' || s.qualified_name) as id,
+                      s.name, s.qualified_name, s.kind,
+                      sp.path as file_path, s.line_start, s.line_end,
+                      s.signature, s.docstring,
+                      e.line as call_line, rp.path as call_file
+               FROM edges e
+               JOIN nodes s ON s.nid = e.source_nid AND s.node_type = 'symbol'
+               JOIN path_map sp ON sp.pid = s.path_id
+               LEFT JOIN path_map rp ON rp.pid = e.path_id
+               WHERE e.target_nid = ? AND e.kind = 'calls'""",
+            (target_nid,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+# tests/test_context.py:198-206
+    def test_assemble_respects_budget(self, cag_engine: ContextAssembler):
+        """Test that assembly respects the token budget."""
+        small_budget = 100
+        package = cag_engine.assemble(
+            task="review the entire codebase",
+            token_budget=small_budget,
+            strategy=ContextStrategy.THOROUGH,
+        )
+        assert package.total_tokens <= small_budget * 1.5  # Allow small overshoot
+
+# src/cegraph/context/models.py:166-168
+    def estimate(cls, text: str) -> int:
+        """Estimate token count for a string."""
+        return max(1, int(len(text) / cls.CHARS_PER_TOKEN))
+
+# src/cegraph/cli.py:62-64
+def main():
+    """CeGraph - AI that actually understands your entire codebase."""
+    pass

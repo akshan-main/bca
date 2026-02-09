@@ -1,0 +1,202 @@
+"""Ablation study runner for BCA.
+
+Runs the context assembler with each component individually disabled,
+measures recall of ground-truth patch symbols at fixed budgets.
+
+Usage:
+    python -m paper.experiments.ablation --repo /path/to/repo --task "fix the bug"
+    python -m paper.experiments.ablation --repo /path/to/repo --tasks-file tasks.jsonl
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+from cegraph.context.engine import AblationConfig, ContextAssembler
+from cegraph.context.models import ContextStrategy
+from cegraph.graph.builder import GraphBuilder
+from cegraph.graph.query import GraphQuery
+
+
+@dataclass
+class AblationResult:
+    """Result of a single ablation run."""
+
+    config_name: str
+    task: str
+    budget: int
+    symbols_selected: int
+    symbols_available: int
+    tokens_used: int
+    budget_used_pct: float
+    assembly_time_ms: float
+    selected_symbols: list[str] = field(default_factory=list)
+    closure_violations: int = 0
+    recall: float | None = None  # Set if ground-truth symbols provided
+
+
+# Each ablation disables exactly one component.
+ABLATION_CONFIGS: dict[str, AblationConfig] = {
+    "full": AblationConfig(),
+    "-dependency_closure": AblationConfig(dependency_closure=False),
+    "-submodular_coverage": AblationConfig(submodular_coverage=False),
+    "-centrality_scoring": AblationConfig(centrality_scoring=False),
+    "-file_proximity": AblationConfig(file_proximity=False),
+    "-kind_weights": AblationConfig(kind_weights=False),
+    "-dependency_ordering": AblationConfig(dependency_ordering=False),
+    "base_bfs_only": AblationConfig(
+        dependency_closure=False,
+        submodular_coverage=False,
+        centrality_scoring=False,
+        file_proximity=False,
+        kind_weights=False,
+        dependency_ordering=False,
+    ),
+    "+pagerank": AblationConfig(use_pagerank=True),
+    "+learned_weights": AblationConfig(learned_weights=True),
+}
+
+
+def run_ablation(
+    repo_path: Path,
+    task: str,
+    budgets: list[int],
+    ground_truth_symbols: list[str] | None = None,
+) -> list[AblationResult]:
+    """Run all ablation configs for a single task across budgets."""
+    builder = GraphBuilder()
+    graph = builder.build_from_directory(repo_path)
+    query = GraphQuery(graph)
+
+    results: list[AblationResult] = []
+
+    for budget in budgets:
+        for config_name, ablation_config in ABLATION_CONFIGS.items():
+            assembler = ContextAssembler(repo_path, graph, query, ablation=ablation_config)
+
+            start = time.time()
+            package = assembler.assemble(
+                task=task,
+                token_budget=budget,
+                strategy=ContextStrategy.SMART,
+            )
+            elapsed_ms = (time.time() - start) * 1000
+
+            selected_syms = [item.qualified_name or item.name for item in package.items]
+
+            # Compute recall against ground truth if provided
+            recall = None
+            if ground_truth_symbols:
+                hits = sum(
+                    1 for gt in ground_truth_symbols
+                    if any(gt in s or s in gt for s in selected_syms)
+                )
+                recall = hits / len(ground_truth_symbols) if ground_truth_symbols else 0.0
+
+            # Check closure violations (symbols whose deps are missing)
+            closure_violations = 0
+            if ablation_config.dependency_closure:
+                selected_ids = {item.symbol_id for item in package.items}
+                for item in package.items:
+                    for succ in graph.successors(item.symbol_id):
+                        edge_data = graph.edges[item.symbol_id, succ]
+                        if edge_data.get("kind") in ("inherits", "implements"):
+                            if succ not in selected_ids:
+                                closure_violations += 1
+
+            results.append(AblationResult(
+                config_name=config_name,
+                task=task,
+                budget=budget,
+                symbols_selected=package.symbols_included,
+                symbols_available=package.symbols_available,
+                tokens_used=package.total_tokens,
+                budget_used_pct=package.budget_used_pct,
+                assembly_time_ms=round(elapsed_ms, 1),
+                selected_symbols=selected_syms,
+                closure_violations=closure_violations,
+                recall=recall,
+            ))
+
+    return results
+
+
+def format_results_table(results: list[AblationResult]) -> str:
+    """Format ablation results as a readable table."""
+    lines = []
+
+    # Group by budget
+    budgets = sorted(set(r.budget for r in results))
+
+    for budget in budgets:
+        lines.append(f"\n{'='*70}")
+        lines.append(f"Budget: {budget} tokens")
+        lines.append(f"{'='*70}")
+        lines.append(
+            f"{'Config':<25} {'Syms':>5} {'Tokens':>7} {'Used%':>6} "
+            f"{'Time':>8} {'Violations':>10} {'Recall':>7}"
+        )
+        lines.append("-" * 70)
+
+        budget_results = [r for r in results if r.budget == budget]
+        for r in budget_results:
+            recall_str = f"{r.recall:.3f}" if r.recall is not None else "n/a"
+            lines.append(
+                f"{r.config_name:<25} {r.symbols_selected:>5} "
+                f"{r.tokens_used:>7} {r.budget_used_pct:>5.1f}% "
+                f"{r.assembly_time_ms:>7.1f}ms {r.closure_violations:>10} "
+                f"{recall_str:>7}"
+            )
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="BCA ablation study")
+    parser.add_argument("--repo", required=True, help="Path to repository")
+    parser.add_argument("--task", help="Single task description")
+    parser.add_argument("--tasks-file", help="JSONL file with tasks")
+    parser.add_argument(
+        "--budgets", default="1000,2000,4000,8000",
+        help="Comma-separated budget values",
+    )
+    parser.add_argument("--output", help="Output JSON file")
+    parser.add_argument("--ground-truth", help="Comma-separated ground-truth symbol names")
+    args = parser.parse_args()
+
+    repo_path = Path(args.repo).resolve()
+    budgets = [int(b) for b in args.budgets.split(",")]
+    gt_symbols = args.ground_truth.split(",") if args.ground_truth else None
+
+    tasks: list[dict] = []
+    if args.task:
+        tasks.append({"task": args.task, "ground_truth": gt_symbols})
+    elif args.tasks_file:
+        with open(args.tasks_file) as f:
+            for line in f:
+                tasks.append(json.loads(line))
+    else:
+        parser.error("Provide --task or --tasks-file")
+
+    all_results: list[AblationResult] = []
+    for t in tasks:
+        task_str = t["task"]
+        gt = t.get("ground_truth", gt_symbols)
+        print(f"\nTask: {task_str}")
+        results = run_ablation(repo_path, task_str, budgets, gt)
+        all_results.extend(results)
+        print(format_results_table(results))
+
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump([asdict(r) for r in all_results], f, indent=2)
+        print(f"\nResults written to {args.output}")
+
+
+if __name__ == "__main__":
+    main()

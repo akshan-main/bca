@@ -1,0 +1,491 @@
+# examples/demo.py
+#!/usr/bin/env python3
+"""Demo: Using CeGraph as a Python library.
+
+This shows how to use CeGraph programmatically, not just as a CLI tool.
+"""
+
+from pathlib import Path
+
+from cegraph.graph.builder import GraphBuilder
+from cegraph.graph.query import GraphQuery
+from cegraph.search.hybrid import HybridSearch
+
+
+def main():
+    # Point at any code directory
+    project_root = Path(".")
+
+    # 1. Build the knowledge graph
+    print("Building knowledge graph...")
+    builder = GraphBuilder()
+    graph = builder.build_from_directory(project_root)
+
+    stats = builder.get_stats()
+    print(f"  Files: {stats['files']}")
+    print(f"  Functions/Methods: {stats['functions']}")
+    print(f"  Classes: {stats['classes']}")
+    print(f"  Total nodes: {stats['total_nodes']}")
+    print(f"  Total edges: {stats['total_edges']}")
+
+    # 2. Query the graph
+    query = GraphQuery(graph)
+
+    # Find a symbol
+    print("\n--- Finding 'GraphBuilder' ---")
+    symbol_ids = query.find_symbol("GraphBuilder")
+    for sid in symbol_ids:
+        info = query.get_symbol_info(sid)
+        if info:
+            print(f"  {info.qualified_name} ({info.kind}) at {info.file_path}:{info.line_start}")
+            print(f"  Callers: {len(info.callers)}")
+            print(f"  Callees: {len(info.callees)}")
+
+    # Who calls a function?
+    print("\n--- Who calls 'parse_file'? ---")
+    callers = query.who_calls("parse_file", max_depth=2)
+    for c in callers:
+        indent = "  " * c["depth"]
+        print(f"{indent}  {c['name']} at {c['file_path']}:{c['line']}")
+
+    # Impact analysis
+    print("\n--- Impact of changing 'GraphQuery' ---")
+    impact = query.impact_of("GraphQuery")
+    print(f"  Risk score: {impact['risk_score']:.1%}")
+    print(f"  Direct callers: {len(impact['direct_callers'])}")
+    print(f"  Affected files: {len(impact['affected_files'])}")
+    for f in impact["affected_files"]:
+        print(f"    - {f}")
+
+    # 3. Search code
+    search = HybridSearch(project_root, graph)
+
+    print("\n--- Searching for 'knowledge graph' ---")
+    results = search.search("knowledge graph", max_results=5)
+    for r in results:
+        print(f"  {r.file_path}:{r.line_number} - {r.line_content.strip()[:80]}")
+
+    print("\n--- Searching for class definitions ---")
+    symbols = search.search_symbols("", kind="class", max_results=10)
+    for s in symbols:
+        print(f"  {s['qualified_name']} at {s['file_path']}:{s['line']}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# paper/experiments/ablation.py
+"""Ablation study runner for BCA.
+
+Runs the context assembler with each component individually disabled,
+measures recall of ground-truth patch symbols at fixed budgets.
+
+Usage:
+    python -m paper.experiments.ablation --repo /path/to/repo --task "fix the bug"
+    python -m paper.experiments.ablation --repo /path/to/repo --tasks-file tasks.jsonl
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+from cegraph.context.engine import AblationConfig, ContextAssembler
+from cegraph.context.models import ContextStrategy
+from cegraph.graph.builder import GraphBuilder
+from cegraph.graph.query import GraphQuery
+
+
+@dataclass
+class AblationResult:
+    """Result of a single ablation run."""
+
+    config_name: str
+    task: str
+    budget: int
+    symbols_selected: int
+    symbols_available: int
+    tokens_used: int
+    budget_used_pct: float
+    assembly_time_ms: float
+    selected_symbols: list[str] = field(default_factory=list)
+    closure_violations: int = 0
+    recall: float | None = None  # Set if ground-truth symbols provided
+
+
+# Each ablation disables exactly one component.
+ABLATION_CONFIGS: dict[str, AblationConfig] = {
+    "full": AblationConfig(),
+    "-dependency_closure": AblationConfig(dependency_closure=False),
+    "-submodular_coverage": AblationConfig(submodular_coverage=False),
+    "-centrality_scoring": AblationConfig(centrality_scoring=False),
+    "-file_proximity": AblationConfig(file_proximity=False),
+    "-kind_weights": AblationConfig(kind_weights=False),
+    "-dependency_ordering": AblationConfig(dependency_ordering=False),
+    "base_bfs_only": AblationConfig(
+        dependency_closure=False,
+        submodular_coverage=False,
+        centrality_scoring=False,
+        file_proximity=False,
+        kind_weights=False,
+        dependency_ordering=False,
+    ),
+    "+pagerank": AblationConfig(use_pagerank=True),
+    "+learned_weights": AblationConfig(learned_weights=True),
+}
+
+
+def run_ablation(
+    repo_path: Path,
+    task: str,
+    budgets: list[int],
+    ground_truth_symbols: list[str] | None = None,
+) -> list[AblationResult]:
+    """Run all ablation configs for a single task across budgets."""
+    builder = GraphBuilder()
+    graph = builder.build_from_directory(repo_path)
+    query = GraphQuery(graph)
+
+    results: list[AblationResult] = []
+
+    for budget in budgets:
+        for config_name, ablation_config in ABLATION_CONFIGS.items():
+            assembler = ContextAssembler(repo_path, graph, query, ablation=ablation_config)
+
+            start = time.time()
+            package = assembler.assemble(
+                task=task,
+                token_budget=budget,
+                strategy=ContextStrategy.SMART,
+            )
+            elapsed_ms = (time.time() - start) * 1000
+
+            selected_syms = [item.qualified_name or item.name for item in package.items]
+
+            # Compute recall against ground truth if provided
+            recall = None
+            if ground_truth_symbols:
+                hits = sum(
+                    1 for gt in ground_truth_symbols
+                    if any(gt in s or s in gt for s in selected_syms)
+                )
+                recall = hits / len(ground_truth_symbols) if ground_truth_symbols else 0.0
+
+            # Check closure violations (symbols whose deps are missing)
+            closure_violations = 0
+            if ablation_config.dependency_closure:
+                selected_ids = {item.symbol_id for item in package.items}
+                for item in package.items:
+                    for succ in graph.successors(item.symbol_id):
+                        edge_data = graph.edges[item.symbol_id, succ]
+                        if edge_data.get("kind") in ("inherits", "implements"):
+                            if succ not in selected_ids:
+                                closure_violations += 1
+
+            results.append(AblationResult(
+                config_name=config_name,
+                task=task,
+                budget=budget,
+                symbols_selected=package.symbols_included,
+                symbols_available=package.symbols_available,
+                tokens_used=package.total_tokens,
+                budget_used_pct=package.budget_used_pct,
+                assembly_time_ms=round(elapsed_ms, 1),
+                selected_symbols=selected_syms,
+                closure_violations=closure_violations,
+                recall=recall,
+            ))
+
+    return results
+
+
+def format_results_table(results: list[AblationResult]) -> str:
+    """Format ablation results as a readable table."""
+    lines = []
+
+    # Group by budget
+    budgets = sorted(set(r.budget for r in results))
+
+    for budget in budgets:
+        lines.append(f"\n{'='*70}")
+        lines.append(f"Budget: {budget} tokens")
+        lines.append(f"{'='*70}")
+        lines.append(
+            f"{'Config':<25} {'Syms':>5} {'Tokens':>7} {'Used%':>6} "
+            f"{'Time':>8} {'Violations':>10} {'Recall':>7}"
+        )
+        lines.append("-" * 70)
+
+        budget_results = [r for r in results if r.budget == budget]
+        for r in budget_results:
+            recall_str = f"{r.recall:.3f}" if r.recall is not None else "n/a"
+            lines.append(
+                f"{r.config_name:<25} {r.symbols_selected:>5} "
+                f"{r.tokens_used:>7} {r.budget_used_pct:>5.1f}% "
+                f"{r.assembly_time_ms:>7.1f}ms {r.closure_violations:>10} "
+                f"{recall_str:>7}"
+            )
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="BCA ablation study")
+    parser.add_argument("--repo", required=True, help="Path to repository")
+    parser.add_argument("--task", help="Single task description")
+    parser.add_argument("--tasks-file", help="JSONL file with tasks")
+    parser.add_argument(
+        "--budgets", default="1000,2000,4000,8000",
+        help="Comma-separated budget values",
+    )
+    parser.add_argument("--output", help="Output JSON file")
+    parser.add_argument("--ground-truth", help="Comma-separated ground-truth symbol names")
+    args = parser.parse_args()
+
+    repo_path = Path(args.repo).resolve()
+    budgets = [int(b) for b in args.budgets.split(",")]
+    gt_symbols = args.ground_truth.split(",") if args.ground_truth else None
+
+    tasks: list[dict] = []
+    if args.task:
+        tasks.append({"task": args.task, "ground_truth": gt_symbols})
+    elif args.tasks_file:
+        with open(args.tasks_file) as f:
+            for line in f:
+                tasks.append(json.loads(line))
+    else:
+        parser.error("Provide --task or --tasks-file")
+
+    all_results: list[AblationResult] = []
+    for t in tasks:
+        task_str = t["task"]
+        gt = t.get("ground_truth", gt_symbols)
+        print(f"\nTask: {task_str}")
+        results = run_ablation(repo_path, task_str, budgets, gt)
+        all_results.extend(results)
+        print(format_results_table(results))
+
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump([asdict(r) for r in all_results], f, indent=2)
+        print(f"\nResults written to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+# paper/experiments/baselines.py
+"""Baseline comparison runner for BCA evaluation.
+
+Implements the baseline retrieval methods described in the evaluation plan
+and compares them against BCA on recall and token usage.
+
+Baselines:
+  1. Full file (grep): all files containing query terms
+  2. BM25 (lexical): symbol-level BM25 scoring, greedy packing
+  3. Unweighted BFS: graph BFS without edge weights or closure
+  4. BCA (ours): full pipeline
+
+Usage:
+    python -m paper.experiments.baselines --repo /path/to/repo --task "fix the bug"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import time
+from collections import Counter
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+from cegraph.context.engine import ContextAssembler
+from cegraph.context.models import ContextStrategy, TokenEstimator
+from cegraph.graph.builder import GraphBuilder
+from cegraph.graph.query import GraphQuery
+
+
+@dataclass
+class BaselineResult:
+    """Result of a single baseline run."""
+
+    method: str
+    task: str
+    budget: int
+    tokens_used: int
+    symbols_selected: int
+    files_included: int
+    assembly_time_ms: float
+    selected_symbols: list[str] = field(default_factory=list)
+    recall: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# Baseline 1: Full file (grep match)
+# ---------------------------------------------------------------------------
+
+def baseline_grep(
+    repo_path: Path,
+    task: str,
+    budget: int,
+    graph,
+) -> BaselineResult:
+    """Select all files containing any task keyword, truncate to budget."""
+    start = time.time()
+
+    keywords = set(re.findall(r"\b([A-Za-z_]\w{2,})\b", task))
+    stop = {
+        "the", "and", "for", "that", "this", "with", "from", "have",
+        "fix", "bug", "add", "class", "function", "method", "file",
+    }
+    keywords -= stop
+
+    matched_files: list[tuple[str, str]] = []
+    for node_id, data in graph.nodes(data=True):
+        if data.get("type") != "file":
+            continue
+        fp = data.get("path", "")
+        full_path = repo_path / fp
+        if not full_path.exists():
+            continue
+        try:
+            content = full_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(kw.lower() in content.lower() for kw in keywords):
+            matched_files.append((fp, content))
+
+    # Pack files until budget
+    total_tokens = 0
+    selected_content: list[str] = []
+    files_used = 0
+    for fp, content in matched_files:
+        tokens = TokenEstimator.estimate(content)
+        if total_tokens + tokens > budget:
+            remaining = budget - total_tokens
+            if remaining > 50:
+                chars = int(remaining * TokenEstimator.CHARS_PER_TOKEN)
+                selected_content.append(content[:chars])
+                total_tokens += remaining
+                files_used += 1
+            break
+        selected_content.append(content)
+        total_tokens += tokens
+        files_used += 1
+
+    elapsed = (time.time() - start) * 1000
+
+    return BaselineResult(
+        method="grep",
+        task=task,
+        budget=budget,
+        tokens_used=total_tokens,
+        symbols_selected=0,
+        files_included=files_used,
+        assembly_time_ms=round(elapsed, 1),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Baseline 2: BM25 (symbol-level lexical)
+# ---------------------------------------------------------------------------
+
+def baseline_bm25(
+    repo_path: Path,
+    task: str,
+    budget: int,
+    graph,
+) -> BaselineResult:
+    """BM25 scoring over symbols, greedy packing by score."""
+    start = time.time()
+
+    query_terms = re.findall(r"\b([A-Za-z_]\w{2,})\b", task.lower())
+    query_tf = Counter(query_terms)
+
+    # Collect symbol documents
+    symbols: list[dict] = []
+    for node_id, data in graph.nodes(data=True):
+        if data.get("type") != "symbol":
+            continue
+        name = data.get("name", "")
+        qname = data.get("qualified_name", "")
+        doc = data.get("docstring", "")
+        text = f"{name} {qname} {doc}".lower()
+        symbols.append({"id": node_id, "text": text, "data": data})
+
+    n = len(symbols)
+    if n == 0:
+        return BaselineResult(
+            method="bm25", task=task, budget=budget,
+            tokens_used=0, symbols_selected=0, files_included=0,
+            assembly_time_ms=0,
+        )
+
+    # IDF
+    doc_freq: Counter[str] = Counter()
+    for sym in symbols:
+        terms_in_doc = set(re.findall(r"\b\w+\b", sym["text"]))
+        for t in terms_in_doc:
+            doc_freq[t] += 1
+
+    k1 = 1.5
+    b = 0.75
+    avg_dl = sum(len(s["text"]) for s in symbols) / n
+
+    # Score each symbol
+    scored: list[tuple[float, dict]] = []
+    for sym in symbols:
+        dl = len(sym["text"])
+        score = 0.0
+        for term, qtf in query_tf.items():
+            tf = sym["text"].count(term)
+            df = doc_freq.get(term, 0)
+            idf = math.log((n - df + 0.5) / (df + 0.5) + 1)
+            tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avg_dl))
+            score += idf * tf_norm * qtf
+        if score > 0:
+            scored.append((score, sym))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Greedy packing
+    selected: list[str] = []
+    total_tokens = 0
+    files = set()
+    for score, sym in scored:
+        line_start = sym["data"].get("line_start", 0)
+        line_end = sym["data"].get("line_end", 0)
+        line_count = max(1, line_end - line_start + 1)
+        cost = TokenEstimator.estimate_lines(line_count)
+        if total_tokens + cost > budget:
+            continue
+        selected.append(sym["data"].get("qualified_name", sym["id"]))
+        total_tokens += cost
+        fp = sym["data"].get("file_path", "")
+        if fp:
+            files.add(fp)
+
+    elapsed = (time.time() - start) * 1000
+
+    return BaselineResult(
+        method="bm25",
+        task=task,
+        budget=budget,
+        tokens_used=total_tokens,
+        symbols_selected=len(selected),
+        files_included=len(files),
+        assembly_time_ms=round(elapsed, 1),
+        selected_symbols=selected,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Baseline 3:

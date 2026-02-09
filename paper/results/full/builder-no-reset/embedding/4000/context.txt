@@ -1,0 +1,451 @@
+# src/cegraph/graph/builder.py:15-213
+class GraphBuilder:
+    """Builds and maintains a code knowledge graph.
+
+    The graph has two types of nodes:
+    - File nodes: represent source files
+    - Symbol nodes: represent code symbols (functions, classes, etc.)
+
+    Edges represent relationships (calls, imports, inherits, contains, etc.)
+    """
+
+    def __init__(self) -> None:
+        self.graph = nx.DiGraph()
+        self._file_hashes: dict[str, str] = {}
+        self._unresolved: list[Relationship] = []
+
+    def build_from_directory(
+        self,
+        root: str | Path,
+        config: ProjectConfig | None = None,
+        progress_callback: callable | None = None,
+    ) -> nx.DiGraph:
+        """Build the full knowledge graph from a directory.
+
+        Args:
+            root: Root directory to index.
+            config: Project configuration.
+            progress_callback: Optional callback(file_path, current, total).
+
+        Returns:
+            The constructed NetworkX directed graph.
+        """
+        root = Path(root).resolve()
+        indexer_config = config.indexer if config else IndexerConfig()
+
+        # Reset state so reusing a builder doesn't accumulate stale data
+        # self.graph = nx.DiGraph()
+        # self._file_hashes = {}
+        # self._unresolved = []
+
+        # Parse all files
+        all_parsed = parse_directory(root, indexer_config, progress_callback)
+
+        # Build graph from parsed results
+        for file_symbols in all_parsed:
+            self._add_file(file_symbols, root)
+
+        # Resolve cross-file references
+        self._resolve_references()
+
+        return self.graph
+
+    def _add_file(self, fs: FileSymbols, root: Path) -> None:
+        """Add a file and its symbols to the graph."""
+        file_path = fs.file_path
+
+        # Add file node
+        self.graph.add_node(
+            f"file::{file_path}",
+            type="file",
+            path=file_path,
+            language=fs.language,
+            symbol_count=len(fs.symbols),
+            import_count=len(fs.imports),
+        )
+
+        # Compute file hash for change detection
+        try:
+            full_path = root / file_path
+            content = full_path.read_bytes()
+            self._file_hashes[file_path] = hashlib.sha256(content).hexdigest()[:16]
+        except OSError:
+            pass
+
+        # Add symbol nodes
+        for symbol in fs.symbols:
+            attrs = {
+                "type": "symbol",
+                "name": symbol.name,
+                "qualified_name": symbol.qualified_name,
+                "kind": symbol.kind.value,
+                "file_path": symbol.file_path,
+                "line_start": symbol.line_start,
+                "line_end": symbol.line_end,
+                "signature": symbol.signature,
+                "docstring": symbol.docstring,
+            }
+            self.graph.add_node(symbol.id, **attrs)
+
+            # Link symbol to its file
+            self.graph.add_edge(
+                f"file::{file_path}",
+                symbol.id,
+                kind="contains",
+            )
+
+        # Add relationships
+        for rel in fs.relationships:
+            if rel.resolved or self._try_resolve(rel):
+                self.graph.add_edge(
+                    rel.source,
+                    rel.target,
+                    kind=rel.kind.value,
+                    file_path=rel.file_path,
+                    line=rel.line,
+                )
+            else:
+                self._unresolved.append(rel)
+
+    def _try_resolve(self, rel: Relationship) -> bool:
+        """Try to resolve a relationship's target to an existing node."""
+        target = rel.target
+
+        # Direct match
+        if self.graph.has_node(target):
+            return True
+
+        # Try finding by name across all files
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("type") != "symbol":
+                continue
+            if data.get("name") == target or data.get("qualified_name") == target:
+                rel.target = node_id
+                rel.resolved = True
+                return True
+
+        return False
+
+    def _resolve_references(self) -> None:
+        """Try to resolve all unresolved references after the full graph is built."""
+        still_unresolved = []
+
+        # Build a lookup index: name -> [node_ids]
+        name_index: dict[str, list[str]] = {}
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("type") != "symbol":
+                continue
+            name = data.get("name", "")
+            qname = data.get("qualified_name", "")
+            if name:
+                name_index.setdefault(name, []).append(node_id)
+            if qname and qname != name:
+                name_index.setdefault(qname, []).append(node_id)
+
+        for rel in self._unresolved:
+            target = rel.target
+            # Try exact match by name
+            candidates = name_index.get(target, [])
+
+            # Try dotted parts (e.g., "module.func" -> "func")
+            if not candidates and "." in target:
+                parts = target.split(".")
+                candidates = name_index.get(parts[-1], [])
+
+            if candidates:
+                # Pick the best candidate (same file first, then any)
+                best = None
+                for c in candidates:
+                    c_data = self.graph.nodes[c]
+                    if c_data.get("file_path") == rel.file_path:
+                        best = c
+                        break
+                if best is None:
+                    best = candidates[0]
+
+                self.graph.add_edge(
+                    rel.source,
+                    best,
+                    kind=rel.kind.value,
+                    file_path=rel.file_path,
+                    line=rel.line,
+                )
+            else:
+                still_unresolved.append(rel)
+
+        self._unresolved = still_unresolved
+
+    def get_stats(self) -> dict:
+        """Get graph statistics."""
+        node_types: dict[str, int] = {}
+        edge_types: dict[str, int] = {}
+
+        for _, data in self.graph.nodes(data=True):
+            kind = data.get("kind", data.get("type", "unknown"))
+            node_types[kind] = node_types.get(kind, 0) + 1
+
+        for _, _, data in self.graph.edges(data=True):
+            kind = data.get("kind", "unknown")
+            edge_types[kind] = edge_types.get(kind, 0) + 1
+
+        return {
+            "total_nodes": self.graph.number_of_nodes(),
+            "total_edges": self.graph.number_of_edges(),
+            "node_types": node_types,
+            "edge_types": edge_types,
+            "files": node_types.get("file", 0),
+            "functions": node_types.get("function", 0) + node_types.get("method", 0),
+            "classes": node_types.get("class", 0),
+            "unresolved_refs": len(self._unresolved),
+        }
+
+# examples/demo.py:9-9
+from cegraph.graph.builder import GraphBuilder
+
+# src/cegraph/graph/__init__.py:3-3
+from cegraph.graph.builder import GraphBuilder
+
+# tests/test_tools.py:9-9
+from cegraph.graph.builder import GraphBuilder
+
+# paper/experiments/baselines.py:29-29
+from cegraph.graph.builder import GraphBuilder
+
+# tests/test_context.py:16-16
+from cegraph.graph.builder import GraphBuilder
+
+# paper/experiments/ablation.py:22-22
+from cegraph.graph.builder import GraphBuilder
+
+# tests/test_graph.py:10-10
+from cegraph.graph.builder import GraphBuilder
+
+# tests/test_impact_bot.py:17-17
+from cegraph.graph.builder import GraphBuilder
+
+# tests/test_mcp.py:10-10
+from cegraph.graph.builder import GraphBuilder
+
+# tests/test_search.py:9-9
+from cegraph.graph.builder import GraphBuilder
+
+# paper/experiments/benchmark.py:56-56
+from cegraph.graph.builder import GraphBuilder
+
+# tests/test_graph.py:77-98
+    def test_rebuild_resets_state(self, tmp_path: Path):
+        """Regression: reusing a builder must not accumulate stale nodes."""
+        # First project
+        p1 = tmp_path / "proj1"
+        p1.mkdir()
+        (p1 / "a.py").write_text("def a_func():\n    pass\n")
+
+        builder = GraphBuilder()
+        g1 = builder.build_from_directory(p1)
+        g1_files = {d["path"] for _, d in g1.nodes(data=True) if d.get("type") == "file"}
+
+        # Second project with different files
+        p2 = tmp_path / "proj2"
+        p2.mkdir()
+        (p2 / "b.py").write_text("def b_func():\n    pass\n")
+
+        g2 = builder.build_from_directory(p2)
+        g2_files = {d["path"] for _, d in g2.nodes(data=True) if d.get("type") == "file"}
+
+        # g2 should NOT contain files from g1
+        assert "a.py" not in g2_files
+        assert "b.py" in g2_files
+
+# src/cegraph/context/engine.py:171-193
+    def _build_native_graph(self) -> None:
+        """Build the C++ graph representation for accelerated BFS."""
+        nodes = list(self.graph.nodes())
+        self._node_to_idx = {n: i for i, n in enumerate(nodes)}
+        self._idx_to_node = {i: n for i, n in enumerate(nodes)}
+
+        self._native_graph = NativeCAG.create_graph(len(nodes))
+
+        for n, data in self.graph.nodes(data=True):
+            idx = self._node_to_idx[n]
+            kind = data.get("kind", "")
+            weight = _KIND_WEIGHTS.get(kind, 0.5)
+            self._native_graph.set_node_weight(idx, weight)
+            self._native_graph.set_lines(
+                idx, data.get("line_start", 0), data.get("line_end", 0)
+            )
+
+        for u, v, data in self.graph.edges(data=True):
+            kind = data.get("kind", "")
+            weight = self._edge_weights.get(kind, 0.3)
+            src = self._node_to_idx[u]
+            dst = self._node_to_idx[v]
+            self._native_graph.add_edge(src, dst, weight)
+
+# tests/test_graph.py:76-98
+class TestGraphBuilderReuse:
+    def test_rebuild_resets_state(self, tmp_path: Path):
+        """Regression: reusing a builder must not accumulate stale nodes."""
+        # First project
+        p1 = tmp_path / "proj1"
+        p1.mkdir()
+        (p1 / "a.py").write_text("def a_func():\n    pass\n")
+
+        builder = GraphBuilder()
+        g1 = builder.build_from_directory(p1)
+        g1_files = {d["path"] for _, d in g1.nodes(data=True) if d.get("type") == "file"}
+
+        # Second project with different files
+        p2 = tmp_path / "proj2"
+        p2.mkdir()
+        (p2 / "b.py").write_text("def b_func():\n    pass\n")
+
+        g2 = builder.build_from_directory(p2)
+        g2_files = {d["path"] for _, d in g2.nodes(data=True) if d.get("type") == "file"}
+
+        # g2 should NOT contain files from g1
+        assert "a.py" not in g2_files
+        assert "b.py" in g2_files
+
+# src/cegraph/graph/builder.py:30-64
+    def build_from_directory(
+        self,
+        root: str | Path,
+        config: ProjectConfig | None = None,
+        progress_callback: callable | None = None,
+    ) -> nx.DiGraph:
+        """Build the full knowledge graph from a directory.
+
+        Args:
+            root: Root directory to index.
+            config: Project configuration.
+            progress_callback: Optional callback(file_path, current, total).
+
+        Returns:
+            The constructed NetworkX directed graph.
+        """
+        root = Path(root).resolve()
+        indexer_config = config.indexer if config else IndexerConfig()
+
+        # Reset state so reusing a builder doesn't accumulate stale data
+        # self.graph = nx.DiGraph()
+        # self._file_hashes = {}
+        # self._unresolved = []
+
+        # Parse all files
+        all_parsed = parse_directory(root, indexer_config, progress_callback)
+
+        # Build graph from parsed results
+        for file_symbols in all_parsed:
+            self._add_file(file_symbols, root)
+
+        # Resolve cross-file references
+        self._resolve_references()
+
+        return self.graph
+
+# tests/test_graph.py:15-73
+class TestGraphBuilder:
+    def test_build_from_directory(self, tmp_project: Path):
+        builder = GraphBuilder()
+        graph = builder.build_from_directory(tmp_project)
+
+        assert graph.number_of_nodes() > 0
+        assert graph.number_of_edges() > 0
+
+    def test_stats(self, tmp_project: Path):
+        builder = GraphBuilder()
+        builder.build_from_directory(tmp_project)
+        stats = builder.get_stats()
+
+        assert stats["files"] > 0
+        assert stats["functions"] > 0
+        assert stats["classes"] > 0
+        assert stats["total_nodes"] > 0
+        assert stats["total_edges"] > 0
+
+    def test_file_nodes_present(self, tmp_project: Path):
+        builder = GraphBuilder()
+        graph = builder.build_from_directory(tmp_project)
+
+        file_nodes = [
+            n for n, d in graph.nodes(data=True) if d.get("type") == "file"
+        ]
+        file_paths = [graph.nodes[n].get("path") for n in file_nodes]
+        assert "main.py" in file_paths
+        assert "utils.py" in file_paths
+        assert "models.py" in file_paths
+
+    def test_symbol_nodes_have_attributes(self, tmp_project: Path):
+        builder = GraphBuilder()
+        graph = builder.build_from_directory(tmp_project)
+
+        for node_id, data in graph.nodes(data=True):
+            if data.get("type") == "symbol":
+                assert "name" in data
+                assert "kind" in data
+                assert "file_path" in data
+                assert "line_start" in data
+
+    def test_call_edges_exist(self, tmp_project: Path):
+        builder = GraphBuilder()
+        graph = builder.build_from_directory(tmp_project)
+
+        call_edges = [
+            (u, v) for u, v, d in graph.edges(data=True) if d.get("kind") == "calls"
+        ]
+        assert len(call_edges) > 0
+
+    def test_contains_edges_exist(self, tmp_project: Path):
+        builder = GraphBuilder()
+        graph = builder.build_from_directory(tmp_project)
+
+        contains_edges = [
+            (u, v) for u, v, d in graph.edges(data=True) if d.get("kind") == "contains"
+        ]
+        assert len(contains_edges) > 0
+
+# src/cegraph/graph/query.py:44-54
+    def _build_index(self) -> None:
+        """Build a name->node_id lookup index."""
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("type") != "symbol":
+                continue
+            name = data.get("name", "")
+            qname = data.get("qualified_name", "")
+            if name:
+                self._name_index.setdefault(name, []).append(node_id)
+            if qname and qname != name:
+                self._name_index.setdefault(qname, []).append(node_id)
+
+# src/cegraph/graph/builder.py:25-28
+    def __init__(self) -> None:
+        self.graph = nx.DiGraph()
+        self._file_hashes: dict[str, str] = {}
+        self._unresolved: list[Relationship] = []
+
+# src/cegraph/graph/__init__.py:4-4
+from cegraph.graph.store import GraphStore
+
+# tests/test_graph.py:12-12
+from cegraph.graph.store import GraphStore
+
+# tests/test_mcp.py:12-12
+from cegraph.graph.store import GraphStore
+
+# src/cegraph/graph/query.py:9-9
+from cegraph.graph.store import GraphStore
+
+# tests/test_graph.py:16-21
+    def test_build_from_directory(self, tmp_project: Path):
+        builder = GraphBuilder()
+        graph = builder.build_from_directory(tmp_project)
+
+        assert graph.number_of_nodes() > 0
+        assert graph.number_of_edges() > 0
+
+# src/cegraph/exceptions.py:16-17
+class GraphError(CeGraphError):
+    """Knowledge graph errors."""
+
+# tests/test_tools.py:12-12
+from cegraph.tools.definitions import CeGraphTools, get_all_tools, get_tool_definitions

@@ -1,0 +1,827 @@
+# src/cegraph/llm/factory.py:9-44
+def create_provider(config: LLMConfig) -> LLMProvider:
+    """Create an LLM provider from configuration.
+
+    Args:
+        config: LLM configuration with provider, model, etc.
+
+    Returns:
+        An initialized LLM provider.
+
+    Raises:
+        ValueError: If the provider is unknown.
+        ProviderNotAvailable: If the provider's SDK is not installed.
+    """
+    provider = config.provider.lower()
+
+    if provider == "openai" or provider == "local":
+        from cegraph.llm.openai_provider import OpenAIProvider
+
+        return OpenAIProvider(
+            model=config.model,
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
+    elif provider == "anthropic":
+        from cegraph.llm.anthropic_provider import AnthropicProvider
+
+        return AnthropicProvider(
+            model=config.model,
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
+    else:
+        raise ValueError(
+            f"Unknown LLM provider: '{provider}'. "
+            f"Supported providers: openai, anthropic, local"
+        )
+
+# src/cegraph/llm/anthropic_provider.py:17-168
+class AnthropicProvider(LLMProvider):
+    """Provider for Anthropic's Claude models."""
+
+    def __init__(
+        self,
+        model: str = "claude-sonnet-4-5-20250929",
+        api_key: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        super().__init__(model, api_key, base_url)
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            try:
+                from anthropic import AsyncAnthropic
+            except ImportError:
+                from cegraph.exceptions import ProviderNotAvailable
+                raise ProviderNotAvailable("anthropic", "anthropic")
+
+            kwargs: dict[str, Any] = {}
+            if self.api_key:
+                kwargs["api_key"] = self.api_key
+            if self.base_url:
+                kwargs["base_url"] = self.base_url
+            self._client = AsyncAnthropic(**kwargs)
+        return self._client
+
+    def _format_messages(self, messages: list[Message]) -> tuple[str, list[dict]]:
+        """Convert our Message format to Anthropic's format.
+
+        Returns (system_prompt, messages_list).
+        """
+        system = ""
+        result = []
+
+        for msg in messages:
+            if msg.role == "system":
+                system = msg.content
+                continue
+
+            if msg.role == "tool":
+                result.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": msg.tool_call_id,
+                            "content": msg.content,
+                        }
+                    ],
+                })
+            elif msg.tool_calls:
+                content: list[dict] = []
+                if msg.content:
+                    content.append({"type": "text", "text": msg.content})
+                for tc in msg.tool_calls:
+                    content.append({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.arguments,
+                    })
+                result.append({"role": "assistant", "content": content})
+            else:
+                result.append({"role": msg.role, "content": msg.content})
+
+        return system, result
+
+    def _format_tools(self, tools: list[ToolDefinition]) -> list[dict]:
+        """Convert tool definitions to Anthropic's format."""
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.parameters,
+            }
+            for tool in tools
+        ]
+
+    async def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        client = self._get_client()
+        system, formatted_msgs = self._format_messages(messages)
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": formatted_msgs,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if system:
+            kwargs["system"] = system
+        if tools:
+            kwargs["tools"] = self._format_tools(tools)
+
+        response = await client.messages.create(**kwargs)
+
+        content = ""
+        tool_calls = []
+
+        for block in response.content:
+            if block.type == "text":
+                content += block.text
+            elif block.type == "tool_use":
+                tool_calls.append(
+                    ToolCall(
+                        id=block.id,
+                        name=block.name,
+                        arguments=block.input if isinstance(block.input, dict) else {},
+                    )
+                )
+
+        return LLMResponse(
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason=response.stop_reason or "",
+            usage={
+                "prompt_tokens": response.usage.input_tokens,
+                "completion_tokens": response.usage.output_tokens,
+            },
+        )
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[str]:
+        client = self._get_client()
+        system, formatted_msgs = self._format_messages(messages)
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": formatted_msgs,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if system:
+            kwargs["system"] = system
+        if tools:
+            kwargs["tools"] = self._format_tools(tools)
+
+        async with client.messages.stream(**kwargs) as stream:
+            async for text in stream.text_stream:
+                yield text
+
+# src/cegraph/llm/openai_provider.py:17-152
+class OpenAIProvider(LLMProvider):
+    """Provider for OpenAI and OpenAI-compatible APIs (Ollama, vLLM, etc.)."""
+
+    def __init__(
+        self, model: str = "gpt-4o", api_key: str | None = None, base_url: str | None = None
+    ) -> None:
+        super().__init__(model, api_key, base_url)
+        self._client = None
+        self._async_client = None
+
+    def _get_client(self):
+        if self._async_client is None:
+            try:
+                from openai import AsyncOpenAI
+            except ImportError:
+                from cegraph.exceptions import ProviderNotAvailable
+                raise ProviderNotAvailable("openai", "openai")
+
+            kwargs: dict[str, Any] = {}
+            if self.api_key:
+                kwargs["api_key"] = self.api_key
+            if self.base_url:
+                kwargs["base_url"] = self.base_url
+            self._async_client = AsyncOpenAI(**kwargs)
+        return self._async_client
+
+    def _format_messages(self, messages: list[Message]) -> list[dict]:
+        """Convert our Message format to OpenAI's format."""
+        result = []
+        for msg in messages:
+            if msg.role == "tool":
+                result.append({
+                    "role": "tool",
+                    "content": msg.content,
+                    "tool_call_id": msg.tool_call_id,
+                })
+            elif msg.tool_calls:
+                tool_calls = []
+                for tc in msg.tool_calls:
+                    tool_calls.append({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments),
+                        },
+                    })
+                result.append({
+                    "role": msg.role,
+                    "content": msg.content or None,
+                    "tool_calls": tool_calls,
+                })
+            else:
+                result.append({
+                    "role": msg.role,
+                    "content": msg.content,
+                })
+        return result
+
+    def _format_tools(self, tools: list[ToolDefinition]) -> list[dict]:
+        """Convert tool definitions to OpenAI's format."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                },
+            }
+            for tool in tools
+        ]
+
+    async def complete(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        client = self._get_client()
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._format_messages(messages),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            kwargs["tools"] = self._format_tools(tools)
+
+        response = await client.chat.completions.create(**kwargs)
+        choice = response.choices[0]
+
+        tool_calls = []
+        if choice.message.tool_calls:
+            for tc in choice.message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
+                tool_calls.append(
+                    ToolCall(id=tc.id, name=tc.function.name, arguments=args)
+                )
+
+        return LLMResponse(
+            content=choice.message.content or "",
+            tool_calls=tool_calls,
+            finish_reason=choice.finish_reason or "",
+            usage={
+                "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+            },
+        )
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ) -> AsyncIterator[str]:
+        client = self._get_client()
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._format_messages(messages),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = self._format_tools(tools)
+
+        stream = await client.chat.completions.create(**kwargs)
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+# src/cegraph/llm/anthropic_provider.py:86-95
+    def _format_tools(self, tools: list[ToolDefinition]) -> list[dict]:
+        """Convert tool definitions to Anthropic's format."""
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.parameters,
+            }
+            for tool in tools
+        ]
+
+# src/cegraph/context/models.py:54-102
+    def render(self, include_line_numbers: bool = True, include_metadata: bool = True) -> str:
+        """Render the context package as a string for LLM consumption.
+
+        This is the key output - a carefully structured text that gives the LLM
+        exactly what it needs to understand the relevant code.
+        """
+        sections: list[str] = []
+
+        if include_metadata:
+            sections.append(f"# Codebase Context for: {self.task}")
+            sections.append(
+                f"# {self.symbols_included} symbols from {self.files_included} files "
+                f"(~{self.total_tokens:,} tokens, {self.budget_used_pct:.0f}% of budget)"
+            )
+            sections.append("")
+
+        # Group items by file
+        by_file: dict[str, list[ContextItem]] = {}
+        for item in self.items:
+            by_file.setdefault(item.file_path, []).append(item)
+
+        for file_path, items in sorted(by_file.items()):
+            sections.append(f"## {file_path}")
+            if include_metadata:
+                reasons = set(i.reason for i in items if i.reason)
+                if reasons:
+                    sections.append(f"# Included because: {'; '.join(reasons)}")
+            sections.append("")
+
+            # Sort items by line number
+            items.sort(key=lambda x: x.line_start)
+
+            for item in items:
+                if include_metadata:
+                    sections.append(
+                        f"# [{item.kind}] {item.qualified_name} "
+                        f"(relevance: {item.relevance_score:.2f}, depth: {item.depth})"
+                    )
+
+                if include_line_numbers:
+                    lines = item.source_code.splitlines()
+                    for i, line in enumerate(lines):
+                        sections.append(f"{item.line_start + i:4d} | {line}")
+                else:
+                    sections.append(item.source_code)
+
+                sections.append("")
+
+        return "\n".join(sections)
+
+# src/cegraph/context/engine.py:706-743
+    def _closure_of(self, symbol_id: str, candidate_ids: set[str]) -> set[str]:
+        """Compute D(v): the transitive set of hard dependencies for symbol v."""
+        deps: set[str] = set()
+        stack = [symbol_id]
+        visited = {symbol_id}
+
+        while stack:
+            current = stack.pop()
+            data = self.graph.nodes.get(current, {})
+
+            # Forward edges: inherits, implements
+            for succ in self.graph.successors(current):
+                edge_data = self.graph.edges[current, succ]
+                edge_kind = edge_data.get("kind", "")
+
+                if edge_kind in _HARD_DEP_EDGES:
+                    succ_data = self.graph.nodes.get(succ, {})
+                    if succ_data.get("type") == "symbol" and succ not in visited:
+                        deps.add(succ)
+                        visited.add(succ)
+                        stack.append(succ)
+
+            # Upward containment: if this is a method, its parent class is needed
+            if data.get("kind") in ("method", "function"):
+                for pred in self.graph.predecessors(current):
+                    edge_data = self.graph.edges[pred, current]
+                    if edge_data.get("kind") == "contains":
+                        pred_data = self.graph.nodes.get(pred, {})
+                        if (
+                            pred_data.get("type") == "symbol"
+                            and pred_data.get("kind") == "class"
+                            and pred not in visited
+                        ):
+                            deps.add(pred)
+                            visited.add(pred)
+                            stack.append(pred)
+
+        return deps
+
+# src/cegraph/context/engine.py:567-630
+    def _expand_context_pagerank(
+        self, seeds: list[dict], config: dict
+    ) -> list[dict]:
+        """Expand context via personalized PageRank from seeds.
+
+        Instead of BFS, compute PPR with the seed set as the personalization
+        vector.  This gives a global relevance score that accounts for the
+        full graph structure, not just local neighborhoods.
+        """
+        min_score = config["min_score"]
+
+        # Build personalization vector (seed nodes get their scores)
+        personalization: dict[str, float] = {}
+        for s in seeds:
+            personalization[s["symbol_id"]] = s["score"]
+
+        # Ensure all seed nodes exist in graph
+        personalization = {
+            k: v for k, v in personalization.items()
+            if self.graph.has_node(k)
+        }
+        if not personalization:
+            return []
+
+        # Normalize
+        total = sum(personalization.values())
+        personalization = {k: v / total for k, v in personalization.items()}
+
+        try:
+            ppr = nx.pagerank(
+                self.graph,
+                alpha=0.85,
+                personalization=personalization,
+                max_iter=100,
+                tol=1e-6,
+            )
+        except nx.NetworkXError:
+            return self._expand_context(seeds, config)
+
+        seed_reason = {s["symbol_id"]: s["reason"] for s in seeds}
+        candidates: list[dict] = []
+
+        for node_id, score in ppr.items():
+            if score < min_score * 0.01:
+                continue
+            data = self.graph.nodes.get(node_id, {})
+            if data.get("type") != "symbol":
+                continue
+
+            # Scale PPR scores to be comparable with BFS scores
+            scaled_score = score * 100
+
+            reason = seed_reason.get(node_id, "pagerank expansion")
+            depth = 0 if node_id in personalization else 1
+            candidates.append({
+                "symbol_id": node_id,
+                "score": scaled_score,
+                "depth": depth,
+                "reason": reason,
+                "via": [],
+            })
+
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        return candidates
+
+# src/cegraph/context/engine.py:116-128
+class AblationConfig:
+    """Toggle individual components for ablation studies.
+
+    All features enabled by default. Disable to measure their contribution.
+    """
+    dependency_closure: bool = True    # Enforce D(v) ⊆ X constraint
+    centrality_scoring: bool = True    # Boost high-connectivity symbols
+    file_proximity: bool = True        # Boost symbols in same file as seeds
+    kind_weights: bool = True          # Weight by symbol kind
+    submodular_coverage: bool = True   # Diminishing returns scoring
+    dependency_ordering: bool = True   # Topological sort output
+    learned_weights: bool = False      # Learn edge weights from git history
+    use_pagerank: bool = False         # Personalized PageRank instead of BFS
+
+# src/cegraph/llm/anthropic_provider.py:45-84
+    def _format_messages(self, messages: list[Message]) -> tuple[str, list[dict]]:
+        """Convert our Message format to Anthropic's format.
+
+        Returns (system_prompt, messages_list).
+        """
+        system = ""
+        result = []
+
+        for msg in messages:
+            if msg.role == "system":
+                system = msg.content
+                continue
+
+            if msg.role == "tool":
+                result.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": msg.tool_call_id,
+                            "content": msg.content,
+                        }
+                    ],
+                })
+            elif msg.tool_calls:
+                content: list[dict] = []
+                if msg.content:
+                    content.append({"type": "text", "text": msg.content})
+                for tc in msg.tool_calls:
+                    content.append({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.arguments,
+                    })
+                result.append({"role": "assistant", "content": content})
+            else:
+                result.append({"role": msg.role, "content": msg.content})
+
+        return system, result
+
+# src/cegraph/exceptions.py:32-39
+class ProviderNotAvailable(LLMError):
+    """Raised when an LLM provider's SDK is not installed."""
+
+    def __init__(self, provider: str, package: str):
+        super().__init__(
+            f"Provider '{provider}' requires the '{package}' package. "
+            f"Install it with: pip install cegraph[{provider}]"
+        )
+
+# src/cegraph/graph/query.py:185-229
+    def impact_of(self, name: str, max_depth: int = 3) -> dict:
+        """Analyze the impact of changing a symbol.
+
+        Returns a dict with:
+        - direct_callers: immediate callers
+        - transitive_callers: all callers up to max_depth
+        - affected_files: set of files that could be affected
+        - risk_score: rough risk assessment (0-1)
+        """
+        symbol_ids = self.find_symbol(name)
+        if not symbol_ids:
+            return {
+                "symbol": name,
+                "found": False,
+                "direct_callers": [],
+                "transitive_callers": [],
+                "affected_files": [],
+                "risk_score": 0.0,
+            }
+
+        direct = self.who_calls(name, max_depth=1)
+        transitive = self.who_calls(name, max_depth=max_depth)
+
+        affected_files = set()
+        for item in transitive:
+            if item.get("file_path"):
+                affected_files.add(item["file_path"])
+        # Also include the symbol's own file
+        for sid in symbol_ids:
+            data = self.graph.nodes.get(sid, {})
+            if data.get("file_path"):
+                affected_files.add(data["file_path"])
+
+        # Risk score based on impact breadth
+        total_files = sum(1 for _, d in self.graph.nodes(data=True) if d.get("type") == "file")
+        risk_score = min(len(affected_files) / max(total_files, 1), 1.0)
+
+        return {
+            "symbol": name,
+            "found": True,
+            "direct_callers": direct,
+            "transitive_callers": transitive,
+            "affected_files": sorted(affected_files),
+            "risk_score": round(risk_score, 3),
+        }
+
+# paper/experiments/benchmark.py:837-976
+async def run_benchmark(
+    tasks: list[EvalTask],
+    budgets: list[int],
+    methods: list[str],
+    llm_config: LLMConfig,
+    output_dir: Path,
+) -> list[EvalResult]:
+    """Run the full benchmark: mutate → context → LLM → patch → test → result.
+
+    For each task with a mutation:
+      1. Apply mutation to create buggy code
+      2. Build graph from buggy code
+      3. Assemble context from buggy code using each method
+      4. Send context + bug description to LLM
+      5. Apply LLM's patch to a temp copy of the buggy code
+      6. Run tests — pass means the LLM fixed the bug
+      7. Restore original code
+    """
+    provider = create_provider(llm_config)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_results: list[EvalResult] = []
+    total_runs = len(tasks) * len(budgets) * len(methods)
+    run_idx = 0
+
+    for task in tasks:
+        repo_path = Path(task.repo_path).resolve()
+
+        print(f"\n{'='*60}")
+        print(f"Task: {task.task_id}")
+        print(f"Repo: {repo_path}")
+        print(f"Description: {task.description[:80]}")
+        print(f"{'='*60}")
+
+        # Apply mutation to create buggy code
+        original_content = None
+        if task.mutation:
+            original_content = _apply_mutation(repo_path, task.mutation)
+            if original_content is None:
+                print("  WARNING: mutation could not be applied, skipping task")
+                continue
+            print(f"  Mutation applied: {task.mutation['file']}")
+
+        try:
+            # Build graph from (possibly mutated) code
+            builder = GraphBuilder()
+            graph = builder.build_from_directory(repo_path)
+            query = GraphQuery(graph)
+
+            for budget in budgets:
+                for method_name in methods:
+                    run_idx += 1
+                    print(f"\n  [{run_idx}/{total_runs}] {method_name} @ B={budget}")
+
+                    method_fn = METHODS[method_name]
+
+                    # 1. Assemble context from buggy code
+                    try:
+                        context, tokens_used, syms, files, asm_time = method_fn(
+                            repo_path, task.description, budget, graph, query,
+                        )
+                    except Exception as e:
+                        print(f"    assembly error: {e}")
+                        all_results.append(EvalResult(
+                            task_id=task.task_id, method=method_name, budget=budget,
+                            tokens_used=0, symbols_selected=0, files_included=0,
+                            assembly_time_ms=0, llm_time_ms=0,
+                            llm_input_tokens=0, llm_output_tokens=0,
+                            tests_passed=False, test_output="", patch="",
+                            error=str(e),
+                        ))
+                        continue
+
+                    print(f"    context: {tokens_used} tokens, {syms} symbols, {files} files ({asm_time}ms)")
+
+                    # 2. Call LLM
+                    try:
+                        llm_response, llm_time, in_tok, out_tok = await call_llm(
+                            provider, context, task.description,
+                        )
+                    except Exception as e:
+                        print(f"    LLM error: {e}")
+                        all_results.append(EvalResult(
+                            task_id=task.task_id, method=method_name, budget=budget,
+                            tokens_used=tokens_used, symbols_selected=syms,
+                            files_included=files, assembly_time_ms=asm_time,
+                            llm_time_ms=0, llm_input_tokens=0, llm_output_tokens=0,
+                            tests_passed=False, test_output="", patch="",
+                            error=str(e),
+                        ))
+                        continue
+
+                    print(f"    LLM: {in_tok} in, {out_tok} out ({llm_time}ms)")
+
+                    # 3. Extract edits
+                    edits = extract_edits(llm_response)
+                    patch = extract_patch(llm_response)
+                    print(f"    edits: {len(edits)} blocks, {len(patch)} chars")
+
+                    # 4. Apply edits to buggy code and test
+                    passed, test_output = apply_and_test(
+                        repo_path, llm_response, task.test_cmd, task.timeout,
+                    )
+                    status = "PASS" if passed else "FAIL"
+                    print(f"    result: {status}")
+
+                    result = EvalResult(
+                        task_id=task.task_id,
+                        method=method_name,
+                        budget=budget,
+                        tokens_used=tokens_used,
+                        symbols_selected=syms,
+                        files_included=files,
+                        assembly_time_ms=asm_time,
+                        llm_time_ms=llm_time,
+                        llm_input_tokens=in_tok,
+                        llm_output_tokens=out_tok,
+                        tests_passed=passed,
+                        test_output=test_output[-500:],
+                        patch=patch[:2000],
+                    )
+                    all_results.append(result)
+
+                    # Save per-run artifact
+                    artifact_dir = output_dir / task.task_id / method_name / str(budget)
+                    artifact_dir.mkdir(parents=True, exist_ok=True)
+                    (artifact_dir / "context.txt").write_text(context[:50000])
+                    (artifact_dir / "llm_response.txt").write_text(llm_response)
+                    (artifact_dir / "patch.diff").write_text(patch)
+                    (artifact_dir / "test_output.txt").write_text(test_output)
+                    (artifact_dir / "result.json").write_text(
+                        json.dumps(asdict(result), indent=2)
+                    )
+        finally:
+            # Always restore original code
+            if original_content is not None:
+                _restore_mutation(repo_path, task.mutation, original_content)
+                print(f"\n  Mutation restored: {task.mutation['file']}")
+
+    return all_results
+
+# src/cegraph/config.py:18-38
+class LLMConfig(BaseModel):
+    """LLM provider configuration."""
+
+    provider: str = "openai"
+    model: str = "claude-sonnet-4-5-20250929"
+    api_key_env: str = ""
+    max_tokens: int = 4096
+    temperature: float = 0.0
+    base_url: str | None = None
+
+    @property
+    def api_key(self) -> str | None:
+        if self.api_key_env:
+            return os.environ.get(self.api_key_env)
+        # Try common env vars
+        env_map = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+        }
+        env_var = env_map.get(self.provider, "")
+        return os.environ.get(env_var)
+
+# src/cegraph/tools/registry.py:11-58
+class ToolRegistry:
+    """Registry that manages available agent tools.
+
+    Tools are functions decorated with @tool that the LLM agent can call.
+    """
+
+    def __init__(self) -> None:
+        self._tools: dict[str, Callable] = {}
+        self._definitions: dict[str, ToolDefinition] = {}
+
+    def register(self, func: Callable, definition: ToolDefinition) -> None:
+        """Register a tool function with its definition."""
+        self._tools[definition.name] = func
+        self._definitions[definition.name] = definition
+
+    def get(self, name: str) -> Callable | None:
+        """Get a tool function by name."""
+        return self._tools.get(name)
+
+    def get_definition(self, name: str) -> ToolDefinition | None:
+        """Get a tool definition by name."""
+        return self._definitions.get(name)
+
+    def list_tools(self) -> list[str]:
+        """List all registered tool names."""
+        return list(self._tools.keys())
+
+    def get_definitions(self) -> list[ToolDefinition]:
+        """Get all tool definitions (for passing to LLM)."""
+        return list(self._definitions.values())
+
+    async def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        """Execute a tool by name with the given arguments.
+
+        Returns the result as a string.
+        """
+        func = self._tools.get(name)
+        if func is None:
+            return f"Error: Unknown tool '{name}'"
+
+        try:
+            if inspect.iscoroutinefunction(func):
+                result = await func(**arguments)
+            else:
+                result = func(**arguments)
+            return str(result) if result is not None else "Done."
+        except Exception as e:
+            return f"Error executing tool '{name}': {e}"

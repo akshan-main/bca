@@ -1,0 +1,841 @@
+# src/cegraph/context/models.py:15-15
+    SMART = "balanced"  # Graph-expanded with relevance scoring (default)
+
+# src/cegraph/context/models.py:11-16
+class ContextStrategy(str, Enum):
+    """Strategy for assembling context."""
+
+    PRECISE = "precise"  # Only directly relevant symbols
+    SMART = "balanced"  # Graph-expanded with relevance scoring (default)
+    THOROUGH = "thorough"  # Deep expansion, all related code
+
+# paper/experiments/ablation.py:21-21
+from cegraph.context.models import ContextStrategy
+
+# paper/experiments/baselines.py:28-28
+from cegraph.context.models import ContextStrategy, TokenEstimator
+
+# paper/experiments/benchmark.py:55-55
+from cegraph.context.models import ContextStrategy, TokenEstimator
+
+# src/cegraph/context/__init__.py:15-15
+from cegraph.context.models import ContextPackage, ContextItem, ContextStrategy
+
+# src/cegraph/context/engine.py:43-48
+from cegraph.context.models import (
+    ContextItem,
+    ContextPackage,
+    ContextStrategy,
+    TokenEstimator,
+)
+
+# tests/test_context.py:10-15
+from cegraph.context.models import (
+    ContextItem,
+    ContextPackage,
+    ContextStrategy,
+    TokenEstimator,
+)
+
+# src/cegraph/context/engine.py:204-272
+    def assemble(
+        self,
+        task: str,
+        token_budget: int = 8000,
+        strategy: ContextStrategy = ContextStrategy.SMART,
+        focus_files: list[str] | None = None,
+    ) -> ContextPackage:
+        """Assemble a budgeted context package for a given task.
+
+        Args:
+            task: Natural language description of the task.
+            token_budget: Maximum tokens to include (budget B).
+            strategy: How aggressively to expand context.
+            focus_files: Optional list of files to prioritize.
+
+        Returns:
+            A ContextPackage with the selected symbols and their source code,
+            ordered by dependency (definitions before usage).
+        """
+        start_time = time.time()
+        config = _STRATEGY_CONFIG[strategy]
+
+        # Phase 1: Extract entities from the task
+        entities = self._extract_entities(task)
+
+        # Phase 2: Find seed symbols in the graph
+        seeds = self._find_seeds(entities, focus_files)
+
+        # Phase 3: Expand context via graph traversal
+        if self.ablation.use_pagerank and seeds:
+            candidates = self._expand_context_pagerank(seeds, config)
+        elif self._native_graph and seeds:
+            candidates = self._expand_context_native(seeds, config)
+        else:
+            candidates = self._expand_context(seeds, config)
+
+        # Phase 4: Score candidates
+        scored = self._score_candidates(candidates, entities, seeds)
+
+        # Phase 5: Compute dependency closures
+        closures = self._compute_closures(scored)
+
+        # Phase 6: Budgeted selection with closure constraints
+        selected = self._budget_select(scored, closures, token_budget)
+
+        # Phase 7: Load source code
+        items = self._load_source(selected)
+
+        # Phase 8: Dependency-safe ordering
+        if self.ablation.dependency_ordering:
+            items = self._dependency_order(items)
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        total_tokens = sum(item.token_estimate for item in items)
+        files = set(item.file_path for item in items)
+
+        return ContextPackage(
+            task=task,
+            strategy=strategy,
+            items=items,
+            seed_symbols=[s["symbol_id"] for s in seeds],
+            total_tokens=total_tokens,
+            token_budget=token_budget,
+            files_included=len(files),
+            symbols_included=len(items),
+            symbols_available=len(scored),
+            budget_used_pct=round(total_tokens / max(token_budget, 1) * 100, 1),
+            assembly_time_ms=round(elapsed_ms, 1),
+        )
+
+# src/cegraph/ui/console.py:49-51
+    def code(self, text: str, language: str = "python") -> None:
+        """Render syntax-highlighted code."""
+        self.console.print(Syntax(text, language, theme="monokai", line_numbers=True))
+
+# src/cegraph/context/models.py:54-102
+    def render(self, include_line_numbers: bool = True, include_metadata: bool = True) -> str:
+        """Render the context package as a string for LLM consumption.
+
+        This is the key output - a carefully structured text that gives the LLM
+        exactly what it needs to understand the relevant code.
+        """
+        sections: list[str] = []
+
+        if include_metadata:
+            sections.append(f"# Codebase Context for: {self.task}")
+            sections.append(
+                f"# {self.symbols_included} symbols from {self.files_included} files "
+                f"(~{self.total_tokens:,} tokens, {self.budget_used_pct:.0f}% of budget)"
+            )
+            sections.append("")
+
+        # Group items by file
+        by_file: dict[str, list[ContextItem]] = {}
+        for item in self.items:
+            by_file.setdefault(item.file_path, []).append(item)
+
+        for file_path, items in sorted(by_file.items()):
+            sections.append(f"## {file_path}")
+            if include_metadata:
+                reasons = set(i.reason for i in items if i.reason)
+                if reasons:
+                    sections.append(f"# Included because: {'; '.join(reasons)}")
+            sections.append("")
+
+            # Sort items by line number
+            items.sort(key=lambda x: x.line_start)
+
+            for item in items:
+                if include_metadata:
+                    sections.append(
+                        f"# [{item.kind}] {item.qualified_name} "
+                        f"(relevance: {item.relevance_score:.2f}, depth: {item.depth})"
+                    )
+
+                if include_line_numbers:
+                    lines = item.source_code.splitlines()
+                    for i, line in enumerate(lines):
+                        sections.append(f"{item.line_start + i:4d} | {line}")
+                else:
+                    sections.append(item.source_code)
+
+                sections.append("")
+
+        return "\n".join(sections)
+
+# tests/test_cli.py:19-24
+def indexed_project(tmp_project: Path) -> Path:
+    """Create a tmp_project that has been indexed."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["init", "--path", str(tmp_project)])
+    assert result.exit_code == 0, f"Init failed: {result.output}"
+    return tmp_project
+
+# src/cegraph/cli.py:255-352
+def context(
+    task: str, path: str | None, budget: int, strategy: str,
+    compact: bool, savings: bool, focus: tuple[str, ...]
+):
+    """Assemble budgeted code context for a task using CAG.
+
+    Given a natural language task description, assembles relevant code from the
+    knowledge graph -- scored, ranked, and dependency-ordered within a token
+    budget.
+
+    Examples:
+
+        cegraph context "fix the login bug in AuthService"
+
+        cegraph context "add pagination to the user list API" --budget 4000
+
+        cegraph context "refactor calculate_total" --strategy thorough --savings
+    """
+    root = _get_project_root(path)
+    graph, store = _load_graph(root)
+
+    from cegraph.context.engine import ContextAssembler
+    from cegraph.context.models import ContextStrategy
+    from cegraph.graph.query import GraphQuery
+
+    query = GraphQuery(graph, store)
+    assembler = ContextAssembler(root, graph, query)
+
+    strategy_map = {
+        "precise": ContextStrategy.PRECISE,
+        "smart": ContextStrategy.SMART,
+        "thorough": ContextStrategy.THOROUGH,
+    }
+
+    if savings:
+        console.info("Computing token savings comparison...")
+        result = assembler.estimate_savings(task, budget)
+        console.console.print()
+        console.console.print("[bold]CAG Token Savings Analysis[/bold]")
+        console.console.print(f"  Task: {task}")
+        accel_str = "[green]C++ accelerated[/green]" if result["accelerated"] else "Python"
+        console.console.print(f"  Backend: {accel_str}")
+        console.console.print()
+
+        if result["cag_symbols"] == 0:
+            console.warning(
+                "CAG found no matching symbols in the knowledge graph. "
+                "Check that the symbol names in your task match actual code in this project."
+            )
+            console.console.print()
+
+        console.console.print(f"  [bold cyan]CAG:[/bold cyan] {result['cag_tokens']:,} tokens "
+                            f"({result['cag_symbols']} symbols, {result['cag_files']} files)")
+        console.console.print(f"  [dim]grep:[/dim] {result['grep_tokens']:,} tokens "
+                            f"({result['grep_files']} files)")
+        console.console.print(f"  [dim]all files:[/dim] {result['all_files_tokens']:,} tokens")
+        console.console.print()
+        console.console.print(f"  Savings vs grep: [green]{result['savings_vs_grep']}[/green]")
+        console.console.print(f"  Savings vs all:  [green]{result['savings_vs_all']}[/green]")
+    else:
+        package = assembler.assemble(
+            task=task,
+            token_budget=budget,
+            strategy=strategy_map[strategy],
+            focus_files=list(focus) if focus else None,
+        )
+
+        # Show summary
+        console.console.print()
+        console.console.print(f"[bold]CAG Context Package[/bold]")
+        console.console.print(f"  Strategy: {strategy}")
+        accel = assembler.is_accelerated
+        accel_str = "[green]C++ accelerated[/green]" if accel else "Python"
+        console.console.print(f"  Backend: {accel_str}")
+        console.console.print(
+            f"  Tokens: {package.total_tokens:,} / {package.token_budget:,} "
+            f"({package.budget_used_pct:.0f}%)"
+        )
+        console.console.print(f"  Symbols: {package.symbols_included} (from {package.symbols_available} candidates)")
+        console.console.print(f"  Files: {package.files_included}")
+        console.console.print(f"  Time: {package.assembly_time_ms:.1f}ms")
+        console.console.print()
+
+        if package.symbols_included == 0:
+            console.warning(
+                "No matching symbols found. The names in your task description "
+                "must match actual symbols in this codebase.\n"
+                "  Try: cegraph search <name> to find valid symbol names."
+            )
+            console.console.print()
+
+        # Output the context
+        if compact:
+            console.console.print(package.render_compact())
+        else:
+            console.console.print(package.render())
+
+    store.close()
+
+# src/cegraph/config.py:125-137
+def set_config_value(config: ProjectConfig, key: str, value: Any) -> ProjectConfig:
+    """Set a nested config value using dot notation (e.g., 'llm.provider')."""
+    parts = key.split(".")
+    data = config.model_dump()
+    target = data
+    for part in parts[:-1]:
+        if part not in target or not isinstance(target[part], dict):
+            raise KeyError(f"Invalid config key: {key}")
+        target = target[part]
+    if parts[-1] not in target:
+        raise KeyError(f"Invalid config key: {key}")
+    target[parts[-1]] = value
+    return ProjectConfig(**data)
+
+# src/cegraph/context/models.py:16-16
+    THOROUGH = "thorough"  # Deep expansion, all related code
+
+# src/cegraph/graph/builder.py:15-213
+class GraphBuilder:
+    """Builds and maintains a code knowledge graph.
+
+    The graph has two types of nodes:
+    - File nodes: represent source files
+    - Symbol nodes: represent code symbols (functions, classes, etc.)
+
+    Edges represent relationships (calls, imports, inherits, contains, etc.)
+    """
+
+    def __init__(self) -> None:
+        self.graph = nx.DiGraph()
+        self._file_hashes: dict[str, str] = {}
+        self._unresolved: list[Relationship] = []
+
+    def build_from_directory(
+        self,
+        root: str | Path,
+        config: ProjectConfig | None = None,
+        progress_callback: callable | None = None,
+    ) -> nx.DiGraph:
+        """Build the full knowledge graph from a directory.
+
+        Args:
+            root: Root directory to index.
+            config: Project configuration.
+            progress_callback: Optional callback(file_path, current, total).
+
+        Returns:
+            The constructed NetworkX directed graph.
+        """
+        root = Path(root).resolve()
+        indexer_config = config.indexer if config else IndexerConfig()
+
+        # Reset state so reusing a builder doesn't accumulate stale data
+        # self.graph = nx.DiGraph()
+        # self._file_hashes = {}
+        # self._unresolved = []
+
+        # Parse all files
+        all_parsed = parse_directory(root, indexer_config, progress_callback)
+
+        # Build graph from parsed results
+        for file_symbols in all_parsed:
+            self._add_file(file_symbols, root)
+
+        # Resolve cross-file references
+        self._resolve_references()
+
+        return self.graph
+
+    def _add_file(self, fs: FileSymbols, root: Path) -> None:
+        """Add a file and its symbols to the graph."""
+        file_path = fs.file_path
+
+        # Add file node
+        self.graph.add_node(
+            f"file::{file_path}",
+            type="file",
+            path=file_path,
+            language=fs.language,
+            symbol_count=len(fs.symbols),
+            import_count=len(fs.imports),
+        )
+
+        # Compute file hash for change detection
+        try:
+            full_path = root / file_path
+            content = full_path.read_bytes()
+            self._file_hashes[file_path] = hashlib.sha256(content).hexdigest()[:16]
+        except OSError:
+            pass
+
+        # Add symbol nodes
+        for symbol in fs.symbols:
+            attrs = {
+                "type": "symbol",
+                "name": symbol.name,
+                "qualified_name": symbol.qualified_name,
+                "kind": symbol.kind.value,
+                "file_path": symbol.file_path,
+                "line_start": symbol.line_start,
+                "line_end": symbol.line_end,
+                "signature": symbol.signature,
+                "docstring": symbol.docstring,
+            }
+            self.graph.add_node(symbol.id, **attrs)
+
+            # Link symbol to its file
+            self.graph.add_edge(
+                f"file::{file_path}",
+                symbol.id,
+                kind="contains",
+            )
+
+        # Add relationships
+        for rel in fs.relationships:
+            if rel.resolved or self._try_resolve(rel):
+                self.graph.add_edge(
+                    rel.source,
+                    rel.target,
+                    kind=rel.kind.value,
+                    file_path=rel.file_path,
+                    line=rel.line,
+                )
+            else:
+                self._unresolved.append(rel)
+
+    def _try_resolve(self, rel: Relationship) -> bool:
+        """Try to resolve a relationship's target to an existing node."""
+        target = rel.target
+
+        # Direct match
+        if self.graph.has_node(target):
+            return True
+
+        # Try finding by name across all files
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("type") != "symbol":
+                continue
+            if data.get("name") == target or data.get("qualified_name") == target:
+                rel.target = node_id
+                rel.resolved = True
+                return True
+
+        return False
+
+    def _resolve_references(self) -> None:
+        """Try to resolve all unresolved references after the full graph is built."""
+        still_unresolved = []
+
+        # Build a lookup index: name -> [node_ids]
+        name_index: dict[str, list[str]] = {}
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("type") != "symbol":
+                continue
+            name = data.get("name", "")
+            qname = data.get("qualified_name", "")
+            if name:
+                name_index.setdefault(name, []).append(node_id)
+            if qname and qname != name:
+                name_index.setdefault(qname, []).append(node_id)
+
+        for rel in self._unresolved:
+            target = rel.target
+            # Try exact match by name
+            candidates = name_index.get(target, [])
+
+            # Try dotted parts (e.g., "module.func" -> "func")
+            if not candidates and "." in target:
+                parts = target.split(".")
+                candidates = name_index.get(parts[-1], [])
+
+            if candidates:
+                # Pick the best candidate (same file first, then any)
+                best = None
+                for c in candidates:
+                    c_data = self.graph.nodes[c]
+                    if c_data.get("file_path") == rel.file_path:
+                        best = c
+                        break
+                if best is None:
+                    best = candidates[0]
+
+                self.graph.add_edge(
+                    rel.source,
+                    best,
+                    kind=rel.kind.value,
+                    file_path=rel.file_path,
+                    line=rel.line,
+                )
+            else:
+                still_unresolved.append(rel)
+
+        self._unresolved = still_unresolved
+
+    def get_stats(self) -> dict:
+        """Get graph statistics."""
+        node_types: dict[str, int] = {}
+        edge_types: dict[str, int] = {}
+
+        for _, data in self.graph.nodes(data=True):
+            kind = data.get("kind", data.get("type", "unknown"))
+            node_types[kind] = node_types.get(kind, 0) + 1
+
+        for _, _, data in self.graph.edges(data=True):
+            kind = data.get("kind", "unknown")
+            edge_types[kind] = edge_types.get(kind, 0) + 1
+
+        return {
+            "total_nodes": self.graph.number_of_nodes(),
+            "total_edges": self.graph.number_of_edges(),
+            "node_types": node_types,
+            "edge_types": edge_types,
+            "files": node_types.get("file", 0),
+            "functions": node_types.get("function", 0) + node_types.get("method", 0),
+            "classes": node_types.get("class", 0),
+            "unresolved_refs": len(self._unresolved),
+        }
+
+# paper/experiments/benchmark.py:837-976
+async def run_benchmark(
+    tasks: list[EvalTask],
+    budgets: list[int],
+    methods: list[str],
+    llm_config: LLMConfig,
+    output_dir: Path,
+) -> list[EvalResult]:
+    """Run the full benchmark: mutate → context → LLM → patch → test → result.
+
+    For each task with a mutation:
+      1. Apply mutation to create buggy code
+      2. Build graph from buggy code
+      3. Assemble context from buggy code using each method
+      4. Send context + bug description to LLM
+      5. Apply LLM's patch to a temp copy of the buggy code
+      6. Run tests — pass means the LLM fixed the bug
+      7. Restore original code
+    """
+    provider = create_provider(llm_config)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_results: list[EvalResult] = []
+    total_runs = len(tasks) * len(budgets) * len(methods)
+    run_idx = 0
+
+    for task in tasks:
+        repo_path = Path(task.repo_path).resolve()
+
+        print(f"\n{'='*60}")
+        print(f"Task: {task.task_id}")
+        print(f"Repo: {repo_path}")
+        print(f"Description: {task.description[:80]}")
+        print(f"{'='*60}")
+
+        # Apply mutation to create buggy code
+        original_content = None
+        if task.mutation:
+            original_content = _apply_mutation(repo_path, task.mutation)
+            if original_content is None:
+                print("  WARNING: mutation could not be applied, skipping task")
+                continue
+            print(f"  Mutation applied: {task.mutation['file']}")
+
+        try:
+            # Build graph from (possibly mutated) code
+            builder = GraphBuilder()
+            graph = builder.build_from_directory(repo_path)
+            query = GraphQuery(graph)
+
+            for budget in budgets:
+                for method_name in methods:
+                    run_idx += 1
+                    print(f"\n  [{run_idx}/{total_runs}] {method_name} @ B={budget}")
+
+                    method_fn = METHODS[method_name]
+
+                    # 1. Assemble context from buggy code
+                    try:
+                        context, tokens_used, syms, files, asm_time = method_fn(
+                            repo_path, task.description, budget, graph, query,
+                        )
+                    except Exception as e:
+                        print(f"    assembly error: {e}")
+                        all_results.append(EvalResult(
+                            task_id=task.task_id, method=method_name, budget=budget,
+                            tokens_used=0, symbols_selected=0, files_included=0,
+                            assembly_time_ms=0, llm_time_ms=0,
+                            llm_input_tokens=0, llm_output_tokens=0,
+                            tests_passed=False, test_output="", patch="",
+                            error=str(e),
+                        ))
+                        continue
+
+                    print(f"    context: {tokens_used} tokens, {syms} symbols, {files} files ({asm_time}ms)")
+
+                    # 2. Call LLM
+                    try:
+                        llm_response, llm_time, in_tok, out_tok = await call_llm(
+                            provider, context, task.description,
+                        )
+                    except Exception as e:
+                        print(f"    LLM error: {e}")
+                        all_results.append(EvalResult(
+                            task_id=task.task_id, method=method_name, budget=budget,
+                            tokens_used=tokens_used, symbols_selected=syms,
+                            files_included=files, assembly_time_ms=asm_time,
+                            llm_time_ms=0, llm_input_tokens=0, llm_output_tokens=0,
+                            tests_passed=False, test_output="", patch="",
+                            error=str(e),
+                        ))
+                        continue
+
+                    print(f"    LLM: {in_tok} in, {out_tok} out ({llm_time}ms)")
+
+                    # 3. Extract edits
+                    edits = extract_edits(llm_response)
+                    patch = extract_patch(llm_response)
+                    print(f"    edits: {len(edits)} blocks, {len(patch)} chars")
+
+                    # 4. Apply edits to buggy code and test
+                    passed, test_output = apply_and_test(
+                        repo_path, llm_response, task.test_cmd, task.timeout,
+                    )
+                    status = "PASS" if passed else "FAIL"
+                    print(f"    result: {status}")
+
+                    result = EvalResult(
+                        task_id=task.task_id,
+                        method=method_name,
+                        budget=budget,
+                        tokens_used=tokens_used,
+                        symbols_selected=syms,
+                        files_included=files,
+                        assembly_time_ms=asm_time,
+                        llm_time_ms=llm_time,
+                        llm_input_tokens=in_tok,
+                        llm_output_tokens=out_tok,
+                        tests_passed=passed,
+                        test_output=test_output[-500:],
+                        patch=patch[:2000],
+                    )
+                    all_results.append(result)
+
+                    # Save per-run artifact
+                    artifact_dir = output_dir / task.task_id / method_name / str(budget)
+                    artifact_dir.mkdir(parents=True, exist_ok=True)
+                    (artifact_dir / "context.txt").write_text(context[:50000])
+                    (artifact_dir / "llm_response.txt").write_text(llm_response)
+                    (artifact_dir / "patch.diff").write_text(patch)
+                    (artifact_dir / "test_output.txt").write_text(test_output)
+                    (artifact_dir / "result.json").write_text(
+                        json.dumps(asdict(result), indent=2)
+                    )
+        finally:
+            # Always restore original code
+            if original_content is not None:
+                _restore_mutation(repo_path, task.mutation, original_content)
+                print(f"\n  Mutation restored: {task.mutation['file']}")
+
+    return all_results
+
+# src/cegraph/context/models.py:14-14
+    PRECISE = "precise"  # Only directly relevant symbols
+
+# src/cegraph/tools/registry.py:11-58
+class ToolRegistry:
+    """Registry that manages available agent tools.
+
+    Tools are functions decorated with @tool that the LLM agent can call.
+    """
+
+    def __init__(self) -> None:
+        self._tools: dict[str, Callable] = {}
+        self._definitions: dict[str, ToolDefinition] = {}
+
+    def register(self, func: Callable, definition: ToolDefinition) -> None:
+        """Register a tool function with its definition."""
+        self._tools[definition.name] = func
+        self._definitions[definition.name] = definition
+
+    def get(self, name: str) -> Callable | None:
+        """Get a tool function by name."""
+        return self._tools.get(name)
+
+    def get_definition(self, name: str) -> ToolDefinition | None:
+        """Get a tool definition by name."""
+        return self._definitions.get(name)
+
+    def list_tools(self) -> list[str]:
+        """List all registered tool names."""
+        return list(self._tools.keys())
+
+    def get_definitions(self) -> list[ToolDefinition]:
+        """Get all tool definitions (for passing to LLM)."""
+        return list(self._definitions.values())
+
+    async def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        """Execute a tool by name with the given arguments.
+
+        Returns the result as a string.
+        """
+        func = self._tools.get(name)
+        if func is None:
+            return f"Error: Unknown tool '{name}'"
+
+        try:
+            if inspect.iscoroutinefunction(func):
+                result = await func(**arguments)
+            else:
+                result = func(**arguments)
+            return str(result) if result is not None else "Done."
+        except Exception as e:
+            return f"Error executing tool '{name}': {e}"
+
+# src/cegraph/agent/loop.py:45-191
+class AgentLoop:
+    """ReAct agent loop that iteratively uses tools to complete tasks.
+
+    The agent:
+    1. Receives a task from the user
+    2. Reasons about what to do next
+    3. Calls tools to gather information or make changes
+    4. Processes tool results
+    5. Repeats until it has enough info to give a final answer
+    6. Presents the answer/changes for user approval
+    """
+
+    def __init__(
+        self,
+        llm: LLMProvider,
+        tools: ToolRegistry,
+        project_name: str = "",
+        max_iterations: int = 15,
+        on_step: Callable[[AgentStep], None] | None = None,
+        on_approval_needed: Callable[[str], bool] | None = None,
+    ) -> None:
+        self.llm = llm
+        self.tools = tools
+        self.project_name = project_name
+        self.max_iterations = max_iterations
+        self.on_step = on_step
+        self.on_approval_needed = on_approval_needed
+
+    async def run(self, task: str, context: str = "") -> AgentResult:
+        """Run the agent loop for a given task.
+
+        Args:
+            task: The user's request/task.
+            context: Additional context (e.g., file content, error messages).
+
+        Returns:
+            AgentResult with the final answer and step history.
+        """
+        messages: list[Message] = [
+            Message(role="system", content=get_system_prompt(self.project_name)),
+        ]
+
+        # Add context if provided
+        user_content = task
+        if context:
+            user_content = f"{task}\n\nContext:\n{context}"
+        messages.append(Message(role="user", content=user_content))
+
+        steps: list[AgentStep] = []
+        total_tokens = 0
+
+        for iteration in range(self.max_iterations):
+            step = AgentStep(iteration=iteration + 1)
+
+            try:
+                response = await self.llm.complete(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    temperature=0.0,
+                )
+            except Exception as e:
+                return AgentResult(
+                    answer="",
+                    steps=steps,
+                    total_iterations=iteration + 1,
+                    total_tokens=total_tokens,
+                    success=False,
+                    error=f"LLM error: {e}",
+                )
+
+            step.usage = response.usage
+            total_tokens += sum(response.usage.values())
+
+            if response.has_tool_calls:
+                # Agent wants to use tools
+                step.thought = response.content
+                step.tool_calls = response.tool_calls
+
+                # Add assistant message with tool calls
+                messages.append(
+                    Message(
+                        role="assistant",
+                        content=response.content,
+                        tool_calls=response.tool_calls,
+                    )
+                )
+
+                # Execute each tool call
+                for tc in response.tool_calls:
+                    result = await self.tools.execute(tc.name, tc.arguments)
+                    tool_result = ToolResult(
+                        tool_call_id=tc.id,
+                        name=tc.name,
+                        content=result,
+                    )
+                    step.tool_results.append(tool_result)
+
+                    # Add tool result message
+                    messages.append(
+                        Message(
+                            role="tool",
+                            content=result,
+                            tool_call_id=tc.id,
+                            name=tc.name,
+                        )
+                    )
+
+                # Notify step callback
+                if self.on_step:
+                    self.on_step(step)
+
+                steps.append(step)
+
+            else:
+                # Agent is done - final answer
+                step.response = response.content
+
+                if self.on_step:
+                    self.on_step(step)
+
+                steps.append(step)
+
+                return AgentResult(
+                    answer=response.content,
+                    steps=steps,
+                    total_iterations=iteration + 1,
+                    total_tokens=total_tokens,
+                    success=True,
+                )
+
+        # Max iterations reached
+        return AgentResult(
+            answer="I reached the maximum number of iterations. Here's what I've found so far based on my analysis.",
+            steps=steps,
+            total_iterations=self.max_iterations,
+            total_tokens=total_tokens,
+            success=False,
+            error="Max iterations reached",
+        )
+
+    async def ask(self, question: str) -> str:
+        """Simple Q&A mode - ask a question about the codebase.
+
+        Returns just the answer string.
+        """
+        result = await self.run(question)
+        return result.answer
+
+# src/cegraph/context/models.py:166-168
+    def estimate(cls, text: str) -> int:
+        """Estimate token count for a string."""
+        return max(1, int(len(text) / cls.CHARS_PER_TOKEN))

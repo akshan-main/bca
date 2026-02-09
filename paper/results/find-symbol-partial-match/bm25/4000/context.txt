@@ -1,0 +1,511 @@
+# src/cegraph/graph/query.py:56-64
+    def find_symbol(self, name: str) -> list[str]:
+        """Find symbol node IDs matching a name (exact or qualified)."""
+        results = self._name_index.get(name, [])
+        if not results:
+            # Try partial match
+            for key, ids in self._name_index.items():
+                if name.lower() == key.lower():
+                    results.extend(ids)
+        return list(set(results))
+
+# tests/test_graph.py:165-168
+    def test_find_symbol_partial(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        results = query.find_symbol("helper")
+        assert len(results) > 0
+
+# tests/test_graph.py:160-163
+    def test_find_symbol(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        results = query.find_symbol("main")
+        assert len(results) > 0
+
+# src/cegraph/parser/core.py:5-5
+import fnmatch
+
+# src/cegraph/parser/core.py:133-144
+def _should_exclude(path: str, patterns: list[str]) -> bool:
+    """Check if a path matches any exclusion pattern."""
+    path_parts = Path(path).parts
+    for pattern in patterns:
+        # Check against full path
+        if fnmatch.fnmatch(path, pattern):
+            return True
+        # Check against any path component
+        for part in path_parts:
+            if fnmatch.fnmatch(part, pattern):
+                return True
+    return False
+
+# src/cegraph/search/lexical.py:185-209
+    def _score_match(self, query: str, line: str, file_path: str) -> float:
+        """Score a match based on quality heuristics."""
+        score = 1.0
+
+        # Exact case match bonus
+        if query in line:
+            score += 0.5
+
+        # Definition bonus (line starts with def, class, function, etc.)
+        stripped = line.strip()
+        if any(
+            stripped.startswith(kw)
+            for kw in ("def ", "class ", "function ", "const ", "let ", "var ", "fn ", "func ", "pub ")
+        ):
+            score += 1.0
+
+        # Shorter lines are usually more relevant
+        if len(stripped) < 80:
+            score += 0.3
+
+        # Test files penalty
+        if "test" in file_path.lower():
+            score -= 0.3
+
+        return score
+
+# tests/test_graph.py:196-201
+    def test_get_file_symbols(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        symbols = query.get_file_symbols("main.py")
+        assert len(symbols) > 0
+        names = [s["name"] for s in symbols]
+        assert "main" in names
+
+# src/cegraph/graph/query.py:231-246
+    def get_file_symbols(self, file_path: str) -> list[dict]:
+        """Get all symbols defined in a file."""
+        file_node = f"file::{file_path}"
+        if not self.graph.has_node(file_node):
+            return []
+
+        symbols = []
+        for succ in self.graph.successors(file_node):
+            data = self.graph.nodes.get(succ, {})
+            if data.get("type") == "symbol":
+                symbols.append({
+                    "id": succ,
+                    **{k: v for k, v in data.items() if k != "type"},
+                })
+
+        return sorted(symbols, key=lambda s: s.get("line_start", 0))
+
+# src/cegraph/mcp/server.py:37-37
+    SERVER_NAME = "cegraph"
+
+# src/cegraph/graph/query.py:44-54
+    def _build_index(self) -> None:
+        """Build a name->node_id lookup index."""
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("type") != "symbol":
+                continue
+            name = data.get("name", "")
+            qname = data.get("qualified_name", "")
+            if name:
+                self._name_index.setdefault(name, []).append(node_id)
+            if qname and qname != name:
+                self._name_index.setdefault(qname, []).append(node_id)
+
+# src/cegraph/parser/python_parser.py:305-316
+def _node_to_name(node: ast.AST) -> str:
+    """Convert an AST node to a dotted name string."""
+    if isinstance(node, ast.Name):
+        return node.id
+    elif isinstance(node, ast.Attribute):
+        parent = _node_to_name(node.value)
+        if parent:
+            return f"{parent}.{node.attr}"
+        return node.attr
+    elif isinstance(node, ast.Subscript):
+        return _node_to_name(node.value)
+    return ""
+
+# src/cegraph/context/engine.py:349-427
+    def _find_seeds(
+        self, entities: list[dict], focus_files: list[str] | None = None
+    ) -> list[dict]:
+        """Find seed symbols in the graph matching extracted entities."""
+        seeds: list[dict] = []
+        seen_ids = set()
+
+        for entity in entities:
+            name = entity["name"]
+            confidence = entity["confidence"]
+
+            if entity["type"] == "file":
+                file_node = f"file::{name}"
+                if self.graph.has_node(file_node):
+                    for succ in self.graph.successors(file_node):
+                        data = self.graph.nodes.get(succ, {})
+                        if data.get("type") == "symbol" and succ not in seen_ids:
+                            kind_w = _KIND_WEIGHTS.get(data.get("kind", ""), 0.5)
+                            seeds.append({
+                                "symbol_id": succ,
+                                "score": confidence * kind_w,
+                                "reason": f"in file '{name}'",
+                            })
+                            seen_ids.add(succ)
+            else:
+                matches = self.query.find_symbol(name)
+                for sid in matches:
+                    if sid in seen_ids:
+                        continue
+                    data = self.graph.nodes.get(sid, {})
+                    if data.get("type") != "symbol":
+                        continue
+                    kind = data.get("kind", "")
+                    sym_name = data.get("name", "")
+
+                    if sym_name.lower() == name.lower():
+                        match_score = 1.0
+                    elif name.lower() in sym_name.lower():
+                        match_score = 0.7
+                    else:
+                        match_score = 0.4
+
+                    kind_w = _KIND_WEIGHTS.get(kind, 0.5)
+                    score = confidence * match_score * kind_w
+
+                    if kind == "import" and score < 0.3:
+                        continue
+
+                    seeds.append({
+                        "symbol_id": sid,
+                        "score": score,
+                        "reason": f"matches '{name}'",
+                    })
+                    seen_ids.add(sid)
+
+        if focus_files:
+            for fp in focus_files:
+                file_node = f"file::{fp}"
+                if self.graph.has_node(file_node):
+                    for succ in self.graph.successors(file_node):
+                        data = self.graph.nodes.get(succ, {})
+                        if data.get("type") == "symbol" and succ not in seen_ids:
+                            kind_w = _KIND_WEIGHTS.get(data.get("kind", ""), 0.5)
+                            seeds.append({
+                                "symbol_id": succ,
+                                "score": 0.8 * kind_w,
+                                "reason": f"in focus file '{fp}'",
+                            })
+                            seen_ids.add(succ)
+
+        seeds.sort(key=lambda x: x["score"], reverse=True)
+
+        # Cap low-confidence keyword seeds to avoid noise explosion.
+        # Keep all high-confidence seeds (>= 0.5), but limit keywords to 5.
+        high = [s for s in seeds if s["score"] >= 0.5]
+        low = [s for s in seeds if s["score"] < 0.5]
+        seeds = high + low[:5]
+
+        return seeds
+
+# src/cegraph/parser/tree_sitter_parser.py:207-217
+def _extract_name(node, language: str) -> str:
+    """Extract the name of a symbol from its tree-sitter node."""
+    # Look for a name/identifier child
+    for child in node.children:
+        if child.type in ("identifier", "name", "type_identifier", "property_identifier"):
+            return child.text.decode("utf-8")
+    # For some languages, try named children
+    name_child = node.child_by_field_name("name")
+    if name_child:
+        return name_child.text.decode("utf-8")
+    return ""
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# examples/demo.py:10-10
+from cegraph.graph.query import GraphQuery
+
+# src/cegraph/context/models.py:104-132
+    def render_compact(self) -> str:
+        """Render a compact version - signatures + docstrings only for secondary symbols."""
+        sections: list[str] = []
+        sections.append(f"# Context for: {self.task}")
+        sections.append("")
+
+        by_file: dict[str, list[ContextItem]] = {}
+        for item in self.items:
+            by_file.setdefault(item.file_path, []).append(item)
+
+        for file_path, items in sorted(by_file.items()):
+            sections.append(f"## {file_path}")
+            items.sort(key=lambda x: x.line_start)
+
+            for item in items:
+                if item.depth == 0:
+                    # Primary symbols: full source
+                    sections.append(item.source_code)
+                else:
+                    # Secondary: signature + docstring only
+                    sections.append(item.signature)
+                    if item.docstring:
+                        doc_preview = item.docstring[:150]
+                        if len(item.docstring) > 150:
+                            doc_preview += "..."
+                        sections.append(f'    """{doc_preview}"""')
+                sections.append("")
+
+        return "\n".join(sections)
+
+# tests/test_graph.py:154-226
+class TestGraphQuery:
+    def _build_query(self, tmp_project: Path) -> GraphQuery:
+        builder = GraphBuilder()
+        graph = builder.build_from_directory(tmp_project)
+        return GraphQuery(graph)
+
+    def test_find_symbol(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        results = query.find_symbol("main")
+        assert len(results) > 0
+
+    def test_find_symbol_partial(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        results = query.find_symbol("helper")
+        assert len(results) > 0
+
+    def test_who_calls(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        callers = query.who_calls("helper_function")
+        # main() calls helper_function()
+        caller_names = [c["name"] for c in callers]
+        assert any("main" in name for name in caller_names)
+
+    def test_what_calls(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        callees = query.what_calls("main")
+        callee_names = [c["name"] for c in callees]
+        # main() should call several functions
+        assert len(callees) > 0
+
+    def test_impact_of(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        impact = query.impact_of("calculate_total")
+        assert impact["found"] is True
+        assert len(impact["affected_files"]) > 0
+        assert impact["risk_score"] >= 0
+
+    def test_impact_not_found(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        impact = query.impact_of("nonexistent_function")
+        assert impact["found"] is False
+
+    def test_get_file_symbols(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        symbols = query.get_file_symbols("main.py")
+        assert len(symbols) > 0
+        names = [s["name"] for s in symbols]
+        assert "main" in names
+
+    def test_get_structure(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        structure = query.get_structure()
+        assert "main.py" in structure or len(structure) > 0
+
+    def test_find_related(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        related = query.find_related("calculate_total")
+        assert len(related) > 0
+
+    def test_get_symbol_info(self, tmp_project: Path):
+        query = self._build_query(tmp_project)
+        symbol_ids = query.find_symbol("User")
+        assert len(symbol_ids) > 0
+        # Find the class definition (not import)
+        class_info = None
+        for sid in symbol_ids:
+            info = query.get_symbol_info(sid)
+            if info and info.kind == "class":
+                class_info = info
+                break
+        assert class_info is not None
+        assert class_info.name == "User"
+        assert class_info.kind == "class"
+
+# src/cegraph/graph/query.py:162-183
+    def what_calls(self, name: str) -> list[dict]:
+        """Find all symbols called by the given symbol."""
+        symbol_ids = self.find_symbol(name)
+        results = []
+
+        for sid in symbol_ids:
+            for succ in self.graph.successors(sid):
+                edge_data = self.graph.edges[sid, succ]
+                if edge_data.get("kind") != "calls":
+                    continue
+                succ_data = self.graph.nodes.get(succ, {})
+                if succ_data.get("type") != "symbol":
+                    continue
+                results.append({
+                    "symbol_id": succ,
+                    "name": succ_data.get("qualified_name", succ_data.get("name", "")),
+                    "kind": succ_data.get("kind", ""),
+                    "file_path": succ_data.get("file_path", ""),
+                    "line": succ_data.get("line_start", 0),
+                })
+
+        return results
+
+# src/cegraph/graph/builder.py:12-12
+from cegraph.parser.models import FileSymbols, RelKind, Relationship, Symbol, SymbolKind
+
+# src/cegraph/graph/builder.py:12-12
+from cegraph.parser.models import FileSymbols, RelKind, Relationship, Symbol, SymbolKind
+
+# src/cegraph/graph/builder.py:12-12
+from cegraph.parser.models import FileSymbols, RelKind, Relationship, Symbol, SymbolKind
+
+# src/cegraph/graph/builder.py:12-12
+from cegraph.parser.models import FileSymbols, RelKind, Relationship, Symbol, SymbolKind
+
+# src/cegraph/graph/builder.py:12-12
+from cegraph.parser.models import FileSymbols, RelKind, Relationship, Symbol, SymbolKind
+
+# src/cegraph/graph/query.py:270-315
+    def find_related(self, name: str, max_hops: int = 2) -> list[dict]:
+        """Find symbols related to the given one within N hops."""
+        symbol_ids = self.find_symbol(name)
+        if not symbol_ids:
+            return []
+
+        related = set()
+        visited = set()
+
+        def _bfs(start: str, hops: int) -> None:
+            if hops > max_hops or start in visited:
+                return
+            visited.add(start)
+
+            # Forward edges
+            for succ in self.graph.successors(start):
+                succ_data = self.graph.nodes.get(succ, {})
+                if succ_data.get("type") == "symbol":
+                    related.add(succ)
+                    _bfs(succ, hops + 1)
+
+            # Backward edges
+            for pred in self.graph.predecessors(start):
+                pred_data = self.graph.nodes.get(pred, {})
+                if pred_data.get("type") == "symbol":
+                    related.add(pred)
+                    _bfs(pred, hops + 1)
+
+        for sid in symbol_ids:
+            _bfs(sid, 0)
+
+        # Remove the original symbols
+        related -= set(symbol_ids)
+
+        results = []
+        for node_id in related:
+            data = self.graph.nodes.get(node_id, {})
+            results.append({
+                "symbol_id": node_id,
+                "name": data.get("qualified_name", data.get("name", "")),
+                "kind": data.get("kind", ""),
+                "file_path": data.get("file_path", ""),
+                "line": data.get("line_start", 0),
+            })
+
+        return results
+
+# src/cegraph/github/diff_parser.py:116-177
+def get_changed_symbols(
+    root: Path, graph, file_diffs: list[FileDiff]
+) -> list[ChangedSymbol]:
+    """Map diff hunks to symbols using the knowledge graph.
+
+    For each changed line range, find which symbols in the graph
+    overlap with those lines.
+    """
+    changed: list[ChangedSymbol] = []
+    seen = set()
+
+    for fd in file_diffs:
+        if fd.status == "deleted":
+            # All symbols in deleted file are affected
+            for node_id, data in graph.nodes(data=True):
+                if data.get("type") == "symbol" and data.get("file_path") == fd.path:
+                    key = (data.get("name"), fd.path)
+                    if key not in seen:
+                        changed.append(ChangedSymbol(
+                            name=data.get("name", ""),
+                            qualified_name=data.get("qualified_name", ""),
+                            kind=data.get("kind", ""),
+                            file_path=fd.path,
+                            line_start=data.get("line_start", 0),
+                            line_end=data.get("line_end", 0),
+                            change_type="deleted",
+                        ))
+                        seen.add(key)
+            continue
+
+        # For modified/added files, find overlapping symbols
+        ranges = fd.changed_line_ranges
+        for node_id, data in graph.nodes(data=True):
+            if data.get("type") != "symbol":
+                continue
+            if data.get("file_path") != fd.path:
+                continue
+
+            sym_start = data.get("line_start", 0)
+            sym_end = data.get("line_end", 0)
+
+            # Check if any hunk overlaps with this symbol
+            for r_start, r_end in ranges:
+                if sym_start <= r_end and sym_end >= r_start:
+                    key = (data.get("name"), fd.path)
+                    if key not in seen:
+                        overlap = min(sym_end, r_end) - max(sym_start, r_start)
+                        change_type = "added" if fd.status == "added" else "modified"
+                        changed.append(ChangedSymbol(
+                            name=data.get("name", ""),
+                            qualified_name=data.get("qualified_name", ""),
+                            kind=data.get("kind", ""),
+                            file_path=fd.path,
+                            line_start=sym_start,
+                            line_end=sym_end,
+                            change_type=change_type,
+                            lines_changed=max(0, overlap),
+                        ))
+                        seen.add(key)
+                    break
+
+    return changed
+
+# src/cegraph/search/hybrid.py:49-51
+    def search_symbols(self, query: str, kind: str = "", max_results: int = 20) -> list[dict]:
+        """Search symbols using lexical + optional semantic."""
+        return self.lexical.search_symbols(query, kind, max_results)
