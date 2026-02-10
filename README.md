@@ -239,7 +239,6 @@ Optional extras:
 
 ```bash
 pip install cegraph[map]       # Interactive terminal code map (Textual TUI)
-pip install cegraph[parsing]   # Tree-sitter for accurate multi-language parsing
 pip install cegraph[all]       # Everything
 ```
 
@@ -259,10 +258,6 @@ cegraph benchmark                                # Prove token savings on your r
 | Language | Parser | Accuracy |
 |:---------|:-------|:---------|
 | Python | AST (stdlib) | Full |
-| JavaScript/TypeScript | tree-sitter | Full |
-| Go | tree-sitter | Full |
-| Rust | tree-sitter | Full |
-| Java | tree-sitter | Full |
 
 ## CLI Reference
 
@@ -295,11 +290,10 @@ cegraph/
 │   ├── impact_bot.py   # Analysis pipeline
 │   ├── diff_parser.py  # Git diff → changed symbols
 │   └── renderer.py     # Markdown blast radius rendering
-├── parser/             # Multi-language code parsing
+├── parser/             # Python code parsing
 │   ├── python_parser.py    # Python AST (stdlib, zero deps)
-│   ├── javascript_parser.py # JS/TS regex-based
-│   ├── generic_parser.py   # Go, Rust, Java, Ruby, C/C++
-│   └── tree_sitter_parser.py # Optional tree-sitter
+│   ├── core.py             # Parser orchestration
+│   └── models.py           # Symbol/Relationship data models
 ├── graph/              # Knowledge graph (NetworkX + SQLite)
 │   ├── builder.py      # Graph construction
 │   ├── store.py        # SQLite persistence (normalized, < source size)

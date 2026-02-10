@@ -13,7 +13,7 @@ CeGraph is a pip-installable, repository-aware AI coding assistant that builds a
 src/cegraph/
 ├── cli.py              # Click CLI (entry point)
 ├── config.py           # Configuration & .cegraph/ management
-├── parser/             # Multi-language code parsing (tree-sitter + fallbacks)
+├── parser/             # Python code parsing (stdlib AST)
 ├── graph/              # Knowledge graph construction & querying
 ├── search/             # Lexical + semantic code search
 ├── tools/              # Agent tools (search_code, who_calls, impact_of, etc.)
@@ -26,7 +26,7 @@ src/cegraph/
 
 1. **Local-first**: Everything runs on the user's machine. No data leaves unless calling an LLM API.
 2. **Minimal dependencies**: Core functionality works with just `click`, `rich`, `networkx`, `pydantic`.
-3. **Graceful degradation**: Tree-sitter is optional; falls back to Python AST / regex parsing.
+3. **Python-focused**: Uses stdlib AST for accurate Python parsing with zero external deps.
 4. **Provider agnostic**: Supports OpenAI, Anthropic, and local models via OpenAI-compatible APIs.
 5. **Human-in-the-loop**: Always confirm before making changes. The developer is the architect.
 
@@ -52,10 +52,6 @@ src/cegraph/
 ### Optional - LLM Providers (`pip install cegraph[openai]` or `cegraph[anthropic]`)
 - openai >= 1.0
 - anthropic >= 0.30
-
-### Optional - Enhanced Parsing (`pip install cegraph[parsing]`)
-- tree-sitter >= 0.22
-- tree-sitter-python, tree-sitter-javascript, tree-sitter-typescript, etc.
 
 ### Optional - Semantic Search (`pip install cegraph[search]`)
 - numpy >= 1.24

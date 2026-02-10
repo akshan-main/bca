@@ -33,8 +33,10 @@ Copyright (c) 2025 CeGraph Contributors. MIT License.
 
 from __future__ import annotations
 
+import math
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -208,6 +210,7 @@ class ContextAssembler:
         token_budget: int = 8000,
         strategy: ContextStrategy = ContextStrategy.SMART,
         focus_files: list[str] | None = None,
+        seed_override: list[dict] | None = None,
     ) -> ContextPackage:
         """Assemble a budgeted context package for a given task.
 
@@ -216,6 +219,9 @@ class ContextAssembler:
             token_budget: Maximum tokens to include (budget B).
             strategy: How aggressively to expand context.
             focus_files: Optional list of files to prioritize.
+            seed_override: Pre-computed seeds (list of dicts with
+                ``symbol_id``, ``score``, ``reason``).  Bypasses entity
+                extraction and seed finding when provided.
 
         Returns:
             A ContextPackage with the selected symbols and their source code,
@@ -224,11 +230,15 @@ class ContextAssembler:
         start_time = time.time()
         config = _STRATEGY_CONFIG[strategy]
 
-        # Phase 1: Extract entities from the task
-        entities = self._extract_entities(task)
+        if seed_override is not None:
+            entities = [{"name": "override", "type": "other", "confidence": 1.0}]
+            seeds = seed_override
+        else:
+            # Phase 1: Extract entities from the task
+            entities = self._extract_entities(task)
 
-        # Phase 2: Find seed symbols in the graph
-        seeds = self._find_seeds(entities, focus_files)
+            # Phase 2: Find seed symbols in the graph
+            seeds = self._find_seeds(entities, focus_files)
 
         # Phase 3: Expand context via graph traversal
         if self.ablation.use_pagerank and seeds:
@@ -243,6 +253,11 @@ class ContextAssembler:
 
         # Phase 5: Compute dependency closures
         closures = self._compute_closures(scored)
+
+        # Compute closure debug stats before selection
+        _closure_sym_ids: set[str] = set()
+        for deps in closures.values():
+            _closure_sym_ids |= deps
 
         # Phase 6: Budgeted selection with closure constraints
         selected = self._budget_select(scored, closures, token_budget)
@@ -264,12 +279,28 @@ class ContextAssembler:
             items = trimmed
             total_tokens = running
 
+        # Phase 7c: Backfill underutilized budget with BM25 symbol results
+        items, total_tokens = self._backfill_budget(
+            task, items, total_tokens, token_budget
+        )
+
+        # Phase 7d: File-level backfill for remaining budget
+        # Catches config files, enum defs, etc. where keywords appear in
+        # file content but not in symbol metadata.
+        items, total_tokens = self._backfill_files(
+            task, items, total_tokens, token_budget
+        )
+
         # Phase 8: Dependency-safe ordering
         if self.ablation.dependency_ordering:
             items = self._dependency_order(items)
 
         elapsed_ms = (time.time() - start_time) * 1000
         files = set(item.file_path for item in items)
+
+        # Compute closure contribution in final selection
+        closure_items = [it for it in items if it.is_dependency]
+        closure_tokens = sum(it.token_estimate for it in closure_items)
 
         return ContextPackage(
             task=task,
@@ -283,6 +314,11 @@ class ContextAssembler:
             symbols_available=len(scored),
             budget_used_pct=round(total_tokens / max(token_budget, 1) * 100, 1),
             assembly_time_ms=round(elapsed_ms, 1),
+            entities_extracted=len(entities),
+            entities_mapped=len(seeds),
+            closure_added_symbols=len(closure_items),
+            closure_added_tokens=closure_tokens,
+            frontier_visited=len(candidates),
         )
 
     # -------------------------------------------------------------------
@@ -438,6 +474,98 @@ class ContextAssembler:
         low = [s for s in seeds if s["score"] < 0.5]
         seeds = high + low[:5]
 
+        # Vague query fallback: if entity matching found fewer than 3
+        # high-confidence seeds, use BM25 to inject additional seeds.
+        # This ensures vague queries ("fix the login flow") still get
+        # meaningful starting points for BFS expansion.
+        if len(high) < 3:
+            seeds = self._bm25_seed_boost(entities, seeds, seen_ids)
+
+        return seeds
+
+    def _bm25_seed_boost(
+        self,
+        entities: list[dict],
+        seeds: list[dict],
+        seen_ids: set[str],
+    ) -> list[dict]:
+        """Inject BM25-ranked symbols as seeds when entity matching is weak."""
+        # Build query from entity names
+        query_parts = [e["name"] for e in entities]
+        if not query_parts:
+            return seeds
+
+        query_text = " ".join(query_parts).lower()
+        query_terms = re.findall(r"\b([A-Za-z_]\w{2,})\b", query_text)
+        query_tf: Counter[str] = Counter(query_terms)
+
+        if not query_terms:
+            return seeds
+
+        # Collect symbol documents
+        symbols: list[dict] = []
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("type") != "symbol":
+                continue
+            if node_id in seen_ids:
+                continue
+            kind = data.get("kind", "")
+            if kind == "import":
+                continue
+            name = data.get("name", "")
+            qname = data.get("qualified_name", "")
+            doc = data.get("docstring", "")
+            sig = data.get("signature", "")
+            text = f"{name} {qname} {doc} {sig}".lower()
+            symbols.append({"id": node_id, "text": text, "data": data})
+
+        if not symbols:
+            return seeds
+
+        # BM25 scoring
+        n = len(symbols)
+        doc_freq: Counter[str] = Counter()
+        for sym in symbols:
+            terms_in_doc = set(re.findall(r"\b\w+\b", sym["text"]))
+            for t in terms_in_doc:
+                doc_freq[t] += 1
+
+        k1, b_param = 1.5, 0.75
+        avg_dl = sum(len(s["text"]) for s in symbols) / n
+
+        scored: list[tuple[float, dict]] = []
+        for sym in symbols:
+            dl = len(sym["text"])
+            score = 0.0
+            for term, qtf in query_tf.items():
+                tf = sym["text"].count(term)
+                df = doc_freq.get(term, 0)
+                idf = math.log((n - df + 0.5) / (df + 0.5) + 1)
+                tf_norm = (tf * (k1 + 1)) / (
+                    tf + k1 * (1 - b_param + b_param * dl / avg_dl)
+                )
+                score += idf * tf_norm * qtf
+            if score > 0:
+                scored.append((score, sym))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # Add top-10 BM25 results as seeds with moderate confidence
+        max_bm25_seeds = 10
+        for bm25_score, sym in scored[:max_bm25_seeds]:
+            data = sym["data"]
+            kind = data.get("kind", "")
+            kind_w = _KIND_WEIGHTS.get(kind, 0.5)
+            # Normalize BM25 score to [0.3, 0.7] range
+            norm_score = min(0.7, 0.3 + bm25_score / max(scored[0][0], 1) * 0.4)
+            seeds.append({
+                "symbol_id": sym["id"],
+                "score": norm_score * kind_w,
+                "reason": "BM25 seed boost",
+            })
+            seen_ids.add(sym["id"])
+
+        seeds.sort(key=lambda x: x["score"], reverse=True)
         return seeds
 
     # -------------------------------------------------------------------
@@ -852,11 +980,68 @@ class ContextAssembler:
             unselected_deps = closure_deps - selected_ids
             self_cost = token_costs.get(sid, 0)
             dep_cost = sum(token_costs.get(d, 0) for d in unselected_deps)
+
+            # Closure cost cap: if deps alone exceed 30% of total budget,
+            # skip them and include the symbol standalone.  This prevents
+            # expensive class hierarchies from dominating the budget,
+            # especially for vague queries with BM25-boosted seeds.
+            max_closure_cost = int(token_budget * 0.3)
+            if dep_cost > max_closure_cost:
+                unselected_deps = set()
+                dep_cost = 0
+
             effective_cost = self_cost + dep_cost
 
             if effective_cost > remaining_budget:
                 if remaining_budget < 50:
                     break
+
+                # Skeleton fallback: include symbol at full detail but deps
+                # as signature+docstring only (progressive detail levels)
+                skeleton_dep_cost = sum(
+                    self._skeleton_cost(d) for d in unselected_deps
+                )
+                skeleton_effective = self_cost + skeleton_dep_cost
+                if skeleton_effective <= remaining_budget:
+                    # Select the symbol itself at full detail
+                    cand["token_estimate"] = self_cost
+                    cand["is_dependency"] = False
+                    cand["closure_of"] = ""
+                    cand["is_skeleton"] = False
+                    selected.append(cand)
+                    selected_ids.add(sid)
+                    remaining_budget -= self_cost
+
+                    if self.ablation.submodular_coverage:
+                        self._update_coverage(sid, covered_edges)
+
+                    # Select closure deps as skeletons
+                    for dep_id in unselected_deps:
+                        if dep_id in selected_ids:
+                            continue
+                        skel_cost = self._skeleton_cost(dep_id)
+                        dep_name = self.graph.nodes.get(sid, {}).get("name", sid)
+                        if dep_id in cand_by_id:
+                            dep_cand = dict(cand_by_id[dep_id])
+                        else:
+                            dep_cand = {
+                                "symbol_id": dep_id,
+                                "score": cand["score"] * 0.5,
+                                "depth": cand["depth"] + 1,
+                                "reason": f"skeleton dependency of {dep_name}",
+                                "via": [],
+                            }
+                        dep_cand["token_estimate"] = skel_cost
+                        dep_cand["is_dependency"] = True
+                        dep_cand["closure_of"] = sid
+                        dep_cand["is_skeleton"] = True
+                        selected.append(dep_cand)
+                        selected_ids.add(dep_id)
+                        remaining_budget -= skel_cost
+
+                        if self.ablation.submodular_coverage:
+                            self._update_coverage(dep_id, covered_edges)
+
                 continue
 
             # Compute marginal utility (submodular coverage)
@@ -916,6 +1101,25 @@ class ContextAssembler:
         line_count = max(1, line_end - line_start + 1)
         return TokenEstimator.estimate_lines(line_count)
 
+    def _skeleton_cost(self, symbol_id: str) -> int:
+        """Estimate token cost for skeleton representation (signature + docstring).
+
+        Used as a budget fallback: when full source of a dependency is too
+        expensive, we include just the signature and docstring so the LLM
+        knows the symbol's interface without the implementation detail.
+        """
+        data = self.graph.nodes.get(symbol_id, {})
+        sig = data.get("signature", "")
+        doc = data.get("docstring", "")
+        if not sig:
+            # No signature available — fall back to full cost
+            return self._token_cost(symbol_id)
+        text = sig
+        if doc:
+            text += f'\n    """{doc}"""'
+        text += "\n    ..."
+        return max(1, TokenEstimator.estimate(text))
+
     def _marginal_utility(
         self, symbol_id: str, covered_edges: set[tuple[str, str]]
     ) -> float:
@@ -963,6 +1167,248 @@ class ContextAssembler:
                 covered_edges.add((pred, symbol_id))
 
     # -------------------------------------------------------------------
+    # Phase 7b+: Budget backfill (BM25 over graph symbols)
+    # -------------------------------------------------------------------
+
+    def _backfill_budget(
+        self,
+        task: str,
+        items: list[ContextItem],
+        total_tokens: int,
+        token_budget: int,
+    ) -> tuple[list[ContextItem], int]:
+        """Fill remaining budget with BM25-ranked symbols when underutilized.
+
+        When budget utilization is below 90%, this method runs a BM25-style
+        search over all graph symbols and adds top-scoring results (not already
+        included) until utilization reaches ~95%.  This fixes the budget
+        underutilization problem where BCA's graph BFS finds too few candidates
+        for vague or broad queries.
+        """
+        utilization = total_tokens / max(token_budget, 1)
+        if utilization >= 0.9:
+            return items, total_tokens
+
+        included_ids = {item.symbol_id for item in items}
+        remaining = token_budget - total_tokens
+
+        # Tokenize query
+        query_terms = re.findall(r"\b([A-Za-z_]\w{2,})\b", task.lower())
+        stop = {
+            "the", "and", "for", "that", "this", "with", "from", "have",
+            "fix", "bug", "add", "class", "function", "method", "file",
+            "should", "when", "where", "what", "which", "there", "their",
+        }
+        query_terms = [t for t in query_terms if t not in stop]
+        query_tf: Counter[str] = Counter(query_terms)
+
+        if not query_terms:
+            return items, total_tokens
+
+        # Collect all non-included symbol documents
+        symbols: list[dict] = []
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("type") != "symbol":
+                continue
+            if node_id in included_ids:
+                continue
+            kind = data.get("kind", "")
+            if kind == "import":
+                continue
+            name = data.get("name", "")
+            qname = data.get("qualified_name", "")
+            doc = data.get("docstring", "")
+            sig = data.get("signature", "")
+            text = f"{name} {qname} {doc} {sig}".lower()
+            symbols.append({"id": node_id, "text": text, "data": data})
+
+        if not symbols:
+            return items, total_tokens
+
+        # BM25 scoring
+        n = len(symbols)
+        doc_freq: Counter[str] = Counter()
+        for sym in symbols:
+            terms_in_doc = set(re.findall(r"\b\w+\b", sym["text"]))
+            for t in terms_in_doc:
+                doc_freq[t] += 1
+
+        k1, b_param = 1.5, 0.75
+        avg_dl = sum(len(s["text"]) for s in symbols) / n
+
+        scored: list[tuple[float, dict]] = []
+        for sym in symbols:
+            dl = len(sym["text"])
+            score = 0.0
+            for term, qtf in query_tf.items():
+                tf = sym["text"].count(term)
+                df = doc_freq.get(term, 0)
+                idf = math.log((n - df + 0.5) / (df + 0.5) + 1)
+                tf_norm = (tf * (k1 + 1)) / (
+                    tf + k1 * (1 - b_param + b_param * dl / avg_dl)
+                )
+                score += idf * tf_norm * qtf
+            if score > 0:
+                scored.append((score, sym))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # Greedily add until ~95% utilized
+        target_remaining = int(token_budget * 0.05)
+        backfill_items: list[ContextItem] = []
+
+        for bm25_score, sym in scored:
+            if remaining <= target_remaining:
+                break
+
+            data = sym["data"]
+            file_path = data.get("file_path", "")
+            line_start = data.get("line_start", 0)
+            line_end = data.get("line_end", 0)
+
+            # Load source
+            full_path = self.root / file_path
+            if not full_path.exists():
+                continue
+            try:
+                all_lines = full_path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).splitlines()
+                source = "\n".join(
+                    all_lines[max(0, line_start - 1) : line_end]
+                )
+            except OSError:
+                continue
+
+            if not source:
+                continue
+
+            token_est = TokenEstimator.estimate(source)
+            if token_est > remaining - target_remaining:
+                continue
+
+            backfill_items.append(
+                ContextItem(
+                    symbol_id=sym["id"],
+                    name=data.get("name", ""),
+                    qualified_name=data.get("qualified_name", ""),
+                    kind=data.get("kind", ""),
+                    file_path=file_path,
+                    line_start=line_start,
+                    line_end=line_end,
+                    source_code=source,
+                    signature=data.get("signature", ""),
+                    docstring=data.get("docstring", ""),
+                    relevance_score=round(min(bm25_score / 10, 0.5), 3),
+                    reason="backfill (BM25)",
+                    token_estimate=token_est,
+                    depth=99,
+                    is_dependency=False,
+                    is_skeleton=False,
+                )
+            )
+            remaining -= token_est
+            total_tokens += token_est
+
+        return items + backfill_items, total_tokens
+
+    def _backfill_files(
+        self,
+        task: str,
+        items: list[ContextItem],
+        total_tokens: int,
+        token_budget: int,
+    ) -> tuple[list[ContextItem], int]:
+        """File-level backfill: include whole files containing task keywords.
+
+        Runs after symbol-level backfill.  Catches config files, enum
+        definitions, and other code where the relevant keywords appear in
+        file content but not in symbol names/docstrings.  Only activates
+        when budget utilization is still below 85%.
+        """
+        utilization = total_tokens / max(token_budget, 1)
+        if utilization >= 0.85:
+            return items, total_tokens
+
+        included_files = {item.file_path for item in items}
+        remaining = token_budget - total_tokens
+
+        # Extract keywords from task
+        keywords = set(re.findall(r"\b([A-Za-z_]\w{2,})\b", task))
+        stop = {
+            "the", "and", "for", "that", "this", "with", "from", "have",
+            "fix", "bug", "add", "class", "function", "method", "file",
+            "should", "when", "where", "what", "which", "there", "their",
+        }
+        keywords -= stop
+
+        if not keywords:
+            return items, total_tokens
+
+        # Score files by keyword match count
+        file_scores: list[tuple[int, str, str]] = []
+        for node_id, data in self.graph.nodes(data=True):
+            if data.get("type") != "file":
+                continue
+            fp = data.get("path", "")
+            if fp in included_files:
+                continue
+            full_path = self.root / fp
+            if not full_path.exists():
+                continue
+            try:
+                content = full_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                continue
+
+            hits = sum(1 for kw in keywords if kw.lower() in content.lower())
+            if hits > 0:
+                file_scores.append((hits, fp, content))
+
+        file_scores.sort(key=lambda x: x[0], reverse=True)
+
+        target_remaining = int(token_budget * 0.05)
+        backfill_items: list[ContextItem] = []
+
+        for hits, fp, content in file_scores:
+            if remaining <= target_remaining:
+                break
+
+            token_est = TokenEstimator.estimate(content)
+            if token_est > remaining - target_remaining:
+                # Try truncating to fit
+                chars = int((remaining - target_remaining) * TokenEstimator.CHARS_PER_TOKEN)
+                if chars < 200:
+                    continue
+                content = content[:chars]
+                token_est = TokenEstimator.estimate(content)
+
+            backfill_items.append(
+                ContextItem(
+                    symbol_id=f"file::{fp}",
+                    name=fp,
+                    qualified_name=fp,
+                    kind="file",
+                    file_path=fp,
+                    line_start=1,
+                    line_end=content.count("\n") + 1,
+                    source_code=content,
+                    relevance_score=round(hits / max(len(keywords), 1), 3),
+                    reason="file backfill (keyword match)",
+                    token_estimate=token_est,
+                    depth=99,
+                    is_dependency=False,
+                    is_skeleton=False,
+                )
+            )
+            remaining -= token_est
+            total_tokens += token_est
+
+        return items + backfill_items, total_tokens
+
+    # -------------------------------------------------------------------
     # Phase 7-8: Source loading + dependency ordering
     # -------------------------------------------------------------------
 
@@ -977,16 +1423,30 @@ class ContextAssembler:
             line_start = data.get("line_start", 0)
             line_end = data.get("line_end", 0)
 
+            is_skeleton = cand.get("is_skeleton", False)
             source = ""
-            full_path = self.root / file_path
-            if full_path.exists():
-                try:
-                    all_lines = full_path.read_text(
-                        encoding="utf-8", errors="replace"
-                    ).splitlines()
-                    source = "\n".join(all_lines[max(0, line_start - 1):line_end])
-                except OSError:
-                    source = f"# Could not read {file_path}"
+
+            if is_skeleton:
+                # Skeleton mode: signature + docstring only
+                sig = data.get("signature", "")
+                doc = data.get("docstring", "")
+                if sig:
+                    source = sig
+                    if doc:
+                        source += f'\n    """{doc}"""'
+                    source += "\n    ...  # (skeleton: full source omitted for budget)"
+
+            if not source:
+                # Full source mode (or skeleton with no signature)
+                full_path = self.root / file_path
+                if full_path.exists():
+                    try:
+                        all_lines = full_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        ).splitlines()
+                        source = "\n".join(all_lines[max(0, line_start - 1):line_end])
+                    except OSError:
+                        source = f"# Could not read {file_path}"
 
             token_est = (
                 TokenEstimator.estimate(source)
@@ -998,7 +1458,10 @@ class ContextAssembler:
             if cand.get("is_dependency"):
                 closure_sym = cand.get("closure_of", "")
                 closure_name = self.graph.nodes.get(closure_sym, {}).get("name", "")
-                reason = f"required dependency of {closure_name}"
+                if is_skeleton:
+                    reason = f"skeleton dependency of {closure_name}"
+                else:
+                    reason = f"required dependency of {closure_name}"
 
             items.append(
                 ContextItem(
@@ -1017,6 +1480,7 @@ class ContextAssembler:
                     token_estimate=token_est,
                     depth=cand.get("depth", 0),
                     is_dependency=cand.get("is_dependency", False),
+                    is_skeleton=is_skeleton,
                 )
             )
 

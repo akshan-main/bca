@@ -33,6 +33,7 @@ class ContextItem(BaseModel):
     token_estimate: int = 0
     depth: int = 0  # Distance from seed symbols
     is_dependency: bool = False  # Included via dependency closure
+    is_skeleton: bool = False  # Skeleton mode: signature+docstring only (budget fallback)
 
 
 class ContextPackage(BaseModel):
@@ -49,6 +50,12 @@ class ContextPackage(BaseModel):
     symbols_available: int = 0  # Total candidates before budget cut
     budget_used_pct: float = 0.0
     assembly_time_ms: float = 0.0
+    # Debug/metrics info (populated by assembler, not used in rendering)
+    entities_extracted: int = 0
+    entities_mapped: int = 0  # How many entities resolved to graph symbols
+    closure_added_symbols: int = 0
+    closure_added_tokens: int = 0
+    frontier_visited: int = 0  # BFS expansion candidates before scoring
 
     def render(self, include_line_numbers: bool = True, include_metadata: bool = True) -> str:
         """Render the context package as a string for LLM consumption.
