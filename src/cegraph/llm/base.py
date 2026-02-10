@@ -72,6 +72,7 @@ class LLMProvider(ABC):
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        seed: int | None = None,
     ) -> LLMResponse:
         """Send a completion request to the LLM."""
         ...

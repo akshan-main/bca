@@ -100,6 +100,7 @@ class AnthropicProvider(LLMProvider):
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        seed: int | None = None,
     ) -> LLMResponse:
         client = self._get_client()
         system, formatted_msgs = self._format_messages(messages)

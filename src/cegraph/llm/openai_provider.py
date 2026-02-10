@@ -94,6 +94,7 @@ class OpenAIProvider(LLMProvider):
         tools: list[ToolDefinition] | None = None,
         temperature: float = 0.0,
         max_tokens: int = 4096,
+        seed: int | None = None,
     ) -> LLMResponse:
         client = self._get_client()
         kwargs: dict[str, Any] = {
@@ -101,7 +102,12 @@ class OpenAIProvider(LLMProvider):
             "messages": self._format_messages(messages),
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "top_p": 1,
+            "presence_penalty": 0,
+            "frequency_penalty": 0,
         }
+        if seed is not None:
+            kwargs["seed"] = seed
         if tools:
             kwargs["tools"] = self._format_tools(tools)
 

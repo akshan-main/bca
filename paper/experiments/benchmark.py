@@ -108,7 +108,7 @@ class EvalResult:
     error: str = ""
     test_time_ms: float = 0  # Time for apply + test
     # Failure diagnosis
-    failure_mode: str = ""  # no_patch, patch_apply_fail, test_fail, regression, timeout, error
+    failure_mode: str = ""  # pass, no_patch, patch_apply_fail, test_fail, regression, timeout, syntax_error, llm_error, assembly_error
     # Retrieval quality
     target_file_hit: bool = False  # Did context include the mutated file?
     target_symbol_hit: bool = False  # Did context include the mutated function/class?
@@ -132,6 +132,13 @@ class EvalResult:
     bca_frontier_visited: int = 0
     # Context symbols (for post-hoc dependency coverage analysis)
     context_symbol_keys: list[str] = field(default_factory=list)
+    # Code metadata (per-task constants, logged per-attempt for self-contained analysis)
+    mutation_symbol_lines: int = 0  # Line span of the mutated function/class
+    mutation_symbol_kind: str = ""  # function, method, class, constant, etc.
+    mutation_file_symbols: int = 0  # Number of symbols in the mutated file
+    graph_node_count: int = 0  # Total graph nodes (normalizes across repos)
+    # Slicing dimensions (ensure every result is self-contained for analysis)
+    repo_name: str = ""  # Repository name (e.g. "pydantic-ai", "httpx")
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +163,44 @@ def assemble_bca(
     # Use lean rendering: no metadata annotations or line-number prefixes.
     # This matches the format of other methods (just file headers + source code)
     # and avoids wasting budget tokens on annotations the LLM doesn't need.
+    return (
+        package.render(include_metadata=False, include_line_numbers=False),
+        package.total_tokens,
+        package.symbols_included,
+        package.files_included,
+        round(elapsed, 1),
+    )
+
+
+def assemble_bca_d1(
+    repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
+) -> tuple[str, int, int, int, float]:
+    """BCA with PRECISE strategy (depth=1, min_score=0.3). Shallow expansion."""
+    global _last_context_package
+    start = time.time()
+    assembler = ContextAssembler(repo_path, graph, query)
+    package = assembler.assemble(task=task, token_budget=budget, strategy=ContextStrategy.PRECISE)
+    elapsed = (time.time() - start) * 1000
+    _last_context_package = package
+    return (
+        package.render(include_metadata=False, include_line_numbers=False),
+        package.total_tokens,
+        package.symbols_included,
+        package.files_included,
+        round(elapsed, 1),
+    )
+
+
+def assemble_bca_d5(
+    repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
+) -> tuple[str, int, int, int, float]:
+    """BCA with THOROUGH strategy (depth=5, min_score=0.05). Deep expansion."""
+    global _last_context_package
+    start = time.time()
+    assembler = ContextAssembler(repo_path, graph, query)
+    package = assembler.assemble(task=task, token_budget=budget, strategy=ContextStrategy.THOROUGH)
+    elapsed = (time.time() - start) * 1000
+    _last_context_package = package
     return (
         package.render(include_metadata=False, include_line_numbers=False),
         package.total_tokens,
@@ -776,7 +821,9 @@ METHODS: dict[str, callable] = {
     "repo_map": assemble_repo_map,
     "vector": assemble_vector,
     "embedding": assemble_embedding,
+    "bca_d1": assemble_bca_d1,
     "bca": assemble_bca,
+    "bca_d5": assemble_bca_d5,
     "bca_no_closure": assemble_bca_no_closure,
     "bca_no_scoring": assemble_bca_no_scoring,
     "target_file": assemble_target_file,
@@ -827,7 +874,7 @@ def build_prompt(context: str, task: str) -> str:
 Produce SEARCH/REPLACE blocks to fix this bug."""
 
 
-_RETRY_DELAYS = [8, 20, 42, 50]  # seconds between retries, then skip
+_RETRY_DELAYS = [5, 8, 15, 30, 60]  # deterministic backoff: 5s, 8s, 15s, 30s, 60s, then fail
 
 # Model version tracking — populated on first LLM call for reproducibility logging.
 # Stores the model ID and any fingerprint returned by the provider.
@@ -861,6 +908,7 @@ async def call_llm(
                 messages=messages,
                 temperature=0.0,
                 max_tokens=4096,
+                seed=42,
             )
             elapsed = (time.time() - start) * 1000
 
@@ -1444,15 +1492,22 @@ def _resolve_entities_to_seeds(entities: list[dict], graph, query: GraphQuery) -
     return seed_ids
 
 
-def _find_mutation_symbol(graph, mutation: dict) -> str:
-    """Find the graph symbol ID that contains the mutated line. Returns '' if not found."""
+def _find_mutation_symbol(graph, mutation: dict) -> dict:
+    """Find the graph symbol containing the mutated line.
+
+    Returns dict with keys: key, lines, kind, file_symbols.
+    All empty/0 if not found.
+    """
+    empty = {"key": "", "lines": 0, "kind": "", "file_symbols": 0}
     if not mutation or "file" not in mutation or "line_num" not in mutation:
-        return ""
+        return empty
 
     mut_file = mutation["file"]
     mut_line = mutation["line_num"]
     best_id = ""
-    best_span = float("inf")  # Prefer smallest enclosing symbol
+    best_span = float("inf")
+    best_kind = ""
+    file_symbols = 0
 
     for nid, ndata in graph.nodes(data=True):
         if ndata.get("kind") == "file" or ndata.get("type") == "file":
@@ -1465,6 +1520,9 @@ def _find_mutation_symbol(graph, mutation: dict) -> str:
         if not (npath.endswith(mut_file) or mut_file.endswith(npath)):
             continue
 
+        # Count all symbols in this file
+        file_symbols += 1
+
         nstart = ndata.get("line_start", 0) or ndata.get("start_line", 0)
         nend = ndata.get("line_end", 0) or ndata.get("end_line", 0)
         if nstart and nend and nstart <= mut_line <= nend:
@@ -1472,8 +1530,17 @@ def _find_mutation_symbol(graph, mutation: dict) -> str:
             if span < best_span:
                 best_span = span
                 best_id = str(nid)
+                best_kind = ndata.get("kind", "")
 
-    return best_id
+    if not best_id:
+        return {"key": "", "lines": 0, "kind": "", "file_symbols": file_symbols}
+
+    return {
+        "key": best_id,
+        "lines": best_span + 1,  # inclusive line count
+        "kind": best_kind,
+        "file_symbols": file_symbols,
+    }
 
 
 def _compute_graph_hops(graph, seed_ids: list[str], target_id: str) -> tuple[int, float]:
@@ -1622,7 +1689,8 @@ async def _run_single_eval(
                 repo_path, description, budget, graph, query,
             )
     except Exception as e:
-        print(f"    assembly error: {e}")
+        err_type = type(e).__name__
+        print(f"    assembly error ({err_type}): {e}")
         return EvalResult(
             task_id=task.task_id, method=method_name, budget=budget,
             query_type=query_type,
@@ -1630,7 +1698,9 @@ async def _run_single_eval(
             assembly_time_ms=0, llm_time_ms=0,
             llm_input_tokens=0, llm_output_tokens=0,
             tests_passed=False, test_output="", patch="",
-            error=str(e),
+            error=f"{err_type}: {e}",
+            failure_mode="assembly_error",
+            repo_name=Path(task.repo_path).name if task.repo_path else "",
         )
 
     print(
@@ -1640,20 +1710,25 @@ async def _run_single_eval(
 
     # 2. Call LLM (with throttle to avoid rate limits)
     await asyncio.sleep(1.0)  # 1s between calls
+    llm_start = time.time()
     try:
         llm_response, llm_time, in_tok, out_tok = await call_llm(
             provider, context, description,
         )
     except Exception as e:
-        print(f"    LLM error: {e}")
+        err_type = type(e).__name__
+        llm_elapsed = round((time.time() - llm_start) * 1000, 1)
+        print(f"    LLM error ({err_type}): {e} [{llm_elapsed}ms]")
         return EvalResult(
             task_id=task.task_id, method=method_name, budget=budget,
             query_type=query_type,
             tokens_used=tokens_used, symbols_selected=syms,
             files_included=files, assembly_time_ms=asm_time,
-            llm_time_ms=0, llm_input_tokens=0, llm_output_tokens=0,
+            llm_time_ms=llm_elapsed, llm_input_tokens=0, llm_output_tokens=0,
             tests_passed=False, test_output="", patch="",
-            error=str(e),
+            error=f"{err_type}: {e}",
+            failure_mode="llm_error",
+            repo_name=Path(task.repo_path).name if task.repo_path else "",
         )
 
     print(f"    LLM: {in_tok} in, {out_tok} out ({llm_time}ms)")
@@ -1768,7 +1843,8 @@ async def _run_single_eval(
     qid_density = _compute_query_identifier_density(description)
 
     # 9. Mutation symbol key (reuse for graph distance)
-    mut_sym_key = _find_mutation_symbol(graph, task.mutation) if graph is not None else ""
+    mut_info = _find_mutation_symbol(graph, task.mutation) if graph is not None else {"key": "", "lines": 0, "kind": "", "file_symbols": 0}
+    mut_sym_key = mut_info["key"]
 
     # 10. Graph distance: seed symbols → mutation symbol
     min_hops, median_hops = _compute_graph_hops(graph, seed_keys, mut_sym_key) if graph is not None else (-1, -1.0)
@@ -1781,7 +1857,7 @@ async def _run_single_eval(
     bca_closure_syms = 0
     bca_closure_toks = 0
     bca_frontier = 0
-    if method_name in ("bca", "bca_no_closure", "bca_no_scoring") and _last_context_package is not None:
+    if method_name in ("bca", "bca_d1", "bca_d5", "bca_no_closure", "bca_no_scoring") and _last_context_package is not None:
         bca_closure_syms = getattr(_last_context_package, "closure_added_symbols", 0)
         bca_closure_toks = getattr(_last_context_package, "closure_added_tokens", 0)
         bca_frontier = getattr(_last_context_package, "frontier_visited", 0)
@@ -1830,12 +1906,18 @@ async def _run_single_eval(
         bca_closure_added_tokens=bca_closure_toks,
         bca_frontier_visited=bca_frontier,
         context_symbol_keys=ctx_sym_keys,
+        # Code metadata
+        mutation_symbol_lines=mut_info["lines"],
+        mutation_symbol_kind=mut_info["kind"],
+        mutation_file_symbols=mut_info["file_symbols"],
+        graph_node_count=graph.number_of_nodes() if graph is not None else 0,
+        repo_name=Path(task.repo_path).name if task.repo_path else "",
     )
 
     # Save per-run artifact
     artifact_dir = output_dir / task.task_id / method_name / str(budget) / query_type
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    (artifact_dir / "context.txt").write_text(context[:50000])
+    (artifact_dir / "context.txt").write_text(context)
     (artifact_dir / "llm_response.txt").write_text(llm_response)
     (artifact_dir / "patch.diff").write_text(patch)
     (artifact_dir / "test_output.txt").write_text(test_output)
@@ -1934,8 +2016,30 @@ async def run_benchmark(
                 else:
                     description = task.description
 
+                # Methods whose output doesn't depend on budget (context is fixed).
+                # Run once at min budget; duplicate results for other budgets to keep
+                # the grid complete without wasting LLM calls + test time.
+                _BUDGET_INDEPENDENT = {"no_retrieval", "target_file"}
+
                 for budget in budgets:
                     for method_name in methods:
+                        # Skip redundant budget runs for budget-independent methods
+                        if method_name in _BUDGET_INDEPENDENT and budget != budgets[0]:
+                            # Reuse result from first budget
+                            src = next(
+                                (r for r in all_results
+                                 if r.task_id == task.task_id and r.method == method_name
+                                 and r.query_type == qt and r.budget == budgets[0]),
+                                None,
+                            )
+                            if src is not None:
+                                from dataclasses import replace as _dc_replace
+                                dup = _dc_replace(src, budget=budget)
+                                all_results.append(dup)
+                                run_idx += 1
+                                print(f"  [{run_idx}/{total_runs}] {task.task_id} {method_name} B={budget} {qt} (reused from B={budgets[0]})")
+                                continue
+
                         run_idx += 1
                         result = await _run_single_eval(
                             task=task,
@@ -2218,6 +2322,70 @@ def format_results(results: list[EvalResult], budgets: list[int]) -> str:
                 else:
                     row += f"  {'n/a':>5}"
             lines.append(row)
+
+    return "\n".join(lines)
+
+
+def format_per_repo_results(
+    results: list[EvalResult],
+    tasks: list[EvalTask],
+    budgets: list[int],
+) -> str:
+    """Format pass@1 tables broken down by repository.
+
+    Derives repo name from task.repo_path (uses directory name).
+    Produces a separate pass@1 table for each repo, enabling cross-repo comparison.
+    Excludes ceiling methods (target_file).
+    """
+    from pathlib import Path as _P
+
+    # Build task_id -> repo_name mapping
+    task_repo: dict[str, str] = {}
+    for t in tasks:
+        repo_name = _P(t.repo_path).name if t.repo_path else "unknown"
+        task_repo[t.task_id] = repo_name
+
+    grid_results = [r for r in results if r.method not in _CEILING_METHODS]
+    repos = sorted(set(task_repo.get(r.task_id, "unknown") for r in grid_results))
+
+    if len(repos) < 2:
+        return ""  # Skip if single repo — main table already covers it
+
+    query_types = sorted(set(r.query_type for r in grid_results))
+    methods = sorted(set(r.method for r in grid_results))
+    lines = []
+
+    for repo in repos:
+        repo_task_ids = {tid for tid, rn in task_repo.items() if rn == repo}
+        repo_results = [r for r in grid_results if r.task_id in repo_task_ids]
+        n_tasks = len(set(r.task_id for r in repo_results))
+
+        for qt in query_types:
+            qt_results = [r for r in repo_results if r.query_type == qt]
+            qt_label = qt.upper()
+
+            lines.append(f"\n{'='*70}")
+            lines.append(f"Pass@1 — {repo} (n={n_tasks} tasks) [{qt_label} queries]")
+            lines.append(f"{'='*70}")
+
+            header = f"{'Method':<20}" + "".join(f"  B={b:>5}" for b in budgets) + "    Avg"
+            lines.append(header)
+            lines.append("-" * 70)
+
+            for m in methods:
+                row = f"{m:<20}"
+                method_rates = []
+                for b in budgets:
+                    runs = [r for r in qt_results if r.method == m and r.budget == b]
+                    if runs:
+                        rate = sum(1 for r in runs if r.tests_passed) / len(runs)
+                        row += f"  {rate:>5.2f}"
+                        method_rates.append(rate)
+                    else:
+                        row += f"  {'n/a':>5}"
+                if method_rates:
+                    row += f"  {sum(method_rates)/len(method_rates):>5.2f}"
+                lines.append(row)
 
     return "\n".join(lines)
 
@@ -2540,6 +2708,183 @@ def format_decomposition(
     return "\n".join(lines)
 
 
+def format_conditional_bins(results: list[EvalResult], budgets: list[int]) -> str:
+    """Format pass@1 stratified by identifier density and hop distance.
+
+    These conditional bins answer "when does BCA win?" by slicing results
+    along two mechanistic axes:
+      - Identifier density: do code identifiers appear in the query? (0 vs >0)
+      - Hop distance: how far is the mutation from the nearest seed? (0, 1-2, 3+)
+    Excludes ceiling methods (target_file).
+    """
+    grid_results = [r for r in results if r.method not in _CEILING_METHODS]
+    lines = []
+
+    query_types = sorted(set(r.query_type for r in grid_results))
+    methods = sorted(set(r.method for r in grid_results))
+    show_budgets = [budgets[0], budgets[-1]] if len(budgets) > 1 else budgets
+
+    # --- By identifier density ---
+    def density_bin(density: float) -> str:
+        if density == 0.0:
+            return "zero (no identifiers)"
+        return "positive (has identifiers)"
+
+    for qt in query_types:
+        qt_results = [r for r in grid_results if r.query_type == qt]
+        qt_label = qt.upper()
+
+        lines.append(f"\n{'='*80}")
+        lines.append(f"Pass@1 by Identifier Density [{qt_label} queries]")
+        lines.append(f"{'='*80}")
+
+        # Group task_ids by density bin (use first result per task for the density)
+        task_density: dict[str, str] = {}
+        for r in qt_results:
+            if r.task_id not in task_density:
+                task_density[r.task_id] = density_bin(r.query_identifier_density)
+
+        bin_tasks: dict[str, list[str]] = {}
+        for tid, db in task_density.items():
+            bin_tasks.setdefault(db, [])
+            if tid not in bin_tasks[db]:
+                bin_tasks[db].append(tid)
+
+        for b in show_budgets:
+            lines.append(f"\n  Budget = {b}")
+            header = f"  {'Identifier Density':<30}" + "".join(f"  {m[:12]:>12}" for m in methods) + "    N"
+            lines.append(header)
+            lines.append(f"  {'-'*len(header)}")
+
+            for db in sorted(bin_tasks.keys()):
+                tids = bin_tasks[db]
+                row = f"  {db:<30}"
+                for m in methods:
+                    passes = sum(
+                        1 for tid in tids
+                        for r in qt_results
+                        if r.task_id == tid and r.method == m and r.budget == b and r.tests_passed
+                    )
+                    total = sum(
+                        1 for tid in tids
+                        for r in qt_results
+                        if r.task_id == tid and r.method == m and r.budget == b
+                    )
+                    rate = passes / total if total else 0
+                    row += f"  {rate:>12.2f}"
+                row += f"  {len(tids):>4}"
+                lines.append(row)
+
+        # --- By hop distance ---
+        lines.append(f"\n{'='*80}")
+        lines.append(f"Pass@1 by Hop Distance (seed → mutation) [{qt_label} queries]")
+        lines.append(f"{'='*80}")
+
+        def hop_bin(hops: int) -> str:
+            if hops < 0:
+                return "unreachable / unknown"
+            if hops == 0:
+                return "0 hops (direct hit)"
+            if hops <= 2:
+                return "1-2 hops (close)"
+            return "3+ hops (distant)"
+
+        # Group task_ids by hop bin (use first result per task for hops)
+        task_hops: dict[str, str] = {}
+        for r in qt_results:
+            if r.task_id not in task_hops:
+                task_hops[r.task_id] = hop_bin(r.min_hops_seed_to_mutation)
+
+        hbin_tasks: dict[str, list[str]] = {}
+        for tid, hb in task_hops.items():
+            hbin_tasks.setdefault(hb, [])
+            if tid not in hbin_tasks[hb]:
+                hbin_tasks[hb].append(tid)
+
+        for b in show_budgets:
+            lines.append(f"\n  Budget = {b}")
+            header = f"  {'Hop Distance':<30}" + "".join(f"  {m[:12]:>12}" for m in methods) + "    N"
+            lines.append(header)
+            lines.append(f"  {'-'*len(header)}")
+
+            for hb in sorted(hbin_tasks.keys()):
+                tids = hbin_tasks[hb]
+                row = f"  {hb:<30}"
+                for m in methods:
+                    passes = sum(
+                        1 for tid in tids
+                        for r in qt_results
+                        if r.task_id == tid and r.method == m and r.budget == b and r.tests_passed
+                    )
+                    total = sum(
+                        1 for tid in tids
+                        for r in qt_results
+                        if r.task_id == tid and r.method == m and r.budget == b
+                    )
+                    rate = passes / total if total else 0
+                    row += f"  {rate:>12.2f}"
+                row += f"  {len(tids):>4}"
+                lines.append(row)
+
+        # --- By mutation symbol size ---
+        lines.append(f"\n{'='*80}")
+        lines.append(f"Pass@1 by Mutation Size (function/class lines) [{qt_label} queries]")
+        lines.append(f"{'='*80}")
+
+        def size_bin(lines_count: int) -> str:
+            if lines_count <= 0:
+                return "unknown"
+            if lines_count < 5:
+                return "<5 lines (tiny)"
+            if lines_count < 20:
+                return "5-19 lines (small)"
+            if lines_count < 50:
+                return "20-49 lines (medium)"
+            if lines_count < 100:
+                return "50-99 lines (large)"
+            return "100+ lines (very large)"
+
+        task_size: dict[str, str] = {}
+        for r in qt_results:
+            if r.task_id not in task_size:
+                task_size[r.task_id] = size_bin(r.mutation_symbol_lines)
+
+        sbin_tasks: dict[str, list[str]] = {}
+        for tid, sb in task_size.items():
+            sbin_tasks.setdefault(sb, [])
+            if tid not in sbin_tasks[sb]:
+                sbin_tasks[sb].append(tid)
+
+        for b in show_budgets:
+            lines.append(f"\n  Budget = {b}")
+            header = f"  {'Mutation Size':<30}" + "".join(f"  {m[:12]:>12}" for m in methods) + "    N"
+            lines.append(header)
+            lines.append(f"  {'-'*len(header)}")
+
+            for sb in sorted(sbin_tasks.keys()):
+                tids = sbin_tasks[sb]
+                if len(tids) < 2:
+                    continue  # Skip bins with <2 tasks
+                row = f"  {sb:<30}"
+                for m in methods:
+                    passes = sum(
+                        1 for tid in tids
+                        for r in qt_results
+                        if r.task_id == tid and r.method == m and r.budget == b and r.tests_passed
+                    )
+                    total = sum(
+                        1 for tid in tids
+                        for r in qt_results
+                        if r.task_id == tid and r.method == m and r.budget == b
+                    )
+                    rate = passes / total if total else 0
+                    row += f"  {rate:>12.2f}"
+                row += f"  {len(tids):>4}"
+                lines.append(row)
+
+    return "\n".join(lines)
+
+
 def format_failure_diagnosis(results: list[EvalResult], budgets: list[int]) -> str:
     """Format failure mode breakdown per method and budget.
 
@@ -2551,7 +2896,7 @@ def format_failure_diagnosis(results: list[EvalResult], budgets: list[int]) -> s
     grid_results = [r for r in results if r.method not in _CEILING_METHODS]
     query_types = sorted(set(r.query_type for r in grid_results))
     methods = sorted(set(r.method for r in grid_results))
-    failure_modes = ["pass", "no_patch", "patch_apply_fail", "syntax_error", "test_fail", "regression", "timeout", "error"]
+    failure_modes = ["pass", "no_patch", "patch_apply_fail", "syntax_error", "test_fail", "regression", "timeout", "llm_error", "assembly_error"]
     lines = []
 
     for qt in query_types:
@@ -2899,20 +3244,26 @@ def _collect_run_metadata(args, tasks, budgets, methods, results, query_types):
     except Exception:
         pass
 
-    # Get target repo commit (from first task with a repo_path)
-    target_repo_commit = "unknown"
-    if tasks:
-        try:
-            repo_path = Path(tasks[0].repo_path).resolve()
-            repo_git = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                capture_output=True, text=True, timeout=5,
-                cwd=repo_path,
-            )
-            if repo_git.returncode == 0:
-                target_repo_commit = repo_git.stdout.strip()
-        except Exception:
-            pass
+    # Get target repo commits (one per unique repo)
+    target_repo_commits = {}
+    seen_repos = set()
+    for t in tasks:
+        rp = Path(t.repo_path).resolve() if t.repo_path else None
+        if rp and str(rp) not in seen_repos:
+            seen_repos.add(str(rp))
+            try:
+                repo_git = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                    cwd=rp,
+                )
+                if repo_git.returncode == 0:
+                    target_repo_commits[rp.name] = repo_git.stdout.strip()
+            except Exception:
+                target_repo_commits[rp.name] = "unknown"
+    target_repo_commit = target_repo_commits.get(
+        next(iter(target_repo_commits), ""), "unknown"
+    )
 
     total_pass = sum(1 for r in results if r.tests_passed)
     total_runs = len(results)
@@ -2938,7 +3289,25 @@ def _collect_run_metadata(args, tasks, budgets, methods, results, query_types):
         "bootstrap_seed": 42,
         "bootstrap_n": 10000,
         "naive_random_seed_scheme": "(task_id, budget, query_type) hash",
+        "llm_params": {
+            "temperature": 0.0,
+            "max_tokens": 4096,
+            "seed": 42,
+            "top_p": 1,
+            "presence_penalty": 0,
+            "frequency_penalty": 0,
+        },
         "model_version_info": dict(_model_version_info),
+        "retry_delays_seconds": _RETRY_DELAYS,
+        "target_repo_commits": target_repo_commits,
+        "bca_strategy_configs": {
+            "bca_d1": {"strategy": "PRECISE", "max_depth": 1, "min_score": 0.3},
+            "bca": {"strategy": "SMART", "max_depth": 3, "min_score": 0.1},
+            "bca_d5": {"strategy": "THOROUGH", "max_depth": 5, "min_score": 0.05},
+            "bca_no_closure": {"strategy": "SMART", "ablation": "no_closure"},
+            "bca_no_scoring": {"strategy": "SMART", "ablation": "no_scoring"},
+        },
+        "repos": list(target_repo_commits.keys()),
     }
 
 
@@ -2951,7 +3320,7 @@ def main():
     )
     parser.add_argument(
         "--methods",
-        default="no_retrieval,naive_random,grep,bm25,vector,embedding,repo_map,bca,bca_no_closure,bca_no_scoring,target_file",
+        default="no_retrieval,bm25,vector,repo_map,bca_d1,bca,bca_d5,bca_no_closure,bca_no_scoring,target_file",
         help="Comma-separated method names",
     )
     parser.add_argument("--provider", default="openai", help="LLM provider")
@@ -3029,6 +3398,12 @@ def main():
     print(summary)
     (output_dir / "summary.txt").write_text(summary)
 
+    # --- Table 1a: Pass@1 per-repo breakdown ---
+    per_repo = format_per_repo_results(results, tasks, budgets)
+    if per_repo:
+        print(per_repo)
+        (output_dir / "per_repo_results.txt").write_text(per_repo)
+
     # --- Table 1b: Pass@1 with per-cell bootstrap CIs ---
     ci_summary = format_results_with_ci(results, budgets)
     print(ci_summary)
@@ -3076,6 +3451,11 @@ def main():
     decomp = format_decomposition(results, tasks, budgets)
     print(decomp)
     (output_dir / "decomposition.txt").write_text(decomp)
+
+    # --- Conditional bins (identifier density, hop distance, mutation size) ---
+    cond_bins = format_conditional_bins(results, budgets)
+    print(cond_bins)
+    (output_dir / "conditional_bins.txt").write_text(cond_bins)
 
     # --- Paired bootstrap CI analysis (appendix) ---
     bootstrap_text = format_bootstrap_analysis(results, budgets)
@@ -3133,10 +3513,12 @@ def main():
     print(f"Per-run artifacts in {output_dir}/<task_id>/<method>/<budget>/")
     print(f"\nOutput files:")
     print(f"  summary.txt              - Pass@1 table (main grid, no ceiling)")
+    print(f"  per_repo_results.txt     - Pass@1 broken down by repository")
     print(f"  summary_with_ci.txt      - Pass@1 with 95% bootstrap CIs")
     print(f"  ceiling_probe.txt        - target_file ceiling probe")
     print(f"  router_analysis.txt      - Oracle vs Router vs Best Single")
     print(f"  decomposition.txt        - Pass@1 by mutation type and category")
+    print(f"  conditional_bins.txt     - Pass@1 by identifier density, hops, mutation size")
     print(f"  failure_diagnosis.txt    - Failure mode breakdown")
     print(f"  retrieval_metrics.txt    - Target file hit rate, budget utilization")
     print(f"  patch_quality.txt        - Patch size and locality")

@@ -9,15 +9,26 @@ Running notes for the arXiv preprint. Everything interesting goes here so nothin
 ### Title
 **CeGraph: Budgeted Context Assembly via Code Knowledge Graphs**
 
-### Core Thesis
-There is a "missing middle layer" between naive retrieval (grep/BM25) and whole-file dumping.
-BCA formulates context selection as a knapsack-style optimization: entity extraction -> seed
-resolution -> weighted BFS -> relevance scoring -> dependency closure -> greedy budget packing.
+### Core Thesis (The Real One)
+Context assembly under a token budget is a **decision problem**. The community keeps treating it
+like a single-method retrieval shootout ("our RAG beats your RAG"). Our paper's point is to:
+1. Build a **reproducible harness** that isolates context selection from code generation
+2. Measure **mechanisms** (not just pass@1) — explain *why* methods work or fail
+3. Show that **conditional routing** is the right abstraction
 
-### Unique Angle: The Router Story
-No single retrieval method dominates. The paper's publishable contribution is showing *when and why*
-each method wins, backed by causal-ish evidence from logged metrics. A lightweight query classifier
-(logistic regression on graph features) routes to the best method per-task and approaches the oracle.
+If BCA wins sometimes and loses sometimes, that is not failure — that is literally the thesis.
+
+### Publishable Contribution (Even If BCA Is Mediocre)
+The contribution is the **system + instrumentation + conditional analysis**, not BCA's average score.
+
+1. **Reproducible benchmark**: Mutation-based code repair with dual query modes, pinned commits,
+   pinned model snapshots, byte-identical revert, and full per-attempt artifacts
+2. **Mechanistic logging**: Explains *why* methods work/fail — file hit, symbol hit, graph hops,
+   closure overhead, failure-mode taxonomy (patch_apply_fail vs test_fail vs regression)
+3. **Router framing**: Quantify oracle gap and show a lightweight router (logistic regression on
+   graph features) closes meaningful gap without extra LLM calls
+
+That combination is workshop-ready once we have the full two-repo run and artifacts.
 
 ### Paper Positioning
 - **arXiv v1**: gpt-4o-mini-2024-07-18, 2 repos (pydantic-ai + httpx), workshop-ready
@@ -77,14 +88,19 @@ caps (max 15/file, 25/category, 30/mutation_type).
 **httpx**: 12 categories — transports(25), config(15), content(15), multipart(15), utils(15), cli(14), decoders(14), auth(11), models(10), url_parsing(9), client(8), exceptions(1)
 
 ### Dual Query Modes
-- **Exact**: Developer-level descriptions mentioning file names, line numbers, operators
+- **Dev-localized** (exact): File name + line number + operator diff. This is ceiling-ish —
+  the description effectively leaks the bug location. Label as such in paper. Reviewers WILL
+  note that no_retrieval can solve these.
   - Example: "In _client.py:172, the comparison operator was changed: '>' became '>='"
-- **Vague**: User-reported symptom descriptions with no internal references
+- **Vague** (user-reported): Symptom-only, no code identifiers. This is the realistic query mode.
   - Example: "A threshold or limit check seems to trigger at the wrong value"
+
+> **Note**: Consider adding a third "Dev-report" mode later (mentions function/class but no
+> line numbers) to fill the gap between god-mode and zero-info.
 
 ---
 
-## 3. Methods (11 total)
+## 3. Methods (13 total)
 
 | Method | Type | Description |
 |--------|------|-------------|
@@ -95,10 +111,24 @@ caps (max 15/file, 25/category, 30/mutation_type).
 | vector | Semantic | TF-IDF vector similarity search |
 | embedding | Semantic | (if available) embedding-based search |
 | repo_map | Structural | Signature-only overview of entire codebase |
-| bca | **Ours** | Full BCA: entity extraction -> BFS -> scoring -> closure -> budget |
-| bca_no_closure | Ablation | BCA without dependency closure |
-| bca_no_scoring | Ablation | BCA with scoring disabled (graph traversal + closure only) |
+| bca_d1 | **Ours** (depth=1) | BCA with PRECISE strategy: shallow expansion, min_score=0.3 |
+| bca | **Ours** (depth=3) | BCA with SMART strategy (default): entity extraction -> BFS -> scoring -> closure -> budget |
+| bca_d5 | **Ours** (depth=5) | BCA with THOROUGH strategy: deep expansion, min_score=0.05 |
+| bca_no_closure | Ablation | BCA-SMART without dependency closure |
+| bca_no_scoring | Ablation | BCA-SMART with scoring disabled (graph traversal + closure only) |
 | target_file | Ceiling | Oracle: gives the LLM the entire mutated file (upper bound) |
+
+### Depth Strategy Details
+
+| Strategy | max_depth | min_score | Why it matters |
+|----------|-----------|-----------|----------------|
+| PRECISE (bca_d1) | 1 | 0.3 | Only immediate neighbors of seeds. Budget-efficient but may miss dependencies. |
+| SMART (bca) | 3 | 0.1 | Default. Balanced depth and score threshold. |
+| THOROUGH (bca_d5) | 5 | 0.05 | Wide neighborhood. May waste budget on low-relevance code at tight budgets. |
+
+**Key question depth answers**: Does BCA benefit from deeper expansion, or does it waste budget?
+At 1k tokens, d1 may win (less noise). At 10k tokens, d5 may win (more room for distant context).
+If depth doesn't matter, that's interesting too — means scoring/packing dominates over expansion.
 
 ---
 
@@ -125,6 +155,12 @@ caps (max 15/file, 25/category, 30/mutation_type).
 - `bca_frontier_visited` — BFS expansion candidates before scoring (BCA only)
 - `context_symbol_keys` — Symbol IDs present in context (for post-hoc coverage)
 
+### Code Metadata (per-task constants, logged per-attempt for self-contained analysis)
+- `mutation_symbol_lines` — Line span of the mutated function/class
+- `mutation_symbol_kind` — function, method, class, constant, etc.
+- `mutation_file_symbols` — Number of symbols in the mutated file
+- `graph_node_count` — Total graph nodes (normalizes across repos)
+
 ### Post-Hoc Metrics (no rerun needed)
 - Cost per solved task (total tokens / passes)
 - Context redundancy/entropy (from stored context text)
@@ -133,9 +169,13 @@ caps (max 15/file, 25/category, 30/mutation_type).
 
 ---
 
-## 5. Key Findings (from sanity runs)
+## 5. Sanity-Check Observations (n=2-3 tasks, NOT findings)
 
-### Finding 1: Entity Density Perfectly Separates Exact vs Vague
+> **Disclaimer**: These are directional signals from sanity runs on 2-3 tasks.
+> They are NOT findings. Do not cite these numbers in the paper.
+> The full run will produce actual findings.
+
+### Observation 1: Entity Density Perfectly Separates Exact vs Vague
 Tested on real tasks:
 - **Exact description**: entity_count=3, mapped=2, identifier_density=0.13
 - **Vague description**: entity_count=0, mapped=0, identifier_density=0.0
@@ -144,7 +184,7 @@ This is the backbone of the conditional analysis. BCA's entity extraction finds 
 vague descriptions, meaning it falls back to keyword-only seeds (low quality). Lexical methods
 don't depend on entity extraction so they degrade more gracefully.
 
-### Finding 2: BCA Achieves 100% Target Symbol Hit Rate
+### Observation 2: BCA Achieves 100% Target Symbol Hit Rate
 From httpx_sanity2 retrieval metrics:
 - **BCA**: 100% target file hit, 100% target symbol hit (both budgets)
 - **grep**: 0-50% target file hit, 50% target symbol hit
@@ -153,7 +193,7 @@ From httpx_sanity2 retrieval metrics:
 
 BCA's graph traversal reliably locates the mutation site when entities resolve.
 
-### Finding 3: BCA Needs Budget to Shine
+### Observation 3: BCA Needs Budget to Shine
 From sanity_mini (pydantic-ai, 3 tasks):
 - **BCA @ 1k**: 67% pass@1
 - **BCA @ 4k**: 100% pass@1 (statistically significant vs no_retrieval, CI=[+1.0, +1.0])
@@ -162,7 +202,7 @@ From sanity_mini (pydantic-ai, 3 tasks):
 At tight budgets, BCA includes the right symbols but may not have room for enough context.
 At 4k+, BCA has enough room for seeds + closure + supporting code.
 
-### Finding 4: Graph Distance Is Meaningful
+### Observation 4: Graph Distance Is Meaningful
 From entity-resolution tests:
 - Seed symbol = mutation symbol: min_hops=0 (exact entity match, e.g. `UsageBase.total_tokens`)
 - Seed in same file, different symbol: min_hops=1-2
@@ -171,7 +211,7 @@ From entity-resolution tests:
 **Prediction**: Tasks with min_hops=0 should have highest pass@1 for BCA.
 Tasks with min_hops >= 3 are where BCA struggles and lexical methods may win.
 
-### Finding 5: Closure Adds Minimal Overhead (So Far)
+### Observation 5: Closure Adds Minimal Overhead (So Far)
 From BCA sanity run:
 - `bca_closure_added_symbols`: 1
 - `bca_closure_added_tokens`: 9
@@ -180,7 +220,7 @@ From BCA sanity run:
 Closure is cheap when the seed already points to the right place. The interesting case
 is when closure pulls in distant dependencies — we need the full benchmark to see this.
 
-### Finding 6: grep Can Fail Hard
+### Observation 6: grep Can Fail Hard
 From quick_test (agent-library, 2 tasks):
 - **grep**: 0% pass@1 at both budgets
 - **BCA & BM25**: 100% at both budgets
@@ -189,7 +229,7 @@ grep's failure mode: the LLM's patches reference wrong file paths (e.g. `cegraph
 instead of `src/cegraph/graph/query.py`), causing "file not found" errors. This is a real issue
 with keyword-based retrieval — it gives code snippets without structural awareness.
 
-### Finding 7: no_retrieval Sometimes Works (httpx)
+### Observation 7: no_retrieval Sometimes Works (httpx)
 In httpx_sanity2: no_retrieval got 100% pass@1. This is because:
 - httpx is well-known (in GPT-4o's training data)
 - The exact descriptions are very specific ("In _auth.py:272, a constant was changed")
@@ -212,8 +252,8 @@ descriptions are too informative for some tasks. The vague descriptions will tel
 | `syntax_error` | SyntaxError or ImportError after patch | LLM generated invalid code |
 | `timeout` | Test execution timed out | Fix caused infinite loop |
 
-**Key insight**: `patch_apply_fail` is grep's dominant failure mode. BCA avoids this because
-it includes structural metadata (file paths from the graph) in the context.
+**Observation from sanity runs**: `patch_apply_fail` is grep's dominant failure mode. BCA avoids
+this because it includes structural metadata (file paths from the graph) in the context.
 
 ---
 
@@ -259,13 +299,15 @@ At minimum, router should beat any single method's average performance.
 
 ## 9. Tables to Include in Paper
 
-1. **Table 1**: Pass@1 by method x budget x query_type (main result)
-2. **Table 2**: Pass@1 with 95% bootstrap CIs
-3. **Table 3**: Ablation (BCA vs no-closure vs no-scoring)
-4. **Table 4**: Failure mode breakdown by method
-5. **Table 5**: Retrieval quality metrics (file hit, symbol hit, overlap)
-6. **Table 6**: Router vs oracle vs best single method
-7. **Table 7**: Conditional analysis — pass@1 stratified by entity density or graph distance
+1. **Table 1**: Pass@1 by method x budget x query_type (main result) → `summary.txt`
+2. **Table 1a**: Pass@1 per-repo breakdown → `per_repo_results.txt`
+3. **Table 2**: Pass@1 with 95% bootstrap CIs → `summary_with_ci.txt`
+4. **Table 3**: Ablation — BCA-d1 vs BCA vs BCA-d5 vs no-closure vs no-scoring (depth + ablation)
+5. **Table 4**: Failure mode breakdown by method → `failure_diagnosis.txt`
+6. **Table 5**: Retrieval quality metrics (file hit, symbol hit, overlap) → `retrieval_metrics.txt`
+7. **Table 6**: Router vs oracle vs best single method → `router_analysis.txt`
+8. **Table 7**: Conditional bins — pass@1 by identifier density, hops, mutation size → `conditional_bins.txt`
+9. **Table 8**: Decomposition by mutation type and category → `decomposition.txt`
 
 ### Figures
 1. **Figure 1**: CeGraph architecture diagram (graph build -> BCA pipeline)
@@ -300,6 +342,12 @@ can never accidentally burn gpt-4o credits. To run the conference variant, you m
 - [x] Byte-identical restoration after each eval (SHA256 verification)
 - [x] Full per-attempt JSON artifacts saved (context, LLM response, patch, test output)
 - [x] Bootstrap CIs with n=10000
+- [x] `repo_name` in every EvalResult row (enables per-repo, per-method, per-budget, per-query_type slicing)
+- [x] BCA strategy configs logged in run_metadata.json (depth, min_score per variant)
+- [x] Per-repo commit hashes logged in run_metadata.json
+- [x] Deterministic retry backoff: 5s, 8s, 15s, 30s, 60s (no jitter, reproducible)
+- [x] OpenAI `seed=42` parameter in all API calls (best-effort determinism)
+- [x] Budget-independent methods (no_retrieval, target_file) run once, results duplicated across budgets
 - [ ] Release eval_tasks JSONL files
 - [ ] Release discover_mutations.py and make_*_tasks.py scripts
 - [ ] Release benchmark.py harness
@@ -314,7 +362,11 @@ can never accidentally burn gpt-4o credits. To run the conference variant, you m
 4. **Python only** — CeGraph supports JS/TS via regex, but benchmark is Python-only
 5. **gpt-4o-mini** — Weaker model may not fully exploit context quality differences
 6. **No multi-turn** — Single-shot fix, no iterative refinement
-7. **Exact descriptions are too easy** — LLM can sometimes fix without any context when the
+7. **LLM non-determinism** — OpenAI states that even with `temperature=0` and `seed=42`,
+   outputs are "mostly deterministic" due to GPU floating-point non-determinism. We log the
+   `system_fingerprint` from each response to detect cluster changes. Bootstrap CIs account
+   for this variance statistically, but exact bit-for-bit reproduction is not guaranteed.
+8. **Exact descriptions are too easy** — LLM can sometimes fix without any context when the
    description says "In file.py:172, operator changed from > to >="
 
 ---
@@ -359,22 +411,81 @@ can never accidentally burn gpt-4o credits. To run the conference variant, you m
 
 ## 15. Kill Rate Analysis
 
+**Two definitions — keep both, name them clearly:**
+
 | Metric | pydantic-ai | httpx |
 |--------|------------|-------|
 | Source files | 186 | ~100 |
 | Candidates generated | 1,454 | 388 |
-| Killed | 199 (13.7%) | 210 (54.1%) |
-| Kill rate | 20.5% | 54.1% |
+| Killed | 199 | 210 |
+| Survived (test ran, mutation undetected) | 770 | 152 |
+| Skipped (no matching test found) | 485 | 26 |
+| **Candidate kill rate** (killed / total candidates) | **13.7%** (199/1454) | **54.1%** (210/388) |
+| **Tested kill rate** (killed / (killed + survived)) | **20.5%** (199/969) | **58.0%** (210/362) |
 | Selected for eval | 174 | 152 |
 
-httpx's higher kill rate suggests tighter test coverage. pydantic-ai has many mutations in
-untested code paths (33.4% skipped = no matching test found, 52.9% survived = test didn't catch it).
+**Why two rates matter**: Candidate kill rate reflects overall test coverage breadth (how much code
+is tested at all). Tested kill rate reflects test sensitivity (how well tests detect mutations in
+code they do exercise). httpx has both higher candidate kill rate (54.1% vs 13.7%) and higher
+tested kill rate (58.0% vs 20.5%), consistent with a smaller, more tightly-tested codebase.
+
+pydantic-ai has 485 skipped candidates (33.4%) — mutations in code with no matching test file.
+This is typical for larger frameworks where many modules have integration tests but not unit tests.
 
 **Paper point**: Kill rate itself is an interesting codebase health metric.
 
 ---
 
-## 16. Budget Configuration
+## 16. Mutation Site Size Diversity
+
+The mutations span a wide range of function/class sizes — from 1-line constants to 1400-line classes.
+
+**pydantic-ai (174 tasks):**
+| Size bucket | Count | % |
+|-------------|-------|---|
+| <5 lines | 9 | 5% |
+| 5-20 lines | 77 | 44% |
+| 20-50 lines | 39 | 22% |
+| 50-100 lines | 41 | 24% |
+| 100+ lines | 8 | 5% |
+| **Median: 20 lines, Mean: 82.5, Range: 1-1406** |||
+
+**httpx (152 tasks):**
+| Size bucket | Count | % |
+|-------------|-------|---|
+| <5 lines | 8 | 5% |
+| 5-20 lines | 56 | 37% |
+| 20-50 lines | 58 | 38% |
+| 50-100 lines | 20 | 13% |
+| 100+ lines | 10 | 7% |
+| **Median: 27 lines, Mean: 37.8, Range: 2-241** |||
+
+**Paper point**: This diversity matters because short functions fit entirely in small budgets
+(even 1k tokens), while large classes require intelligent selection of which parts to include.
+BCA's advantage should be most visible on medium-to-large functions (20-100 lines) where budget
+allocation decisions matter.
+
+**Hypothesis**: Tasks in tiny functions (<5 lines) should be easy for all methods (the whole
+function fits). Tasks in huge classes (100+ lines) may be hardest for BCA if entity extraction
+doesn't point to the right submethod.
+
+---
+
+## 17. C++ Acceleration Layer
+
+CeGraph includes an optional C++ accelerator (`csrc/cag_fast.cpp`) loaded via ctypes:
+- Weighted BFS (the hot path): ~10-50x faster than Python for 50k+ node graphs
+- Batch token estimation
+- Topological sort (Kahn's algorithm)
+- Entity extraction (pattern matching)
+
+Currently compiled and active (`cag_fast.dylib` exists). Falls back to pure Python if missing.
+**Not mentioned in paper** — it's an implementation detail, not a contribution. But worth noting
+that assembly times in benchmarks include this acceleration.
+
+---
+
+## 18. Budget Configuration
 
 | Budget | Description | Typical Content |
 |--------|-------------|----------------|
@@ -386,3 +497,44 @@ untested code paths (33.4% skipped = no matching test found, 52.9% survived = te
 BCA's budget utilization is consistently 94-100% across all budgets (greedy packing works).
 Lexical methods also hit 100% (they just pack differently).
 no_retrieval uses 0-2% (just the prompt, no context).
+
+---
+
+## 19. Post-Hoc Analysis TODO (After Full Run — Do Not Skip)
+
+These analyses require only the logged artifacts — no reruns needed. Do them ALL before writing
+the abstract or any claims.
+
+- [ ] **Cost per solved task**: `(llm_input_tokens + llm_output_tokens) * price_per_token` for
+  passes only. Compare cost-efficiency across methods.
+- [ ] **Context redundancy/entropy**: Compute from stored `context.txt` artifacts. How much of
+  the context is actually relevant vs padding?
+- [ ] **Logistic regression router**: Train on `{entity_count_mapped, query_identifier_density,
+  budget, mutation_symbol_lines}` → predict best method. LOO cross-validation.
+- [ ] **k-hop dependency coverage**: `coverage_k = |D_k(mutation) ∩ context_symbol_keys| / |D_k(mutation)|`
+  for k=1,2. Measures whether the context includes the mutation's dependency neighborhood.
+- [ ] **Conditional slices**: Pass@1 binned by identifier_density (0 vs >0) and by min_hops
+  (0, 1-2, 3+). This is the core of the "when does BCA win?" story.
+- [ ] **Write abstract ONLY after results** — do not overclaim before seeing the full numbers
+- [ ] **If embedding method included**: Pin embedding model snapshot too and log it, same as LLM
+
+---
+
+## 20. Paper Story Arc
+
+The clean structure for the paper:
+
+1. **Problem**: Token budgets force selection. Whole-file dumping wastes budget, lexical retrieval
+   misses dependencies. The community treats this as a single-method shootout.
+2. **Approach**: BCA as graph-guided assembly — entity extraction, weighted BFS, relevance scoring,
+   dependency closure, greedy budget packing.
+3. **Benchmark**: Two repos, controlled fault injection (mutation testing), dual query modes
+   (dev-localized + vague), pinned snapshots, strict byte-identical revert.
+4. **Results**: No single method dominates. Show main table. This is the thesis, not a failure.
+5. **Mechanism**: Explain *why*. Use failure modes + graph hops + entity density + closure overhead.
+   This is the section that makes reviewers take the paper seriously.
+6. **Router**: Oracle gap exists. Simple logistic regression router closes X% of the gap without
+   extra LLM calls. Show router vs best-single-method vs oracle.
+7. **Limits**: Python-only, mutation testing is a proxy for real bugs, dev-localized descriptions
+   may be overly informative (inflates no_retrieval), two repos only (detailed case study, not
+   a general claim).
