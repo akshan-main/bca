@@ -133,6 +133,7 @@ class OpenAIProvider(LLMProvider):
                 "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
                 "completion_tokens": response.usage.completion_tokens if response.usage else 0,
             },
+            system_fingerprint=getattr(response, "system_fingerprint", "") or "",
         )
 
     async def stream(

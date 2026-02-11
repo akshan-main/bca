@@ -7,12 +7,20 @@ This is the line between "implementation" and "paper": it produces the
 pass@1 vs token-budget plots that constitute evidence.
 
 Usage:
+    # Full paper run (245 tasks, all methods, both query types):
     python -m paper.experiments.benchmark \
-        --tasks-file paper/experiments/eval_tasks.jsonl \
+        --tasks-file paper/experiments/eval_tasks_full.jsonl \
         --budgets 1000,4000,8000,10000 \
+        --query-types exact,vague \
         --provider openai \
         --model gpt-4o-mini-2024-07-18 \
         --output-dir paper/results/
+
+    # Quick sanity check (2 tasks, 2 budgets, 5 methods):
+    python -m paper.experiments.benchmark \
+        --tasks-file paper/experiments/eval_tasks_trial.jsonl \
+        --quick \
+        --output-dir paper/results/trial/
 
 Task JSONL format:
     {
@@ -33,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import collections
 import hashlib
 import json
 import os
@@ -41,6 +48,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -64,11 +72,9 @@ from cegraph.graph.builder import GraphBuilder
 from cegraph.graph.query import GraphQuery
 from cegraph.llm.base import LLMResponse, Message
 from cegraph.llm.factory import create_provider
-
 from paper.experiments.baselines import (
     baseline_bm25,
 )
-
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -87,6 +93,9 @@ class EvalTask:
     in_place: bool = False  # True for editable installs (e.g. pydantic-ai)
     timeout: int = 60
     mutation: dict = field(default_factory=dict)  # {file, original, mutated, line_num}
+    category: str = ""  # subsystem category (e.g. "auth", "models", "ssrf")
+    mutation_type: str = ""  # mutation kind (e.g. "comparison_swap", "constant_mutation")
+    source: str = ""  # task origin: "handcrafted" or "discovered"
 
 
 @dataclass
@@ -137,8 +146,28 @@ class EvalResult:
     mutation_symbol_kind: str = ""  # function, method, class, constant, etc.
     mutation_file_symbols: int = 0  # Number of symbols in the mutated file
     graph_node_count: int = 0  # Total graph nodes (normalizes across repos)
+    # Router B confidence features (retrieval scores, computed pre-LLM).
+    # WARNING: Raw scores are NOT comparable across methods (BM25, TF-IDF, BCA use
+    # different scales). Use scale-free features for cross-method routing.
+    # --- Scale-free features (safe for cross-method comparison) ---
+    retrieval_top1_top2_gap: float = 0.0  # Score gap: rank-1 minus rank-2 (scale-dependent but gap is relative)
+    retrieval_softmax_entropy: float = 0.0  # Entropy of softmax(top-K scores) in bits. Low = confident, high = scattered.
+    retrieval_softmax_tau: float = 0.0  # Temperature used for softmax (median(|top-K scores|)). Logged for auditability.
+    retrieval_effective_candidates: float = 0.0  # exp(entropy) = perplexity. "How many plausible choices?"
+    retrieval_top5_ratio: float = 0.0  # mean(top5) / top1. Close to 1.0 = flat ranking, close to 0 = clear winner.
+    retrieval_within95_count: int = 0  # How many symbols score >= 95% of top1. Measures ranking sharpness.
+    retrieval_scored_symbols: int = 0  # Number of symbols with score > 0
+    # --- Raw score features (per-method only, NOT for cross-method comparison) ---
+    retrieval_top1_score: float = 0.0  # Highest retrieval score (scale varies by method)
+    retrieval_top5_mean_score: float = 0.0  # Mean of top-5 scores (scale varies)
+    # --- Coverage confidence features (scale-free, method-agnostic) ---
+    retrieval_budget_utilization: float = 0.0  # tokens_used / budget (already in other fields but useful as feature)
+    retrieval_file_concentration: float = 0.0  # Fraction of top-K symbols in the same file as top-1. High = focused.
     # Slicing dimensions (ensure every result is self-contained for analysis)
     repo_name: str = ""  # Repository name (e.g. "pydantic-ai", "httpx")
+    category: str = ""  # Subsystem category (e.g. "auth", "ssrf", "client")
+    mutation_type: str = ""  # Mutation kind (e.g. "comparison_swap", "handcrafted")
+    source: str = ""  # Task origin: "handcrafted" or "discovered"
 
 
 # ---------------------------------------------------------------------------
@@ -149,17 +178,123 @@ class EvalResult:
 # Read by _run_single_eval to extract debug info without changing method signatures.
 _last_context_package = None
 
+# Module-level list to capture retrieval scores from the most recent assembly call.
+# Populated by scored methods (BM25, TF-IDF, embedding, BCA); empty for unscored
+# methods (grep, no_retrieval, naive_random, repo_map, target_file).
+# Read by _run_single_eval to compute Router B confidence features.
+_last_retrieval_scores: list[float] = []
+
+
+def _compute_retrieval_confidence(scores: list[float]) -> dict[str, float | int]:
+    """Compute Router B confidence features from raw retrieval scores.
+
+    Uses softmax probabilities for entropy (not raw normalization) so the
+    distribution is well-defined even with negative or unbounded scores.
+    All features except raw scores are scale-free or scale-invariant.
+    """
+    import math
+
+    empty = {
+        "retrieval_top1_score": 0.0,
+        "retrieval_top1_top2_gap": 0.0,
+        "retrieval_softmax_entropy": 0.0,
+        "retrieval_softmax_tau": 0.0,
+        "retrieval_effective_candidates": 0.0,
+        "retrieval_top5_ratio": 0.0,
+        "retrieval_within95_count": 0,
+        "retrieval_top5_mean_score": 0.0,
+        "retrieval_scored_symbols": 0,
+    }
+    if not scores:
+        return empty
+
+    sorted_scores = sorted(scores, reverse=True)
+    top1 = sorted_scores[0]
+    top2 = sorted_scores[1] if len(sorted_scores) > 1 else 0.0
+    top5 = sorted_scores[:5]
+    top_k = sorted_scores[:20]  # Use top-20 for entropy
+
+    # --- Softmax entropy (proper probability distribution) ---
+    # Temperature tau = median(|scores|) to avoid degenerate distributions.
+    # If tau is tiny, fall back to tau=1.0.
+    abs_scores = [abs(s) for s in top_k]
+    abs_sorted = sorted(abs_scores)
+    tau = abs_sorted[len(abs_sorted) // 2] if abs_sorted else 1.0
+    if tau < 1e-9:
+        tau = 1.0
+
+    # Softmax with numerical stability (subtract max before exp)
+    max_s = max(top_k)
+    exps = [math.exp((s - max_s) / tau) for s in top_k]
+    exp_sum = sum(exps)
+    entropy = 0.0
+    if exp_sum > 0:
+        for e in exps:
+            p = e / exp_sum
+            if p > 1e-12:
+                entropy -= p * math.log2(p)
+
+    effective_candidates = 2.0 ** entropy  # Perplexity: "how many plausible choices"
+
+    # --- Scale-free ratio features ---
+    top5_ratio = (sum(top5) / len(top5)) / top1 if top1 > 1e-12 else 0.0
+    threshold_95 = top1 * 0.95
+    within95 = sum(1 for s in sorted_scores if s >= threshold_95)
+
+    return {
+        "retrieval_top1_score": round(top1, 6),
+        "retrieval_top1_top2_gap": round(top1 - top2, 6),
+        "retrieval_softmax_entropy": round(entropy, 4),
+        "retrieval_softmax_tau": round(tau, 6),
+        "retrieval_effective_candidates": round(effective_candidates, 2),
+        "retrieval_top5_ratio": round(top5_ratio, 4),
+        "retrieval_within95_count": within95,
+        "retrieval_top5_mean_score": round(sum(top5) / len(top5), 6),
+        "retrieval_scored_symbols": len(scores),
+    }
+
+
+def _compute_file_concentration(context: str) -> float:
+    """Fraction of context symbols that share a file with the most-frequent file.
+
+    High concentration = retrieval is focused on one file.
+    Low concentration = retrieval is scattered across many files.
+    Scale-free: always in [0, 1] regardless of method.
+    """
+    # Extract file headers from context (format: "# filepath:start-end")
+    file_refs = re.findall(r"^# ([a-zA-Z0-9_/.]+\.\w+)", context, re.MULTILINE)
+    if not file_refs:
+        return 0.0
+    from collections import Counter as _Counter
+    counts = _Counter(file_refs)
+    most_common_count = counts.most_common(1)[0][1]
+    return round(most_common_count / len(file_refs), 4)
+
+
+def _extract_bca_scores(package) -> list[float]:
+    """Extract relevance scores from a BCA ContextPackage for Router B features.
+
+    Returns top-50 positive scores (sorted descending). Capped to avoid
+    storing hundreds of scores per attempt in artifacts.
+    """
+    scores = sorted(
+        [item.relevance_score for item in package.items if item.relevance_score > 0],
+        reverse=True,
+    )
+    return scores[:50]
+
 
 def assemble_bca(
     repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
 ) -> tuple[str, int, int, int, float]:
     """BCA context assembly. Returns (context_str, tokens, syms, files, time_ms)."""
-    global _last_context_package
+    global _last_context_package, _last_retrieval_scores
     start = time.time()
     assembler = ContextAssembler(repo_path, graph, query)
     package = assembler.assemble(task=task, token_budget=budget, strategy=ContextStrategy.SMART)
     elapsed = (time.time() - start) * 1000
     _last_context_package = package
+    _last_retrieval_scores = _extract_bca_scores(package)
     # Use lean rendering: no metadata annotations or line-number prefixes.
     # This matches the format of other methods (just file headers + source code)
     # and avoids wasting budget tokens on annotations the LLM doesn't need.
@@ -176,12 +311,13 @@ def assemble_bca_d1(
     repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
 ) -> tuple[str, int, int, int, float]:
     """BCA with PRECISE strategy (depth=1, min_score=0.3). Shallow expansion."""
-    global _last_context_package
+    global _last_context_package, _last_retrieval_scores
     start = time.time()
     assembler = ContextAssembler(repo_path, graph, query)
     package = assembler.assemble(task=task, token_budget=budget, strategy=ContextStrategy.PRECISE)
     elapsed = (time.time() - start) * 1000
     _last_context_package = package
+    _last_retrieval_scores = _extract_bca_scores(package)
     return (
         package.render(include_metadata=False, include_line_numbers=False),
         package.total_tokens,
@@ -195,12 +331,13 @@ def assemble_bca_d5(
     repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
 ) -> tuple[str, int, int, int, float]:
     """BCA with THOROUGH strategy (depth=5, min_score=0.05). Deep expansion."""
-    global _last_context_package
+    global _last_context_package, _last_retrieval_scores
     start = time.time()
     assembler = ContextAssembler(repo_path, graph, query)
     package = assembler.assemble(task=task, token_budget=budget, strategy=ContextStrategy.THOROUGH)
     elapsed = (time.time() - start) * 1000
     _last_context_package = package
+    _last_retrieval_scores = _extract_bca_scores(package)
     return (
         package.render(include_metadata=False, include_line_numbers=False),
         package.total_tokens,
@@ -214,13 +351,14 @@ def assemble_bca_no_closure(
     repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
 ) -> tuple[str, int, int, int, float]:
     """BCA without dependency closure."""
-    global _last_context_package
+    global _last_context_package, _last_retrieval_scores
     start = time.time()
     ablation = AblationConfig(dependency_closure=False)
     assembler = ContextAssembler(repo_path, graph, query, ablation=ablation)
     package = assembler.assemble(task=task, token_budget=budget, strategy=ContextStrategy.SMART)
     elapsed = (time.time() - start) * 1000
     _last_context_package = package
+    _last_retrieval_scores = _extract_bca_scores(package)
     return (
         package.render(include_metadata=False, include_line_numbers=False),
         package.total_tokens,
@@ -234,8 +372,10 @@ def assemble_bm25(
     repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
 ) -> tuple[str, int, int, int, float]:
     """BM25 symbol retrieval + greedy packing."""
+    global _last_retrieval_scores
     start = time.time()
     result = baseline_bm25(repo_path, task, budget, graph)
+    _last_retrieval_scores = result.retrieval_scores
     # BM25 gives us symbol names; we need to render their source
     content_parts = []
     for sym_qname in result.selected_symbols:
@@ -278,6 +418,8 @@ def assemble_grep(
     repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
 ) -> tuple[str, int, int, int, float]:
     """Full-file grep baseline."""
+    global _last_retrieval_scores
+    _last_retrieval_scores = []  # Grep has no per-symbol scoring
     start = time.time()
     keywords = set(re.findall(r"\b([A-Za-z_]\w{2,})\b", task))
     stop = {
@@ -329,6 +471,8 @@ def assemble_repo_map(
     then fill remaining budget with actual source code of relevant symbols.
     The LLM needs real source code to produce valid SEARCH/REPLACE blocks.
     """
+    global _last_retrieval_scores
+    _last_retrieval_scores = []  # Repo map has no per-symbol scoring
     start = time.time()
 
     # Phase 1: Build compact file tree (just paths, ~1 token per line)
@@ -428,6 +572,7 @@ def assemble_vector(
     Uses TF-IDF for zero-dependency reproducibility. For dense embeddings,
     install sentence-transformers and set BENCHMARK_USE_DENSE=1.
     """
+    global _last_retrieval_scores
     start = time.time()
 
     # Collect symbol documents
@@ -443,6 +588,7 @@ def assemble_vector(
         symbols.append({"id": node_id, "text": text, "data": data})
 
     if not symbols:
+        _last_retrieval_scores = []
         elapsed = (time.time() - start) * 1000
         return ("", 0, 0, 0, round(elapsed, 1))
 
@@ -452,6 +598,9 @@ def assemble_vector(
         scores = _vector_score_dense(task, symbols)
     else:
         scores = _vector_score_tfidf(task, symbols)
+
+    # Capture positive scores for Router B confidence features
+    _last_retrieval_scores = sorted([s for s in scores if s > 0], reverse=True)[:50]
 
     # Sort by score descending, greedy pack
     scored = sorted(zip(scores, symbols), key=lambda x: x[0], reverse=True)
@@ -558,6 +707,7 @@ def assemble_embedding(
     repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
 ) -> tuple[str, int, int, int, float]:
     """OpenAI embedding baseline (text-embedding-3-small)."""
+    global _last_retrieval_scores
     start = time.time()
 
     # Collect symbol documents
@@ -574,10 +724,14 @@ def assemble_embedding(
             symbols.append({"id": node_id, "text": text, "data": data})
 
     if not symbols:
+        _last_retrieval_scores = []
         elapsed = (time.time() - start) * 1000
         return ("", 0, 0, 0, round(elapsed, 1))
 
     scores = _embedding_score_openai(task, symbols)
+
+    # Capture positive scores for Router B confidence features
+    _last_retrieval_scores = sorted([s for s in scores if s > 0], reverse=True)[:50]
 
     # Sort by score descending, greedy pack
     scored = sorted(zip(scores, symbols), key=lambda x: x[0], reverse=True)
@@ -676,6 +830,8 @@ def assemble_no_retrieval(
     Proves retrieval matters at all. If this scores well, retrieval adds
     little value. If near zero, retrieval is carrying the run.
     """
+    global _last_retrieval_scores
+    _last_retrieval_scores = []
     start = time.time()
     context = "(No code context provided. Fix the bug based on the description alone.)"
     tokens = TokenEstimator.estimate(context)
@@ -696,10 +852,14 @@ def assemble_naive_random(
     same budget rule) as other symbol-based methods. Seed is derived from
     (task_id, budget, query_type) for exact reproducibility.
     """
+    global _last_retrieval_scores
+    _last_retrieval_scores = []  # Random has no scoring
     start = time.time()
-    # Deterministic seed from (task_id, budget, query_type) — or fallback to task text hash
+    # Deterministic seed from (task_id, budget, query_type) — uses hashlib, not hash(),
+    # because hash() is randomized per-process unless PYTHONHASHSEED=0
+    import hashlib
     seed_str = f"{_task_id}:{budget}:{_query_type}" if _task_id else task
-    rng = random.Random(hash(seed_str) % (2**32))
+    rng = random.Random(int(hashlib.sha256(seed_str.encode()).hexdigest(), 16) % (2**32))
 
     # Collect all symbols with valid source ranges
     symbols = []
@@ -756,6 +916,8 @@ def assemble_target_file(
     "retrieval failure" from "LLM cannot repair even with the right file."
     Budget caps how much of the file to include.
     """
+    global _last_retrieval_scores
+    _last_retrieval_scores = []  # Ceiling method, no scoring
     start = time.time()
 
     if not mutation or "file" not in mutation:
@@ -790,7 +952,7 @@ def assemble_bca_no_scoring(
     repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
 ) -> tuple[str, int, int, int, float]:
     """BCA with scoring disabled — graph traversal + closure only."""
-    global _last_context_package
+    global _last_context_package, _last_retrieval_scores
     start = time.time()
     ablation = AblationConfig(
         centrality_scoring=False,
@@ -802,6 +964,7 @@ def assemble_bca_no_scoring(
     package = assembler.assemble(task=task, token_budget=budget, strategy=ContextStrategy.SMART)
     elapsed = (time.time() - start) * 1000
     _last_context_package = package
+    _last_retrieval_scores = _extract_bca_scores(package)
     return (
         package.render(include_metadata=False, include_line_numbers=False),
         package.total_tokens,
@@ -923,16 +1086,8 @@ async def call_llm(
 
             # Capture model version info on first successful call
             if not _model_version_info:
-                # OpenAI returns model ID and system_fingerprint in response
-                if hasattr(response, "raw") and response.raw:
-                    raw = response.raw
-                    if hasattr(raw, "model"):
-                        _model_version_info["model_id"] = str(raw.model)
-                    if hasattr(raw, "system_fingerprint") and raw.system_fingerprint:
-                        _model_version_info["system_fingerprint"] = str(raw.system_fingerprint)
-                # Anthropic returns model in response
-                if hasattr(response, "model"):
-                    _model_version_info["model_id"] = str(response.model)
+                if response.system_fingerprint:
+                    _model_version_info["system_fingerprint"] = response.system_fingerprint
                 # Log it once
                 if _model_version_info:
                     print(f"  Model version: {_model_version_info}")
@@ -1852,7 +2007,12 @@ async def _run_single_eval(
     # 11. Context symbol keys (for post-hoc dependency coverage)
     ctx_sym_keys = _extract_context_symbol_keys(context, graph) if graph is not None else []
 
-    # 12. BCA-specific debug from _last_context_package
+    # 12. Router B confidence features from retrieval scores
+    global _last_retrieval_scores
+    retrieval_conf = _compute_retrieval_confidence(_last_retrieval_scores)
+    _last_retrieval_scores = []  # Reset for next call
+
+    # 13. BCA-specific debug from _last_context_package
     global _last_context_package
     bca_closure_syms = 0
     bca_closure_toks = 0
@@ -1911,7 +2071,23 @@ async def _run_single_eval(
         mutation_symbol_kind=mut_info["kind"],
         mutation_file_symbols=mut_info["file_symbols"],
         graph_node_count=graph.number_of_nodes() if graph is not None else 0,
+        # Router B confidence features (scale-free + raw)
+        retrieval_top1_score=retrieval_conf["retrieval_top1_score"],
+        retrieval_top1_top2_gap=retrieval_conf["retrieval_top1_top2_gap"],
+        retrieval_softmax_entropy=retrieval_conf["retrieval_softmax_entropy"],
+        retrieval_softmax_tau=retrieval_conf["retrieval_softmax_tau"],
+        retrieval_effective_candidates=retrieval_conf["retrieval_effective_candidates"],
+        retrieval_top5_ratio=retrieval_conf["retrieval_top5_ratio"],
+        retrieval_within95_count=retrieval_conf["retrieval_within95_count"],
+        retrieval_top5_mean_score=retrieval_conf["retrieval_top5_mean_score"],
+        retrieval_scored_symbols=retrieval_conf["retrieval_scored_symbols"],
+        # Coverage confidence (method-agnostic, scale-free)
+        retrieval_budget_utilization=round(tokens_used / budget, 4) if budget > 0 else 0.0,
+        retrieval_file_concentration=_compute_file_concentration(context),
         repo_name=Path(task.repo_path).name if task.repo_path else "",
+        category=task.category,
+        mutation_type=task.mutation_type or "handcrafted",
+        source=task.source or "handcrafted",
     )
 
     # Save per-run artifact
@@ -1964,6 +2140,73 @@ async def run_benchmark(
     all_results: list[EvalResult] = []
     total_runs = len(tasks) * len(budgets) * len(methods) * len(query_types)
     run_idx = 0
+
+    # Run setup_cmd once per unique repo (installs deps for test execution).
+    # Cached by repo path so it only runs once even with 100+ tasks per repo.
+    _setup_done: set[str] = set()
+    for task in tasks:
+        if not task.setup_cmd or not task.repo_path:
+            continue
+        rp = str(Path(task.repo_path).resolve())
+        if rp in _setup_done:
+            continue
+        _setup_done.add(rp)
+        print(f"\n  Running setup for {rp}...")
+        print(f"    cmd: {task.setup_cmd}")
+        try:
+            setup_result = subprocess.run(
+                task.setup_cmd, shell=True, capture_output=True, text=True,
+                timeout=300, cwd=rp,
+            )
+            if setup_result.returncode != 0:
+                print(f"  FATAL: setup_cmd failed (rc={setup_result.returncode})")
+                print(f"    stderr: {setup_result.stderr[-500:]}")
+                raise RuntimeError(
+                    f"Setup failed for {rp}: {setup_result.stderr[-200:]}"
+                )
+            print(f"    setup OK ({rp})")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Setup timed out after 300s for {rp}")
+
+    # --- Preflight: verify test infrastructure works on clean code ---
+    # Runs one task's test_cmd per repo on un-mutated code. If the test infra
+    # is broken (missing deps, conftest errors), we fail fast before burning
+    # any LLM credits.
+    _preflight_done: set[str] = set()
+    for task in tasks:
+        if not task.repo_path or not task.test_cmd:
+            continue
+        rp = str(Path(task.repo_path).resolve())
+        if rp in _preflight_done:
+            continue
+        _preflight_done.add(rp)
+        print(f"\n  Preflight test for {rp}...")
+        print(f"    cmd: {task.test_cmd}")
+        try:
+            preflight = subprocess.run(
+                task.test_cmd.split(),
+                capture_output=True, text=True,
+                timeout=task.timeout + 30,
+                cwd=rp,
+            )
+            if preflight.returncode != 0:
+                stderr_tail = preflight.stderr[-800:] if preflight.stderr else ""
+                stdout_tail = preflight.stdout[-400:] if preflight.stdout else ""
+                print(f"  FATAL: Preflight test failed (rc={preflight.returncode})")
+                print(f"    stderr: {stderr_tail}")
+                print(f"    stdout: {stdout_tail}")
+                raise RuntimeError(
+                    f"Preflight test failed for {rp}. Test infrastructure is broken. "
+                    f"Fix before running benchmark to avoid wasting LLM credits.\n"
+                    f"  cmd: {task.test_cmd}\n  stderr: {stderr_tail[-200:]}"
+                )
+            print("    preflight OK — tests pass on clean code")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(
+                f"Preflight test timed out (>{task.timeout + 30}s) for {rp}. "
+                f"Test infrastructure may be broken or test is too slow.\n"
+                f"  cmd: {task.test_cmd}"
+            )
 
     # Build graph once per unique repo path (not per task).
     # Single-line mutations don't change graph structure; source is loaded
@@ -2219,7 +2462,7 @@ def format_bootstrap_analysis(
                 )
 
         # Summary: how many significant pairs per budget
-        lines.append(f"\n  Summary: significant pairs (CI excludes 0)")
+        lines.append("\n  Summary: significant pairs (CI excludes 0)")
         for budget in budgets:
             relevant = {
                 k: v for k, v in cis.items()
@@ -2587,39 +2830,30 @@ def format_decomposition(
     query_types = sorted(set(r.query_type for r in grid_results))
     methods = sorted(set(r.method for r in grid_results))
 
-    # Group results by mutation_type — we derive it from the task_id pattern
-    # Task IDs for discovered mutations look like: d-{stem}-L{line}-{mutation_type}
+    # Build task lookup for metadata
+    _task_lookup: dict[str, EvalTask] = {t.task_id: t for t in tasks}
+
     def extract_mutation_type(task_id: str) -> str:
+        t = _task_lookup.get(task_id)
+        if t and t.mutation_type:
+            return t.mutation_type
+        # Fallback: infer from task_id pattern (d-{stem}-L{line}-{mutation_type})
         if task_id.startswith("d-"):
             parts = task_id.split("-")
             if len(parts) >= 4:
-                return parts[-1]  # last part is mutation_type
+                return parts[-1]
         return "handcrafted"
 
     def extract_category(task_id: str, tasks_list: list[EvalTask]) -> str:
-        """Derive category from file path in the task's mutation."""
-        for t in tasks_list:
-            if t.task_id == task_id and t.mutation:
+        t = _task_lookup.get(task_id)
+        if t and t.category:
+            return t.category
+        # Fallback: derive from file path
+        for t2 in tasks_list:
+            if t2.task_id == task_id and t2.mutation:
                 from pathlib import Path as _P
-                fname = _P(t.mutation.get("file", "")).name
-                # Simplified category map matching make_pydantic_ai_tasks.py
-                cat_map = {
-                    "usage.py": "usage", "_ssrf.py": "ssrf",
-                    "exceptions.py": "exceptions", "messages.py": "messages",
-                    "result.py": "result", "concurrency.py": "concurrency",
-                    "retries.py": "retries", "direct.py": "direct_api",
-                    "_utils.py": "utils", "_json_schema.py": "json_schema",
-                    "_parts_manager.py": "parts_manager", "tools.py": "tools",
-                    "builtin_tools.py": "builtin_tools", "run.py": "run",
-                    "_thinking_part.py": "thinking", "settings.py": "settings",
-                }
-                if fname in cat_map:
-                    return cat_map[fname]
-                parts = _P(t.mutation.get("file", "")).parts
-                for d in ("models", "agent", "toolsets", "ui"):
-                    if d in parts:
-                        return d
-                return "other"
+                fname = _P(t2.mutation.get("file", "")).stem.lstrip("_")
+                return fname or "other"
         return "unknown"
 
     # Use budget endpoints only (1K and max) to keep table readable
@@ -2952,7 +3186,7 @@ def format_retrieval_metrics(results: list[EvalResult], budgets: list[int]) -> s
         lines.append(f"{'='*90}")
 
         header = f"  {'Method':<20}" + "".join(f"  B={b:>10}" for b in budgets)
-        lines.append(f"\n  --- Target File Hit Rate (%) ---")
+        lines.append("\n  --- Target File Hit Rate (%) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
 
@@ -2968,7 +3202,7 @@ def format_retrieval_metrics(results: list[EvalResult], budgets: list[int]) -> s
                     row += f"  {'n/a':>10}"
             lines.append(row)
 
-        lines.append(f"\n  --- Target Symbol Hit Rate (%) ---")
+        lines.append("\n  --- Target Symbol Hit Rate (%) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
 
@@ -2984,7 +3218,7 @@ def format_retrieval_metrics(results: list[EvalResult], budgets: list[int]) -> s
                     row += f"  {'n/a':>10}"
             lines.append(row)
 
-        lines.append(f"\n  --- Budget Utilization (% of budget used) ---")
+        lines.append("\n  --- Budget Utilization (% of budget used) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
 
@@ -2999,7 +3233,7 @@ def format_retrieval_metrics(results: list[EvalResult], budgets: list[int]) -> s
                     row += f"  {'n/a':>10}"
             lines.append(row)
 
-        lines.append(f"\n  --- Mean Total LLM Tokens (context + prompt + completion) ---")
+        lines.append("\n  --- Mean Total LLM Tokens (context + prompt + completion) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
 
@@ -3038,7 +3272,7 @@ def format_patch_quality(results: list[EvalResult], budgets: list[int]) -> str:
 
         header = f"  {'Method':<20}" + "".join(f"  B={b:>10}" for b in budgets)
 
-        lines.append(f"\n  --- Mean Files Changed (per attempt) ---")
+        lines.append("\n  --- Mean Files Changed (per attempt) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
 
@@ -3053,7 +3287,7 @@ def format_patch_quality(results: list[EvalResult], budgets: list[int]) -> str:
                     row += f"  {'n/a':>10}"
             lines.append(row)
 
-        lines.append(f"\n  --- Mean Lines Changed (per attempt) ---")
+        lines.append("\n  --- Mean Lines Changed (per attempt) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
 
@@ -3069,7 +3303,7 @@ def format_patch_quality(results: list[EvalResult], budgets: list[int]) -> str:
             lines.append(row)
 
         # Passes only — patch quality of successful repairs
-        lines.append(f"\n  --- Mean Lines Changed (PASSING attempts only) ---")
+        lines.append("\n  --- Mean Lines Changed (PASSING attempts only) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
 
@@ -3109,7 +3343,7 @@ def format_latency_cost(results: list[EvalResult], budgets: list[int], graph_bui
 
         header = f"  {'Method':<20}" + "".join(f"  B={b:>10}" for b in budgets)
 
-        lines.append(f"\n  --- Mean Assembly Time (ms) ---")
+        lines.append("\n  --- Mean Assembly Time (ms) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
         for m in methods:
@@ -3123,7 +3357,7 @@ def format_latency_cost(results: list[EvalResult], budgets: list[int], graph_bui
                     row += f"  {'n/a':>10}"
             lines.append(row)
 
-        lines.append(f"\n  --- Mean LLM Time (ms) ---")
+        lines.append("\n  --- Mean LLM Time (ms) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
         for m in methods:
@@ -3137,7 +3371,7 @@ def format_latency_cost(results: list[EvalResult], budgets: list[int], graph_bui
                     row += f"  {'n/a':>10}"
             lines.append(row)
 
-        lines.append(f"\n  --- Mean Test Time (ms) ---")
+        lines.append("\n  --- Mean Test Time (ms) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
         for m in methods:
@@ -3155,7 +3389,7 @@ def format_latency_cost(results: list[EvalResult], budgets: list[int], graph_bui
     if graph_build_time > 0:
         lines.append(f"\n  Graph build time: {graph_build_time:.1f}s")
         lines.append(f"  Amortized per task: {graph_build_time / n_tasks:.2f}s ({n_tasks} tasks)")
-        lines.append(f"  Note: graph-based methods (bca*) require indexing; lexical methods (grep, bm25) do not.")
+        lines.append("  Note: graph-based methods (bca*) require indexing; lexical methods (grep, bm25) do not.")
 
     return "\n".join(lines)
 
@@ -3178,12 +3412,12 @@ def format_edit_locality(results: list[EvalResult], budgets: list[int]) -> str:
 
         lines.append(f"\n{'='*90}")
         lines.append(f"Edit Locality [{qt_label} queries]")
-        lines.append(f"  (Mean distance in lines from edit to mutation. Lower = more precise.)")
+        lines.append("  (Mean distance in lines from edit to mutation. Lower = more precise.)")
         lines.append(f"{'='*90}")
 
         header = f"  {'Method':<20}" + "".join(f"  B={b:>10}" for b in budgets)
 
-        lines.append(f"\n  --- Mean Edit Distance (lines, all attempts with known distance) ---")
+        lines.append("\n  --- Mean Edit Distance (lines, all attempts with known distance) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
         for m in methods:
@@ -3197,7 +3431,7 @@ def format_edit_locality(results: list[EvalResult], budgets: list[int]) -> str:
                     row += f"  {'---':>10}"
             lines.append(row)
 
-        lines.append(f"\n  --- Context-Patch Overlap (fraction of context files referenced in patch) ---")
+        lines.append("\n  --- Context-Patch Overlap (fraction of context files referenced in patch) ---")
         lines.append(header)
         lines.append(f"  {'-'*len(header)}")
         for m in methods:
@@ -3222,7 +3456,6 @@ def _collect_run_metadata(args, tasks, budgets, methods, results, query_types):
     """
     import datetime
     import platform
-    import sys as _sys
 
     git_hash = "unknown"
     try:
@@ -3268,11 +3501,21 @@ def _collect_run_metadata(args, tasks, budgets, methods, results, query_types):
     total_pass = sum(1 for r in results if r.tests_passed)
     total_runs = len(results)
 
+    # Hash the experiment spec for protocol integrity verification
+    spec_hash = "unknown"
+    spec_path = Path(__file__).parent / "experiment_spec.json"
+    try:
+        if spec_path.exists():
+            spec_hash = hashlib.sha256(spec_path.read_bytes()).hexdigest()
+    except Exception:
+        pass
+
     return {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "git_commit": git_hash,
         "target_repo_commit": target_repo_commit,
-        "python_version": _sys.version,
+        "experiment_spec_sha256": spec_hash,
+        "python_version": sys.version,
         "platform": platform.platform(),
         "llm_provider": args.provider,
         "llm_model": args.model,
@@ -3320,8 +3563,8 @@ def main():
     )
     parser.add_argument(
         "--methods",
-        default="no_retrieval,bm25,vector,repo_map,bca_d1,bca,bca_d5,bca_no_closure,bca_no_scoring,target_file",
-        help="Comma-separated method names",
+        default="no_retrieval,naive_random,grep,bm25,vector,embedding,repo_map,bca_d1,bca,bca_d5,bca_no_closure,bca_no_scoring,target_file",
+        help="Comma-separated method names (default: all 13 methods for paper run)",
     )
     parser.add_argument("--provider", default="openai", help="LLM provider")
     parser.add_argument(
@@ -3331,12 +3574,12 @@ def main():
     )
     parser.add_argument("--output-dir", default="paper/results", help="Output directory")
     parser.add_argument(
-        "--query-types", default="exact",
-        help="Comma-separated query types: exact,vague (default: exact)",
+        "--query-types", default="exact,vague",
+        help="Comma-separated query types (default: exact,vague for dual-query paper mode)",
     )
     parser.add_argument(
         "--quick", action="store_true",
-        help="Quick test: 2 tasks, 2 budgets, 3 methods (6 LLM calls)",
+        help="Quick test: 2 tasks, 2 budgets, 5 methods (~16 LLM calls)",
     )
     args = parser.parse_args()
 
@@ -3363,13 +3606,44 @@ def main():
             if not line.strip():
                 continue
             data = json.loads(line)
-            # Strip extra metadata fields (source, category, mutation_type)
-            # that exist in the JSONL for audit trail but aren't EvalTask fields
+            # Strip extra fields not in EvalTask
             filtered = {k: v for k, v in data.items() if k in eval_fields}
             tasks.append(EvalTask(**filtered))
 
     if args.quick:
         tasks = tasks[:2]
+
+    # --- Verify repo commits match pinned expectations ---
+    _verified_repos: set[str] = set()
+    for t in tasks:
+        if not t.commit or not t.repo_path:
+            continue
+        rp = str(Path(t.repo_path).resolve())
+        if rp in _verified_repos:
+            continue
+        _verified_repos.add(rp)
+        try:
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=5, cwd=rp,
+            )
+            actual = head.stdout.strip() if head.returncode == 0 else "unknown"
+            if not t.commit.startswith(actual[:len(t.commit)]) and actual != "unknown":
+                print(f"ERROR: Repo {rp} is at {actual[:12]} but tasks expect {t.commit[:12]}")
+                print(f"  Run: cd {rp} && git checkout {t.commit}")
+                sys.exit(1)
+            else:
+                print(f"  Repo {Path(rp).name}: commit {actual[:12]} OK")
+        except Exception as e:
+            print(f"  WARNING: Could not verify commit for {rp}: {e}")
+
+    # Verify and print experiment spec
+    spec_path = Path(__file__).parent / "experiment_spec.json"
+    if spec_path.exists():
+        spec_hash = hashlib.sha256(spec_path.read_bytes()).hexdigest()[:16]
+        print(f"\n  Experiment spec: {spec_path.name} (sha256:{spec_hash})")
+    else:
+        print("\n  WARNING: experiment_spec.json not found — protocol not frozen")
 
     total_runs = len(tasks) * len(budgets) * len(methods) * len(query_types)
     print(f"Benchmark: {len(tasks)} tasks, {len(budgets)} budgets, {len(methods)} methods, {len(query_types)} query types")
@@ -3380,6 +3654,33 @@ def main():
     print(f"Query types: {query_types}")
 
     output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save pre-run config immediately (before any LLM calls).
+    # If the run crashes, this file still records what was attempted.
+    run_config = {
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "tasks_file": str(Path(args.tasks_file).resolve()),
+        "task_count": len(tasks),
+        "task_ids": [t.task_id for t in tasks],
+        "budgets": budgets,
+        "methods": methods,
+        "query_types": query_types,
+        "provider": args.provider,
+        "model": args.model,
+        "output_dir": str(output_dir.resolve()),
+        "experiment_spec_sha256": spec_hash if spec_path.exists() else None,
+        "repo_commits": {
+            str(Path(t.repo_path).name): t.commit
+            for t in tasks if t.commit and t.repo_path
+        },
+        "total_runs": total_runs,
+        "quick_mode": args.quick,
+    }
+    with open(output_dir / "run_config.json", "w") as f:
+        json.dump(run_config, f, indent=2)
+    print(f"\n  Pre-run config saved to {output_dir / 'run_config.json'}")
+
     results, graph_build_times = asyncio.run(run_benchmark(tasks, budgets, methods, llm_config, output_dir, query_types))
     total_graph_build_time = sum(graph_build_times.values())
 
@@ -3511,21 +3812,21 @@ def main():
 
     print(f"\nResults saved to {output_dir}/")
     print(f"Per-run artifacts in {output_dir}/<task_id>/<method>/<budget>/")
-    print(f"\nOutput files:")
-    print(f"  summary.txt              - Pass@1 table (main grid, no ceiling)")
-    print(f"  per_repo_results.txt     - Pass@1 broken down by repository")
-    print(f"  summary_with_ci.txt      - Pass@1 with 95% bootstrap CIs")
-    print(f"  ceiling_probe.txt        - target_file ceiling probe")
-    print(f"  router_analysis.txt      - Oracle vs Router vs Best Single")
-    print(f"  decomposition.txt        - Pass@1 by mutation type and category")
-    print(f"  conditional_bins.txt     - Pass@1 by identifier density, hops, mutation size")
-    print(f"  failure_diagnosis.txt    - Failure mode breakdown")
-    print(f"  retrieval_metrics.txt    - Target file hit rate, budget utilization")
-    print(f"  patch_quality.txt        - Patch size and locality")
-    print(f"  latency_cost.txt         - Latency breakdown + amortized indexing")
-    print(f"  edit_locality.txt        - Edit distance + context-patch overlap")
-    print(f"  bootstrap_analysis.txt   - Paired bootstrap CI details")
-    print(f"  run_metadata.json        - Full reproducibility metadata")
+    print("\nOutput files:")
+    print("  summary.txt              - Pass@1 table (main grid, no ceiling)")
+    print("  per_repo_results.txt     - Pass@1 broken down by repository")
+    print("  summary_with_ci.txt      - Pass@1 with 95% bootstrap CIs")
+    print("  ceiling_probe.txt        - target_file ceiling probe")
+    print("  router_analysis.txt      - Oracle vs Router vs Best Single")
+    print("  decomposition.txt        - Pass@1 by mutation type and category")
+    print("  conditional_bins.txt     - Pass@1 by identifier density, hops, mutation size")
+    print("  failure_diagnosis.txt    - Failure mode breakdown")
+    print("  retrieval_metrics.txt    - Target file hit rate, budget utilization")
+    print("  patch_quality.txt        - Patch size and locality")
+    print("  latency_cost.txt         - Latency breakdown + amortized indexing")
+    print("  edit_locality.txt        - Edit distance + context-patch overlap")
+    print("  bootstrap_analysis.txt   - Paired bootstrap CI details")
+    print("  run_metadata.json        - Full reproducibility metadata")
 
 
 if __name__ == "__main__":

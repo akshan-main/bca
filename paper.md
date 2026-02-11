@@ -25,8 +25,9 @@ The contribution is the **system + instrumentation + conditional analysis**, not
    pinned model snapshots, byte-identical revert, and full per-attempt artifacts
 2. **Mechanistic logging**: Explains *why* methods work/fail — file hit, symbol hit, graph hops,
    closure overhead, failure-mode taxonomy (patch_apply_fail vs test_fail vs regression)
-3. **Router framing**: Quantify oracle gap and show a lightweight router (logistic regression on
-   graph features) closes meaningful gap without extra LLM calls
+3. **Router framing**: Quantify oracle gap and show a lightweight router (majority-vote LOO-CV
+   per budget×query_type, plus post-hoc logistic regression on retrieval confidence features)
+   closes meaningful gap without extra LLM calls
 
 That combination is workshop-ready once we have the full two-repo run and artifacts.
 
@@ -57,35 +58,38 @@ Single-line mutations with test oracle. Each mutation:
 
 | Repo | Stars | Source Files | Lines | Source Dir | Kill Rate | Tasks |
 |------|-------|-------------|-------|------------|-----------|-------|
-| pydantic-ai | 14.8k | 186 | 53k | pydantic_ai_slim/pydantic_ai | 20.5% (199/1454) | 174 (14 handcrafted + 160 discovered) |
-| httpx | 13k+ | ~100 | ~15k | httpx | 54.1% (210/388) | 152 (all discovered) |
+| pydantic-ai | 14.8k | 186 | 53k | pydantic_ai_slim/pydantic_ai | 20.5% (199/1454) | 128 (14 handcrafted + 114 discovered) |
+| httpx | 13k+ | ~100 | ~15k | httpx | 54.1% (210/388) | 117 (all discovered, 3 unvalidated removed) |
 
-**Total: 326 tasks across 2 repos**
+**Total: 245 tasks across 2 repos** (78 syntax-invalid + 3 unvalidated httpx mutations filtered out — see Section 15)
 
 pydantic-ai has lower kill rate because it's a larger codebase with more complex test coupling.
 httpx is a focused HTTP library with tighter test coverage.
 
 ### 60-Task Curated Set (pydantic-ai)
-For dev/tuning: 14 handcrafted + 46 discovered = 60 tasks, seed=42, diverse selection with
-caps (max 15/file, 25/category, 30/mutation_type).
+For dev/tuning: 14 handcrafted + 30 discovered = 44 tasks (after syntax filtering), seed=42,
+diverse selection with caps (max 15/file, 25/category, 30/mutation_type).
 
 ### Mutation Type Distribution
 
-**pydantic-ai (174 tasks):**
-- none_check_swap: ~45, membership_swap: ~43, comparison_swap: ~36
-- boolean_flip: ~27, condition_inversion: ~23, constant_mutation: ~12
-- arithmetic_swap: ~6, value_swap: ~7
+**pydantic-ai (128 tasks):**
+- none_check_swap: 30, boolean_flip: 25, condition_inversion: 22
+- handcrafted: 14, comparison_swap: 12, constant_mutation: 11
+- value_swap: 7, arithmetic_swap: 5, membership_swap: 2
 
-**httpx (152 tasks):**
-- membership_swap: 30, none_check_swap: 28, comparison_swap: 26
-- condition_inversion: 21, boolean_flip: 16, value_swap: 16
-- constant_mutation: 9, arithmetic_swap: 4, return_value_swap: 2
+**httpx (117 tasks, 3 unvalidated removed):**
+- none_check_swap: 28, comparison_swap: 23, condition_inversion: 21
+- boolean_flip: 16, value_swap: 14, constant_mutation: 9
+- arithmetic_swap: 4, return_value_swap: 2
+
+> Counts recomputed from eval_tasks_httpx.jsonl (117 tasks). 3 removed tasks
+> were: httpx-content-L195, httpx-asgi-L37, httpx-main-L38 (not in httpx_killed.json).
 
 ### Category Coverage
 
-**pydantic-ai**: 20 categories — ssrf(20), usage(16), messages(15), utils(14), json_schema(13), models(12), agent(10), ...
+**pydantic-ai**: 16 categories — ssrf(19), usage(14), utils(13), parts_manager(12), tools(10), concurrency(9), direct_api(9), json_schema(9), messages(9), retries(7), models(5), exceptions(3), builtin_tools(3), ui(3), thinking(2), settings(1)
 
-**httpx**: 12 categories — transports(25), config(15), content(15), multipart(15), utils(15), cli(14), decoders(14), auth(11), models(10), url_parsing(9), client(8), exceptions(1)
+**httpx**: 11 categories — transports(20), config(15), multipart(13), utils(13), cli(11), decoders(11), content(11), auth(9), url_parsing(8), client(5), exceptions(1)
 
 ### Dual Query Modes
 - **Dev-localized** (exact): File name + line number + operator diff. This is ceiling-ish —
@@ -286,14 +290,19 @@ this because it includes structural metadata (file paths from the graph) in the 
 - IDF-weighted score of query terms against symbol names
 - Budget level (categorical)
 
-### Training
-- Leave-one-out cross-validation over tasks (prevents leakage)
-- Logistic regression (interpretable, publishable coefficients)
-- Labels: which method passed for each task/budget/query_type combination
+### Two Router Tiers
+1. **Majority-vote LOO-CV** (implemented in `compute_router_loo`): For each (budget, query_type),
+   selects the method with the highest pass rate on all other tasks. Simplest possible "pick the
+   best method" router. This is what the benchmark computes automatically.
+2. **Logistic regression** (post-hoc analysis): Train on `{entity_count_mapped,
+   query_identifier_density, budget, retrieval_softmax_entropy, retrieval_effective_candidates,
+   retrieval_budget_utilization}` → predict best method. LOO-CV + leave-one-repo-out.
+   Interpretable coefficients publishable in paper.
 
 ### Expected Story
 Router recovers X% of the oracle gap (best single method vs oracle upper bound).
-At minimum, router should beat any single method's average performance.
+At minimum, the majority-vote router should beat any single method's average performance.
+The logistic regression router should further close the gap by conditioning on task features.
 
 ---
 
@@ -422,7 +431,9 @@ can never accidentally burn gpt-4o credits. To run the conference variant, you m
 | Skipped (no matching test found) | 485 | 26 |
 | **Candidate kill rate** (killed / total candidates) | **13.7%** (199/1454) | **54.1%** (210/388) |
 | **Tested kill rate** (killed / (killed + survived)) | **20.5%** (199/969) | **58.0%** (210/362) |
-| Selected for eval | 174 | 152 |
+| Selected for eval (pre-filter) | 174 | 152 |
+| Syntax-invalid (filtered out) | 46 | 32 |
+| **Final eval tasks** | **128** | **117** |
 
 **Why two rates matter**: Candidate kill rate reflects overall test coverage breadth (how much code
 is tested at all). Tested kill rate reflects test sensitivity (how well tests detect mutations in
@@ -440,7 +451,7 @@ This is typical for larger frameworks where many modules have integration tests 
 
 The mutations span a wide range of function/class sizes — from 1-line constants to 1400-line classes.
 
-**pydantic-ai (174 tasks):**
+**pydantic-ai (174 pre-filter candidates → 128 final eval tasks):**
 | Size bucket | Count | % |
 |-------------|-------|---|
 | <5 lines | 9 | 5% |
@@ -450,7 +461,11 @@ The mutations span a wide range of function/class sizes — from 1-line constant
 | 100+ lines | 8 | 5% |
 | **Median: 20 lines, Mean: 82.5, Range: 1-1406** |||
 
-**httpx (152 tasks):**
+> Counts above are from the pre-filter 174 candidates (sums to 174, not 128).
+> 46 syntax-invalid mutations were removed. Post-filter distribution to be
+> recomputed after the full run if materially different.
+
+**httpx (152 pre-filter candidates → 117 final eval tasks):**
 | Size bucket | Count | % |
 |-------------|-------|---|
 | <5 lines | 8 | 5% |
@@ -459,6 +474,10 @@ The mutations span a wide range of function/class sizes — from 1-line constant
 | 50-100 lines | 20 | 13% |
 | 100+ lines | 10 | 7% |
 | **Median: 27 lines, Mean: 37.8, Range: 2-241** |||
+
+> Counts above are from the pre-filter 152 candidates (sums to 152, not 117).
+> 32 syntax-invalid + 3 unvalidated mutations were removed. Post-filter
+> distribution to be recomputed after the full run if materially different.
 
 **Paper point**: This diversity matters because short functions fit entirely in small budgets
 (even 1k tokens), while large classes require intelligent selection of which parts to include.
@@ -533,8 +552,8 @@ The clean structure for the paper:
 4. **Results**: No single method dominates. Show main table. This is the thesis, not a failure.
 5. **Mechanism**: Explain *why*. Use failure modes + graph hops + entity density + closure overhead.
    This is the section that makes reviewers take the paper seriously.
-6. **Router**: Oracle gap exists. Simple logistic regression router closes X% of the gap without
-   extra LLM calls. Show router vs best-single-method vs oracle.
+6. **Router**: Oracle gap exists. Majority-vote LOO-CV router closes X% of the gap. Post-hoc
+   logistic regression on retrieval confidence features closes further. No extra LLM calls.
 7. **Limits**: Python-only, mutation testing is a proxy for real bugs, dev-localized descriptions
    may be overly informative (inflates no_retrieval), two repos only (detailed case study, not
    a general claim).

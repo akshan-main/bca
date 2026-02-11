@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
-import pytest
 
 from cegraph.graph.builder import GraphBuilder
 from cegraph.graph.query import GraphQuery
@@ -83,7 +81,7 @@ class TestGraphBuilderReuse:
 
         builder = GraphBuilder()
         g1 = builder.build_from_directory(p1)
-        g1_files = {d["path"] for _, d in g1.nodes(data=True) if d.get("type") == "file"}
+        _ = {d["path"] for _, d in g1.nodes(data=True) if d.get("type") == "file"}
 
         # Second project with different files
         p2 = tmp_path / "proj2"
@@ -177,7 +175,6 @@ class TestGraphQuery:
     def test_what_calls(self, tmp_project: Path):
         query = self._build_query(tmp_project)
         callees = query.what_calls("main")
-        callee_names = [c["name"] for c in callees]
         # main() should call several functions
         assert len(callees) > 0
 

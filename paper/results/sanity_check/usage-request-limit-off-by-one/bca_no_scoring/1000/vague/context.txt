@@ -1,0 +1,98 @@
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    usage: _usage.RunUsage = dataclasses.field(default_factory=_usage.RunUsage)
+
+## pydantic_ai_slim/pydantic_ai/_cli/__init__.py
+
+async def ask_agent(
+    agent: AbstractAgent[AgentDepsT, OutputDataT],
+    prompt: str,
+    stream: bool,
+    console: Console,
+    code_theme: str,
+    deps: AgentDepsT = None,
+    messages: Sequence[ModelMessage] | None = None,
+    model_settings: ModelSettings | None = None,
+    usage_limits: _usage.UsageLimits | None = None,
+) -> list[ModelMessage]:
+    status = Status('[dim]Working on it…[/dim]', console=console)
+
+    if not stream:
+        with status:
+            result = await agent.run(prompt, message_history=messages, deps=deps)
+        content = str(result.output)
+        console.print(Markdown(content, code_theme=code_theme))
+        return result.all_messages()
+
+    with status, ExitStack() as stack:
+        async with agent.iter(
+            prompt, message_history=messages, deps=deps, model_settings=model_settings, usage_limits=usage_limits
+        ) as agent_run:
+            live = Live('', refresh_per_second=15, console=console, vertical_overflow='ellipsis')
+            async for node in agent_run:
+                if Agent.is_model_request_node(node):
+                    async with node.stream(agent_run.ctx) as handle_stream:
+                        status.stop()  # stopping multiple times is idempotent
+                        stack.enter_context(live)  # entering multiple times is idempotent
+
+                        async for content in handle_stream.stream_output(debounce_by=None):
+                            live.update(Markdown(str(content), code_theme=code_theme))
+
+        assert agent_run.result is not None
+        return agent_run.result.all_messages()
+
+## pydantic_ai_slim/pydantic_ai/concurrency.py
+
+async def _null_context() -> AsyncIterator[None]:
+    """A no-op async context manager."""
+    yield
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    stop: StopBaseT
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    request_limit: int | None = 50
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_cache_write_and_read(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    """Integration test covering all cache settings using a recorded cassette.
+
+    This test enables all 3 cache settings plus 2 manual CachePoints (5 total),
+    which triggers the _limit_cache_points logic to strip the oldest one (limit is 4).
+    """
+    model = BedrockConverseModel('us.anthropic.claude-sonnet-4-5-20250929-v1:0', provider=bedrock_provider)
+    agent = Agent(
+        model,
+        system_prompt='YOU MUST RESPONSE ONLY WITH SINGLE NUMBER\n' * 50,  # More tokens to activate a cache
+        model_settings=BedrockModelSettings(
+            bedrock_cache_instructions=True,  # 1 cache point
+            bedrock_cache_tool_definitions=True,  # 1 cache point
+            bedrock_cache_messages=True,  # 1 cache point (on last user message)
+        ),
+    )
+
+    @agent.tool_plain
+    def catalog_lookup() -> str:  # pragma: no cover - exercised via agent call
+        return 'catalog-ok'
+
+    @agent.tool_plain
+    def diagnostics() -> str:  # pragma: no cover - exercised via agent call
+        return 'diagnostics-ok'
+
+    long_context = 'Newer response with something except single number\n' * 10
+    document = BinaryContent(data=b'You are a great mathematician', media_type='text/plain')
+    # 2 CachePoints, more that maximum allowed, so will be stripped.
+    run_args = [long_context, CachePoint(), document, CachePoint(), 'What is 10 + 11?']
+
+    first = await agent.run(run_args)
+    assert first.output == snapshot('21')
+    first_usage = first.usage()
+    assert first_usage == snapshot(RunUsage(input_tokens=1324, cache_write_tokens=1322, output_tokens=5, requests=1))
+
+    second = await agent.run(run_args)
+    assert second.output == snapshot('21')
+    second_usage = second.usage()
+    assert second_usage == snapshot(RunUsage(input_tokens=1324, output_tokens=5, cache_read_tokens=1322, requests=1))

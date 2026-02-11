@@ -51,6 +51,7 @@ class LLMResponse(BaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
     finish_reason: str = ""
     usage: dict[str, int] = Field(default_factory=dict)
+    system_fingerprint: str = ""  # OpenAI cluster fingerprint for reproducibility auditing
 
     @property
     def has_tool_calls(self) -> bool:

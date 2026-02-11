@@ -22,8 +22,6 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -79,7 +77,7 @@ class MutationCandidate:
     mutated: str            # mutated line content (same stripping)
     mutation_type: str      # category name
     test_cmd: str           # pytest command to run
-    killed: Optional[bool] = None  # True if tests fail with mutation, None if untested
+    killed: bool | None = None  # True if tests fail with mutation, None if untested
 
     def to_dict(self) -> dict:
         return {
@@ -139,7 +137,7 @@ def _last_line(node: ast.AST) -> int:
     return last
 
 
-def line_in_function_body(line_num: int, spans: list[FunctionSpan]) -> Optional[FunctionSpan]:
+def line_in_function_body(line_num: int, spans: list[FunctionSpan]) -> FunctionSpan | None:
     """Check if a 1-based line number falls inside any function body."""
     for span in spans:
         if span.start_line <= line_num <= span.end_line:
@@ -159,7 +157,7 @@ class MutationPattern:
     replacement: str
     priority: int = 0  # higher = more interesting, preferred
 
-    def apply(self, line: str) -> Optional[str]:
+    def apply(self, line: str) -> str | None:
         """Apply this mutation to a line. Returns mutated line or None."""
         match = self.regex.search(line)
         if match:
@@ -175,7 +173,7 @@ class CallableMutationPattern:
     name: str
     priority: int = 0
 
-    def apply(self, line: str) -> Optional[str]:
+    def apply(self, line: str) -> str | None:
         raise NotImplementedError
 
 
@@ -195,7 +193,7 @@ class ComparisonSwapPattern(CallableMutationPattern):
     def __init__(self):
         super().__init__(name="comparison_swap", priority=8)
 
-    def apply(self, line: str) -> Optional[str]:
+    def apply(self, line: str) -> str | None:
         stripped = line.lstrip()
 
         # Don't mutate string literals or comments
@@ -205,8 +203,9 @@ class ComparisonSwapPattern(CallableMutationPattern):
         for old, new in self.SWAPS:
             # Use word-boundary-aware replacement to avoid mangling strings
             # Look for operator surrounded by spaces or adjacent to identifiers
+            # Also exclude '-' before '>' to avoid mutating return annotations (-> to ->=)
             pattern = re.compile(
-                r'(?<!=)(?<!<)(?<!>)(?<!!)' + re.escape(old) + r'(?!=)(?!<)(?!>)'
+                r'(?<!=)(?<!<)(?<!>)(?<!!)(?<!-)' + re.escape(old) + r'(?!=)(?!<)(?!>)'
             )
             match = pattern.search(line)
             if match:
@@ -226,7 +225,7 @@ class BooleanFlipPattern(CallableMutationPattern):
     def __init__(self):
         super().__init__(name="boolean_flip", priority=7)
 
-    def apply(self, line: str) -> Optional[str]:
+    def apply(self, line: str) -> str | None:
         # and -> or
         result = re.sub(r'\band\b', 'or', line, count=1)
         if result != line and not _in_string(line[:line.find(' and ')]):
@@ -244,7 +243,7 @@ class ConditionInversionPattern(CallableMutationPattern):
     def __init__(self):
         super().__init__(name="condition_inversion", priority=6)
 
-    def apply(self, line: str) -> Optional[str]:
+    def apply(self, line: str) -> str | None:
         # Remove `not ` prefix from conditions
         match = re.search(r'\bnot\s+(\w)', line)
         if match:
@@ -272,7 +271,7 @@ class ArithmeticSwapPattern(CallableMutationPattern):
     def __init__(self):
         super().__init__(name="arithmetic_swap", priority=9)
 
-    def apply(self, line: str) -> Optional[str]:
+    def apply(self, line: str) -> str | None:
         stripped = line.lstrip()
 
         # Skip decorator lines, imports, string-only lines
@@ -327,7 +326,7 @@ class ValueSwapPattern(CallableMutationPattern):
     def __init__(self):
         super().__init__(name="value_swap", priority=5)
 
-    def apply(self, line: str) -> Optional[str]:
+    def apply(self, line: str) -> str | None:
         # True -> False
         match = re.search(r'\bTrue\b', line)
         if match:
@@ -353,7 +352,7 @@ class NoneCheckPattern(CallableMutationPattern):
     def __init__(self):
         super().__init__(name="none_check_swap", priority=9)
 
-    def apply(self, line: str) -> Optional[str]:
+    def apply(self, line: str) -> str | None:
         # is not None -> is None
         match = re.search(r'\bis\s+not\s+None\b', line)
         if match:
@@ -379,8 +378,10 @@ class MembershipTestPattern(CallableMutationPattern):
     def __init__(self):
         super().__init__(name="membership_swap", priority=7)
 
-    def apply(self, line: str) -> Optional[str]:
-        # not in -> in
+    def apply(self, line: str) -> str | None:
+        stripped = line.lstrip()
+
+        # not in -> in (safe: always produces valid syntax)
         match = re.search(r'\bnot\s+in\b', line)
         if match:
             before = line[:match.start()]
@@ -388,13 +389,19 @@ class MembershipTestPattern(CallableMutationPattern):
                 result = line[:match.start()] + "in" + line[match.end():]
                 return result
 
-        # in -> not in (only if it looks like a membership test)
+        # in -> not in (only in `if/elif/while/=` contexts, NOT `for ... in ...`)
+        # `for x in y` -> `for x not in y` is a syntax error
+        if stripped.startswith("for "):
+            return None
         match = re.search(r'(\w)\s+in\s+(\w)', line)
         if match:
             before = line[:match.start()]
             if not _in_string(before):
-                # Find the 'in' keyword position
+                # Also skip generator expressions: `(x for x in y)`
                 in_pos = line.index(' in ', match.start())
+                prefix = line[:in_pos].rstrip()
+                if re.search(r'\bfor\s+\w+$', prefix):
+                    return None
                 result = line[:in_pos] + " not in" + line[in_pos + 3:]
                 return result
 
@@ -407,7 +414,7 @@ class ConstantMutationPattern(CallableMutationPattern):
     def __init__(self):
         super().__init__(name="constant_mutation", priority=4)
 
-    def apply(self, line: str) -> Optional[str]:
+    def apply(self, line: str) -> str | None:
         stripped = line.lstrip()
 
         # Skip lines that are just assignments to version strings, etc.
@@ -445,7 +452,7 @@ class ReturnValuePattern(CallableMutationPattern):
     def __init__(self):
         super().__init__(name="return_value_swap", priority=3)
 
-    def apply(self, line: str) -> Optional[str]:
+    def apply(self, line: str) -> str | None:
         stripped = line.lstrip()
         indent = line[:len(line) - len(stripped)]
 
@@ -520,7 +527,7 @@ ALL_PATTERNS: list[CallableMutationPattern] = sorted([
 # Test file discovery
 # ---------------------------------------------------------------------------
 
-def find_test_file(source_file: str, repo_path: Path, tests_dir_name: str = TESTS_DIR) -> Optional[str]:
+def find_test_file(source_file: str, repo_path: Path, tests_dir_name: str = TESTS_DIR) -> str | None:
     """Heuristic: given a source file path, find the corresponding test file.
 
     Strategy:
@@ -638,7 +645,7 @@ def should_skip_line(line: str, line_num: int, spans: list[FunctionSpan]) -> boo
 
 def generate_mutations_for_line(
     line: str, line_num: int, spans: list[FunctionSpan]
-) -> Optional[tuple[str, str, str]]:
+) -> tuple[str, str, str] | None:
     """Generate the best single mutation for a line.
 
     Returns (mutated_line_stripped, mutation_type, original_stripped) or None.
@@ -752,7 +759,7 @@ def discover_all_mutations(
 # Mutation testing
 # ---------------------------------------------------------------------------
 
-def apply_mutation(file_path: Path, line_num: int, original: str, mutated: str) -> Optional[str]:
+def apply_mutation(file_path: Path, line_num: int, original: str, mutated: str) -> str | None:
     """Apply a mutation to a file. Returns original content for revert, or None on failure."""
     try:
         content = file_path.read_text()
@@ -855,8 +862,19 @@ def test_mutations(
             file_path, candidate.line_num, candidate.original, candidate.mutated
         )
         if original_content is None:
-            log(f"    SKIP: could not apply mutation")
+            log("    SKIP: could not apply mutation")
             candidate.killed = None
+            tested.append(candidate)
+            continue
+
+        # Verify mutation produces valid Python (reject syntax-breaking mutations)
+        try:
+            mutated_source = file_path.read_text(encoding="utf-8")
+            ast.parse(mutated_source)
+        except SyntaxError:
+            log("    SKIP: mutation produces invalid syntax")
+            candidate.killed = None
+            revert_file(file_path, original_content)
             tested.append(candidate)
             continue
 
@@ -869,7 +887,7 @@ def test_mutations(
                 log(f"    KILLED (rc={returncode})")
             else:
                 candidate.killed = False
-                log(f"    SURVIVED -- mutation not detected")
+                log("    SURVIVED -- mutation not detected")
         except Exception as e:
             log(f"    ERROR: {e}")
             candidate.killed = None

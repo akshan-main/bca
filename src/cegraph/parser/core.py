@@ -14,28 +14,15 @@ def parse_file(file_path: str, source: str | None = None) -> FileSymbols | None:
     """Parse a single file, auto-detecting language and selecting the best parser.
 
     Returns None if the file's language is not supported.
-
-    - Python: uses stdlib ast (zero deps, high accuracy)
-    - JS/TS, Go, Rust, Java: uses tree-sitter (required dep, full AST)
+    Currently only Python is supported (via stdlib AST).
     """
     language = detect_language(file_path)
-    if not language:
+    if language != "python":
         return None
 
-    # Python uses stdlib AST — better than tree-sitter for Python
-    if language == "python":
-        from cegraph.parser.python_parser import parse_python_file
+    from cegraph.parser.python_parser import parse_python_file
 
-        return parse_python_file(file_path, source)
-
-    # Everything else uses tree-sitter
-    from cegraph.parser.tree_sitter_parser import is_available, parse_tree_sitter_file
-
-    if is_available(language):
-        return parse_tree_sitter_file(file_path, language, source)
-
-    # Language detected but no tree-sitter grammar installed
-    return None
+    return parse_python_file(file_path, source)
 
 
 def parse_directory(

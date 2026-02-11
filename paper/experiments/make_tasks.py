@@ -20,7 +20,6 @@ import json
 import subprocess
 from pathlib import Path
 
-
 # Each mutation is:
 #   file: relative path to the file to mutate
 #   line_num: 1-based line number where the original string starts

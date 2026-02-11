@@ -50,8 +50,7 @@ AI coding assistants today operate blind:
                      ▼
 ┌─────────────────────────────────────────────────┐
 │              Code Parser Layer                    │
-│  tree-sitter (multi-lang) │ Python AST fallback  │
-│  Regex patterns (fallback)│ .gitignore aware     │
+│  Python AST (stdlib)      │ .gitignore aware     │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -180,7 +179,7 @@ cegraph config set llm.model gpt-4o
 ```toml
 [project]
 name = "my-project"
-languages = ["python", "javascript", "typescript"]
+languages = ["python"]
 
 [llm]
 provider = "anthropic"  # openai, anthropic, local

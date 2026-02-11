@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from cegraph.graph.builder import GraphBuilder
+from cegraph.search.classifier import QueryClassifier
 from cegraph.search.lexical import LexicalSearch
 from cegraph.search.hybrid import HybridSearch
 
@@ -64,6 +64,60 @@ class TestLexicalSearch:
         # Should find the constant and know it's in utils.py
         assert len(results) > 0
         assert any("utils" in r.file_path for r in results)
+
+
+class TestQueryClassifier:
+    def _build_classifier(self, tmp_project: Path) -> QueryClassifier:
+        builder = GraphBuilder()
+        graph = builder.build_from_directory(tmp_project)
+        return QueryClassifier(graph)
+
+    def test_exact_query(self, tmp_project: Path):
+        """Queries with specific identifiers should classify as exact."""
+        classifier = self._build_classifier(tmp_project)
+        result = classifier.classify("Fix the bug in calculate_total function")
+        assert result.query_type == "exact"
+        assert result.recommended_method == "bca"
+
+    def test_vague_query(self, tmp_project: Path):
+        """Natural language queries without identifiers should classify as vague."""
+        classifier = self._build_classifier(tmp_project)
+        result = classifier.classify("fix the login flow and improve error handling")
+        assert result.query_type == "vague"
+        assert result.recommended_method == "bm25"
+
+    def test_structural_query(self, tmp_project: Path):
+        """Queries about call relationships should classify as structural."""
+        classifier = self._build_classifier(tmp_project)
+        result = classifier.classify("who calls helper_function")
+        assert result.query_type == "structural"
+        assert result.recommended_method == "graph"
+
+    def test_structural_impact(self, tmp_project: Path):
+        """Impact queries should classify as structural."""
+        classifier = self._build_classifier(tmp_project)
+        result = classifier.classify("what is the impact of changing calculate_total")
+        assert result.query_type == "structural"
+
+    def test_classification_has_features(self, tmp_project: Path):
+        """Classification should include debug features."""
+        classifier = self._build_classifier(tmp_project)
+        result = classifier.classify("Fix the User class")
+        assert "entity_density" in result.features
+        assert "symbol_hit_ratio" in result.features
+        assert "idf_weighted_score" in result.features
+        assert "structural_score" in result.features
+
+    def test_confidence_range(self, tmp_project: Path):
+        """Confidence should be in [0, 1]."""
+        classifier = self._build_classifier(tmp_project)
+        for query in [
+            "fix calculate_total",
+            "improve the app",
+            "who calls main",
+        ]:
+            result = classifier.classify(query)
+            assert 0.0 <= result.confidence <= 1.0
 
 
 class TestHybridSearch:

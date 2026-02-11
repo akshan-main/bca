@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -200,36 +198,3 @@ def run_pipeline(items: List[str], processor_name: str = "default") -> List[str]
 '''
 
 
-@pytest.fixture
-def sample_js_source() -> str:
-    """Sample JavaScript source code for parser testing."""
-    return '''import { useState, useEffect } from "react";
-import axios from "axios";
-
-const API_URL = "https://api.example.com";
-
-export class UserService {
-    constructor(baseUrl) {
-        this.baseUrl = baseUrl;
-    }
-
-    async getUser(id) {
-        const response = await axios.get(`${this.baseUrl}/users/${id}`);
-        return response.data;
-    }
-
-    async createUser(data) {
-        const response = await axios.post(`${this.baseUrl}/users`, data);
-        return response.data;
-    }
-}
-
-export function formatName(first, last) {
-    return `${first} ${last}`;
-}
-
-export const fetchData = async (url) => {
-    const response = await fetch(url);
-    return response.json();
-};
-'''

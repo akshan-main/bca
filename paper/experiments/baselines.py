@@ -43,6 +43,7 @@ class BaselineResult:
     assembly_time_ms: float
     selected_symbols: list[str] = field(default_factory=list)
     recall: float | None = None
+    retrieval_scores: list[float] = field(default_factory=list)  # Raw scores for Router B features
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +174,9 @@ def baseline_bm25(
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
+    # Capture top-50 positive scores for Router B confidence features (capped to avoid bloat)
+    all_scores = [s for s, _ in scored if s > 0][:50]
+
     # Greedy packing
     selected: list[str] = []
     total_tokens = 0
@@ -201,6 +205,7 @@ def baseline_bm25(
         files_included=len(files),
         assembly_time_ms=round(elapsed, 1),
         selected_symbols=selected,
+        retrieval_scores=all_scores,
     )
 
 

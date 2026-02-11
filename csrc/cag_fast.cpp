@@ -13,7 +13,7 @@
  *   - SIMD-friendly token estimation
  *   - Zero-copy result marshalling via pre-allocated output buffers
  *
- * Copyright (c) 2025 CodeSight Contributors. MIT License.
+ * Copyright (c) 2025 CeGraph Contributors. MIT License.
  */
 
 #include <cstdint>

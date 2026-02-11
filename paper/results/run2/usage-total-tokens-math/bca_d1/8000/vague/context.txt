@@ -1,0 +1,807 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## examples/pydantic_ai_examples/question_graph.py
+
+from pydantic_graph import (
+    BaseNode,
+    End,
+    Graph,
+    GraphRunContext,
+)
+
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+## pydantic_ai_slim/pydantic_ai/direct.py
+
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far."""
+        return self._ensure_stream_ready().usage()
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py
+
+    async def _invoke_model(self, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """Invoke the Bedrock model and return parsed response with token count.
+
+        Returns:
+            A tuple of (response_body, input_token_count).
+        """
+        try:
+            response: InvokeModelResponseTypeDef = await anyio.to_thread.run_sync(
+                functools.partial(
+                    self.client.invoke_model,
+                    modelId=self._model_name,
+                    body=json.dumps(body),
+                    contentType='application/json',
+                    accept='application/json',
+                )
+            )
+        except ClientError as e:
+            status_code = e.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+            if isinstance(status_code, int):
+                raise ModelHTTPError(status_code=status_code, model_name=self.model_name, body=e.response) from e
+            raise ModelAPIError(model_name=self.model_name, message=str(e)) from e
+
+        # Extract input token count from HTTP headers
+        input_tokens = int(
+            response.get('ResponseMetadata', {}).get('HTTPHeaders', {}).get('x-amzn-bedrock-input-token-count', '0')
+        )
+
+        response_body = json.loads(response['body'].read())
+        return response_body, input_tokens
+
+## pydantic_ai_slim/pydantic_ai/embeddings/google.py
+
+def _map_usage(
+    response: EmbedContentResponse,
+    provider: str,
+    provider_url: str,
+    model: str,
+) -> RequestUsage:
+    """Map Google embedding response to RequestUsage.
+
+    Note: The Gemini API (google-gla) doesn't return token usage information.
+    Vertex AI (google-vertex) returns token_count in embedding statistics.
+    """
+    total_tokens = 0
+    if response.embeddings:  # pragma: no branch
+        for emb in response.embeddings:
+            if emb.statistics and emb.statistics.token_count:
+                total_tokens += int(emb.statistics.token_count)  # pragma: lax no cover -- requires vertexai
+
+    return RequestUsage(input_tokens=total_tokens)
+
+## pydantic_ai_slim/pydantic_ai/embeddings/result.py
+
+class EmbeddingResult:
+    """The result of an embedding operation.
+
+    This class contains the generated embeddings along with metadata about
+    the operation, including the original inputs, model information, usage
+    statistics, and timing.
+
+    Example:
+    ```python
+    from pydantic_ai import Embedder
+
+    embedder = Embedder('openai:text-embedding-3-small')
+
+
+    async def main():
+        result = await embedder.embed_query('What is AI?')
+
+        # Access embeddings by index
+        print(len(result.embeddings[0]))
+        #> 1536
+
+        # Access embeddings by original input text
+        print(result['What is AI?'] == result.embeddings[0])
+        #> True
+
+        # Check usage
+        print(f'Tokens used: {result.usage.input_tokens}')
+        #> Tokens used: 3
+    ```
+    """
+
+    embeddings: Sequence[Sequence[float]]
+    """The computed embedding vectors, one per input text.
+
+    Each embedding is a sequence of floats representing the text in vector space.
+    """
+
+    _: KW_ONLY
+
+    inputs: Sequence[str]
+    """The original input texts that were embedded."""
+
+    input_type: EmbedInputType
+    """Whether the inputs were embedded as queries or documents."""
+
+    model_name: str
+    """The name of the model that generated these embeddings."""
+
+    provider_name: str
+    """The name of the provider (e.g., 'openai', 'cohere')."""
+
+    timestamp: datetime = field(default_factory=_now_utc)
+    """When the embedding request was made."""
+
+    usage: RequestUsage = field(default_factory=RequestUsage)
+    """Token usage statistics for this request."""
+
+    provider_details: dict[str, Any] | None = None
+    """Provider-specific details from the response."""
+
+    provider_response_id: str | None = None
+    """Unique identifier for this response from the provider, if available."""
+
+    def __getitem__(self, item: int | str) -> Sequence[float]:
+        """Get the embedding for an input by index or by the original input text.
+
+        Args:
+            item: Either an integer index or the original input string.
+
+        Returns:
+            The embedding vector for the specified input.
+
+        Raises:
+            IndexError: If the index is out of range.
+            ValueError: If the string is not found in the inputs.
+        """
+        if isinstance(item, str):
+            item = self.inputs.index(item)
+
+        return self.embeddings[item]
+
+    def cost(self) -> genai_types.PriceCalculation:
+        """Calculate the cost of the embedding request.
+
+        Uses [`genai-prices`](https://github.com/pydantic/genai-prices) for pricing data.
+
+        Returns:
+            A price calculation object with `total_price`, `input_price`, and other cost details.
+
+        Raises:
+            LookupError: If pricing data is not available for this model/provider.
+        """
+        assert self.model_name, 'Model name is required to calculate price'
+        return calc_price(
+            self.usage,
+            self.model_name,
+            provider_id=self.provider_name,
+            genai_request_timestamp=self.timestamp,
+        )
+
+    def cost(self) -> genai_types.PriceCalculation:
+        """Calculate the cost of the embedding request.
+
+        Uses [`genai-prices`](https://github.com/pydantic/genai-prices) for pricing data.
+
+        Returns:
+            A price calculation object with `total_price`, `input_price`, and other cost details.
+
+        Raises:
+            LookupError: If pricing data is not available for this model/provider.
+        """
+        assert self.model_name, 'Model name is required to calculate price'
+        return calc_price(
+            self.usage,
+            self.model_name,
+            provider_id=self.provider_name,
+            genai_request_timestamp=self.timestamp,
+        )
+
+## pydantic_ai_slim/pydantic_ai/embeddings/voyageai.py
+
+def _map_usage(total_tokens: int) -> RequestUsage:
+    return RequestUsage(input_tokens=total_tokens)
+
+## pydantic_ai_slim/pydantic_ai/models/xai.py
+
+def _map_server_side_tools_used_to_name(server_side_tool: usage_pb2.ServerSideTool) -> str:
+    """Map xAI SDK ServerSideTool enum from usage.server_side_tools_used to a tool name.
+
+    Args:
+        server_side_tool: The ServerSideTool enum value from usage.server_side_tools_used.
+
+    Returns:
+        The tool name (e.g., 'web_search', 'code_execution').
+    """
+    mapping = {
+        usage_pb2.SERVER_SIDE_TOOL_WEB_SEARCH: WebSearchTool.kind,
+        usage_pb2.SERVER_SIDE_TOOL_CODE_EXECUTION: CodeExecutionTool.kind,
+        usage_pb2.SERVER_SIDE_TOOL_MCP: MCPServerTool.kind,
+        usage_pb2.SERVER_SIDE_TOOL_X_SEARCH: 'x_search',
+        usage_pb2.SERVER_SIDE_TOOL_COLLECTIONS_SEARCH: 'collections_search',
+        usage_pb2.SERVER_SIDE_TOOL_VIEW_IMAGE: 'view_image',
+        usage_pb2.SERVER_SIDE_TOOL_VIEW_X_VIDEO: 'view_x_video',
+    }
+    return mapping.get(server_side_tool, 'unknown')
+
+def _extract_usage(
+    response: chat_types.Response,
+    model: str,
+    provider: str,
+    provider_url: str,
+) -> RequestUsage:
+    """Extract usage information from xAI SDK response.
+
+    Extracts token counts and additional usage details including:
+    - reasoning_tokens: Tokens used for model reasoning/thinking
+    - cache_read_tokens: Tokens read from prompt cache
+    - server_side_tools_used: Count of server-side (built-in) tools executed
+    """
+    usage_obj = response.usage
+
+    # Build usage data dict with all integer fields for genai-prices extraction
+    usage_data: dict[str, int] = {
+        'prompt_tokens': usage_obj.prompt_tokens or 0,
+        'completion_tokens': usage_obj.completion_tokens or 0,
+    }
+
+    # Add reasoning tokens if available (optional attribute)
+    if usage_obj.reasoning_tokens:
+        usage_data['reasoning_tokens'] = usage_obj.reasoning_tokens
+
+    # Add cached prompt tokens if available (optional attribute)
+    if usage_obj.cached_prompt_text_tokens:
+        usage_data['cache_read_tokens'] = usage_obj.cached_prompt_text_tokens
+
+    # Aggregate server-side tools used by PydanticAI builtin tool name
+    if usage_obj.server_side_tools_used:
+        tool_counts: dict[str, int] = defaultdict(int)
+        for server_side_tool in usage_obj.server_side_tools_used:
+            tool_name = _map_server_side_tools_used_to_name(server_side_tool)
+            tool_counts[tool_name] += 1
+        # Add each tool as a separate details entry (server_side_tools must be flattened to comply with details being dict[str, int])
+        for tool_name, count in tool_counts.items():
+            usage_data[f'server_side_tools_{tool_name}'] = count
+
+    # Build details from non-standard fields
+    details = {k: v for k, v in usage_data.items() if k not in {'prompt_tokens', 'completion_tokens'}}
+
+    extracted = RequestUsage.extract(
+        dict(model=model, usage=usage_data),
+        provider=provider,
+        provider_url=provider_url,
+        provider_fallback='x_ai',  # Pricing file is defined as x_ai.yml
+        details=details or None,
+    )
+
+    # Ensure token counts are set even if genai-prices extraction failed
+    if extracted.input_tokens == 0 and usage_data['prompt_tokens']:
+        extracted.input_tokens = usage_data['prompt_tokens']
+    if extracted.output_tokens == 0 and usage_data['completion_tokens']:
+        extracted.output_tokens = usage_data['completion_tokens']
+
+    return extracted
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def usage(self) -> _usage.RunUsage:
+        """Get usage statistics for the run so far, including token usage, model requests, and so on."""
+        return self._graph_run.state.usage
+
+    def usage(self) -> _usage.RunUsage:
+        """Return the usage of the whole run."""
+        return self._state.usage
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+class UsageLimits:
+    """Limits on model usage.
+
+    The request count is tracked by pydantic_ai, and the request limit is checked before each request to the model.
+    Token counts are provided in responses from the model, and the token limits are checked after each response.
+
+    Each of the limits can be set to `None` to disable that limit.
+    """
+
+    request_limit: int | None = 50
+    """The maximum number of requests allowed to the model."""
+    tool_calls_limit: int | None = None
+    """The maximum number of successful tool calls allowed to be executed."""
+    input_tokens_limit: int | None = None
+    """The maximum number of input/prompt tokens allowed."""
+    output_tokens_limit: int | None = None
+    """The maximum number of output/response tokens allowed."""
+    total_tokens_limit: int | None = None
+    """The maximum number of tokens allowed in requests and responses combined."""
+    count_tokens_before_request: bool = False
+    """If True, perform a token counting pass before sending the request to the model,
+    to enforce `request_tokens_limit` ahead of time.
+
+    This may incur additional overhead (from calling the model's `count_tokens` API before making the actual request) and is disabled by default.
+
+    Supported by:
+
+    - Anthropic
+    - Google
+    - Bedrock Converse
+
+    Support for OpenAI is in development: https://github.com/pydantic/pydantic-ai/issues/3430
+    """
+
+    @property
+    @deprecated('`request_tokens_limit` is deprecated, use `input_tokens_limit` instead')
+    def request_tokens_limit(self) -> int | None:
+        return self.input_tokens_limit
+
+    @property
+    @deprecated('`response_tokens_limit` is deprecated, use `output_tokens_limit` instead')
+    def response_tokens_limit(self) -> int | None:
+        return self.output_tokens_limit
+
+    @overload
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+    ) -> None:
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit
+        self.output_tokens_limit = output_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    @overload
+    @deprecated(
+        'Use `input_tokens_limit` instead of `request_tokens_limit` and `output_tokens_limit` and `total_tokens_limit`'
+    )
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+    ) -> None:
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = request_tokens_limit
+        self.output_tokens_limit = response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+        # deprecated:
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+    ):
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit if input_tokens_limit is not None else request_tokens_limit
+        self.output_tokens_limit = output_tokens_limit if output_tokens_limit is not None else response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    def has_token_limits(self) -> bool:
+        """Returns `True` if this instance places any limits on token counts.
+
+        If this returns `False`, the `check_tokens` method will never raise an error.
+
+        This is useful because if we have token limits, we need to check them after receiving each streamed message.
+        If there are no limits, we can skip that processing in the streaming response iterator.
+        """
+        return any(
+            limit is not None for limit in (self.input_tokens_limit, self.output_tokens_limit, self.total_tokens_limit)
+        )
+
+    def check_before_request(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next request would exceed any of the limits."""
+        request_limit = self.request_limit
+        if request_limit is not None and usage.requests >= request_limit:
+            raise UsageLimitExceeded(f'The next request would exceed the request_limit of {request_limit}')
+
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(
+                f'The next request would exceed the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(  # pragma: lax no cover
+                f'The next request would exceed the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})'
+            )
+
+    def check_tokens(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the usage exceeds any of the token limits."""
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})')
+
+        output_tokens = usage.output_tokens
+        if self.output_tokens_limit is not None and output_tokens > self.output_tokens_limit:
+            raise UsageLimitExceeded(
+                f'Exceeded the output_tokens_limit of {self.output_tokens_limit} ({output_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})')
+
+    def check_before_tool_call(self, projected_usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next tool call(s) would exceed the tool call limit."""
+        tool_calls_limit = self.tool_calls_limit
+        tool_calls = projected_usage.tool_calls
+        if tool_calls_limit is not None and tool_calls > tool_calls_limit:
+            raise UsageLimitExceeded(
+                f'The next tool call(s) would exceed the tool_calls_limit of {tool_calls_limit} ({tool_calls=}).'
+            )
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    def request_tokens_limit(self) -> int | None:
+        return self.input_tokens_limit
+
+    def response_tokens_limit(self) -> int | None:
+        return self.output_tokens_limit
+
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+        # deprecated:
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+    ):
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit if input_tokens_limit is not None else request_tokens_limit
+        self.output_tokens_limit = output_tokens_limit if output_tokens_limit is not None else response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    def has_token_limits(self) -> bool:
+        """Returns `True` if this instance places any limits on token counts.
+
+        If this returns `False`, the `check_tokens` method will never raise an error.
+
+        This is useful because if we have token limits, we need to check them after receiving each streamed message.
+        If there are no limits, we can skip that processing in the streaming response iterator.
+        """
+        return any(
+            limit is not None for limit in (self.input_tokens_limit, self.output_tokens_limit, self.total_tokens_limit)
+        )
+
+    def check_tokens(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the usage exceeds any of the token limits."""
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})')
+
+        output_tokens = usage.output_tokens
+        if self.output_tokens_limit is not None and output_tokens > self.output_tokens_limit:
+            raise UsageLimitExceeded(
+                f'Exceeded the output_tokens_limit of {self.output_tokens_limit} ({output_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})')
+
+    def check_before_tool_call(self, projected_usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next tool call(s) would exceed the tool call limit."""
+        tool_calls_limit = self.tool_calls_limit
+        tool_calls = projected_usage.tool_calls
+        if tool_calls_limit is not None and tool_calls > tool_calls_limit:
+            raise UsageLimitExceeded(
+                f'The next tool call(s) would exceed the tool_calls_limit of {tool_calls_limit} ({tool_calls=}).'
+            )
+
+## tests/models/mock_xai.py
+
+class MockXai
+    """Mock xAI SDK AsyncClient."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def create_mock(
+        cls,
+        responses: Sequence[chat_types.Response | Exception],
+        api_key: str = 'test-api-key',
+    ) -> AsyncClient:
+        """Create a mock AsyncClient for non-streaming responses."""
+        return cast(AsyncClient, cls(responses=responses, api_key=api_key))
+
+def create_response(
+    content: str = '',
+    tool_calls: list[chat_pb2.ToolCall] | None = None,
+    finish_reason: FinishReason = 'stop',
+    usage: Any | None = None,
+    reasoning_content: str = '',
+    encrypted_content: str = '',
+    logprobs: list[chat_pb2.LogProb] | None = None,
+    index: int = 0,
+) -> chat_types.Response:
+    """Create a Response with a single output."""
+    output = chat_pb2.CompletionOutput(
+        index=index,
+        finish_reason=_get_proto_finish_reason(finish_reason),
+        message=chat_pb2.CompletionMessage(
+            content=content,
+            role=chat_pb2.MessageRole.ROLE_ASSISTANT,
+            reasoning_content=reasoning_content,
+            encrypted_content=encrypted_content,
+            tool_calls=tool_calls or [],
+        ),
+    )
+
+    if logprobs is not None:
+        output.logprobs.CopyFrom(chat_pb2.LogProbs(content=logprobs))
+
+    return _build_response_with_outputs('grok-123', [output], usage)
+
+def create_usage(
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    cached_prompt_text_tokens: int = 0,
+    server_side_tools_used: list[usage_pb2.ServerSideTool] | None = None,
+) -> usage_pb2.SamplingUsage:
+    """Helper to create xAI SamplingUsage protobuf objects for tests with all required fields."""
+    return usage_pb2.SamplingUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cached_prompt_text_tokens=cached_prompt_text_tokens,
+        server_side_tools_used=server_side_tools_used or [],
+    )
+
+## tests/models/test_openai.py
+
+def chunk_with_usage(
+    delta: list[ChoiceDelta],
+    finish_reason: FinishReason | None = None,
+    completion_tokens: int = 1,
+    prompt_tokens: int = 2,
+    total_tokens: int = 3,
+) -> chat.ChatCompletionChunk:
+    """Create a chunk with configurable usage stats for testing continuous_usage_stats."""
+    return chat.ChatCompletionChunk(
+        id='123',
+        choices=[
+            ChunkChoice(index=index, delta=delta, finish_reason=finish_reason) for index, delta in enumerate(delta)
+        ],
+        created=1704067200,  # 2024-01-01
+        model='gpt-4o-123',
+        object='chat.completion.chunk',
+        usage=CompletionUsage(
+            completion_tokens=completion_tokens, prompt_tokens=prompt_tokens, total_tokens=total_tokens
+        ),
+    )
+
+## tests/models/test_xai.py
+
+async def test_xai_request_simple_usage(allow_model_requests: None):
+    response = create_response(
+        content='world',
+        usage=create_usage(prompt_tokens=2, completion_tokens=1),
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Hello')
+    assert result.output == 'world'
+    assert result.usage() == snapshot(RunUsage(input_tokens=2, output_tokens=1, requests=1))
+
+async def test_xai_cost_calculation(allow_model_requests: None):
+    """Test that cost calculation works with genai-prices for xAI models."""
+    response = create_response(
+        content='world',
+        usage=create_usage(prompt_tokens=100, completion_tokens=50),
+    )
+    mock_client = MockXai.create_mock([response])
+    # Use grok-4-1-fast as grok-4-fast is not supported by genai-prices yet
+    m = XaiModel('grok-4-1-fast-non-reasoning', provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Hello')
+    assert result.output == 'world'
+
+    # Verify cost is calculated via genai-prices
+    last_message = result.all_messages()[-1]
+    assert isinstance(last_message, ModelResponse)
+    assert last_message.cost().total_price == snapshot(Decimal('0.000045'))
+
+async def test_xai_binary_content_unknown_media_type_raises(allow_model_requests: None):
+    """Cover the unsupported BinaryContent media type branch."""
+    response = create_response(content='ok', usage=create_usage(prompt_tokens=1, completion_tokens=1))
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    # Neither image/*, audio/*, nor a known document type => should fail during prompt mapping.
+    bc = BinaryContent(b'123', media_type='video/mp4')
+    with pytest.raises(RuntimeError, match='Unsupported binary content type: video/mp4'):
+        await agent.run(['hello', bc])
+
+async def test_xai_usage_with_reasoning_tokens(allow_model_requests: None):
+    """Test that xAI usage extraction includes reasoning tokens when available (mocked)."""
+    response = create_response(
+        content='42',
+        encrypted_content='sig',
+        usage=create_usage(prompt_tokens=10, completion_tokens=2, reasoning_tokens=7),
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m, model_settings=XaiModelSettings(xai_include_encrypted_content=True, max_tokens=20))
+
+    result = await agent.run('What is the meaning of life? Keep it very short.')
+    assert result.output == '42'
+    assert result.usage() == snapshot(
+        RunUsage(
+            input_tokens=10,
+            output_tokens=2,
+            requests=1,
+            details={'reasoning_tokens': 7},
+        )
+    )
+
+async def test_xai_usage_without_details(allow_model_requests: None):
+    """Test that xAI model handles usage without reasoning_tokens or cached tokens."""
+    mock_usage = create_usage(prompt_tokens=20, completion_tokens=10)
+    response = create_response(
+        content='Simple answer',
+        usage=mock_usage,
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Simple question')
+    assert result.output == 'Simple answer'
+
+    # Verify usage without details (empty dict when no additional usage info)
+    assert result.usage() == snapshot(RunUsage(input_tokens=20, output_tokens=10, requests=1))
+
+async def test_xai_usage_with_server_side_tools(allow_model_requests: None):
+    """Test that xAI model properly extracts server_side_tools_used from usage."""
+    # Create a mock usage object with server_side_tools_used
+    # In the real SDK, server_side_tools_used is a repeated field (list-like)
+    mock_usage = create_usage(
+        prompt_tokens=50,
+        completion_tokens=30,
+        server_side_tools_used=[usage_pb2.SERVER_SIDE_TOOL_WEB_SEARCH, usage_pb2.SERVER_SIDE_TOOL_WEB_SEARCH],
+    )
+    response = create_response(
+        content='The answer based on web search',
+        usage=mock_usage,
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Search for something')
+    assert result.output == 'The answer based on web search'
+
+    # Verify usage includes server_side_tools_used in details
+    assert result.usage() == snapshot(
+        RunUsage(input_tokens=50, output_tokens=30, details={'server_side_tools_web_search': 2}, requests=1)
+    )
+
+async def test_xai_map_builtin_tool_call_part_unknown_tool_name_ignored(allow_model_requests: None):
+    """Cover the fallback path where a builtin tool call part has an unknown tool name."""
+    response = create_response(content='ok', usage=create_usage(prompt_tokens=1, completion_tokens=1))
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    message_history: list[ModelMessage] = [
+        ModelResponse(
+            parts=[
+                BuiltinToolCallPart(
+                    tool_name='unknown_builtin_tool',
+                    args={'x': 1},
+                    tool_call_id='unknown_tool_1',
+                    provider_name='xai',
+                )
+            ],
+            model_name=XAI_NON_REASONING_MODEL,
+            timestamp=IsNow(tz=timezone.utc),
+            provider_name='xai',
+        )
+    ]
+
+    result = await agent.run('hello', message_history=message_history)
+    assert result.output == 'ok'
+
+async def test_xai_cache_point_filtered(allow_model_requests: None):
+    """Test that CachePoint in user prompt is filtered out."""
+    response = create_response(content='Hello', usage=create_usage(prompt_tokens=5, completion_tokens=2))
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    # Run with a user prompt that includes a CachePoint (which should be filtered)
+    result = await agent.run(['Hello', CachePoint(), ' world'])
+    assert result.output == 'Hello'
+
+    # Verify message was sent (CachePoint filtered out - only text items remain)
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [{'content': [{'text': 'Hello'}, {'text': ' world'}], 'role': 'ROLE_USER'}],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+async def test_xai_stream_empty_tool_call_name(allow_model_requests: None):
+    """Test streaming skips tool calls with empty function name."""
+    # Create a tool call with empty name
+    empty_name_tool_call = chat_pb2.ToolCall(
+        id='empty_name_001',
+        type=chat_pb2.ToolCallType.TOOL_CALL_TYPE_CLIENT_SIDE_TOOL,
+        function=chat_pb2.FunctionCall(name='', arguments='{}'),  # Empty name
+    )
+
+    # Create a streaming response with a tool call that has an empty name
+    chunk = create_stream_chunk(content='Hello', finish_reason='stop')
+    response = create_response_with_tool_calls(
+        content='Hello',
+        tool_calls=[empty_name_tool_call],
+        finish_reason='stop',
+        usage=create_usage(prompt_tokens=5, completion_tokens=2),
+    )
+
+    stream = [(response, chunk)]
+    mock_client = MockXai.create_mock_stream([stream])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    async with agent.run_stream('Hello') as result:
+        text_chunks = [c async for c in result.stream_text(debounce_by=None)]
+        # Should get text, but skip the empty-name tool call
+        assert 'Hello' in text_chunks[-1]

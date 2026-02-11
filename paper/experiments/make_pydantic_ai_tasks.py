@@ -107,11 +107,43 @@ def categorize_mutation(file_path: str) -> str:
 # Loading and deduplication
 # -------------------------------------------------------------------------
 
-def load_discovered(discovered_file: Path) -> list[dict]:
-    """Load killed mutations from discover_mutations.py output."""
+def load_discovered(discovered_file: Path, repo_path: Path | None = None) -> list[dict]:
+    """Load killed mutations, filtering out those that produce invalid syntax.
+
+    If repo_path is provided, each mutation is applied in-memory and ast.parse'd.
+    Mutations that fail to parse are excluded (they would crash the benchmark).
+    """
+    import ast
+
     with open(discovered_file) as f:
         data = json.load(f)
-    return [m for m in data if m.get("killed") is True]
+    killed = [m for m in data if m.get("killed") is True]
+
+    if repo_path is None:
+        return killed
+
+    valid = []
+    skipped = 0
+    for m in killed:
+        fp = repo_path / m["file"]
+        if not fp.exists():
+            valid.append(m)  # Can't validate, keep it
+            continue
+        try:
+            source = fp.read_text(encoding="utf-8")
+            lines = source.splitlines()
+            line_idx = m["line_num"] - 1
+            if 0 <= line_idx < len(lines):
+                mutated_line = lines[line_idx].replace(m["original"], m["mutated"], 1)
+                lines[line_idx] = mutated_line
+                ast.parse("\n".join(lines))
+            valid.append(m)
+        except SyntaxError:
+            skipped += 1
+
+    if skipped:
+        print(f"  Filtered {skipped} syntax-invalid mutations ({len(valid)} remaining)")
+    return valid
 
 
 # Full discovery stats from mutation_discovery.log (1454 candidates tested)
@@ -315,8 +347,9 @@ def generate_vague_description(mutation: dict) -> str:
     """
     mt = mutation["mutation_type"]
 
-    # Deterministic template selection within a mutation type (hash-based, no category leak)
-    selector = hash(f"{mutation['file']}:{mutation['line_num']}") % 3
+    # Deterministic template selection (hashlib — immune to PYTHONHASHSEED randomization)
+    import hashlib
+    selector = int(hashlib.sha256(f"{mutation['file']}:{mutation['line_num']}".encode()).hexdigest(), 16) % 3
 
     # Symptom templates by mutation type only — no category knowledge
     templates = {
@@ -554,8 +587,8 @@ Reproducibility:
     if args.discovered:
         discovered_file = Path(args.discovered)
         if discovered_file.exists():
-            all_discovered = load_discovered(discovered_file)
-            print(f"Discovered mutations (killed): {len(all_discovered)}")
+            all_discovered = load_discovered(discovered_file, repo_path=repo_path)
+            print(f"Discovered mutations (killed, syntax-valid): {len(all_discovered)}")
 
             deduped = deduplicate(handcrafted, all_discovered)
             print(f"After dedup: {len(deduped)}")

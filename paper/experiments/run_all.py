@@ -13,8 +13,8 @@ from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 
-from paper.experiments.baselines import BaselineResult, run_comparison
 from paper.experiments.ablation import AblationResult, run_ablation
+from paper.experiments.baselines import BaselineResult, run_comparison
 
 
 def aggregate_baselines(results: list[BaselineResult]) -> str:

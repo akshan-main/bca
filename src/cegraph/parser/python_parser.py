@@ -105,6 +105,9 @@ def _extract_from_module(
         elif isinstance(node, ast.Assign):
             _extract_assignment(node, file_path, result, parent_name, parent_id)
 
+        elif isinstance(node, ast.AnnAssign):
+            _extract_ann_assignment(node, file_path, result, parent_name, parent_id)
+
 
 def _extract_import(
     node: ast.Import | ast.ImportFrom, file_path: str, result: FileSymbols
@@ -281,6 +284,47 @@ def _extract_assignment(
             parent=parent_id,
         )
         result.symbols.append(symbol)
+
+
+def _extract_ann_assignment(
+    node: ast.AnnAssign,
+    file_path: str,
+    result: FileSymbols,
+    parent_name: str,
+    parent_id: str,
+) -> None:
+    """Extract annotated assignments (e.g. name: str = 'foo', model: Model)."""
+    if node.target is None:
+        return
+    name = _node_to_name(node.target)
+    if not name:
+        return
+    qualified = f"{parent_name}.{name}" if parent_name else name
+    kind = SymbolKind.CONSTANT if name.isupper() else SymbolKind.VARIABLE
+
+    symbol = Symbol(
+        name=name,
+        qualified_name=qualified,
+        kind=kind,
+        file_path=file_path,
+        line_start=node.lineno,
+        line_end=node.end_lineno or node.lineno,
+        parent=parent_id,
+    )
+    result.symbols.append(symbol)
+
+    # Extract TYPE_OF relationship from the annotation
+    type_name = _node_to_name(node.annotation)
+    if type_name:
+        result.relationships.append(
+            Relationship(
+                source=symbol.id,
+                target=type_name,
+                kind=RelKind.TYPE_OF,
+                file_path=file_path,
+                line=node.lineno,
+            )
+        )
 
 
 def _extract_calls(

@@ -1,0 +1,493 @@
+# .github/set_docs_pr_preview_url.py
+import os
+import re
+
+import httpx
+
+DEPLOY_OUTPUT = os.environ['DEPLOY_OUTPUT']
+GITHUB_TOKEN = os.environ['GITHUB_TOKEN']
+REPOSITORY = os.environ['REPOSITORY']
+PULL_REQUEST_NUMBER = os.environ['PULL_REQUEST_NUMBER']
+REF = os.environ['REF']
+
+m = re.search(r'https://(\S+)\.workers\.dev', DEPLOY_OUTPUT)
+assert m, f'Could not find worker URL in {DEPLOY_OUTPUT!r}'
+
+worker_name = m.group(1)
+m = re.search(r'Current Version ID: ([^-]+)', DEPLOY_OUTPUT)
+assert m, f'Could not find version ID in {DEPLOY_OUTPUT!r}'
+
+version_id = m.group(1)
+preview_url = f'https://{version_id}-{worker_name}.workers.dev'
+print('Docs preview URL:', preview_url, flush=True)
+
+gh_headers = {
+    'Accept': 'application/vnd.github+json',
+    'Authorization': f'Bearer {GITHUB_TOKEN}',
+    'X-GitHub-Api-Version': '2022-11-28',
+}
+
+# now create or update a comment on the PR with the preview URL
+if not PULL_REQUEST_NUMBER:
+    print('Pull request number not set', flush=True)
+    exit(1)
+
+comments_url = f'https://api.github.com/repos/{REPOSITORY}/issues/{PULL_REQUEST_NUMBER}/comments'
+r = httpx.get(comments_url, headers=gh_headers)
+print(f'{r.request.method} {r.request.url} {r.status_code}', flush=True)
+if r.status_code != 200:
+    print(f'Failed to get comments, status {r.status_code}, response:\n{r.text}', flush=True)
+    exit(1)
+
+comment_update_url = None
+
+for comment in r.json():
+    if comment['user']['login'] == 'github-actions[bot]' and comment['body'].startswith('## Docs Preview'):
+        comment_update_url = comment['url']
+        break
+
+body = f"""\
+## Docs Preview
+
+<table>
+<tr>
+<td><strong>commit:</strong></td>
+<td><code>{REF:.7}</code></td>
+</tr>
+<tr>
+<td><strong>Preview URL:</strong></td>
+<td><a href="{preview_url}">{preview_url}</a></td>
+</tr>
+</table>
+"""
+comment_data = {'body': body}
+
+if comment_update_url:
+    print('Updating existing comment...', flush=True)
+    r = httpx.patch(comment_update_url, headers=gh_headers, json=comment_data)
+else:
+    print('Creating new comment...', flush=True)
+    r = httpx.post(comments_url, headers=gh_headers, json=comment_data)
+
+print(f'{r.request.method} {r.request.url} {r.status_code}', flush=True)
+r.raise_for_status()
+
+
+# clai/clai/__init__.py
+from importlib.metadata import version as _metadata_version
+
+from pydantic_ai import _cli
+
+__all__ = '__version__', 'cli'
+__version__ = _metadata_version('clai')
+
+
+def cli():
+    """Run the clai CLI and exit."""
+    _cli.cli_exit('clai')
+
+
+# clai/clai/__main__.py
+"""This means `python -m clai` should run the CLI."""
+
+from pydantic_ai import _cli
+
+if __name__ == '__main__':
+    _cli.cli_exit('clai')
+
+
+# docs/.hooks/algolia.py
+# pyright: reportUnknownMemberType=false
+from __future__ import annotations as _annotations
+
+import os
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+from pydantic import TypeAdapter
+from typing_extensions import TypedDict
+
+if TYPE_CHECKING:
+    from mkdocs.config import Config
+    from mkdocs.structure.files import Files
+    from mkdocs.structure.pages import Page
+
+
+class AlgoliaRecord(TypedDict):
+    content: str
+    pageID: str
+    abs_url: str
+    title: str
+    objectID: str
+    rank: int
+
+
+records: list[AlgoliaRecord] = []
+records_ta = TypeAdapter(list[AlgoliaRecord])
+# these values should match docs/javascripts/search-worker.js.
+ALGOLIA_APP_ID = 'KPPUDTIAVX'
+ALGOLIA_INDEX_NAME = 'pydantic-ai-docs'
+
+# Algolia has a limit of 100kb per record in the paid plan,
+# leave some space for the other fields as well.
+MAX_CONTENT_LENGTH = 90_000
+
+
+def on_page_content(html: str, page: Page, config: Config, files: Files) -> str:
+    if not os.getenv('CI'):
+        return html
+
+    from bs4 import BeautifulSoup
+
+    assert page.title is not None, 'Page title must not be None'
+    title = cast(str, page.title)
+
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # If the page does not start with a heading, add the h1 with the title
+    # Some examples don't have a heading. or start with h2
+    first_element = soup.find()
+
+    if not first_element or not first_element.name or first_element.name not in ['h1', 'h2', 'h3']:
+        soup.insert(0, BeautifulSoup(f'<h1 id="{title}">{title}</h1>', 'html.parser'))
+
+    # Clean up presentational and UI elements
+    for element in soup.find_all(['autoref']):
+        element.decompose()
+
+    # this removes the large source code embeds from Github
+    for element in soup.find_all('details'):
+        element.decompose()
+
+    # Cleanup code examples
+    for extra in soup.find_all('div', attrs={'class': 'language-python highlight'}):
+        extra.replace_with(BeautifulSoup(f'<pre>{extra.find("code").get_text()}</pre>', 'html.parser'))
+
+    # Cleanup code examples, part 2
+    for extra in soup.find_all('div', attrs={'class': 'language-python doc-signature highlight'}):
+        extra.replace_with(BeautifulSoup(f'<pre>{extra.find("code").get_text()}</pre>', 'html.parser'))
+
+    # The API reference generates HTML tables with line numbers, this strips the line numbers cell and goes back to a code block
+    for extra in soup.find_all('table', attrs={'class': 'highlighttable'}):
+        extra.replace_with(BeautifulSoup(f'<pre>{extra.find("code").get_text()}</pre>', 'html.parser'))
+
+    headings = soup.find_all(['h1', 'h2', 'h3'])
+
+    # Use the rank to put the sections in the beginning higher in the search results
+    rank = 100
+
+    # Process each section
+    for current_heading in headings:
+        heading_id = current_heading.get('id', '')
+        section_title = current_heading.get_text().replace('¶', '').strip()
+
+        # Get content until next heading
+        content: list[str] = []
+        sibling = current_heading.find_next_sibling()
+        while sibling and sibling.name not in {'h1', 'h2', 'h3'}:
+            content.append(str(sibling))
+            sibling = sibling.find_next_sibling()
+
+        section_html = ''.join(content)
+
+        section_soup = BeautifulSoup(section_html, 'html.parser')
+        section_plain_text = section_soup.get_text(' ', strip=True)
+
+        # Create anchor URL
+        anchor_url: str = f'{page.abs_url}#{heading_id}' if heading_id else page.abs_url or ''
+
+        record_title = title
+
+        if current_heading.name == 'h2':
+            record_title = f'{title} - {section_title}'
+        elif current_heading.name == 'h3':
+            previous_heading = current_heading.find_previous(['h1', 'h2'])
+            record_title = f'{title} - {previous_heading.get_text()} - {section_title}'
+
+        # print(f'Adding record {record_title}, {rank}, {current_heading.name}')
+        # Create record for this section
+        records.append(
+            AlgoliaRecord(
+                content=section_plain_text,
+                pageID=title,
+                abs_url=anchor_url,
+                title=record_title,
+                objectID=anchor_url,
+                rank=rank,
+            )
+        )
+
+        rank -= 5
+
+    return html
+
+
+ALGOLIA_RECORDS_FILE = 'algolia_records.json'
+
+
+def on_post_build(config: Config) -> None:
+    if records:
+        algolia_records_path = Path(config['site_dir']) / ALGOLIA_RECORDS_FILE
+        with algolia_records_path.open('wb') as f:
+            f.write(records_ta.dump_json(records))
+
+
+def algolia_upload() -> None:
+    from algoliasearch.search.client import SearchClientSync
+
+    algolia_write_api_key = os.environ['ALGOLIA_WRITE_API_KEY']
+
+    client = SearchClientSync(ALGOLIA_APP_ID, algolia_write_api_key)
+    filtered_records: list[AlgoliaRecord] = []
+
+    algolia_records_path = Path.cwd() / 'site' / ALGOLIA_RECORDS_FILE
+
+    with algolia_records_path.open('rb') as f:
+        all_records = records_ta.validate_json(f.read())
+
+    for record in all_records:
+        content = record['content']
+        if len(content) > MAX_CONTENT_LENGTH:
+            print(
+                f"Record with title '{record['title']}' has more than {MAX_CONTENT_LENGTH} characters, {len(content)}."
+            )
+            print(content)
+        else:
+            filtered_records.append(record)
+
+    print(f'Uploading {len(filtered_records)} out of {len(all_records)} records to Algolia...')
+
+    client.clear_objects(index_name=ALGOLIA_INDEX_NAME)
+    client.set_settings(
+        index_name=ALGOLIA_INDEX_NAME,
+        index_settings={
+            'searchableAttributes': ['title', 'content'],
+            'attributesToSnippet': ['content:40'],
+            'customRanking': [
+                'desc(rank)',
+            ],
+        },
+    )
+
+    client.batch(
+        index_name=ALGOLIA_INDEX_NAME,
+        batch_write_params={'requests': [{'action': 'addObject', 'body': record} for record in filtered_records]},
+    )
+
+
+if __name__ == '__main__':
+    if sys.argv[-1] == 'upload':
+        algolia_upload()
+    else:
+        print('Run with "upload" argument to upload records to Algolia.')
+        exit(1)
+
+
+# docs/.hooks/main.py
+from __future__ import annotations as _annotations
+
+import re
+import time
+import urllib.parse
+from pathlib import Path
+
+from jinja2 import Environment
+from mkdocs.config import Config
+from mkdocs.structure.files import Files
+from mkdocs.structure.pages import Page
+from snippets import inject_snippets
+
+DOCS_ROOT = Path(__file__).parent.parent
+
+
+def on_page_markdown(markdown: str, page: Page, config: Config, files: Files) -> str:
+    """Called on each file after it is read and before it is converted to HTML."""
+    relative_path = DOCS_ROOT / page.file.src_uri
+    markdown = inject_snippets(markdown, relative_path.parent)
+    markdown = replace_uv_python_run(markdown)
+    markdown = render_examples(markdown)
+    markdown = render_video(markdown)
+    markdown = create_gateway_toggle(markdown, relative_path)
+    return markdown
+
+
+# path to the main mkdocs material bundle file, found during `on_env`
+bundle_path: Path | None = None
+
+
+def on_env(env: Environment, config: Config, files: Files) -> Environment:
+    global bundle_path
+    for file in files:
+        if re.match('assets/javascripts/bundle.[a-z0-9]+.min.js', file.src_uri):
+            bundle_path = Path(file.dest_dir) / file.src_uri
+
+    env.globals['build_timestamp'] = str(int(time.time()))
+    return env
+
+
+def on_post_build(config: Config) -> None:
+    """Inject extra CSS into mermaid styles to avoid titles being the same color as the background in dark mode."""
+    assert bundle_path is not None
+    if bundle_path.exists():
+        content = bundle_path.read_text(encoding='utf-8')
+        content, _ = re.subn(r'}(\.statediagram)', '}.statediagramTitleText{fill:#888}\1', content, count=1)
+        bundle_path.write_text(content, encoding='utf-8')
+
+
+def replace_uv_python_run(markdown: str) -> str:
+    return re.sub(r'```bash\n(.*?)(python/uv[\- ]run|pip/uv[\- ]add|py-cli)(.+?)\n```', sub_run, markdown)
+
+
+def sub_run(m: re.Match[str]) -> str:
+    prefix = m.group(1)
+    command = m.group(2)
+    if 'pip' in command:
+        pip_base = 'pip install'
+        uv_base = 'uv add'
+    elif command == 'py-cli':
+        pip_base = ''
+        uv_base = 'uv run'
+    else:
+        pip_base = 'python'
+        uv_base = 'uv run'
+    suffix = m.group(3)
+    return f"""\
+=== "pip"
+
+    ```bash
+    {prefix}{pip_base}{suffix}
+    ```
+
+=== "uv"
+
+    ```bash
+    {prefix}{uv_base}{suffix}
+    ```"""
+
+
+EXAMPLES_DIR = Path(__file__).parent.parent.parent / 'examples'
+
+
+def render_examples(markdown: str) -> str:
+    return re.sub(r'^#! *examples/(.+)', sub_example, markdown, flags=re.M)
+
+
+def sub_example(m: re.Match[str]) -> str:
+    example_path = EXAMPLES_DIR / m.group(1)
+    content = example_path.read_text(encoding='utf-8').strip()
+    # remove leading docstring which duplicates what's in the docs page
+    content = re.sub(r'^""".*?"""', '', content, count=1, flags=re.S).strip()
+
+    return content
+
+
+def render_video(markdown: str) -> str:
+    return re.sub(r'\{\{ *video\((["\'])(.+?)\1(?:, (\d+))?(?:, (\d+))?\) *\}\}', sub_cf_video, markdown)
+
+
+def sub_cf_video(m: re.Match[str]) -> str:
+    video_id = m.group(2)
+    time = m.group(3)
+    time = f'{time}s' if time else ''
+    padding_top = m.group(4) or '67'
+
+    domain = 'https://customer-nmegqx24430okhaq.cloudflarestream.com'
+    poster = f'{domain}/{video_id}/thumbnails/thumbnail.jpg?time={time}&height=600'
+    return f"""
+<div style="position: relative; padding-top: {padding_top}%;">
+  <iframe
+    src="{domain}/{video_id}/iframe?poster={urllib.parse.quote_plus(poster)}"
+    loading="lazy"
+    style="border: none; position: absolute; top: 0; left: 0; height: 100%; width: 100%;"
+    allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture;"
+    allowfullscreen="true"
+  ></iframe>
+</div>
+"""
+
+
+def create_gateway_toggle(markdown: str, relative_path: Path) -> str:
+    """Transform Python code blocks with Agent() calls to show both Pydantic AI and Gateway versions."""
+    # Pattern matches Python code blocks with or without attributes, and optional annotation definitions after
+    # Annotation definitions are numbered list items like "1. Some text" that follow the code block
+    return re.sub(
+        r'```py(?:thon)?(?: *\{?([^}\n]*)\}?)?\n(.*?)\n```(\n\n(?:\d+\..+?\n)+?\n)?',
+        lambda m: transform_gateway_code_block(m, relative_path),
+        markdown,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+
+
+# Mapping of provider names to their canonical gateway form
+GATEWAY_MODEL_MAP = {
+    'anthropic': 'anthropic',
+    'openai': 'openai',
+    'openai-responses': 'openai-responses',
+    'openai-chat': 'openai',
+    'bedrock': 'bedrock',
+    'google-gla': 'gemini',
+    'google-vertex': 'google-vertex',
+    'groq': 'groq',
+}
+# Models that should get gateway transformation
+GATEWAY_MODELS = tuple(GATEWAY_MODEL_MAP.keys())
+
+
+def transform_gateway_code_block(m: re.Match[str], relative_path: Path) -> str:
+    """Transform a single code block to show both versions if it contains Agent() calls."""
+    attrs = m.group(1) or ''
+    code = m.group(2)
+    annotations = m.group(3) or ''  # Capture annotation definitions if present
+
+    # Simple check: does the code contain both "Agent(" and a quoted string?
+    if 'Agent(' not in code:
+        attrs_str = f' {{{attrs}}}' if attrs else ''
+        return f'```python{attrs_str}\n{code}\n```{annotations}'
+
+    # Check if code contains Agent() with a model that should be transformed
+    # Look for Agent(...'model:...' or Agent(..."model:..."
+    agent_pattern = r'Agent\((?:(?!["\']).)*([\"\'])([^"\']+)\1'
+    agent_match = re.search(agent_pattern, code, flags=re.DOTALL)
+
+    if not agent_match:
+        # No Agent() with string literal found
+        attrs_str = f' {{{attrs}}}' if attrs else ''
+        return f'```python{attrs_str}\n{code}\n```{annotations}'
+
+    model_string = agent_match.group(2)
+    # Check if model starts with one of the gateway-supported models
+    should_transform = any(model_string.startswith(f'{model}:') for model in GATEWAY_MODELS)
+
+    if not should_transform:
+        # Model doesn't match gateway models, return original
+        attrs_str = f' {{{attrs}}}' if attrs else ''
+        return f'```python{attrs_str}\n{code}\n```{annotations}'
+
+    # Transform the code for gateway version
+    def replace_agent_model(match: re.Match[str]) -> str:
+        """Replace model string with gateway/ prefix if it's a supported provider."""
+        full_match = match.group(0)
+        quote = match.group(1)
+        model = match.group(2)
+
+        for provider, gateway_provider in GATEWAY_MODEL_MAP.items():
+            if model.startswith(f'{provider}:'):
+                new_model = model.replace(f'{provider}:', f'gateway/{gateway_provider}:', 1)
+                return full_match.replace(f'{quote}{model}{quote}', f'{quote}{new_model}{quote}', 1)
+
+        return full_match
+
+    # This pattern finds: "Agent(" followed by anything (lazy), then the first quoted string
+    gateway_code = re.sub(
+        agent_pattern,
+        replace_agent_model,
+        code,
+        flags=re.DOTALL,
+    )
+
+    # Build attributes string
+    docs_path = DOCS_ROOT / 'gateway'
+
+    relative_path_to_gateway = docs_path.relative_to(relative_path, walk_up=True)
+    link = f"<a href='{relative_path_to_gateway}' style='float: right;'>Le

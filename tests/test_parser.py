@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from cegraph.parser.models import SymbolKind, RelKind, detect_language
 from cegraph.parser.python_parser import parse_python_file
@@ -14,26 +13,13 @@ class TestLanguageDetection:
         assert detect_language("main.py") == "python"
         assert detect_language("types.pyi") == "python"
 
-    def test_javascript(self):
-        assert detect_language("app.js") == "javascript"
-        assert detect_language("component.jsx") == "javascript"
-
-    def test_typescript(self):
-        assert detect_language("app.ts") == "typescript"
-        assert detect_language("component.tsx") == "typescript"
-
-    def test_go(self):
-        assert detect_language("main.go") == "go"
-
-    def test_rust(self):
-        assert detect_language("main.rs") == "rust"
-
     def test_unknown(self):
         assert detect_language("readme.md") is None
         assert detect_language("data.json") is None
-        # Languages without tree-sitter grammars are not supported
-        assert detect_language("main.rb") is None
-        assert detect_language("main.php") is None
+        assert detect_language("app.js") is None
+        assert detect_language("app.ts") is None
+        assert detect_language("main.go") is None
+        assert detect_language("main.rs") is None
 
 
 class TestPythonParser:
@@ -119,36 +105,59 @@ class TestPythonParser:
         assert len(result.symbols) == 0
 
 
-class TestJavaScriptParser:
-    def test_parse_classes(self, sample_js_source: str):
-        result = parse_file("app.js", sample_js_source)
-        assert result is not None
-        class_names = [s.name for s in result.symbols if s.kind == SymbolKind.CLASS]
-        assert "UserService" in class_names
+class TestAnnotatedAssignments:
+    def test_annotated_variable(self):
+        source = '''
+name: str = "hello"
+count: int = 42
+'''
+        result = parse_python_file("ann.py", source)
+        vars = [s for s in result.symbols if s.kind == SymbolKind.VARIABLE]
+        var_names = [v.name for v in vars]
+        assert "name" in var_names
+        assert "count" in var_names
 
-    def test_parse_functions(self, sample_js_source: str):
-        result = parse_file("app.js", sample_js_source)
-        assert result is not None
-        func_names = [s.name for s in result.symbols if s.kind == SymbolKind.FUNCTION]
-        assert "formatName" in func_names
+    def test_annotated_constant(self):
+        source = 'MAX_SIZE: int = 100\n'
+        result = parse_python_file("ann.py", source)
+        consts = [s for s in result.symbols if s.kind == SymbolKind.CONSTANT]
+        assert any(c.name == "MAX_SIZE" for c in consts)
 
-    def test_parse_methods(self, sample_js_source: str):
-        result = parse_file("app.js", sample_js_source)
-        assert result is not None
-        method_names = [s.name for s in result.symbols if s.kind == SymbolKind.METHOD]
-        assert "getUser" in method_names
-        assert "createUser" in method_names
+    def test_annotated_class_field(self):
+        source = '''
+class User:
+    name: str
+    age: int = 0
+    email: str = ""
+'''
+        result = parse_python_file("ann.py", source)
+        vars = [s for s in result.symbols if s.kind == SymbolKind.VARIABLE]
+        var_names = [v.name for v in vars]
+        assert "name" in var_names
+        assert "age" in var_names
+        assert "email" in var_names
 
-    def test_parse_imports(self, sample_js_source: str):
-        result = parse_file("app.js", sample_js_source)
-        assert result is not None
-        # tree-sitter captures import statements as raw text
-        assert any("react" in imp for imp in result.imports)
+    def test_type_of_relationship(self):
+        source = 'model: Agent = None\n'
+        result = parse_python_file("ann.py", source)
+        type_rels = [r for r in result.relationships if r.kind == RelKind.TYPE_OF]
+        assert any("model" in r.source and r.target == "Agent" for r in type_rels)
 
-    def test_typescript_detection(self):
-        result = parse_file("app.ts", "const x: number = 1;")
-        assert result is not None
-        assert result.language == "typescript"
+    def test_pydantic_style_model(self):
+        source = '''
+class Config:
+    provider: str = "anthropic"
+    model: str = "claude"
+    max_tokens: int = 4096
+    temperature: float = 0.0
+'''
+        result = parse_python_file("ann.py", source)
+        vars = [s for s in result.symbols if s.kind == SymbolKind.VARIABLE]
+        var_names = [v.name for v in vars]
+        assert "provider" in var_names
+        assert "model" in var_names
+        assert "max_tokens" in var_names
+        assert "temperature" in var_names
 
 
 class TestCoreParser:
@@ -157,10 +166,9 @@ class TestCoreParser:
         assert result is not None
         assert result.language == "python"
 
-    def test_auto_detect_javascript(self, sample_js_source: str):
-        result = parse_file("app.js", sample_js_source)
-        assert result is not None
-        assert result.language == "javascript"
+    def test_unsupported_javascript(self):
+        result = parse_file("app.js", "function foo() {}")
+        assert result is None
 
     def test_unsupported_file(self):
         result = parse_file("readme.md", "# Hello")

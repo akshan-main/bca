@@ -83,17 +83,9 @@ class FileSymbols(BaseModel):
 
 
 # Language detection by file extension
-# Only languages with proper parser support (Python AST or tree-sitter grammars)
 EXTENSION_LANGUAGE_MAP: dict[str, str] = {
     ".py": "python",
     ".pyi": "python",
-    ".js": "javascript",
-    ".jsx": "javascript",
-    ".ts": "typescript",
-    ".tsx": "typescript",
-    ".go": "go",
-    ".rs": "rust",
-    ".java": "java",
 }
 
 
