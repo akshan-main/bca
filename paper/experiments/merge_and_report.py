@@ -130,6 +130,8 @@ def build_run_metadata(
     tasks_file: str,
     model: str,
     provider: str,
+    *,
+    source_run_dirs: list[Path] | None = None,
 ) -> dict:
     """Build run_metadata.json content."""
     git_hash = "unknown"
@@ -175,11 +177,37 @@ def build_run_metadata(
     except Exception:
         pass
 
-    # Extract system_fingerprint from results if available
-    model_version_info = {}
-    for r_data in results:
-        # system_fingerprint isn't in EvalResult, check per-task result.json
-        break  # Will be set from first-run capture if present
+    # Extract model_version_info and retry schedules from source run metadata.
+    # Keep backward-compatible scalar fields, and add per-source details.
+    model_version_info: dict = {}
+    model_version_info_by_run: dict[str, dict] = {}
+    retry_delays_by_run: dict[str, list[int]] = {}
+    if source_run_dirs:
+        for rd in source_run_dirs:
+            meta_path = rd / "run_metadata.json"
+            if meta_path.exists():
+                try:
+                    with open(meta_path) as f:
+                        src_meta = json.load(f)
+                    if src_meta.get("model_version_info"):
+                        info = src_meta["model_version_info"]
+                        model_version_info_by_run[rd.name] = info
+                        # Keep a representative value in the legacy field.
+                        if not model_version_info:
+                            model_version_info = info
+                    if src_meta.get("retry_delays_seconds"):
+                        retry_delays_by_run[rd.name] = src_meta["retry_delays_seconds"]
+                except Exception:
+                    pass
+
+    retry_delays_seconds = [5, 8, 15, 30, 60]
+    if retry_delays_by_run:
+        unique = {tuple(v) for v in retry_delays_by_run.values() if isinstance(v, list)}
+        if len(unique) == 1:
+            retry_delays_seconds = list(next(iter(unique)))
+        else:
+            # Mixed-source merge: keep one representative schedule in the legacy field.
+            retry_delays_seconds = list(next(iter(retry_delays_by_run.values())))
 
     total_pass = sum(1 for r in results if r.tests_passed)
 
@@ -214,7 +242,10 @@ def build_run_metadata(
             "frequency_penalty": 0,
         },
         "model_version_info": model_version_info,
-        "retry_delays_seconds": [2, 5, 10, 30, 60],
+        "model_version_info_by_source_run": model_version_info_by_run,
+        "retry_delays_seconds": retry_delays_seconds,
+        "retry_delays_seconds_by_source_run": retry_delays_by_run,
+        "source_run_dirs": [str(p) for p in (source_run_dirs or [])],
         "target_repo_commits": target_repo_commits,
         "bca_strategy_configs": {
             "bca_d1": {"strategy": "PRECISE", "max_depth": 1, "min_score": 0.3},
@@ -337,7 +368,9 @@ def generate_reports(
         print(patch_q)
         (output_dir / "patch_quality.txt").write_text(patch_q)
 
-    # 13. latency_cost.txt (graph_build_time=0 since we don't have it from interrupted run)
+    # 13. latency_cost.txt
+    # graph_build_time=0 for merge path: individual run reports have the actual value.
+    # Merged report's amortized graph-build row will be underreported (documented).
     latency = format_latency_cost(results, budgets, graph_build_time=0)
     if latency:
         print(latency)
@@ -361,12 +394,21 @@ def main():
                         default="no_retrieval,bm25,vector,repo_map,bca_d1,bca,bca_d5,bca_no_closure,bca_no_scoring,target_file")
     parser.add_argument("--model", default="gpt-4o-mini-2024-07-18")
     parser.add_argument("--provider", default="openai")
+    parser.add_argument(
+        "--source-run-dirs",
+        default="",
+        help=(
+            "Comma-separated run dirs whose run_metadata.json should be used "
+            "to reconstruct mixed-run metadata (e.g. run3,run4 for merged runs)"
+        ),
+    )
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
     budgets = [int(b) for b in args.budgets.split(",")]
     methods = [m.strip() for m in args.methods.split(",")]
     query_types = ["exact", "vague", "dev_report"]
+    source_run_dirs = [Path(p.strip()) for p in args.source_run_dirs.split(",") if p.strip()]
 
     # --- Step 1: Verify all tasks present ---
     tasks = load_tasks(Path(args.tasks_file))
@@ -408,6 +450,7 @@ def main():
         tasks_file=args.tasks_file,
         model=args.model,
         provider=args.provider,
+        source_run_dirs=source_run_dirs,
     )
     with open(run_dir / "run_metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)

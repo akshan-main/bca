@@ -159,6 +159,13 @@ def logistic_router(results: list[dict], budgets: list[int]) -> str:
             for r in b_results:
                 by_task[r["task_id"]][r["method"]] = r
 
+            # Count per-method pass rate for majority-vote labeling
+            method_pass_counts: dict[str, int] = defaultdict(int)
+            for tid2, mr2 in by_task.items():
+                for m2, r2 in mr2.items():
+                    if r2.get("tests_passed"):
+                        method_pass_counts[m2] += 1
+
             # Build training data: for each task, features → best method
             X, y, task_ids = [], [], []
             for tid, method_results in by_task.items():
@@ -167,8 +174,13 @@ def logistic_router(results: list[dict], budgets: list[int]) -> str:
                 if not passing:
                     continue  # Skip tasks where nothing passed
 
-                # Use first method alphabetically as target (deterministic)
-                best = sorted(passing)[0]
+                # Use majority-vote label: pick the method that passes most
+                # often across all tasks at this budget+query_type.
+                # Tie-break alphabetically for determinism.
+                best = sorted(
+                    passing,
+                    key=lambda m: (-method_pass_counts.get(m, 0), m),
+                )[0]
 
                 # Features from the first available result (task-level, same for all methods)
                 sample = next(iter(method_results.values()))
@@ -265,14 +277,16 @@ def _feature_names():
         "retrieval_top1_score",
         "retrieval_budget_utilization",
         "retrieval_file_concentration",
-        "mutation_symbol_lines_log",
-        "mutation_file_symbols",
         "graph_node_count_log",
     ]
 
 
 def _extract_features(r: dict) -> list[float] | None:
-    """Extract feature vector from a result dict."""
+    """Extract feature vector from a result dict.
+
+    Only deployment-valid features: no mutation_* fields (require knowing
+    the mutation location, which is unavailable at inference time).
+    """
     try:
         return [
             r.get("entity_count_mapped", 0) or 0,
@@ -283,8 +297,6 @@ def _extract_features(r: dict) -> list[float] | None:
             r.get("retrieval_top1_score", 0) or 0,
             r.get("retrieval_budget_utilization", 0) or 0,
             r.get("retrieval_file_concentration", 0) or 0,
-            math.log2(max(r.get("mutation_symbol_lines", 1) or 1, 1)),
-            r.get("mutation_file_symbols", 0) or 0,
             math.log2(max(r.get("graph_node_count", 1) or 1, 1)),
         ]
     except (TypeError, ValueError):

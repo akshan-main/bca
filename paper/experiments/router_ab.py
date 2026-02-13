@@ -422,34 +422,44 @@ def comparison_table(results: list[dict], budgets: list[int]) -> str:
 
         lines.append(f"\n  [{qt.upper()} queries]")
         lines.append(
-            f"  {'Budget':<10} {'MajVote':>10} {'Random':>10} "
-            f"{'RouterA':>10} {'RouterB':>10} {'Oracle':>10} {'N':>6}"
+            f"  {'Budget':<10} {'Maj(A)':>8} {'Rnd(A)':>8} {'RtrA':>8} {'Orc(A)':>8} {'N(A)':>6} "
+            f"{'Maj(B)':>8} {'Rnd(B)':>8} {'RtrB':>8} {'Orc(B)':>8} {'N(B)':>6}"
         )
-        lines.append(f"  {'-' * 66}")
+        lines.append(f"  {'-' * 98}")
 
         for b in budgets:
             X_a, ps_a = slices_a[b]
             X_b, ps_b = slices_b[b]
 
-            ra_acc = rb_acc = mv_acc = rnd_acc = orc_acc = "---"
-            n_str = "---"
+            ra_acc = mv_a = rnd_a = orc_a = "---"
+            rb_acc = mv_b = rnd_b = orc_b = "---"
+            na_str = nb_str = "---"
 
             if len(X_a) >= 5:
                 ra = loo_cv_router(X_a, ps_a, ALL_METHODS, "smart")
                 ra_acc = f"{ra['router_acc']:.1%}"
-                mv_acc = f"{ra['best_single_acc']:.1%}"
-                rnd_acc = f"{ra['random_acc']:.1%}"
-                orc_acc = f"{ra['oracle_acc']:.1%}"
-                n_str = str(ra["n"])
+                mv_a = f"{ra['best_single_acc']:.1%}"
+                rnd_a = f"{ra['random_acc']:.1%}"
+                orc_a = f"{ra['oracle_acc']:.1%}"
+                na_str = str(ra["n"])
 
             if len(X_b) >= 5:
                 rb = loo_cv_router(X_b, ps_b, RETRIEVAL_METHODS, "smart")
                 rb_acc = f"{rb['router_acc']:.1%}"
+                mv_b = f"{rb['best_single_acc']:.1%}"
+                rnd_b = f"{rb['random_acc']:.1%}"
+                orc_b = f"{rb['oracle_acc']:.1%}"
+                nb_str = str(rb["n"])
 
             lines.append(
-                f"  B={b:<7} {mv_acc:>10} {rnd_acc:>10} "
-                f"{ra_acc:>10} {rb_acc:>10} {orc_acc:>10} {n_str:>6}"
+                f"  B={b:<7} {mv_a:>8} {rnd_a:>8} {ra_acc:>8} {orc_a:>8} {na_str:>6} "
+                f"{mv_b:>8} {rnd_b:>8} {rb_acc:>8} {orc_b:>8} {nb_str:>6}"
             )
+
+        lines.append(
+            "\n  NOTE: A and B use different candidate sets, so solvable-task pools may differ."
+            "\n  Compare RouterA against A baselines (Maj/Rnd/Orc A), and RouterB against B baselines."
+        )
 
     return "\n".join(lines)
 
