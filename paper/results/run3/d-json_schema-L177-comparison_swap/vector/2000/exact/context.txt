@@ -1,0 +1,219 @@
+# pydantic_ai_slim/pydantic_ai/_utils.py:305-372
+class PeekableAsyncStream(Generic[T]):
+    """Wraps an async iterable of type T and allows peeking at the *next* item without consuming it.
+
+    We only buffer one item at a time (the next item). Once that item is yielded, it is discarded.
+    This is a single-pass stream.
+    """
+
+    def __init__(self, source: AsyncIterable[T]):
+        self._source = source
+        self._source_iter: AsyncIterator[T] | None = None
+        self._buffer: T | Unset = UNSET
+        self._exhausted = False
+
+    async def peek(self) -> T | Unset:
+        """Returns the next item that would be yielded without consuming it.
+
+        Returns None if the stream is exhausted.
+        """
+        if self._exhausted:
+            return UNSET
+
+        # If we already have a buffered item, just return it.
+        if not isinstance(self._buffer, Unset):
+            return self._buffer
+
+        # Otherwise, we need to fetch the next item from the underlying iterator.
+        if self._source_iter is None:
+            self._source_iter = aiter(self._source)
+
+        try:
+            self._buffer = await anext(self._source_iter)
+        except StopAsyncIteration:
+            self._exhausted = True
+            return UNSET
+
+        return self._buffer
+
+    async def is_exhausted(self) -> bool:
+        """Returns True if the stream is exhausted, False otherwise."""
+        return isinstance(await self.peek(), Unset)
+
+    def __aiter__(self) -> AsyncIterator[T]:
+        # For a single-pass iteration, we can return self as the iterator.
+        return self
+
+    async def __anext__(self) -> T:
+        """Yields the buffered item if present, otherwise fetches the next item from the underlying source.
+
+        Raises StopAsyncIteration if the stream is exhausted.
+        """
+        if self._exhausted:
+            raise StopAsyncIteration
+
+        # If we have a buffered item, yield it.
+        if not isinstance(self._buffer, Unset):
+            item = self._buffer
+            self._buffer = UNSET
+            return item
+
+        # Otherwise, fetch the next item from the source.
+        if self._source_iter is None:
+            self._source_iter = aiter(self._source)
+
+        try:
+            return await anext(self._source_iter)
+        except StopAsyncIteration:
+            self._exhausted = True
+            raise
+
+# tests/models/mock_async_stream.py:22-63
+class MockAsyncStream(Generic[T]):
+    """Wraps a synchronous iterator in an asynchronous interface.
+
+    This class allows a synchronous iterator to be treated as an
+    asynchronous iterator, enabling iteration in `async for` loops
+    and usage within `async with` blocks.
+
+    Example usage:
+        async def example():
+            sync_iter = iter([1, 2, 3])
+            async_stream = MockAsyncStream(sync_iter)
+
+            async for item in async_stream:
+                print(item)
+
+            async with MockAsyncStream(sync_iter) as stream:
+                async for item in stream:
+                    print(item)
+    """
+
+    _iter: Iterator[T]
+    """The underlying synchronous iterator."""
+
+    async def __anext__(self) -> T:
+        """Return the next item from the synchronous iterator as if it were asynchronous.
+
+        Calls `_utils.sync_anext` to retrieve the next item from the underlying
+        synchronous iterator. If the iterator is exhausted, `StopAsyncIteration`
+        is raised.
+        """
+        next = _utils.sync_anext(self._iter)
+        raise_if_exception(next)
+        return next
+
+    def __aiter__(self) -> MockAsyncStream[T]:
+        return self
+
+    async def __aenter__(self) -> MockAsyncStream[T]:
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        pass
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:350-372
+    async def __anext__(self) -> T:
+        """Yields the buffered item if present, otherwise fetches the next item from the underlying source.
+
+        Raises StopAsyncIteration if the stream is exhausted.
+        """
+        if self._exhausted:
+            raise StopAsyncIteration
+
+        # If we have a buffered item, yield it.
+        if not isinstance(self._buffer, Unset):
+            item = self._buffer
+            self._buffer = UNSET
+            return item
+
+        # Otherwise, fetch the next item from the source.
+        if self._source_iter is None:
+            self._source_iter = aiter(self._source)
+
+        try:
+            return await anext(self._source_iter)
+        except StopAsyncIteration:
+            self._exhausted = True
+            raise
+
+# pydantic_ai_slim/pydantic_ai/models/__init__.py:1274-1333
+async def download_item(
+    item: FileUrl,
+    data_format: Literal['bytes', 'base64', 'base64_uri', 'text'] = 'bytes',
+    type_format: Literal['mime', 'extension'] = 'mime',
+) -> DownloadedItem[str] | DownloadedItem[bytes]:
+    """Download an item by URL and return the content as a bytes object or a (base64-encoded) string.
+
+    This function includes SSRF (Server-Side Request Forgery) protection:
+    - Only http:// and https:// protocols are allowed
+    - Private/internal IP addresses are blocked by default
+    - Cloud metadata endpoints (169.254.169.254) are always blocked
+    - Hostnames are resolved before requests to prevent DNS rebinding
+
+    Set `item.force_download='allow-local'` to allow private IP addresses.
+
+    Args:
+        item: The item to download.
+        data_format: The format to return the content in:
+            - `bytes`: The raw bytes of the content.
+            - `base64`: The base64-encoded content.
+            - `base64_uri`: The base64-encoded content as a data URI.
+            - `text`: The content as a string.
+        type_format: The format to return the media type in:
+            - `mime`: The media type as a MIME type.
+            - `extension`: The media type as an extension.
+
+    Raises:
+        UserError: If the URL points to a YouTube video.
+        ValueError: If the URL uses an unsupported protocol or targets a private/internal
+            IP address (unless allow-local is set).
+    """
+    if isinstance(item, VideoUrl) and item.is_youtube:
+        raise UserError('Downloading YouTube videos is not supported.')
+
+    from .._ssrf import safe_download
+
+    allow_local = item.force_download == 'allow-local'
+    response = await safe_download(item.url, allow_local=allow_local)
+
+    if content_type := response.headers.get('content-type'):
+        content_type = content_type.split(';')[0]
+        if content_type == 'application/octet-stream':
+            content_type = None
+
+    media_type = content_type or item.media_type
+
+    data_type = media_type
+    if type_format == 'extension':
+        data_type = item.format
+
+    data = response.content
+    if data_format in ('base64', 'base64_uri'):
+        data = base64.b64encode(data).decode('utf-8')
+        if data_format == 'base64_uri':
+            data = f'data:{media_type};base64,{data}'
+        return DownloadedItem[str](data=data, data_type=data_type)
+    elif data_format == 'text':
+        return DownloadedItem[str](data=data.decode('utf-8'), data_type=data_type)
+    else:
+        return DownloadedItem[bytes](data=data, data_type=data_type)
+
+# pydantic_evals/pydantic_evals/dataset.py:230-230
+    cases: list[Case[InputsT, OutputT, MetadataT]]
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:305-305
+    cases: list[ReportCase[InputsT, OutputT, MetadataT]]
+
+# pydantic_evals/pydantic_evals/dataset.py:105-105
+    cases: list[_CaseModel[InputsT, OutputT, MetadataT]]
+
+# tests/test_usage_limits.py:3-3
+import operator
+
+# pydantic_ai_slim/pydantic_ai/models/wrapper.py:87-88
+    def __getattr__(self, item: str):
+        return getattr(self.wrapped, item)
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:20-20
+    type: Literal['tool_call']

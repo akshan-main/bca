@@ -1,0 +1,895 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+class GraphAgentState:
+    """State kept across the execution of the agent graph."""
+
+    message_history: list[_messages.ModelMessage] = dataclasses.field(default_factory=list[_messages.ModelMessage])
+    usage: _usage.RunUsage = dataclasses.field(default_factory=_usage.RunUsage)
+    retries: int = 0
+    run_step: int = 0
+    run_id: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
+    metadata: dict[str, Any] | None = None
+
+    def increment_retries(
+        self,
+        max_result_retries: int,
+        error: BaseException | None = None,
+        model_settings: ModelSettings | None = None,
+    ) -> None:
+        self.retries += 1
+        if self.retries > max_result_retries:
+            if (
+                self.message_history
+                and isinstance(model_response := self.message_history[-1], _messages.ModelResponse)
+                and model_response.finish_reason == 'length'
+                and model_response.parts
+                and isinstance(tool_call := model_response.parts[-1], _messages.ToolCallPart)
+            ):
+                try:
+                    tool_call.args_as_dict()
+                except Exception:
+                    max_tokens = model_settings.get('max_tokens') if model_settings else None
+                    raise exceptions.IncompleteToolCall(
+                        f'Model token limit ({max_tokens or "provider default"}) exceeded while generating a tool call, resulting in incomplete arguments. Increase the `max_tokens` model setting, or simplify the prompt to result in a shorter response that will fit within the limit.'
+                    )
+            message = f'Exceeded maximum retries ({max_result_retries}) for output validation'
+            if error:
+                if isinstance(error, exceptions.UnexpectedModelBehavior) and error.__cause__ is not None:
+                    error = error.__cause__
+                raise exceptions.UnexpectedModelBehavior(message) from error
+            else:
+                raise exceptions.UnexpectedModelBehavior(message)
+
+    def increment_retries(
+        self,
+        max_result_retries: int,
+        error: BaseException | None = None,
+        model_settings: ModelSettings | None = None,
+    ) -> None:
+        self.retries += 1
+        if self.retries > max_result_retries:
+            if (
+                self.message_history
+                and isinstance(model_response := self.message_history[-1], _messages.ModelResponse)
+                and model_response.finish_reason == 'length'
+                and model_response.parts
+                and isinstance(tool_call := model_response.parts[-1], _messages.ToolCallPart)
+            ):
+                try:
+                    tool_call.args_as_dict()
+                except Exception:
+                    max_tokens = model_settings.get('max_tokens') if model_settings else None
+                    raise exceptions.IncompleteToolCall(
+                        f'Model token limit ({max_tokens or "provider default"}) exceeded while generating a tool call, resulting in incomplete arguments. Increase the `max_tokens` model setting, or simplify the prompt to result in a shorter response that will fit within the limit.'
+                    )
+            message = f'Exceeded maximum retries ({max_result_retries}) for output validation'
+            if error:
+                if isinstance(error, exceptions.UnexpectedModelBehavior) and error.__cause__ is not None:
+                    error = error.__cause__
+                raise exceptions.UnexpectedModelBehavior(message) from error
+            else:
+                raise exceptions.UnexpectedModelBehavior(message)
+
+    async def _run_stream(  # noqa: C901
+        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+    ) -> AsyncIterator[_messages.HandleResponseEvent]:
+        if self._events_iterator is None:
+            # Ensure that the stream is only run once
+
+            output_schema = ctx.deps.output_schema
+
+            async def _run_stream() -> AsyncIterator[_messages.HandleResponseEvent]:  # noqa: C901
+                if not self.model_response.parts:
+                    # Don't retry if the model returned an empty response because the token limit was exceeded, possibly during thinking.
+                    if self.model_response.finish_reason == 'length':
+                        model_settings = ctx.deps.model_settings
+                        max_tokens = model_settings.get('max_tokens') if model_settings else None
+                        raise exceptions.UnexpectedModelBehavior(
+                            f'Model token limit ({max_tokens or "provider default"}) exceeded before any response was generated. Increase the `max_tokens` model setting, or simplify the prompt to result in a shorter response that will fit within the limit.'
+                        )
+
+                    # Check for content filter on empty response
+                    if self.model_response.finish_reason == 'content_filter':
+                        details = self.model_response.provider_details or {}
+                        reason = details.get('finish_reason', 'content_filter')
+
+                        body = _messages.ModelMessagesTypeAdapter.dump_json([self.model_response]).decode()
+
+                        raise exceptions.ContentFilterError(
+                            f"Content filter triggered. Finish reason: '{reason}'", body=body
+                        )
+
+                    # we got an empty response.
+                    # this sometimes happens with anthropic (and perhaps other models)
+                    # when the model has already returned text along side tool calls
+                    if text_processor := output_schema.text_processor:  # pragma: no branch
+                        # in this scenario, if text responses are allowed, we return text from the most recent model
+                        # response, if any
+                        for message in reversed(ctx.state.message_history):
+                            if isinstance(message, _messages.ModelResponse):
+                                text = ''
+                                for part in message.parts:
+                                    if isinstance(part, _messages.TextPart):
+                                        text += part.content
+                                    elif isinstance(part, _messages.BuiltinToolCallPart):
+                                        # Text parts before a built-in tool call are essentially thoughts,
+                                        # not part of the final result output, so we reset the accumulated text
+                                        text = ''  # pragma: no cover
+                                if text:
+                                    try:
+                                        self._next_node = await self._handle_text_response(ctx, text, text_processor)
+                                        return
+                                    except ToolRetryError:  # pragma: no cover
+                                        # If the text from the previous response was invalid, ignore it.
+                                        pass
+
+                    # Go back to the model request node with an empty request, which means we'll essentially
+                    # resubmit the most recent request that resulted in an empty response,
+                    # as the empty response and request will not create any items in the API payload,
+                    # in the hope the model will return a non-empty response this time.
+                    ctx.state.increment_retries(ctx.deps.max_result_retries, model_settings=ctx.deps.model_settings)
+                    run_context = build_run_context(ctx)
+                    instructions = await ctx.deps.get_instructions(run_context)
+                    self._next_node = ModelRequestNode[DepsT, NodeRunEndT](
+                        _messages.ModelRequest(parts=[], instructions=instructions)
+                    )
+                    return
+
+                text = ''
+                tool_calls: list[_messages.ToolCallPart] = []
+                files: list[_messages.BinaryContent] = []
+
+                for part in self.model_response.parts:
+                    if isinstance(part, _messages.TextPart):
+                        text += part.content
+                    elif isinstance(part, _messages.ToolCallPart):
+                        tool_calls.append(part)
+                    elif isinstance(part, _messages.FilePart):
+                        files.append(part.content)
+                    elif isinstance(part, _messages.BuiltinToolCallPart):
+                        # Text parts before a built-in tool call are essentially thoughts,
+                        # not part of the final result output, so we reset the accumulated text
+                        text = ''
+                        yield _messages.BuiltinToolCallEvent(part)  # pyright: ignore[reportDeprecated]
+                    elif isinstance(part, _messages.BuiltinToolReturnPart):
+                        yield _messages.BuiltinToolResultEvent(part)  # pyright: ignore[reportDeprecated]
+                    elif isinstance(part, _messages.ThinkingPart):
+                        pass
+                    else:
+                        assert_never(part)
+
+                try:
+                    # At the moment, we prioritize at least executing tool calls if they are present.
+                    # In the future, we'd consider making this configurable at the agent or run level.
+                    # This accounts for cases like anthropic returns that might contain a text response
+                    # and a tool call response, where the text response just indicates the tool call will happen.
+                    alternatives: list[str] = []
+                    if tool_calls:
+                        async for event in self._handle_tool_calls(ctx, tool_calls):
+                            yield event
+                        return
+                    elif output_schema.toolset:
+                        alternatives.append('include your response in a tool call')
+                    else:
+                        alternatives.append('call a tool')
+
+                    if output_schema.allows_image:
+                        if image := next((file for file in files if isinstance(file, _messages.BinaryImage)), None):
+                            self._next_node = await self._handle_image_response(ctx, image)
+                            return
+                        alternatives.append('return an image')
+
+                    if text_processor := output_schema.text_processor:
+                        if text:
+                            self._next_node = await self._handle_text_response(ctx, text, text_processor)
+                            return
+                        alternatives.insert(0, 'return text')
+
+                    # handle responses with only parts that don't constitute output.
+                    # This can happen with models that support thinking mode when they don't provide
+                    # actionable output alongside their thinking content. so we tell the model to try again.
+                    m = _messages.RetryPromptPart(
+                        content=f'Please {" or ".join(alternatives)}.',
+                    )
+                    raise ToolRetryError(m)
+                except ToolRetryError as e:
+                    ctx.state.increment_retries(
+                        ctx.deps.max_result_retries, error=e, model_settings=ctx.deps.model_settings
+                    )
+                    run_context = build_run_context(ctx)
+                    instructions = await ctx.deps.get_instructions(run_context)
+                    self._next_node = ModelRequestNode[DepsT, NodeRunEndT](
+                        _messages.ModelRequest(parts=[e.tool_retry], instructions=instructions)
+                    )
+
+            self._events_iterator = _run_stream()
+
+        async for event in self._events_iterator:
+            yield event
+
+async def process_tool_calls(  # noqa: C901
+    tool_manager: ToolManager[DepsT],
+    tool_calls: list[_messages.ToolCallPart],
+    tool_call_results: dict[str, DeferredToolResult | Literal['skip']] | None,
+    tool_call_metadata: dict[str, dict[str, Any]] | None,
+    final_result: result.FinalResult[NodeRunEndT] | None,
+    ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]],
+    output_parts: list[_messages.ModelRequestPart],
+    output_final_result: deque[result.FinalResult[NodeRunEndT]] = deque(maxlen=1),
+) -> AsyncIterator[_messages.HandleResponseEvent]:
+    """Process function (i.e., non-result) tool calls in parallel.
+
+    Also add stub return parts for any other tools that need it.
+
+    Because async iterators can't have return values, we use `output_parts` and `output_final_result` as output arguments.
+    """
+    tool_calls_by_kind: dict[ToolKind | Literal['unknown'], list[_messages.ToolCallPart]] = defaultdict(list)
+    for call in tool_calls:
+        tool_def = tool_manager.get_tool_def(call.tool_name)
+        if tool_def:
+            kind = tool_def.kind
+        else:
+            kind = 'unknown'
+        tool_calls_by_kind[kind].append(call)
+
+    # First, we handle output tool calls
+    for call in tool_calls_by_kind['output']:
+        # `final_result` can be passed into `process_tool_calls` from `Agent.run_stream`
+        # when streaming and there's already a final result
+        if final_result and final_result.tool_call_id == call.tool_call_id:
+            part = _messages.ToolReturnPart(
+                tool_name=call.tool_name,
+                content='Final result processed.',
+                tool_call_id=call.tool_call_id,
+            )
+            output_parts.append(part)
+        # Early strategy is chosen and final result is already set
+        elif ctx.deps.end_strategy == 'early' and final_result:
+            yield _messages.FunctionToolCallEvent(call)
+            part = _messages.ToolReturnPart(
+                tool_name=call.tool_name,
+                content='Output tool not used - a final result was already processed.',
+                tool_call_id=call.tool_call_id,
+            )
+            yield _messages.FunctionToolResultEvent(part)
+            output_parts.append(part)
+        # Early strategy is chosen and final result is not yet set
+        # Or exhaustive strategy is chosen
+        else:
+            try:
+                result_data = await tool_manager.handle_call(call)
+            except exceptions.UnexpectedModelBehavior as e:
+                # If we already have a valid final result, don't fail the entire run
+                # This allows exhaustive strategy to complete successfully when at least one output tool is valid
+                if final_result:
+                    # If output tool fails when we already have a final result, skip it without retrying
+                    yield _messages.FunctionToolCallEvent(call)
+                    part = _messages.ToolReturnPart(
+                        tool_name=call.tool_name,
+                        content='Output tool not used - output failed validation.',
+                        tool_call_id=call.tool_call_id,
+                    )
+                    output_parts.append(part)
+                    yield _messages.FunctionToolResultEvent(part)
+                else:
+                    # No valid result yet, so this is a real failure
+                    ctx.state.increment_retries(
+                        ctx.deps.max_result_retries, error=e, model_settings=ctx.deps.model_settings
+                    )
+                    raise e  # pragma: lax no cover
+            except ToolRetryError as e:
+                # If we already have a valid final result, don't increment retries for invalid output tools
+                # This allows the run to succeed if at least one output tool returned a valid result
+                if not final_result:
+                    ctx.state.increment_retries(
+                        ctx.deps.max_result_retries, error=e, model_settings=ctx.deps.model_settings
+                    )
+                yield _messages.FunctionToolCallEvent(call)
+                output_parts.append(e.tool_retry)
+                yield _messages.FunctionToolResultEvent(e.tool_retry)
+            else:
+                part = _messages.ToolReturnPart(
+                    tool_name=call.tool_name,
+                    content='Final result processed.',
+                    tool_call_id=call.tool_call_id,
+                )
+                output_parts.append(part)
+
+                # In both `early` and `exhaustive` modes, use the first output tool's result as the final result
+                if not final_result:
+                    final_result = result.FinalResult(result_data, call.tool_name, call.tool_call_id)
+
+    # Then, we handle function tool calls
+    calls_to_run: list[_messages.ToolCallPart] = []
+    if final_result and ctx.deps.end_strategy == 'early':
+        for call in tool_calls_by_kind['function']:
+            output_parts.append(
+                _messages.ToolReturnPart(
+                    tool_name=call.tool_name,
+                    content='Tool not executed - a final result was already processed.',
+                    tool_call_id=call.tool_call_id,
+                )
+            )
+    else:
+        calls_to_run.extend(tool_calls_by_kind['function'])
+
+    # Then, we handle unknown tool calls
+    if tool_calls_by_kind['unknown']:
+        ctx.state.increment_retries(ctx.deps.max_result_retries, model_settings=ctx.deps.model_settings)
+        calls_to_run.extend(tool_calls_by_kind['unknown'])
+
+    calls_to_run_results: dict[str, DeferredToolResult] = {}
+    if tool_call_results is not None:
+        # Deferred tool calls are "run" as well, by reading their value from the tool call results
+        calls_to_run.extend(tool_calls_by_kind['external'])
+        calls_to_run.extend(tool_calls_by_kind['unapproved'])
+
+        result_tool_call_ids = set(tool_call_results.keys())
+        tool_call_ids_to_run = {call.tool_call_id for call in calls_to_run}
+        if tool_call_ids_to_run != result_tool_call_ids:
+            raise exceptions.UserError(
+                'Tool call results need to be provided for all deferred tool calls. '
+                f'Expected: {tool_call_ids_to_run}, got: {result_tool_call_ids}'
+            )
+
+        # Filter out calls that were already executed before and should now be skipped
+        calls_to_run_results = {call_id: result for call_id, result in tool_call_results.items() if result != 'skip'}
+        calls_to_run = [call for call in calls_to_run if call.tool_call_id in calls_to_run_results]
+
+    deferred_calls: dict[Literal['external', 'unapproved'], list[_messages.ToolCallPart]] = defaultdict(list)
+    deferred_metadata: dict[str, dict[str, Any]] = {}
+
+    if calls_to_run:
+        async for event in _call_tools(
+            tool_manager=tool_manager,
+            tool_calls=calls_to_run,
+            tool_call_results=calls_to_run_results,
+            tool_call_metadata=tool_call_metadata,
+            tracer=ctx.deps.tracer,
+            usage=ctx.state.usage,
+            usage_limits=ctx.deps.usage_limits,
+            output_parts=output_parts,
+            output_deferred_calls=deferred_calls,
+            output_deferred_metadata=deferred_metadata,
+        ):
+            yield event
+
+    # Finally, we handle deferred tool calls (unless they were already included in the run because results were provided)
+    if tool_call_results is None:
+        calls = [*tool_calls_by_kind['external'], *tool_calls_by_kind['unapproved']]
+        if final_result:
+            # If the run was already determined to end on deferred tool calls,
+            # we shouldn't insert return parts as the deferred tools will still get a real result.
+            if not isinstance(final_result.output, _output.DeferredToolRequests):
+                for call in calls:
+                    output_parts.append(
+                        _messages.ToolReturnPart(
+                            tool_name=call.tool_name,
+                            content='Tool not executed - a final result was already processed.',
+                            tool_call_id=call.tool_call_id,
+                        )
+                    )
+        elif calls:
+            deferred_calls['external'].extend(tool_calls_by_kind['external'])
+            deferred_calls['unapproved'].extend(tool_calls_by_kind['unapproved'])
+
+            for call in calls:
+                yield _messages.FunctionToolCallEvent(call)
+
+    if not final_result and deferred_calls:
+        if not ctx.deps.output_schema.allows_deferred_tools:
+            raise exceptions.UserError(
+                'A deferred tool call was present, but `DeferredToolRequests` is not among output types. To resolve this, add `DeferredToolRequests` to the list of output types for this agent.'
+            )
+        deferred_tool_requests = _output.DeferredToolRequests(
+            calls=deferred_calls['external'],
+            approvals=deferred_calls['unapproved'],
+            metadata=deferred_metadata,
+        )
+
+        final_result = result.FinalResult(cast(NodeRunEndT, deferred_tool_requests), None, None)
+
+    if final_result:
+        output_final_result.append(final_result)
+
+## pydantic_ai_slim/pydantic_ai/_output.py
+
+    max_retries: int
+
+## pydantic_ai_slim/pydantic_ai/_run_context.py
+
+    max_retries: int = 0
+
+## pydantic_ai_slim/pydantic_ai/ag_ui.py
+
+from .models import KnownModelName, Model
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_dynamic_toolset.py
+
+    max_retries: int
+
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+    max_retries: int
+
+    max_retries: int
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    def args_as_dict(self) -> dict[str, Any]:
+        """Return the arguments as a Python dictionary.
+
+        This is just for convenience with models that require dicts as input.
+        """
+        if not self.args:
+            return {}
+        if isinstance(self.args, dict):
+            return self.args
+        args = pydantic_core.from_json(self.args)
+        assert isinstance(args, dict), 'args should be a dict'
+        return cast(dict[str, Any], args)
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class TestModel(Model):
+    """A model specifically for testing purposes.
+
+    This will (by default) call all tools in the agent, then return a tool response if possible,
+    otherwise a plain response.
+
+    How useful this model is will vary significantly.
+
+    Apart from `__init__` derived by the `dataclass` decorator, all methods are private or match those
+    of the base class.
+    """
+
+    # NOTE: Avoid test discovery by pytest.
+    __test__ = False
+
+    call_tools: list[str] | Literal['all'] = 'all'
+    """List of tools to call. If `'all'`, all tools will be called."""
+    custom_output_text: str | None = None
+    """If set, this text is returned as the final output."""
+    custom_output_args: Any | None = None
+    """If set, these args will be passed to the output tool."""
+    seed: int = 0
+    """Seed for generating random data."""
+    last_model_request_parameters: ModelRequestParameters | None = field(default=None, init=False)
+    """The last ModelRequestParameters passed to the model in a request.
+
+    The ModelRequestParameters contains information about the function and output tools available during request handling.
+
+    This is set when a request is made, so will reflect the function tools from the last step of the last run.
+    """
+    _model_name: str = field(default='test', repr=False)
+    _system: str = field(default='test', repr=False)
+
+    def __init__(
+        self,
+        *,
+        call_tools: list[str] | Literal['all'] = 'all',
+        custom_output_text: str | None = None,
+        custom_output_args: Any | None = None,
+        seed: int = 0,
+        model_name: str = 'test',
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize TestModel with optional settings and profile."""
+        self.call_tools = call_tools
+        self.custom_output_text = custom_output_text
+        self.custom_output_args = custom_output_args
+        self.seed = seed
+        self.last_model_request_parameters = None
+        self._model_name = model_name
+        self._system = 'test'
+        super().__init__(settings=settings, profile=profile)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        model_response.usage = _estimate_usage([*messages, model_response])
+        return model_response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        yield TestStreamedResponse(
+            model_request_parameters=model_request_parameters,
+            _model_name=self._model_name,
+            _structured_response=model_response,
+            _messages=messages,
+            _provider_name=self._system,
+        )
+
+    @property
+    def model_name(self) -> str:
+        """The model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The model provider."""
+        return self._system
+
+    @classmethod
+    def supported_builtin_tools(cls) -> frozenset[type[AbstractBuiltinTool]]:
+        """TestModel supports all builtin tools for testing flexibility."""
+        return SUPPORTED_BUILTIN_TOOLS
+
+    def gen_tool_args(self, tool_def: ToolDefinition) -> Any:
+        return _JsonSchemaTestData(tool_def.parameters_json_schema, self.seed).generate()
+
+    def _get_tool_calls(self, model_request_parameters: ModelRequestParameters) -> list[tuple[str, ToolDefinition]]:
+        if self.call_tools == 'all':
+            return [(r.name, r) for r in model_request_parameters.function_tools]
+        else:
+            function_tools_lookup = {t.name: t for t in model_request_parameters.function_tools}
+            tools_to_call = (function_tools_lookup[name] for name in self.call_tools)
+            return [(r.name, r) for r in tools_to_call]
+
+    def _get_output(self, model_request_parameters: ModelRequestParameters) -> _WrappedTextOutput | _WrappedToolOutput:
+        if self.custom_output_text is not None:
+            assert model_request_parameters.output_mode != 'tool', (
+                'Plain response not allowed, but `custom_output_text` is set.'
+            )
+            assert self.custom_output_args is None, 'Cannot set both `custom_output_text` and `custom_output_args`.'
+            return _WrappedTextOutput(self.custom_output_text)
+        elif self.custom_output_args is not None:
+            assert model_request_parameters.output_tools is not None, (
+                'No output tools provided, but `custom_output_args` is set.'
+            )
+            output_tool = model_request_parameters.output_tools[0]
+
+            if k := output_tool.outer_typed_dict_key:
+                return _WrappedToolOutput({k: self.custom_output_args})
+            else:
+                return _WrappedToolOutput(self.custom_output_args)
+        elif model_request_parameters.allow_text_output:
+            return _WrappedTextOutput(None)
+        elif model_request_parameters.output_tools:
+            return _WrappedToolOutput(None)
+        else:
+            return _WrappedTextOutput(None)
+
+    def _request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        if model_request_parameters.builtin_tools:
+            raise UserError('TestModel does not support built-in tools')
+
+        tool_calls = self._get_tool_calls(model_request_parameters)
+        output_wrapper = self._get_output(model_request_parameters)
+        output_tools = model_request_parameters.output_tools
+
+        # if there are tools, the first thing we want to do is call all of them
+        if tool_calls and not any(isinstance(m, ModelResponse) for m in messages):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(name, self.gen_tool_args(args), tool_call_id=f'pyd_ai_tool_call_id__{name}')
+                    for name, args in tool_calls
+                ],
+                model_name=self._model_name,
+            )
+
+        if messages:  # pragma: no branch
+            last_message = messages[-1]
+            assert isinstance(last_message, ModelRequest), 'Expected last message to be a `ModelRequest`.'
+
+            # check if there are any retry prompts, if so retry them
+            new_retry_names = {p.tool_name for p in last_message.parts if isinstance(p, RetryPromptPart)}
+            if new_retry_names:
+                # Handle retries for both function tools and output tools
+                # Check function tools first
+                retry_parts: list[ModelResponsePart] = [
+                    ToolCallPart(name, self.gen_tool_args(args)) for name, args in tool_calls if name in new_retry_names
+                ]
+                # Check output tools
+                if output_tools:
+                    retry_parts.extend(
+                        [
+                            ToolCallPart(
+                                tool.name,
+                                output_wrapper.value
+                                if isinstance(output_wrapper, _WrappedToolOutput) and output_wrapper.value is not None
+                                else self.gen_tool_args(tool),
+                                tool_call_id=f'pyd_ai_tool_call_id__{tool.name}',
+                            )
+                            for tool in output_tools
+                            if tool.name in new_retry_names
+                        ]
+                    )
+                return ModelResponse(parts=retry_parts, model_name=self._model_name)
+
+        if isinstance(output_wrapper, _WrappedTextOutput):
+            if (response_text := output_wrapper.value) is None:
+                # build up details of tool responses
+                output: dict[str, Any] = {}
+                for message in messages:
+                    if isinstance(message, ModelRequest):
+                        for part in message.parts:
+                            if isinstance(part, ToolReturnPart):
+                                output[part.tool_name] = part.content
+                if output:
+                    return ModelResponse(
+                        parts=[TextPart(pydantic_core.to_json(output).decode())], model_name=self._model_name
+                    )
+                else:
+                    return ModelResponse(parts=[TextPart('success (no tool calls)')], model_name=self._model_name)
+            else:
+                return ModelResponse(parts=[TextPart(response_text)], model_name=self._model_name)
+        else:
+            assert output_tools, 'No output tools provided'
+            custom_output_args = output_wrapper.value
+            output_tool = output_tools[self.seed % len(output_tools)]
+            if custom_output_args is not None:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            custom_output_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+            else:
+                response_args = self.gen_tool_args(output_tool)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            response_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+
+## pydantic_ai_slim/pydantic_ai/output.py
+
+    max_retries: int | None
+
+## pydantic_ai_slim/pydantic_ai/tools.py
+
+    max_retries: int | None
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+    max_retries: int
+
+## tests/evals/test_otel.py
+
+async def test_span_query_logical_combinations():
+    """Test logical combinations (AND/OR) in SpanQuery."""
+
+    with context_subtree() as tree:
+        with logfire.span('root1', level='0'):
+            with logfire.span('child1', level='1', category='important'):
+                pass
+            with logfire.span('child2', level='1', category='normal'):
+                pass
+            with logfire.span('special', level='1', category='important', priority='high'):
+                pass
+    assert isinstance(tree, SpanTree)
+
+    # Test AND logic
+    and_query: SpanQuery = {'and_': [{'name_contains': '1'}, {'has_attributes': {'level': '1'}}]}
+    matched_nodes = list(tree.find(and_query))
+    assert len(matched_nodes) == 1, matched_nodes
+    assert all(node.name in ['child1'] for node in matched_nodes)
+
+    # Test OR logic
+    or_query: SpanQuery = {'or_': [{'name_contains': '2'}, {'has_attributes': {'level': '0'}}]}
+    matched_nodes = list(tree.find(or_query))
+    assert len(matched_nodes) == 2
+    assert any(node.name == 'child2' for node in matched_nodes)
+    assert any(node.attributes.get('level') == '0' for node in matched_nodes)
+
+    # Test complex combination (AND + OR)
+    complex_query: SpanQuery = {
+        'and_': [
+            {'has_attributes': {'level': '1'}},
+            {'or_': [{'has_attributes': {'category': 'important'}}, {'name_equals': 'child2'}]},
+        ]
+    }
+    matched_nodes = list(tree.find(complex_query))
+    assert len(matched_nodes) == 3  # child1, child2, special
+    matched_names = [node.name for node in matched_nodes]
+    assert set(matched_names) == {'child1', 'child2', 'special'}
+
+async def test_span_query_timing_conditions():
+    """Test timing-related conditions in SpanQuery."""
+    from datetime import timedelta
+
+    with context_subtree() as tree:
+        with logfire.span('fast_operation'):
+            pass
+
+        with logfire.span('medium_operation'):
+            logfire.info('add a wait')
+
+        with logfire.span('slow_operation'):
+            logfire.info('add a wait')
+            logfire.info('add a wait')
+    assert isinstance(tree, SpanTree)
+
+    durations = sorted([node.duration for node in tree if node.duration > timedelta(seconds=0)])
+    fast_threshold = (durations[0] + durations[1]) / 2
+    medium_threshold = (durations[1] + durations[2]) / 2
+
+    # Test min_duration
+    min_duration_query: SpanQuery = {'min_duration': fast_threshold}
+    matched_nodes = list(tree.find(min_duration_query))
+    assert len(matched_nodes) == 2
+    assert 'fast_operation' not in [node.name for node in matched_nodes]
+
+    # Test max_duration
+    max_duration_queries: list[SpanQuery] = [
+        {'min_duration': 0.001, 'max_duration': medium_threshold},
+        {'min_duration': 0.001, 'max_duration': medium_threshold.seconds},
+    ]
+    for max_duration_query in max_duration_queries:
+        matched_nodes = list(tree.find(max_duration_query))
+        assert len(matched_nodes) == 2
+        assert 'slow_operation' not in [node.name for node in matched_nodes]
+
+    # Test min and max duration together using timedelta
+    duration_range_query: SpanQuery = {
+        'min_duration': fast_threshold,
+        'max_duration': medium_threshold,
+    }
+    matched_node = tree.first(duration_range_query)
+    assert matched_node is not None
+    assert matched_node.name == 'medium_operation'
+
+## tests/graph/beta/test_v1_v2_integration.py
+
+async def test_v1_node_conditional_return():
+    """Test v1 nodes with conditional returns creating implicit decisions."""
+
+    @dataclass
+    class RouterNode(BaseNode[IntegrationState, None, str]):
+        value: int
+
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> PathA | PathB:
+            if self.value < 10:
+                return PathA()
+            else:
+                return PathB()
+
+    @dataclass
+    class PathA(BaseNode[IntegrationState, None, str]):
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> End[str]:
+            return End('Path A')
+
+    @dataclass
+    class PathB(BaseNode[IntegrationState, None, str]):
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> End[str]:
+            return End('Path B')
+
+    g = GraphBuilder(state_type=IntegrationState, input_type=int, output_type=str)
+
+    @g.step
+    async def create_router(ctx: StepContext[IntegrationState, None, int]) -> RouterNode:
+        return RouterNode(ctx.inputs)
+
+    g.add(
+        g.node(RouterNode),
+        g.node(PathA),
+        g.node(PathB),
+        g.edge_from(g.start_node).to(create_router),
+    )
+
+    graph = g.build()
+
+    assert str(graph) == snapshot("""\
+stateDiagram-v2
+  create_router
+  RouterNode
+  state decision <<choice>>
+  PathA
+  PathB
+
+  [*] --> create_router
+  create_router --> RouterNode
+  RouterNode --> decision
+  decision --> PathA
+  decision --> PathB
+  PathA --> [*]
+  PathB --> [*]\
+""")
+
+    # Test path A
+    result_a = await graph.run(state=IntegrationState(), inputs=5)
+    assert result_a == 'Path A'
+
+    # Test path B
+    result_b = await graph.run(state=IntegrationState(), inputs=15)
+    assert result_b == 'Path B'
+
+## tests/test_prefect.py
+
+def conditions(city: str) -> str:
+    # Simplified version without RunContext
+    return "It's raining"
+
+## tests/test_tools.py
+
+def test_tool_retries():
+    prepare_tools_retries: list[int] = []
+    prepare_retries: list[int] = []
+    prepare_max_retries: list[int] = []
+    prepare_last_attempt: list[bool] = []
+    call_retries: list[int] = []
+    call_max_retries: list[int] = []
+    call_last_attempt: list[bool] = []
+
+    async def prepare_tool_defs(ctx: RunContext[None], tool_defs: list[ToolDefinition]) -> list[ToolDefinition] | None:
+        nonlocal prepare_tools_retries
+        retry = ctx.retries.get('infinite_retry_tool', 0)
+        prepare_tools_retries.append(retry)
+        return tool_defs
+
+    agent = Agent(TestModel(), retries=3, prepare_tools=prepare_tool_defs)
+
+    async def prepare_tool_def(ctx: RunContext[None], tool_def: ToolDefinition) -> ToolDefinition | None:
+        nonlocal prepare_retries
+        prepare_retries.append(ctx.retry)
+        prepare_max_retries.append(ctx.max_retries)
+        prepare_last_attempt.append(ctx.last_attempt)
+        return tool_def
+
+    @agent.tool(retries=5, prepare=prepare_tool_def)
+    def infinite_retry_tool(ctx: RunContext[None]) -> int:
+        nonlocal call_retries
+        call_retries.append(ctx.retry)
+        call_max_retries.append(ctx.max_retries)
+        call_last_attempt.append(ctx.last_attempt)
+        raise ModelRetry('Please try again.')
+
+    with pytest.raises(UnexpectedModelBehavior, match="Tool 'infinite_retry_tool' exceeded max retries count of 5"):
+        agent.run_sync('Begin infinite retry loop!')
+
+    assert prepare_tools_retries == snapshot([0, 1, 2, 3, 4, 5])
+
+    assert prepare_retries == snapshot([0, 1, 2, 3, 4, 5])
+    assert prepare_max_retries == snapshot([5, 5, 5, 5, 5, 5])
+    assert prepare_last_attempt == snapshot([False, False, False, False, False, True])
+
+    assert call_retries == snapshot([0, 1, 2, 3, 4, 5])
+    assert call_max_retries == snapshot([5, 5, 5, 5, 5, 5])
+    assert call_last_attempt == snapshot([False, False, False, False, False, True])

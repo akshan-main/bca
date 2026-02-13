@@ -1,0 +1,506 @@
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:421-423
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the instrumentation options for all agents where `instrument` is not set."""
+        Agent._instrument_default = instrument
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:140-143
+class Some(Generic[T]):
+    """Analogous to Rust's `Option::Some` type."""
+
+    value: T
+
+# tests/test_usage_limits.py:258-284
+def test_add_usages_with_none_detail_value():
+    """Test that None values in details are skipped when incrementing usage."""
+    usage = RunUsage(
+        requests=1,
+        input_tokens=10,
+        output_tokens=20,
+        details={'reasoning_tokens': 5},
+    )
+
+    # Create a usage with None in details (simulating model response with missing detail)
+    incr_usage = RunUsage(
+        requests=1,
+        input_tokens=5,
+        output_tokens=10,
+    )
+    # Manually set a None value in details to simulate edge case from model responses
+    incr_usage.details = {'reasoning_tokens': None, 'other_tokens': 10}  # type: ignore[dict-item]
+
+    result = usage + incr_usage
+    assert result == snapshot(
+        RunUsage(
+            requests=2,
+            input_tokens=15,
+            output_tokens=30,
+            details={'reasoning_tokens': 5, 'other_tokens': 10},
+        )
+    )
+
+# tests/test_direct.py:206-213
+def set_instrument_default(value: bool):
+    """Context manager to temporarily set the default instrumentation value."""
+    initial_value = Agent._instrument_default  # pyright: ignore[reportPrivateUsage]
+    try:
+        Agent._instrument_default = value  # pyright: ignore[reportPrivateUsage]
+        yield
+    finally:
+        Agent._instrument_default = initial_value  # pyright: ignore[reportPrivateUsage]
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:427-520
+    def _instrument(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> Iterator[Callable[[ModelResponse, ModelRequestParameters], None]]:
+        operation = 'chat'
+        span_name = f'{operation} {self.model_name}'
+        # TODO Missing attributes:
+        #  - error.type: unclear if we should do something here or just always rely on span exceptions
+        #  - gen_ai.request.stop_sequences/top_k: model_settings doesn't include these
+        attributes: dict[str, AttributeValue] = {
+            'gen_ai.operation.name': operation,
+            **self.model_attributes(self.wrapped),
+            **self.model_request_parameters_attributes(model_request_parameters),
+            'logfire.json_schema': json.dumps(
+                {
+                    'type': 'object',
+                    'properties': {'model_request_parameters': {'type': 'object'}},
+                }
+            ),
+        }
+
+        tool_definitions = _build_tool_definitions(model_request_parameters)
+        if tool_definitions:
+            attributes['gen_ai.tool.definitions'] = json.dumps(tool_definitions)
+
+        if model_settings:
+            for key in MODEL_SETTING_ATTRIBUTES:
+                if isinstance(value := model_settings.get(key), float | int):
+                    attributes[f'gen_ai.request.{key}'] = value
+
+        record_metrics: Callable[[], None] | None = None
+        try:
+            with self.instrumentation_settings.tracer.start_as_current_span(
+                span_name, attributes=attributes, kind=SpanKind.CLIENT
+            ) as span:
+
+                def finish(response: ModelResponse, parameters: ModelRequestParameters):
+                    # FallbackModel updates these span attributes.
+                    attributes.update(getattr(span, 'attributes', {}))
+                    request_model = attributes[GEN_AI_REQUEST_MODEL_ATTRIBUTE]
+                    system = cast(str, attributes[GEN_AI_SYSTEM_ATTRIBUTE])
+
+                    response_model = response.model_name or request_model
+                    price_calculation = None
+
+                    def _record_metrics():
+                        metric_attributes = {
+                            GEN_AI_PROVIDER_NAME_ATTRIBUTE: system,  # New OTel standard attribute
+                            GEN_AI_SYSTEM_ATTRIBUTE: system,  # Preserved for backward compatibility (deprecated)
+                            'gen_ai.operation.name': operation,
+                            'gen_ai.request.model': request_model,
+                            'gen_ai.response.model': response_model,
+                        }
+                        self.instrumentation_settings.record_metrics(response, price_calculation, metric_attributes)
+
+                    nonlocal record_metrics
+                    record_metrics = _record_metrics
+
+                    if not span.is_recording():
+                        return
+
+                    self.instrumentation_settings.handle_messages(messages, response, system, span, parameters)
+
+                    attributes_to_set = {
+                        **response.usage.opentelemetry_attributes(),
+                        'gen_ai.response.model': response_model,
+                    }
+                    try:
+                        price_calculation = response.cost()
+                    except LookupError:
+                        # The cost of this provider/model is unknown, which is common.
+                        pass
+                    except Exception as e:
+                        warnings.warn(
+                            f'Failed to get cost from response: {type(e).__name__}: {e}', CostCalculationFailedWarning
+                        )
+                    else:
+                        attributes_to_set['operation.cost'] = float(price_calculation.total_price)
+
+                    if response.provider_response_id is not None:
+                        attributes_to_set['gen_ai.response.id'] = response.provider_response_id
+                    if response.finish_reason is not None:
+                        attributes_to_set['gen_ai.response.finish_reasons'] = [response.finish_reason]
+                    span.set_attributes(attributes_to_set)
+                    span.update_name(f'{operation} {request_model}')
+
+                yield finish
+        finally:
+            if record_metrics:
+                # We only want to record metrics after the span is finished,
+                # to prevent them from being redundantly recorded in the span itself by logfire.
+                record_metrics()
+
+# tests/test_tools.py:2665-2675
+def test_tool_timeout_default_none():
+    """Test that timeout defaults to None when not specified."""
+    agent = Agent(TestModel())
+
+    @agent.tool_plain
+    def tool_without_timeout() -> str:
+        return 'done'  # pragma: no cover
+
+    tool = agent._function_toolset.tools['tool_without_timeout']
+    assert tool.timeout is None
+    assert tool.tool_def.timeout is None
+
+# tests/models/test_instrumented.py:366-383
+async def test_instrumented_model_not_recording():
+    model = InstrumentedModel(
+        MyModel(),
+        InstrumentationSettings(tracer_provider=NoOpTracerProvider(), logger_provider=NoOpLoggerProvider()),
+    )
+
+    messages: list[ModelMessage] = [ModelRequest(parts=[SystemPromptPart('system_prompt')], timestamp=IsDatetime())]
+    await model.request(
+        messages,
+        model_settings=ModelSettings(temperature=1),
+        model_request_parameters=ModelRequestParameters(
+            function_tools=[],
+            allow_text_output=True,
+            output_tools=[],
+            output_mode='text',
+            output_object=None,
+        ),
+    )
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:144-144
+    instrument: InstrumentationSettings | bool | None
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# tests/mcp_server.py:164-165
+async def get_none():
+    return None
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:157-157
+    instrument: InstrumentationSettings | bool | None
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/format_prompt.py:84-84
+    none_str: str
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:377-377
+    instrumentation_settings: InstrumentationSettings
+
+# pydantic_graph/pydantic_graph/beta/graph.py:138-138
+    auto_instrument: bool
+
+# pydantic_graph/pydantic_graph/beta/graph.py:138-138
+    auto_instrument: bool
+
+# pydantic_ai_slim/pydantic_ai/direct.py:23-23
+from .models import StreamedResponse, instrumented as instrumented_models
+
+# pydantic_ai_slim/pydantic_ai/_instrumentation.py:14-95
+class InstrumentationNames:
+    """Configuration for instrumentation span names and attributes based on version."""
+
+    # Agent run span configuration
+    agent_run_span_name: str
+    agent_name_attr: str
+
+    # Tool execution span configuration
+    tool_span_name: str
+    tool_arguments_attr: str
+    tool_result_attr: str
+
+    # Output Tool execution span configuration
+    output_tool_span_name: str
+
+    @classmethod
+    def for_version(cls, version: int) -> Self:
+        """Create instrumentation configuration for a specific version.
+
+        Args:
+            version: The instrumentation version (1, 2, or 3+)
+
+        Returns:
+            InstrumentationConfig instance with version-appropriate settings
+        """
+        if version <= 2:
+            return cls(
+                agent_run_span_name='agent run',
+                agent_name_attr='agent_name',
+                tool_span_name='running tool',
+                tool_arguments_attr='tool_arguments',
+                tool_result_attr='tool_response',
+                output_tool_span_name='running output function',
+            )
+        else:
+            return cls(
+                agent_run_span_name='invoke_agent',
+                agent_name_attr='gen_ai.agent.name',
+                tool_span_name='execute_tool',  # Will be formatted with tool name
+                tool_arguments_attr='gen_ai.tool.call.arguments',
+                tool_result_attr='gen_ai.tool.call.result',
+                output_tool_span_name='execute_tool',
+            )
+
+    def get_agent_run_span_name(self, agent_name: str) -> str:
+        """Get the formatted agent span name.
+
+        Args:
+            agent_name: Name of the agent being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.agent_run_span_name == 'invoke_agent':
+            return f'invoke_agent {agent_name}'
+        return self.agent_run_span_name
+
+    def get_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.tool_span_name
+
+    def get_output_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted output tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.output_tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.output_tool_span_name
+
+# pydantic_ai_slim/pydantic_ai/_instrumentation.py:14-95
+class InstrumentationNames:
+    """Configuration for instrumentation span names and attributes based on version."""
+
+    # Agent run span configuration
+    agent_run_span_name: str
+    agent_name_attr: str
+
+    # Tool execution span configuration
+    tool_span_name: str
+    tool_arguments_attr: str
+    tool_result_attr: str
+
+    # Output Tool execution span configuration
+    output_tool_span_name: str
+
+    @classmethod
+    def for_version(cls, version: int) -> Self:
+        """Create instrumentation configuration for a specific version.
+
+        Args:
+            version: The instrumentation version (1, 2, or 3+)
+
+        Returns:
+            InstrumentationConfig instance with version-appropriate settings
+        """
+        if version <= 2:
+            return cls(
+                agent_run_span_name='agent run',
+                agent_name_attr='agent_name',
+                tool_span_name='running tool',
+                tool_arguments_attr='tool_arguments',
+                tool_result_attr='tool_response',
+                output_tool_span_name='running output function',
+            )
+        else:
+            return cls(
+                agent_run_span_name='invoke_agent',
+                agent_name_attr='gen_ai.agent.name',
+                tool_span_name='execute_tool',  # Will be formatted with tool name
+                tool_arguments_attr='gen_ai.tool.call.arguments',
+                tool_result_attr='gen_ai.tool.call.result',
+                output_tool_span_name='execute_tool',
+            )
+
+    def get_agent_run_span_name(self, agent_name: str) -> str:
+        """Get the formatted agent span name.
+
+        Args:
+            agent_name: Name of the agent being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.agent_run_span_name == 'invoke_agent':
+            return f'invoke_agent {agent_name}'
+        return self.agent_run_span_name
+
+    def get_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.tool_span_name
+
+    def get_output_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted output tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.output_tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.output_tool_span_name
+
+# pydantic_ai_slim/pydantic_ai/_instrumentation.py:14-95
+class InstrumentationNames:
+    """Configuration for instrumentation span names and attributes based on version."""
+
+    # Agent run span configuration
+    agent_run_span_name: str
+    agent_name_attr: str
+
+    # Tool execution span configuration
+    tool_span_name: str
+    tool_arguments_attr: str
+    tool_result_attr: str
+
+    # Output Tool execution span configuration
+    output_tool_span_name: str
+
+    @classmethod
+    def for_version(cls, version: int) -> Self:
+        """Create instrumentation configuration for a specific version.
+
+        Args:
+            version: The instrumentation version (1, 2, or 3+)
+
+        Returns:
+            InstrumentationConfig instance with version-appropriate settings
+        """
+        if version <= 2:
+            return cls(
+                agent_run_span_name='agent run',
+                agent_name_attr='agent_name',
+                tool_span_name='running tool',
+                tool_arguments_attr='tool_arguments',
+                tool_result_attr='tool_response',
+                output_tool_span_name='running output function',
+            )
+        else:
+            return cls(
+                agent_run_span_name='invoke_agent',
+                agent_name_attr='gen_ai.agent.name',
+                tool_span_name='execute_tool',  # Will be formatted with tool name
+                tool_arguments_attr='gen_ai.tool.call.arguments',
+                tool_result_attr='gen_ai.tool.call.result',
+                output_tool_span_name='execute_tool',
+            )
+
+    def get_agent_run_span_name(self, agent_name: str) -> str:
+        """Get the formatted agent span name.
+
+        Args:
+            agent_name: Name of the agent being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.agent_run_span_name == 'invoke_agent':
+            return f'invoke_agent {agent_name}'
+        return self.agent_run_span_name
+
+    def get_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.tool_span_name
+
+    def get_output_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted output tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.output_tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.output_tool_span_name
+
+# pydantic_ai_slim/pydantic_ai/embeddings/instrumented.py:48-48
+    instrumentation_settings: InstrumentationSettings

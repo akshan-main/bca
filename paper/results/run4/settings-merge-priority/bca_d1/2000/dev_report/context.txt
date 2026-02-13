@@ -1,0 +1,207 @@
+## tests/test_agent.py
+
+def test_output_validator():
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        if len(messages) == 1:
+            args_json = '{"a": 41, "b": "foo"}'
+        else:
+            args_json = '{"a": 42, "b": "foo"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=Foo)
+
+    @agent.output_validator
+    def validate_output(ctx: RunContext[None], o: Foo) -> Foo:
+        assert ctx.tool_name == 'final_result'
+        if o.a == 42:
+            return o
+        else:
+            raise ModelRetry('"a" should be 42')
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, Foo)
+    assert result.output.model_dump() == {'a': 42, 'b': 'foo'}
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='final_result', args='{"a": 41, "b": "foo"}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=51, output_tokens=7),
+                model_name='function:return_model:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='"a" should be 42',
+                        tool_name='final_result',
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='final_result', args='{"a": 42, "b": "foo"}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=63, output_tokens=14),
+                model_name='function:return_model:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+class OutputType(BaseModel):
+    """Result type used by multiple tests."""
+
+    value: str
+
+def test_capture_run_messages_tool_agent() -> None:
+    agent_outer = Agent('test')
+    agent_inner = Agent(TestModel(custom_output_text='inner agent result'))
+
+    @agent_outer.tool_plain
+    async def foobar(x: str) -> str:
+        result_ = await agent_inner.run(x)
+        return result_.output
+
+    with capture_run_messages() as messages:
+        result = agent_outer.run_sync('foobar')
+
+    assert result.output == snapshot('{"foobar":"inner agent result"}')
+    assert messages == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='foobar', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args={'x': 'a'}, tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=51, output_tokens=5),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='foobar',
+                        content='inner agent result',
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='{"foobar":"inner agent result"}')],
+                usage=RequestUsage(input_tokens=54, output_tokens=11),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+def test_custom_output_type_sync() -> None:
+    agent = Agent('test', output_type=Foo)
+
+    assert agent.run_sync('Hello').output == snapshot(Foo(a=0, b='a'))
+    assert agent.run_sync('Hello', output_type=Bar).output == snapshot(Bar(c=0, d='a'))
+    assert agent.run_sync('Hello', output_type=str).output == snapshot('success (no tool calls)')
+    assert agent.run_sync('Hello', output_type=int).output == snapshot(0)
+
+async def test_thinking_only_response_retry():
+    """Test that thinking-only responses trigger a retry mechanism."""
+    from pydantic_ai import ThinkingPart
+    from pydantic_ai.models.function import FunctionModel
+
+    call_count = 0
+
+    def model_function(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal call_count
+        call_count += 1
+
+        if call_count == 1:
+            # First call: return thinking-only response
+            return ModelResponse(
+                parts=[ThinkingPart(content='Let me think about this...')],
+                model_name='thinking-test-model',
+            )
+        else:
+            # Second call: return proper response
+            return ModelResponse(
+                parts=[TextPart(content='Final answer')],
+                model_name='thinking-test-model',
+            )
+
+    model = FunctionModel(model_function)
+    agent = Agent(model, instructions='You are a helpful assistant.')
+
+    result = await agent.run('Hello')
+
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Hello',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                instructions='You are a helpful assistant.',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ThinkingPart(content='Let me think about this...')],
+                usage=RequestUsage(input_tokens=51, output_tokens=6),
+                model_name='function:model_function:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Please return text or call a tool.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                instructions='You are a helpful assistant.',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Final answer')],
+                usage=RequestUsage(input_tokens=67, output_tokens=8),
+                model_name='function:model_function:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+class UserContext:
+    location: str | None

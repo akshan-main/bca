@@ -1,0 +1,469 @@
+## clai/clai/__init__.py
+
+def cli():
+    """Run the clai CLI and exit."""
+    _cli.cli_exit('clai')
+
+## examples/pydantic_ai_examples/chat_app.py
+
+async def index() -> FileResponse:
+    return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
+
+async def main_ts() -> FileResponse:
+    """Get the raw typescript code, it's compiled in the browser, forgive me."""
+    return FileResponse((THIS_DIR / 'chat_app.ts'), media_type='text/plain')
+
+## examples/pydantic_ai_examples/data_analyst.py
+
+def display(ctx: RunContext[AnalystAgentDeps], name: str) -> str:
+    """Display at most 5 rows of the dataframe."""
+    dataset = ctx.deps.get(name)
+    return dataset.head().to_string()  # pyright: ignore[reportUnknownMemberType]
+
+## examples/pydantic_ai_examples/evals/agent.py
+
+async def infer_time_range(inputs: TimeRangeInputs) -> TimeRangeResponse:
+    """Infer a time range from a user prompt."""
+    deps = TimeRangeDeps(now=inputs['now'])
+    return (await time_range_agent.run(inputs['prompt'], deps=deps)).output
+
+## examples/pydantic_ai_examples/flight_booking.py
+
+async def buy_tickets(flight_details: FlightDetails, seat: SeatPreference):
+    print(f'Purchasing flight {flight_details=!r} {seat=!r}...')
+
+## examples/pydantic_ai_examples/pydantic_model.py
+
+class MyModel(BaseModel):
+    city: str
+    country: str
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/agent.py
+
+async def analyze_profile(profile: Profile) -> Analysis | None:
+    result = await agent.run(profile.as_prompt())
+    return result.output  ### [/analyze_profile]
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    async def _handle_tool_calls(
+        self,
+        ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]],
+        tool_calls: list[_messages.ToolCallPart],
+    ) -> AsyncIterator[_messages.HandleResponseEvent]:
+        run_context = build_run_context(ctx)
+
+        # This will raise errors for any tool name conflicts
+        ctx.deps.tool_manager = await ctx.deps.tool_manager.for_run_step(run_context)
+
+        output_parts: list[_messages.ModelRequestPart] = []
+        output_final_result: deque[result.FinalResult[NodeRunEndT]] = deque(maxlen=1)
+
+        async for event in process_tool_calls(
+            tool_manager=ctx.deps.tool_manager,
+            tool_calls=tool_calls,
+            tool_call_results=self.tool_call_results,
+            tool_call_metadata=self.tool_call_metadata,
+            final_result=None,
+            ctx=ctx,
+            output_parts=output_parts,
+            output_final_result=output_final_result,
+        ):
+            yield event
+
+        if output_final_result:
+            final_result = output_final_result[0]
+            self._next_node = self._handle_final_result(ctx, final_result, output_parts)
+        else:
+            # Add user prompt if provided, after all tool return parts
+            if self.user_prompt is not None:
+                output_parts.append(_messages.UserPromptPart(self.user_prompt))
+
+            instructions = await ctx.deps.get_instructions(run_context)
+            self._next_node = ModelRequestNode[DepsT, NodeRunEndT](
+                _messages.ModelRequest(parts=output_parts, instructions=instructions)
+            )
+
+async def _call_tools(  # noqa: C901
+    tool_manager: ToolManager[DepsT],
+    tool_calls: list[_messages.ToolCallPart],
+    tool_call_results: dict[str, DeferredToolResult],
+    tool_call_metadata: dict[str, dict[str, Any]] | None,
+    tracer: Tracer,
+    usage: _usage.RunUsage,
+    usage_limits: _usage.UsageLimits,
+    output_parts: list[_messages.ModelRequestPart],
+    output_deferred_calls: dict[Literal['external', 'unapproved'], list[_messages.ToolCallPart]],
+    output_deferred_metadata: dict[str, dict[str, Any]],
+) -> AsyncIterator[_messages.HandleResponseEvent]:
+    tool_parts_by_index: dict[int, _messages.ModelRequestPart] = {}
+    user_parts_by_index: dict[int, _messages.UserPromptPart] = {}
+    deferred_calls_by_index: dict[int, Literal['external', 'unapproved']] = {}
+    deferred_metadata_by_index: dict[int, dict[str, Any] | None] = {}
+
+    if usage_limits.tool_calls_limit is not None:
+        projected_usage = deepcopy(usage)
+        projected_usage.tool_calls += len(tool_calls)
+        usage_limits.check_before_tool_call(projected_usage)
+
+    for call in tool_calls:
+        yield _messages.FunctionToolCallEvent(call)
+
+    with tracer.start_as_current_span(
+        'running tools',
+        attributes={
+            'tools': [call.tool_name for call in tool_calls],
+            'logfire.msg': f'running {len(tool_calls)} tool{"" if len(tool_calls) == 1 else "s"}',
+        },
+    ):
+
+        async def handle_call_or_result(
+            coro_or_task: Awaitable[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ]
+            | Task[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ],
+            index: int,
+        ) -> _messages.HandleResponseEvent | None:
+            try:
+                tool_part, tool_user_content = (
+                    (await coro_or_task) if inspect.isawaitable(coro_or_task) else coro_or_task.result()
+                )
+            except exceptions.CallDeferred as e:
+                deferred_calls_by_index[index] = 'external'
+                deferred_metadata_by_index[index] = e.metadata
+            except exceptions.ApprovalRequired as e:
+                deferred_calls_by_index[index] = 'unapproved'
+                deferred_metadata_by_index[index] = e.metadata
+            else:
+                tool_parts_by_index[index] = tool_part
+                if tool_user_content:
+                    user_parts_by_index[index] = _messages.UserPromptPart(content=tool_user_content)
+
+                return _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
+
+        parallel_execution_mode = tool_manager.get_parallel_execution_mode(tool_calls)
+        if parallel_execution_mode == 'sequential':
+            for index, call in enumerate(tool_calls):
+                if event := await handle_call_or_result(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    index,
+                ):
+                    yield event
+
+        else:
+            tasks = [
+                asyncio.create_task(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    name=call.tool_name,
+                )
+                for call in tool_calls
+            ]
+            try:
+                if parallel_execution_mode == 'parallel_ordered_events':
+                    # Wait for all tasks to complete before yielding any events
+                    await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+                    for index, task in enumerate(tasks):
+                        if event := await handle_call_or_result(coro_or_task=task, index=index):
+                            yield event
+                else:
+                    pending: set[
+                        asyncio.Task[
+                            tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, _messages.UserPromptPart | None]
+                        ]
+                    ] = set(tasks)  # pyright: ignore[reportAssignmentType]
+                    while pending:
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            index = tasks.index(task)  # pyright: ignore[reportArgumentType]
+                            if event := await handle_call_or_result(coro_or_task=task, index=index):  # pyright: ignore[reportArgumentType]
+                                yield event
+
+            except asyncio.CancelledError as e:
+                for task in tasks:
+                    task.cancel(msg=e.args[0] if len(e.args) != 0 else None)
+
+                raise
+
+    # We append the results at the end, rather than as they are received, to retain a consistent ordering
+    # This is mostly just to simplify testing
+    output_parts.extend([tool_parts_by_index[k] for k in sorted(tool_parts_by_index)])
+    output_parts.extend([user_parts_by_index[k] for k in sorted(user_parts_by_index)])
+
+    _populate_deferred_calls(
+        tool_calls, deferred_calls_by_index, deferred_metadata_by_index, output_deferred_calls, output_deferred_metadata
+    )
+
+class _RunMessages:
+    messages: list[_messages.ModelMessage]
+    used: bool = False
+
+def get_captured_run_messages() -> _RunMessages:
+    return _messages_ctx_var.get()
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def get_traceparent(x: AgentRun | AgentRunResult | GraphRun | GraphRunResult) -> str:
+    return x._traceparent(required=False) or ''  # type: ignore[reportPrivateUsage]
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    def parallel_tool_call_execution_mode(mode: _tool_manager.ParallelExecutionMode = 'parallel') -> Iterator[None]:
+        """Set the parallel execution mode during the context.
+
+        Args:
+            mode: The execution mode for tool calls:
+                - 'parallel': Run tool calls in parallel, yielding events as they complete (default).
+                - 'sequential': Run tool calls one at a time in order.
+                - 'parallel_ordered_events': Run tool calls in parallel, but events are emitted in order, after all calls complete.
+        """
+        with ToolManager.parallel_execution_mode(mode):
+            yield
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    def tool_calls(self) -> list[ToolCallPart]:
+        """Get the tool calls in the response."""
+        return [part for part in self.parts if isinstance(part, ToolCallPart)]
+
+## pydantic_ai_slim/pydantic_ai/models/function.py
+
+DeltaToolCalls: TypeAlias = dict[int, DeltaToolCall]
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+def _function_call_part_from_call(tool: ToolCallPart) -> _GeminiFunctionCallPart:
+    return _GeminiFunctionCallPart(function_call=_GeminiFunctionCall(name=tool.tool_name, args=tool.args_as_dict()))
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class _WrappedTextOutput:
+    """A private wrapper class to tag an output that came from the custom_output_text field."""
+
+    value: str | None
+
+## pydantic_ai_slim/pydantic_ai/output.py
+
+class DeferredToolCalls(DeferredToolRequests):  # pragma: no cover
+    @property
+    @deprecated('`DeferredToolCalls.tool_calls` is deprecated, use `DeferredToolRequests.calls` instead')
+    def tool_calls(self) -> list[ToolCallPart]:
+        return self.calls
+
+    @property
+    @deprecated('`DeferredToolCalls.tool_defs` is deprecated')
+    def tool_defs(self) -> dict[str, ToolDefinition]:
+        return {}
+
+    def tool_calls(self) -> list[ToolCallPart]:
+        return self.calls
+
+    def tool_defs(self) -> dict[str, ToolDefinition]:
+        return {}
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    wait: WaitBaseT
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_utils.py
+
+def load_provider_metadata(provider_metadata: ProviderMetadata | None) -> dict[str, Any]:
+    """Load the Pydantic AI metadata from the provider metadata."""
+    return provider_metadata.get(PROVIDER_METADATA_KEY, {}) if provider_metadata else {}
+
+## tests/graph/beta/test_broadcast_and_spread.py
+
+class CounterState:
+    values: list[int] = field(default_factory=list[int])
+
+## tests/graph/beta/test_decisions.py
+
+class DecisionState:
+    path_taken: str | None = None
+    value: int = 0
+
+## tests/graph/beta/test_edge_cases.py
+
+class EdgeCaseState:
+    value: int = 0
+    error_raised: bool = False
+
+## tests/graph/beta/test_edge_labels.py
+
+class LabelState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_builder.py
+
+class SimpleState:
+    counter: int = 0
+    result: str | None = None
+
+## tests/graph/beta/test_graph_edge_cases.py
+
+class MyState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_execution.py
+
+class ExecutionState:
+    log: list[str] = field(default_factory=list[str])
+    counter: int = 0
+
+## tests/graph/beta/test_v1_v2_integration.py
+
+class IntegrationState:
+    log: list[str] = field(default_factory=list[str])
+
+## tests/models/test_model_test.py
+
+class AgentRunDeps:
+    run_id: int
+
+def test_different_content_input(content: AudioUrl | VideoUrl | ImageUrl | BinaryContent):
+    agent = Agent()
+    result = agent.run_sync(['x', content], model=TestModel(custom_output_text='custom'))
+    assert result.output == snapshot('custom')
+    assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=1))
+
+## tests/providers/test_alibaba_provider.py
+
+def test_alibaba_provider_env_key(env: TestEnv):
+    env.set('ALIBABA_API_KEY', 'env-key')
+    provider = AlibabaProvider()
+    assert provider.client.api_key == 'env-key'
+
+## tests/providers/test_google_gla.py
+
+def test_api_key_env_var(env: TestEnv):
+    env.set('GEMINI_API_KEY', 'via-env-var')
+    provider = GoogleGLAProvider()
+    assert 'x-goog-api-key' in dict(provider.client.headers)
+
+## tests/providers/test_sambanova_provider.py
+
+def test_sambanova_provider_env_key(env: TestEnv):
+    env.set('SAMBANOVA_API_KEY', 'env-key')
+    provider = SambaNovaProvider()
+    assert provider.client.api_key == 'env-key'
+
+## tests/test_agent.py
+
+class Foo(BaseModel):
+    a: int
+    b: str
+
+class OutputType(BaseModel):
+    """Result type used by multiple tests."""
+
+    value: str
+
+class Bar(BaseModel):
+    c: int
+    d: str
+
+class UserContext:
+    location: str | None
+
+## tests/test_dbos.py
+
+class BasicSpan:
+    content: str
+    children: list[BasicSpan] = field(default_factory=list['BasicSpan'])
+    parent_id: int | None = field(repr=False, compare=False, default=None)
+
+async def test_dbos_agent_run(allow_model_requests: None, dbos: DBOS):
+    # Note: this runs as a DBOS workflow because we automatically wrap the run function.
+    result = await simple_dbos_agent.run('What is the capital of Mexico?')
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_dbos_agent_run_in_workflow_with_toolsets(allow_model_requests: None, dbos: DBOS):
+    # Since DBOS does not automatically wrap the tools in a workflow, and allows dynamic steps, we can pass in toolsets directly.
+    result = await simple_dbos_agent.run('What is the capital of Mexico?', toolsets=[FunctionToolset()])
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+class UnserializableDeps:
+    client: AsyncClient
+
+async def test_custom_model_settings(allow_model_requests: None, dbos: DBOS):
+    result = await settings_dbos_agent.run('Give me those settings')
+    assert result.output == snapshot("{'max_tokens': 123, 'custom_setting': 'custom_value'}")
+
+## tests/test_deps.py
+
+class MyDeps:
+    foo: int
+    bar: int
+
+## tests/test_mcp.py
+
+async def test_agent_with_server_not_running(agent: Agent, allow_model_requests: None):
+    result = await agent.run('What is 0 degrees Celsius in Fahrenheit?')
+    assert result.output == snapshot('0 degrees Celsius is 32.0 degrees Fahrenheit.')
+
+## tests/test_prefect.py
+
+async def test_prefect_agent_run(allow_model_requests: None) -> None:
+    """Test that agent.run() works (auto-wrapped as flow)."""
+    result = await simple_prefect_agent.run('What is the capital of Mexico?')
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_prefect_agent_with_model_retry(allow_model_requests: None) -> None:
+    """Test that ModelRetry works correctly."""
+    result = await model_retry_prefect_agent.run('What is the weather in CDMX?')
+    assert 'sunny' in result.output.lower() or 'mexico city' in result.output.lower()
+
+async def test_custom_model_settings(allow_model_requests: None):
+    """Test that custom model settings are passed through correctly."""
+    result = await settings_prefect_agent.run('Give me those settings')
+    assert result.output == snapshot("{'max_tokens': 123, 'custom_setting': 'custom_value'}")
+
+class SimpleDeps:
+    value: str
+
+## tests/test_tools.py
+
+def test_output_type_deferred_tool_requests_by_itself():
+    with pytest.raises(UserError, match='At least one output type must be provided other than `DeferredToolRequests`.'):
+        Agent(TestModel(), output_type=DeferredToolRequests)
+
+def test_output_type_empty():
+    with pytest.raises(UserError, match='At least one output type must be provided.'):
+        Agent(TestModel(), output_type=[])
+
+## tests/test_ui_web.py
+
+def test_model_profile():
+    """Test Model.profile cached property."""
+    model = TestModel()
+    assert model.profile is not None
+
+def test_model_label_openrouter():
+    """Test Model.label handles OpenRouter-style names with /."""
+    model = TestModel(model_name='meta-llama/llama-3-70b')
+    assert model.label == snapshot('Llama 3 70b')
+
+## tests/test_usage_limits.py
+
+async def test_failed_tool_calls_not_counted() -> None:
+    """Test that failed tool calls (raising ModelRetry) are not counted in usage or against limits."""
+    test_agent = Agent(TestModel())
+
+    call_count = 0
+
+    @test_agent.tool_plain
+    async def flaky_tool(x: str) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ModelRetry('Temporary failure, please retry')
+        return f'{x}-success'
+
+    result = await test_agent.run('test', usage_limits=UsageLimits(tool_calls_limit=1))
+    assert call_count == 2
+    assert result.usage() == snapshot(RunUsage(requests=3, input_tokens=176, output_tokens=29, tool_calls=1))

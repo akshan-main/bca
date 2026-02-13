@@ -1,0 +1,478 @@
+## httpx/_client.py
+
+    def _transport_for_url(self, url: URL) -> BaseTransport:
+        """
+        Returns the transport instance that should be used for a given URL.
+        This will either be the standard connection pool, or a proxy.
+        """
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(url):
+                return self._transport if transport is None else transport
+
+        return self._transport
+
+## httpx/_content.py
+
+class AsyncIteratorByteStream(AsyncByteStream):
+    CHUNK_SIZE = 65_536
+
+    def __init__(self, stream: AsyncIterable[bytes]) -> None:
+        self._stream = stream
+        self._is_stream_consumed = False
+        self._is_generator = inspect.isasyncgen(stream)
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        if self._is_stream_consumed and self._is_generator:
+            raise StreamConsumed()
+
+        self._is_stream_consumed = True
+        if hasattr(self._stream, "aread"):
+            # File-like interfaces should use 'aread' directly.
+            chunk = await self._stream.aread(self.CHUNK_SIZE)
+            while chunk:
+                yield chunk
+                chunk = await self._stream.aread(self.CHUNK_SIZE)
+        else:
+            # Otherwise iterate.
+            async for part in self._stream:
+                yield part
+
+## httpx/_exceptions.py
+
+class HTTPError(Exception):
+    """
+    Base class for `RequestError` and `HTTPStatusError`.
+
+    Useful for `try...except` blocks when issuing a request,
+    and then calling `.raise_for_status()`.
+
+    For example:
+
+    ```
+    try:
+        response = httpx.get("https://www.example.com")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        print(f"HTTP Exception for {exc.request.url} - {exc}")
+    ```
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._request: Request | None = None
+
+    @property
+    def request(self) -> Request:
+        if self._request is None:
+            raise RuntimeError("The .request property has not been set.")
+        return self._request
+
+    @request.setter
+    def request(self, request: Request) -> None:
+        self._request = request
+
+class RequestError(HTTPError):
+    """
+    Base class for all exceptions that may occur when issuing a `.request()`.
+    """
+
+    def __init__(self, message: str, *, request: Request | None = None) -> None:
+        super().__init__(message)
+        # At the point an exception is raised we won't typically have a request
+        # instance to associate it with.
+        #
+        # The 'request_context' context manager is used within the Client and
+        # Response methods in order to ensure that any raised exceptions
+        # have a `.request` property set on them.
+        self._request = request
+
+class TransportError(RequestError):
+    """
+    Base class for all exceptions that occur at the level of the Transport API.
+    """
+
+class NetworkError(TransportError):
+    """
+    The base class for network-related errors.
+
+    An error occurred while interacting with the network.
+    """
+
+class StreamError(RuntimeError):
+    """
+    The base class for stream exceptions.
+
+    The developer made an error in accessing the request stream in
+    an invalid way.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+## httpx/_main.py
+
+def format_response_headers(
+    http_version: bytes,
+    status: int,
+    reason_phrase: bytes | None,
+    headers: list[tuple[bytes, bytes]],
+) -> str:
+    version = http_version.decode("ascii")
+    reason = (
+        codes.get_reason_phrase(status)
+        if reason_phrase is None
+        else reason_phrase.decode("ascii")
+    )
+    lines = [f"{version} {status} {reason}"] + [
+        f"{name.decode('ascii')}: {value.decode('ascii')}" for name, value in headers
+    ]
+    return "\n".join(lines)
+
+## httpx/_status_codes.py
+
+    SERVICE_UNAVAILABLE = 503, "Service Unavailable"
+
+## httpx/_transports/default.py
+
+def map_httpcore_exceptions() -> typing.Iterator[None]:
+    global HTTPCORE_EXC_MAP
+    if len(HTTPCORE_EXC_MAP) == 0:
+        HTTPCORE_EXC_MAP = _load_httpcore_exceptions()
+    try:
+        yield
+    except Exception as exc:
+        mapped_exc = None
+
+        for from_exc, to_exc in HTTPCORE_EXC_MAP.items():
+            if not isinstance(exc, from_exc):
+                continue
+            # We want to map to the most specific exception we can find.
+            # Eg if `exc` is an `httpcore.ReadTimeout`, we want to map to
+            # `httpx.ReadTimeout`, not just `httpx.TimeoutException`.
+            if mapped_exc is None or issubclass(to_exc, mapped_exc):
+                mapped_exc = to_exc
+
+        if mapped_exc is None:  # pragma: no cover
+            raise
+
+        message = str(exc)
+        raise mapped_exc(message) from exc
+
+## httpx/_transports/mock.py
+
+class MockTransport(AsyncBaseTransport, BaseTransport):
+    def __init__(self, handler: SyncHandler | AsyncHandler) -> None:
+        self.handler = handler
+
+    def handle_request(
+        self,
+        request: Request,
+    ) -> Response:
+        request.read()
+        response = self.handler(request)
+        if not isinstance(response, Response):  # pragma: no cover
+            raise TypeError("Cannot use an async handler in a sync Client")
+        return response
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        await request.aread()
+        response = self.handler(request)
+
+        # Allow handler to *optionally* be an `async` function.
+        # If it is, then the `response` variable need to be awaited to actually
+        # return the result.
+
+        if not isinstance(response, Response):
+            response = await response
+
+        return response
+
+## tests/client/test_async_client.py
+
+async def test_raise_for_status(server):
+    async with httpx.AsyncClient() as client:
+        for status_code in (200, 400, 404, 500, 505):
+            response = await client.request(
+                "GET", server.url.copy_with(path=f"/status/{status_code}")
+            )
+
+            if 400 <= status_code < 600:
+                with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                    response.raise_for_status()
+                assert exc_info.value.response == response
+            else:
+                assert response.raise_for_status() is response
+
+def hello_world(request):
+    return httpx.Response(200, text="Hello, world!")
+
+## tests/client/test_auth.py
+
+class SyncOrAsyncAuth(httpx.Auth):
+    """
+    A mock authentication scheme that uses a different implementation for the
+    sync and async cases.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._async_lock = anyio.Lock()
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.AsyncGenerator[httpx.Request, httpx.Response]:
+        async with self._async_lock:
+            request.headers["Authorization"] = "async-auth"
+        yield request
+
+async def test_digest_auth_qop_including_spaces_and_auth_returns_auth(qop: str) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop=qop)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+async def test_digest_auth_qop_must_be_auth_or_auth_int() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="not-auth")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+async def test_digest_auth_incorrect_credentials() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(send_response_after_attempt=2)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert len(response.history) == 1
+
+async def test_async_digest_auth_raises_protocol_error_on_malformed_header(
+    auth_header: str,
+) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App(auth_header=auth_header, status_code=401)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+def test_sync_digest_auth_raises_protocol_error_on_malformed_header(
+    auth_header: str,
+) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App(auth_header=auth_header, status_code=401)
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            client.get(url, auth=auth)
+
+async def test_async_auth_history() -> None:
+    """
+    Test that intermediate requests sent as part of an authentication flow
+    are recorded in the response history.
+    """
+    url = "https://example.org/"
+    auth = RepeatAuth(repeat=2)
+    app = App(auth_header="abc")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Repeat abc.abc"}
+
+    assert len(response.history) == 2
+    resp1, resp2 = response.history
+    assert resp1.json() == {"auth": "Repeat 0"}
+    assert resp2.json() == {"auth": "Repeat 1"}
+
+    assert len(resp2.history) == 1
+    assert resp2.history == [resp1]
+
+    assert len(resp1.history) == 0
+
+def test_sync_auth_history() -> None:
+    """
+    Test that intermediate requests sent as part of an authentication flow
+    are recorded in the response history.
+    """
+    url = "https://example.org/"
+    auth = RepeatAuth(repeat=2)
+    app = App(auth_header="abc")
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Repeat abc.abc"}
+
+    assert len(response.history) == 2
+    resp1, resp2 = response.history
+    assert resp1.json() == {"auth": "Repeat 0"}
+    assert resp2.json() == {"auth": "Repeat 1"}
+
+    assert len(resp2.history) == 1
+    assert resp2.history == [resp1]
+
+    assert len(resp1.history) == 0
+
+## tests/client/test_client.py
+
+def hello_world(request):
+    return httpx.Response(200, text="Hello, world!")
+
+def test_all_mounted_transport():
+    mounts = {"all://": httpx.MockTransport(mounted)}
+
+    client = httpx.Client(mounts=mounts)
+
+    response = client.get("https://www.example.com")
+    assert response.status_code == 200
+    assert response.json() == {"app": "mounted"}
+
+## tests/client/test_headers.py
+
+def test_same_origin():
+    origin = httpx.URL("https://example.com")
+    request = httpx.Request("GET", "HTTPS://EXAMPLE.COM:443")
+
+    client = httpx.Client()
+    headers = client._redirect_headers(request, origin, "GET")
+
+    assert headers["Host"] == request.url.netloc.decode("ascii")
+
+def test_not_same_origin():
+    origin = httpx.URL("https://example.com")
+    request = httpx.Request("GET", "HTTP://EXAMPLE.COM:80")
+
+    client = httpx.Client()
+    headers = client._redirect_headers(request, origin, "GET")
+
+    assert headers["Host"] == origin.netloc.decode("ascii")
+
+## tests/client/test_proxies.py
+
+def test_transport_for_request(url, proxies, expected):
+    mounts = {key: httpx.HTTPTransport(proxy=value) for key, value in proxies.items()}
+    client = httpx.Client(mounts=mounts)
+
+    transport = client._transport_for_url(httpx.URL(url))
+
+    if expected is None:
+        assert transport is client._transport
+    else:
+        assert isinstance(transport, httpx.HTTPTransport)
+        assert isinstance(transport._pool, httpcore.HTTPProxy)
+        assert transport._pool._proxy_url == url_to_origin(expected)
+
+## tests/test_asgi.py
+
+async def test_asgi_raw_path_should_not_include_querystring_portion():
+    """
+    See https://github.com/encode/httpx/issues/2810
+    """
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/path?query")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/path"}
+
+## tests/test_content.py
+
+async def test_urlencoded_boolean():
+    request = httpx.Request(method, url, data={"example": True})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "12",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"example=true"
+    assert async_content == b"example=true"
+
+## tests/test_wsgi.py
+
+def application_factory(output: typing.Iterable[bytes]) -> WSGIApplication:
+    def application(environ, start_response):
+        status = "200 OK"
+
+        response_headers = [
+            ("Content-type", "text/plain"),
+        ]
+
+        start_response(status, response_headers)
+
+        for item in output:
+            yield item
+
+    return wsgiref.validate.validator(application)
+
+def test_wsgi_http_error():
+    transport = httpx.WSGITransport(app=partial(raise_exc, exc=RuntimeError))
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")
+
+def test_wsgi_generator():
+    output = [b"", b"", b"Some content", b" and more content"]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "Some content and more content"
+
+def test_wsgi_generator_empty():
+    output = [b"", b"", b"", b""]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == ""
+
+def test_wsgi_server_port(url: str, expected_server_port: str) -> None:
+    """
+    SERVER_PORT is populated correctly from the requested URL.
+    """
+    hello_world_app = application_factory([b"Hello, World!"])
+    server_port: str | None = None
+
+    def app(environ, start_response):
+        nonlocal server_port
+        server_port = environ["SERVER_PORT"]
+        return hello_world_app(environ, start_response)
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get(url)
+    assert response.status_code == 200
+    assert response.text == "Hello, World!"
+    assert server_port == expected_server_port

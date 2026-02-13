@@ -1,0 +1,459 @@
+# tests/test_ssrf.py:432-459
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+# tests/test_ssrf.py:402-672
+class TestSafeDownload:
+    """Tests for safe_download function."""
+
+    async def test_successful_download(self) -> None:
+        """Test successful download of a public URL."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+        mock_response.content = b'test content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'test content'
+
+            # Verify the request was made to the resolved IP with Host header and SNI
+            mock_client.get.assert_called_once()
+            call_args = mock_client.get.call_args
+            assert '93.184.215.14' in call_args[0][0]
+            assert call_args[1]['headers']['Host'] == 'example.com'
+            assert call_args[1]['extensions'] == {'sni_hostname': 'example.com'}
+
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+    async def test_redirect_to_private_ip_blocked(self) -> None:
+        """Test that redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'http://internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com (public), second for internal.local (private)
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_relative_redirect_resolved(self) -> None:
+        """Test that relative redirect URLs are resolved correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '/new-path/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/old-path/file.txt')
+            assert response.content == b'final content'
+
+            # Check that the second request was to the correct path
+            second_call = mock_client.get.call_args_list[1]
+            assert '/new-path/file.txt' in second_call[0][0]
+
+    async def test_missing_location_header(self) -> None:
+        """Test that redirect without Location header raises error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Redirect response missing Location header'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_protocol_relative_redirect(self) -> None:
+        """Test that protocol-relative redirects are handled correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+            # Verify second request was to cdn.example.com with https
+            second_call = mock_client.get.call_args_list[1]
+            assert second_call[1]['headers']['Host'] == 'cdn.example.com'
+
+    async def test_protocol_relative_redirect_to_private_blocked(self) -> None:
+        """Test that protocol-relative redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_http_no_sni_extension(self) -> None:
+        """Test that sni_hostname extension is not set for HTTP requests."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('http://example.com/file.txt')
+
+            call_args = mock_client.get.call_args
+            assert call_args[1]['extensions'] == {}
+
+    async def test_protocol_validation(self) -> None:
+        """Test that non-http(s) protocols are rejected."""
+        with pytest.raises(ValueError, match='URL protocol "file" is not allowed'):
+            await safe_download('file:///etc/passwd')
+
+        with pytest.raises(ValueError, match='URL protocol "ftp" is not allowed'):
+            await safe_download('ftp://ftp.example.com/file.txt')
+
+    async def test_timeout_parameter(self) -> None:
+        """Test that timeout parameter is passed to client."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('https://example.com/file.txt', timeout=60)
+
+            mock_client_fn.assert_called_once_with(timeout=60)
+
+    async def test_default_timeout(self) -> None:
+        """Test that default timeout is used."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('https://example.com/file.txt')
+
+            mock_client_fn.assert_called_once_with(timeout=_DEFAULT_TIMEOUT)
+
+# tests/test_ssrf.py:484-501
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/models/test_mcp_sampling.py:4-4
+from unittest.mock import AsyncMock
+
+# tests/models/test_openai.py:11-11
+from unittest.mock import AsyncMock, patch
+
+# tests/test_direct.py:5-5
+from unittest.mock import AsyncMock, patch
+
+# tests/test_embeddings.py:8-8
+from unittest.mock import AsyncMock, MagicMock, patch
+
+# tests/test_mcp.py:10-10
+from unittest.mock import AsyncMock, patch
+
+# tests/test_ssrf.py:5-5
+from unittest.mock import AsyncMock, patch
+
+# tests/test_tenacity.py:9-9
+from unittest.mock import AsyncMock, Mock
+
+# tests/test_toolsets.py:7-7
+from unittest.mock import AsyncMock
+
+# tests/test_ui_web.py:9-9
+from unittest.mock import AsyncMock
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:1354-1408
+    def to_a2a(
+        self,
+        *,
+        storage: Storage | None = None,
+        broker: Broker | None = None,
+        # Agent card
+        name: str | None = None,
+        url: str = 'http://localhost:8000',
+        version: str = '1.0.0',
+        description: str | None = None,
+        provider: AgentProvider | None = None,
+        skills: list[Skill] | None = None,
+        # Starlette
+        debug: bool = False,
+        routes: Sequence[Route] | None = None,
+        middleware: Sequence[Middleware] | None = None,
+        exception_handlers: dict[Any, ExceptionHandler] | None = None,
+        lifespan: Lifespan[FastA2A] | None = None,
+    ) -> FastA2A:
+        """Convert the agent to a FastA2A application.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+        app = agent.to_a2a()
+        ```
+
+        The `app` is an ASGI application that can be used with any ASGI server.
+
+        To run the application, you can use the following command:
+
+        ```bash
+        uvicorn app:app --host 0.0.0.0 --port 8000
+        ```
+        """
+        from .._a2a import agent_to_a2a
+
+        return agent_to_a2a(
+            self,
+            storage=storage,
+            broker=broker,
+            name=name,
+            url=url,
+            version=version,
+            description=description,
+            provider=provider,
+            skills=skills,
+            debug=debug,
+            routes=routes,
+            middleware=middleware,
+            exception_handlers=exception_handlers,
+            lifespan=lifespan,
+        )
+
+# tests/models/test_groq.py:10-10
+from unittest.mock import patch
+
+# tests/models/test_model.py:4-4
+from unittest.mock import patch
+
+# tests/models/test_openai.py:11-11
+from unittest.mock import AsyncMock, patch
+
+# tests/providers/test_gateway.py:4-4
+from unittest.mock import patch
+
+# tests/providers/test_google_vertex.py:8-8
+from unittest.mock import patch
+
+# tests/providers/test_huggingface.py:4-4
+from unittest.mock import MagicMock, Mock, patch
+
+# tests/providers/test_provider_names.py:5-5
+from unittest.mock import patch
+
+# tests/test_direct.py:5-5
+from unittest.mock import AsyncMock, patch
+
+# tests/test_embeddings.py:8-8
+from unittest.mock import AsyncMock, MagicMock, patch
+
+# tests/test_mcp.py:10-10
+from unittest.mock import AsyncMock, patch
+
+# tests/test_ssrf.py:5-5
+from unittest.mock import AsyncMock, patch
+
+# pydantic_ai_slim/pydantic_ai/result.py:434-436
+    async def stream(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[OutputDataT]:
+        async for output in self.stream_output(debounce_by=debounce_by):
+            yield output
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:16-16
+    content: NotRequired[str]
+
+# pydantic_ai_slim/pydantic_ai/messages.py:1064-1064
+    content: str
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:48-48
+    content: NotRequired[str]
+
+# pydantic_ai_slim/pydantic_ai/messages.py:1102-1102
+    content: str
+
+# pydantic_ai_slim/pydantic_ai/messages.py:751-751
+    content: str | Sequence[UserContent]

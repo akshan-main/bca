@@ -1,0 +1,443 @@
+## httpx/_client.py
+
+def _is_https_redirect(url: URL, location: URL) -> bool:
+    """
+    Return 'True' if 'location' is a HTTPS upgrade of 'url'
+    """
+    if url.host != location.host:
+        return False
+
+    return (
+        url.scheme == "http"
+        and _port_or_default(url) == 80
+        and location.scheme == "https"
+        and _port_or_default(location) == 443
+    )
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+def _same_origin(url: URL, other: URL) -> bool:
+    """
+    Return 'True' if the given URLs share the same origin.
+    """
+    return (
+        url.scheme == other.scheme
+        and url.host == other.host
+        and _port_or_default(url) == _port_or_default(other)
+    )
+
+class UseClientDefault:
+    """
+    For some parameters such as `auth=...` and `timeout=...` we need to be able
+    to indicate the default "unset" state, in a way that is distinctly different
+    to using `None`.
+
+    The default "unset" state indicates that whatever default is set on the
+    client should be used. This is different to setting `None`, which
+    explicitly disables the parameter, possibly overriding a client default.
+
+    For example we use `timeout=USE_CLIENT_DEFAULT` in the `request()` signature.
+    Omitting the `timeout` parameter will send a request using whatever default
+    timeout has been configured on the client. Including `timeout=None` will
+    ensure no timeout is used.
+
+    Note that user code shouldn't need to use the `USE_CLIENT_DEFAULT` constant,
+    but it is used internally when a parameter is not included.
+    """
+
+class ClientState(enum.Enum):
+    # UNOPENED:
+    #   The client has been instantiated, but has not been used to send a request,
+    #   or been opened by entering the context of a `with` block.
+    UNOPENED = 1
+    # OPENED:
+    #   The client has either sent a request, or is within a `with` block.
+    OPENED = 2
+    # CLOSED:
+    #   The client has either exited the `with` block, or `close()` has
+    #   been called explicitly.
+    CLOSED = 3
+
+class BoundSyncStream(SyncByteStream):
+    """
+    A byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: SyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        for chunk in self._stream:
+            yield chunk
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+class BoundAsyncStream(AsyncByteStream):
+    """
+    An async byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: AsyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    def __init__(
+        self, stream: AsyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    def is_closed(self) -> bool:
+        """
+        Check if the client being closed
+        """
+        return self._state == ClientState.CLOSED
+
+    def trust_env(self) -> bool:
+        return self._trust_env
+
+    def _enforce_trailing_slash(self, url: URL) -> URL:
+        if url.raw_path.endswith(b"/"):
+            return url
+        return url.copy_with(raw_path=url.raw_path + b"/")
+
+    def _get_proxy_map(
+        self, proxy: ProxyTypes | None, allow_env_proxies: bool
+    ) -> dict[str, Proxy | None]:
+        if proxy is None:
+            if allow_env_proxies:
+                return {
+                    key: None if url is None else Proxy(url=url)
+                    for key, url in get_environment_proxies().items()
+                }
+            return {}
+        else:
+            proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
+            return {"all://": proxy}
+
+    def timeout(self, timeout: TimeoutTypes) -> None:
+        self._timeout = Timeout(timeout)
+
+## httpx/_models.py
+
+def _is_known_encoding(encoding: str) -> bool:
+    """
+    Return `True` if `encoding` is a known codec.
+    """
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        return False
+    return True
+
+def _normalize_header_key(key: str | bytes, encoding: str | None = None) -> bytes:
+    """
+    Coerce str/bytes into a strictly byte-wise HTTP header key.
+    """
+    return key if isinstance(key, bytes) else key.encode(encoding or "ascii")
+
+def _normalize_header_value(value: str | bytes, encoding: str | None = None) -> bytes:
+    """
+    Coerce str/bytes into a strictly byte-wise HTTP header value.
+    """
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise TypeError(f"Header value must be str or bytes, not {type(value)}")
+    return value.encode(encoding or "ascii")
+
+def _parse_content_type_charset(content_type: str) -> str | None:
+    # We used to use `cgi.parse_header()` here, but `cgi` became a dead battery.
+    # See: https://peps.python.org/pep-0594/#cgi
+    msg = email.message.Message()
+    msg["content-type"] = content_type
+    return msg.get_content_charset(failobj=None)
+
+def _parse_header_links(value: str) -> list[dict[str, str]]:
+    """
+    Returns a list of parsed link headers, for more info see:
+    https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Link
+    The generic syntax of those is:
+    Link: < uri-reference >; param1=value1; param2="value2"
+    So for instance:
+    Link; '<http:/.../front.jpeg>; type="image/jpeg",<http://.../back.jpeg>;'
+    would return
+        [
+            {"url": "http:/.../front.jpeg", "type": "image/jpeg"},
+            {"url": "http://.../back.jpeg"},
+        ]
+    :param value: HTTP Link entity-header field
+    :return: list of parsed link headers
+    """
+    links: list[dict[str, str]] = []
+    replace_chars = " '\""
+    value = value.strip(replace_chars)
+    if not value:
+        return links
+    for val in re.split(", *<", value):
+        try:
+            url, params = val.split(";", 1)
+        except ValueError:
+            url, params = val, ""
+        link = {"url": url.strip("<> '\"")}
+        for param in params.split(";"):
+            try:
+                key, value = param.split("=")
+            except ValueError:
+                break
+            link[key.strip(replace_chars)] = value.strip(replace_chars)
+        links.append(link)
+    return links
+
+def _obfuscate_sensitive_headers(
+    items: typing.Iterable[tuple[typing.AnyStr, typing.AnyStr]],
+) -> typing.Iterator[tuple[typing.AnyStr, typing.AnyStr]]:
+    for k, v in items:
+        if to_str(k.lower()) in SENSITIVE_HEADERS:
+            v = to_bytes_or_str("[secure]", match_type_of=v)
+        yield k, v
+
+    def _prepare(self, default_headers: dict[str, str]) -> None:
+        for key, value in default_headers.items():
+            # Ignore Transfer-Encoding if the Content-Length has been set explicitly.
+            if key.lower() == "transfer-encoding" and "Content-Length" in self.headers:
+                continue
+            self.headers.setdefault(key, value)
+
+        auto_headers: list[tuple[bytes, bytes]] = []
+
+        has_host = "Host" in self.headers
+        has_content_length = (
+            "Content-Length" in self.headers or "Transfer-Encoding" in self.headers
+        )
+
+        if not has_host and self.url.host:
+            auto_headers.append((b"Host", self.url.netloc))
+        if not has_content_length and self.method in ("POST", "PUT", "PATCH"):
+            auto_headers.append((b"Content-Length", b"0"))
+
+        self.headers = Headers(auto_headers + self.headers.raw)
+
+    class _CookieCompatRequest(urllib.request.Request):
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
+
+        def __init__(self, request: Request) -> None:
+            super().__init__(
+                url=str(request.url),
+                headers=dict(request.headers),
+                method=request.method,
+            )
+            self.request = request
+
+        def add_unredirected_header(self, key: str, value: str) -> None:
+            super().add_unredirected_header(key, value)
+            self.request.headers[key] = value
+
+    class _CookieCompatResponse:
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
+
+        def __init__(self, response: Response) -> None:
+            self.response = response
+
+        def info(self) -> email.message.Message:
+            info = email.message.Message()
+            for key, value in self.response.headers.multi_items():
+                # Note that setting `info[key]` here is an "append" operation,
+                # not a "replace" operation.
+                # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
+                info[key] = value
+            return info
+
+        def info(self) -> email.message.Message:
+            info = email.message.Message()
+            for key, value in self.response.headers.multi_items():
+                # Note that setting `info[key]` here is an "append" operation,
+                # not a "replace" operation.
+                # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
+                info[key] = value
+            return info
+
+## tests/test_wsgi.py
+
+def application_factory(output: typing.Iterable[bytes]) -> WSGIApplication:
+    def application(environ, start_response):
+        status = "200 OK"
+
+        response_headers = [
+            ("Content-type", "text/plain"),
+        ]
+
+        start_response(status, response_headers)
+
+        for item in output:
+            yield item
+
+    return wsgiref.validate.validator(application)
+
+def echo_body_with_response_stream(
+    environ: WSGIEnvironment, start_response: StartResponse
+) -> typing.Iterable[bytes]:
+    status = "200 OK"
+
+    response_headers = [("Content-Type", "text/plain")]
+
+    start_response(status, response_headers)
+
+    def output_generator(f: typing.IO[bytes]) -> typing.Iterator[bytes]:
+        while True:
+            output = f.read(2)
+            if not output:
+                break
+            yield output
+
+    return output_generator(f=environ["wsgi.input"])
+
+def raise_exc(
+    environ: WSGIEnvironment,
+    start_response: StartResponse,
+    exc: type[Exception] = ValueError,
+) -> typing.Iterable[bytes]:
+    status = "500 Server Error"
+    output = b"Nope!"
+
+    response_headers = [
+        ("Content-type", "text/plain"),
+    ]
+
+    try:
+        raise exc()
+    except exc:
+        exc_info = sys.exc_info()
+        start_response(status, response_headers, exc_info)
+
+    return [output]
+
+def log_to_wsgi_log_buffer(environ, start_response):
+    print("test1", file=environ["wsgi.errors"])
+    environ["wsgi.errors"].write("test2")
+    return echo_body(environ, start_response)
+
+def test_wsgi_upload_with_response_stream():
+    transport = httpx.WSGITransport(app=echo_body_with_response_stream)
+    client = httpx.Client(transport=transport)
+    response = client.post("http://www.example.org/", content=b"example")
+    assert response.status_code == 200
+    assert response.text == "example"
+
+def test_wsgi_exc():
+    transport = httpx.WSGITransport(app=raise_exc)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(ValueError):
+        client.get("http://www.example.org/")
+
+def test_wsgi_http_error():
+    transport = httpx.WSGITransport(app=partial(raise_exc, exc=RuntimeError))
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")
+
+def test_wsgi_generator():
+    output = [b"", b"", b"Some content", b" and more content"]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "Some content and more content"
+
+def test_wsgi_generator_empty():
+    output = [b"", b"", b"", b""]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == ""
+
+def test_logging():
+    buffer = StringIO()
+    transport = httpx.WSGITransport(app=log_to_wsgi_log_buffer, wsgi_errors=buffer)
+    client = httpx.Client(transport=transport)
+    response = client.post("http://www.example.org/", content=b"example")
+    assert response.status_code == 200  # no errors
+    buffer.seek(0)
+    assert buffer.read() == "test1\ntest2"
+
+def test_wsgi_server_port(url: str, expected_server_port: str) -> None:
+    """
+    SERVER_PORT is populated correctly from the requested URL.
+    """
+    hello_world_app = application_factory([b"Hello, World!"])
+    server_port: str | None = None
+
+    def app(environ, start_response):
+        nonlocal server_port
+        server_port = environ["SERVER_PORT"]
+        return hello_world_app(environ, start_response)
+
+    transport = httpx.WSGITransport(app=app)
+    client = httpx.Client(transport=transport)
+    response = client.get(url)
+    assert response.status_code == 200
+    assert response.text == "Hello, World!"
+    assert server_port == expected_server_port
+
+def test_wsgi_server_protocol():
+    server_protocol = None
+
+    def app(environ, start_response):
+        nonlocal server_protocol
+        server_protocol = environ["SERVER_PROTOCOL"]
+        start_response("200 OK", [("Content-Type", "text/plain")])
+        return [b"success"]
+
+    transport = httpx.WSGITransport(app=app)
+    with httpx.Client(transport=transport, base_url="http://testserver") as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.text == "success"
+    assert server_protocol == "HTTP/1.1"

@@ -1,0 +1,195 @@
+## pydantic_ai_slim/pydantic_ai/_mcp.py
+
+def map_from_pai_messages(pai_messages: list[messages.ModelMessage]) -> tuple[str, list[mcp_types.SamplingMessage]]:
+    """Convert from pydantic-ai messages to MCP sampling messages.
+
+    Returns:
+        A tuple containing the system prompt and a list of sampling messages.
+    """
+    sampling_msgs: list[mcp_types.SamplingMessage] = []
+
+    def add_msg(
+        role: Literal['user', 'assistant'],
+        content: mcp_types.TextContent | mcp_types.ImageContent | mcp_types.AudioContent,
+    ):
+        sampling_msgs.append(mcp_types.SamplingMessage(role=role, content=content))
+
+    system_prompt: list[str] = []
+    for pai_message in pai_messages:
+        if isinstance(pai_message, messages.ModelRequest):
+            if pai_message.instructions is not None:
+                system_prompt.append(pai_message.instructions)
+
+            for part in pai_message.parts:
+                if isinstance(part, messages.SystemPromptPart):
+                    system_prompt.append(part.content)
+                if isinstance(part, messages.UserPromptPart):
+                    if isinstance(part.content, str):
+                        add_msg('user', mcp_types.TextContent(type='text', text=part.content))
+                    else:
+                        for chunk in part.content:
+                            if isinstance(chunk, str):
+                                add_msg('user', mcp_types.TextContent(type='text', text=chunk))
+                            elif isinstance(chunk, messages.BinaryContent) and chunk.is_image:
+                                add_msg(
+                                    'user',
+                                    mcp_types.ImageContent(
+                                        type='image',
+                                        data=chunk.base64,
+                                        mimeType=chunk.media_type,
+                                    ),
+                                )
+                            # TODO(Marcelo): Add support for audio content.
+                            else:
+                                raise NotImplementedError(f'Unsupported content type: {type(chunk)}')
+        else:
+            add_msg('assistant', map_from_model_response(pai_message))
+    return ''.join(system_prompt), sampling_msgs
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def guard_tool_call_id(
+    t: _messages.ToolCallPart
+    | _messages.ToolReturnPart
+    | _messages.RetryPromptPart
+    | _messages.BuiltinToolCallPart
+    | _messages.BuiltinToolReturnPart,
+) -> str:
+    """Type guard that either returns the tool call id or generates a new one if it's None."""
+    return t.tool_call_id or generate_tool_call_id()
+
+## pydantic_ai_slim/pydantic_ai/models/instrumented.py
+
+    def messages_to_otel_messages(self, messages: list[ModelMessage]) -> list[_otel_messages.ChatMessage]:
+        result: list[_otel_messages.ChatMessage] = []
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for is_system, group in itertools.groupby(message.parts, key=lambda p: isinstance(p, SystemPromptPart)):
+                    message_parts: list[_otel_messages.MessagePart] = []
+                    for part in group:
+                        if hasattr(part, 'otel_message_parts'):
+                            message_parts.extend(part.otel_message_parts(self))
+
+                    result.append(
+                        _otel_messages.ChatMessage(role='system' if is_system else 'user', parts=message_parts)
+                    )
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                otel_message = _otel_messages.OutputMessage(role='assistant', parts=message.otel_message_parts(self))
+                if message.finish_reason is not None:
+                    otel_message['finish_reason'] = message.finish_reason
+                result.append(otel_message)
+        return result
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_adapter.py
+
+    def dump_messages(
+        cls,
+        messages: Sequence[ModelMessage],
+    ) -> list[UIMessage]:
+        """Transform Pydantic AI messages into Vercel AI messages.
+
+        Args:
+            messages: A sequence of ModelMessage objects to convert
+
+        Returns:
+            A list of UIMessage objects in Vercel AI format
+        """
+        tool_results: dict[str, ToolReturnPart | RetryPromptPart] = {}
+
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                for part in msg.parts:
+                    if isinstance(part, ToolReturnPart):
+                        tool_results[part.tool_call_id] = part
+                    elif isinstance(part, RetryPromptPart) and part.tool_name:
+                        tool_results[part.tool_call_id] = part
+
+        result: list[UIMessage] = []
+
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                system_ui_parts, user_ui_parts = cls._dump_request_message(msg)
+                if system_ui_parts:
+                    result.append(UIMessage(id=str(uuid.uuid4()), role='system', parts=system_ui_parts))
+
+                if user_ui_parts:
+                    result.append(UIMessage(id=str(uuid.uuid4()), role='user', parts=user_ui_parts))
+
+            elif isinstance(  # pragma: no branch
+                msg, ModelResponse
+            ):
+                ui_parts: list[UIMessagePart] = cls._dump_response_message(msg, tool_results)
+                if ui_parts:  # pragma: no branch
+                    result.append(UIMessage(id=str(uuid.uuid4()), role='assistant', parts=ui_parts))
+            else:
+                assert_never(msg)
+
+        return result
+
+## tests/test_vercel_ai.py
+
+async def test_adapter_dump_messages_with_tools():
+    """Test dumping messages with tool calls and returns."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Search for something')]),
+        ModelResponse(
+            parts=[
+                TextPart(content='Let me search for that.'),
+                ToolCallPart(
+                    tool_name='web_search',
+                    args={'query': 'test query'},
+                    tool_call_id='tool_123',
+                ),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='web_search',
+                    content={'results': ['result1', 'result2']},
+                    tool_call_id='tool_123',
+                )
+            ]
+        ),
+        ModelResponse(parts=[TextPart(content='Here are the results.')]),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Search for something', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'Let me search for that.', 'state': 'done', 'provider_metadata': None},
+                    {
+                        'type': 'dynamic-tool',
+                        'tool_name': 'web_search',
+                        'tool_call_id': 'tool_123',
+                        'state': 'output-available',
+                        'input': '{"query":"test query"}',
+                        'output': '{"results":["result1","result2"]}',
+                        'call_provider_metadata': None,
+                        'preliminary': None,
+                    },
+                ],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'Here are the results.', 'state': 'done', 'provider_metadata': None}
+                ],
+            },
+        ]
+    )

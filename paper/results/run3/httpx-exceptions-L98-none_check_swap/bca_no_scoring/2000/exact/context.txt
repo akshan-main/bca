@@ -1,0 +1,242 @@
+## httpx/_transports/base.py
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        raise NotImplementedError(
+            "The 'handle_async_request' method must be implemented."
+        )  # pragma: no cover
+
+## httpx/_transports/default.py
+
+def map_httpcore_exceptions() -> typing.Iterator[None]:
+    global HTTPCORE_EXC_MAP
+    if len(HTTPCORE_EXC_MAP) == 0:
+        HTTPCORE_EXC_MAP = _load_httpcore_exceptions()
+    try:
+        yield
+    except Exception as exc:
+        mapped_exc = None
+
+        for from_exc, to_exc in HTTPCORE_EXC_MAP.items():
+            if not isinstance(exc, from_exc):
+                continue
+            # We want to map to the most specific exception we can find.
+            # Eg if `exc` is an `httpcore.ReadTimeout`, we want to map to
+            # `httpx.ReadTimeout`, not just `httpx.TimeoutException`.
+            if mapped_exc is None or issubclass(to_exc, mapped_exc):
+                mapped_exc = to_exc
+
+        if mapped_exc is None:  # pragma: no cover
+            raise
+
+        message = str(exc)
+        raise mapped_exc(message) from exc
+
+    def handle_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, SyncByteStream)
+        import httpcore
+
+        req = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        )
+        with map_httpcore_exceptions():
+            resp = self._pool.handle_request(req)
+
+        assert isinstance(resp.stream, typing.Iterable)
+
+        return Response(
+            status_code=resp.status,
+            headers=resp.headers,
+            stream=ResponseStream(resp.stream),
+            extensions=resp.extensions,
+        )
+
+## httpx/_transports/mock.py
+
+    def handle_request(
+        self,
+        request: Request,
+    ) -> Response:
+        request.read()
+        response = self.handler(request)
+        if not isinstance(response, Response):  # pragma: no cover
+            raise TypeError("Cannot use an async handler in a sync Client")
+        return response
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        await request.aread()
+        response = self.handler(request)
+
+        # Allow handler to *optionally* be an `async` function.
+        # If it is, then the `response` variable need to be awaited to actually
+        # return the result.
+
+        if not isinstance(response, Response):
+            response = await response
+
+        return response
+
+## httpx/_transports/wsgi.py
+
+    def handle_request(self, request: Request) -> Response:
+        request.read()
+        wsgi_input = io.BytesIO(request.content)
+
+        port = request.url.port or {"http": 80, "https": 443}[request.url.scheme]
+        environ = {
+            "wsgi.version": (1, 0),
+            "wsgi.url_scheme": request.url.scheme,
+            "wsgi.input": wsgi_input,
+            "wsgi.errors": self.wsgi_errors or sys.stderr,
+            "wsgi.multithread": True,
+            "wsgi.multiprocess": False,
+            "wsgi.run_once": False,
+            "REQUEST_METHOD": request.method,
+            "SCRIPT_NAME": self.script_name,
+            "PATH_INFO": request.url.path,
+            "QUERY_STRING": request.url.query.decode("ascii"),
+            "SERVER_NAME": request.url.host,
+            "SERVER_PORT": str(port),
+            "SERVER_PROTOCOL": "HTTP/1.1",
+            "REMOTE_ADDR": self.remote_addr,
+        }
+        for header_key, header_value in request.headers.raw:
+            key = header_key.decode("ascii").upper().replace("-", "_")
+            if key not in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+                key = "HTTP_" + key
+            environ[key] = header_value.decode("ascii")
+
+        seen_status = None
+        seen_response_headers = None
+        seen_exc_info = None
+
+        def start_response(
+            status: str,
+            response_headers: list[tuple[str, str]],
+            exc_info: OptExcInfo | None = None,
+        ) -> typing.Callable[[bytes], typing.Any]:
+            nonlocal seen_status, seen_response_headers, seen_exc_info
+            seen_status = status
+            seen_response_headers = response_headers
+            seen_exc_info = exc_info
+            return lambda _: None
+
+        result = self.app(environ, start_response)
+
+        stream = WSGIByteStream(result)
+
+        assert seen_status is not None
+        assert seen_response_headers is not None
+        if seen_exc_info and seen_exc_info[0] and self.raise_app_exceptions:
+            raise seen_exc_info[1]
+
+        status_code = int(seen_status.split()[0])
+        headers = [
+            (key.encode("ascii"), value.encode("ascii"))
+            for key, value in seen_response_headers
+        ]
+
+        return Response(status_code, headers=headers, stream=stream)
+
+## httpx/_urlparse.py
+
+def PERCENT(string: str) -> str:
+    return "".join([f"%{byte:02X}" for byte in string.encode("utf-8")])
+
+## httpx/_utils.py
+
+def to_str(value: str | bytes, encoding: str = "utf-8") -> str:
+    return value if isinstance(value, str) else value.decode(encoding)
+
+## tests/client/test_client.py
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+## tests/client/test_headers.py
+
+def echo_repeated_headers_items(request: httpx.Request) -> httpx.Response:
+    data = {"headers": list(request.headers.items())}
+    return httpx.Response(200, json=data)
+
+## tests/client/test_redirects.py
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.SyncByteStream)
+        list(request.stream)
+        return self.handler(request)  # type: ignore[return-value]
+
+## tests/models/test_responses.py
+
+def streaming_body() -> typing.Iterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+async def async_streaming_body() -> typing.AsyncIterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+def test_decode_error_with_request(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    broken_compressed_body = b"xxxxxxxxxxxxxx"
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(
+            200,
+            headers=headers,
+            content=broken_compressed_body,
+        )
+
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(
+            200,
+            headers=headers,
+            content=broken_compressed_body,
+            request=httpx.Request("GET", "https://www.example.org/"),
+        )
+
+## tests/test_api.py
+
+def test_get_invalid_url():
+    with pytest.raises(httpx.UnsupportedProtocol):
+        httpx.get("invalid://example.org")
+
+## tests/test_exceptions.py
+
+def test_request_attribute() -> None:
+    # Exception without request attribute
+    exc = httpx.ReadTimeout("Read operation timed out")
+    with pytest.raises(RuntimeError):
+        exc.request  # noqa: B018
+
+    # Exception with request attribute
+    request = httpx.Request("GET", "https://www.example.com")
+    exc = httpx.ReadTimeout("Read operation timed out", request=request)
+    assert exc.request == request
+
+## tests/test_main.py
+
+def splitlines(output: str) -> typing.Iterable[str]:
+    return [line.strip() for line in output.splitlines()]
+
+def remove_date_header(lines: typing.Iterable[str]) -> typing.Iterable[str]:
+    return [line for line in lines if not line.startswith("date:")]

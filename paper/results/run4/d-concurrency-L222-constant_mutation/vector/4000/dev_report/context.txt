@@ -1,0 +1,477 @@
+# tests/test_concurrency.py:69-97
+    async def test_waiting_count_tracking(self):
+        """Test that waiting_count is accurately tracked."""
+        limiter = ConcurrencyLimiter(max_running=1)
+        started = anyio.Event()
+        release = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                started.set()
+                await release.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Now limiter is held, check waiting count as we add waiters
+            assert limiter.waiting_count == 0
+
+            for _ in range(3):
+                tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+            assert limiter.waiting_count == 3
+
+            release.set()
+        assert limiter.waiting_count == 0
+
+# tests/test_concurrency.py:41-204
+class TestConcurrencyLimiter:
+    """Tests for the ConcurrencyLimiter class."""
+
+    async def test_basic_acquisition(self):
+        """Test that limiter limits concurrent access."""
+        limiter = ConcurrencyLimiter(max_running=2)
+        acquired: list[int] = []
+
+        async def acquire_and_hold(id: int, hold_time: float):
+            async with get_concurrency_context(limiter, 'test'):
+                acquired.append(id)
+                await anyio.sleep(hold_time)
+
+        # Start 3 tasks with limit of 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(acquire_and_hold, i, 0.1)
+            await anyio.sleep(0.05)
+            assert len(acquired) == 2  # Only 2 can proceed
+        assert len(acquired) == 3
+
+    async def test_nowait_acquisition(self):
+        """Test that immediate acquisition works."""
+        limiter = ConcurrencyLimiter(max_running=10)
+        # With high limit, should acquire immediately
+        async with get_concurrency_context(limiter, 'test'):
+            pass  # No waiting
+
+    async def test_waiting_count_tracking(self):
+        """Test that waiting_count is accurately tracked."""
+        limiter = ConcurrencyLimiter(max_running=1)
+        started = anyio.Event()
+        release = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                started.set()
+                await release.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Now limiter is held, check waiting count as we add waiters
+            assert limiter.waiting_count == 0
+
+            for _ in range(3):
+                tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+            assert limiter.waiting_count == 3
+
+            release.set()
+        assert limiter.waiting_count == 0
+
+    async def test_backpressure_raises(self):
+        """Test that exceeding max_queued raises ConcurrencyLimitExceeded."""
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=2)
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                await hold.wait()
+
+        async with anyio.create_task_group() as tg:
+            # Fill the running slot
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            # Fill the queue (2 allowed)
+            tg.start_soon(holder)
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            # This should raise - queue is full
+            with pytest.raises(ConcurrencyLimitExceeded):
+                async with get_concurrency_context(limiter, 'test'):
+                    pass
+
+            hold.set()
+
+    async def test_backpressure_race_condition(self):
+        """Test that max_queued is enforced atomically under concurrent load.
+
+        This test verifies the fix for a race condition where multiple tasks could
+        simultaneously pass the max_queued check before any of them actually started
+        waiting on the limiter.
+        """
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=1)
+        hold = anyio.Event()
+        started = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'holder'):
+                started.set()
+                await hold.wait()
+
+        # Now launch multiple tasks simultaneously that all try to queue.
+        # With max_queued=1, exactly one should succeed in queuing.
+        num_concurrent = 5
+        results: list[str] = []
+        barrier = AsyncBarrier(num_concurrent)
+
+        async def try_acquire(idx: int):
+            # Use barrier to ensure all tasks try to acquire at the same time
+            await barrier.wait()
+            try:
+                async with get_concurrency_context(limiter, f'task-{idx}'):
+                    results.append(f'acquired-{idx}')
+            except ConcurrencyLimitExceeded:
+                results.append(f'rejected-{idx}')
+
+        async with anyio.create_task_group() as tg:
+            # Fill the running slot and wait for it to be held
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Launch all tasks simultaneously
+            for i in range(num_concurrent):
+                tg.start_soon(try_acquire, i)
+            await anyio.sleep(0.1)  # Give tasks time to hit the barrier and try to acquire
+
+            # Release the holder
+            hold.set()
+
+        # Verify: exactly one task should have been allowed to queue and acquire
+        # The rest should have been rejected
+        acquired = [r for r in results if r.startswith('acquired-')]
+        rejected = [r for r in results if r.startswith('rejected-')]
+        assert len(acquired) == 1, f'Expected exactly 1 acquired, got {len(acquired)}: {acquired}'
+        assert len(rejected) == num_concurrent - 1, f'Expected {num_concurrent - 1} rejected, got {len(rejected)}'
+
+    async def test_from_int_limit(self):
+        """Test creating from simple int."""
+        limiter = ConcurrencyLimiter.from_limit(5)
+        assert limiter.max_running == 5
+        assert limiter._max_queued is None
+
+    async def test_from_limiter_config(self):
+        """Test creating from ConcurrencyLimit."""
+        config = ConcurrencyLimit(max_running=5, max_queued=10)
+        limiter = ConcurrencyLimiter.from_limit(config)
+        assert limiter.max_running == 5
+        assert limiter._max_queued == 10
+
+    async def test_properties(self):
+        """Test the various properties of ConcurrencyLimiter."""
+        limiter = ConcurrencyLimiter(max_running=5, name='test-limiter')
+        assert limiter.max_running == 5
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+        assert limiter.waiting_count == 0
+        assert limiter.name == 'test-limiter'
+
+        # After acquiring one slot
+        await limiter.acquire('test')
+        assert limiter.running_count == 1
+        assert limiter.available_count == 4
+        limiter.release()
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:256-273
+def get_concurrency_context(
+    limiter: AbstractConcurrencyLimiter | None,
+    source: str = 'unnamed',
+) -> AbstractAsyncContextManager[None]:
+    """Get an async context manager for the concurrency limiter.
+
+    If limiter is None, returns a no-op context manager.
+
+    Args:
+        limiter: The AbstractConcurrencyLimiter or None.
+        source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+
+    Returns:
+        An async context manager.
+    """
+    if limiter is None:
+        return _null_context()
+    return _limiter_context(limiter, source)
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:16-16
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/toolsets/function.py:7-7
+import anyio
+
+# pydantic_evals/pydantic_evals/_utils.py:12-12
+import anyio
+
+# pydantic_evals/pydantic_evals/dataset.py:26-26
+import anyio
+
+# pydantic_graph/pydantic_graph/persistence/file.py:11-11
+import anyio
+
+# tests/test_a2a.py:5-5
+import anyio
+
+# tests/test_concurrency.py:9-9
+import anyio
+
+# tests/test_concurrency.py:125-174
+    async def test_backpressure_race_condition(self):
+        """Test that max_queued is enforced atomically under concurrent load.
+
+        This test verifies the fix for a race condition where multiple tasks could
+        simultaneously pass the max_queued check before any of them actually started
+        waiting on the limiter.
+        """
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=1)
+        hold = anyio.Event()
+        started = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'holder'):
+                started.set()
+                await hold.wait()
+
+        # Now launch multiple tasks simultaneously that all try to queue.
+        # With max_queued=1, exactly one should succeed in queuing.
+        num_concurrent = 5
+        results: list[str] = []
+        barrier = AsyncBarrier(num_concurrent)
+
+        async def try_acquire(idx: int):
+            # Use barrier to ensure all tasks try to acquire at the same time
+            await barrier.wait()
+            try:
+                async with get_concurrency_context(limiter, f'task-{idx}'):
+                    results.append(f'acquired-{idx}')
+            except ConcurrencyLimitExceeded:
+                results.append(f'rejected-{idx}')
+
+        async with anyio.create_task_group() as tg:
+            # Fill the running slot and wait for it to be held
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Launch all tasks simultaneously
+            for i in range(num_concurrent):
+                tg.start_soon(try_acquire, i)
+            await anyio.sleep(0.1)  # Give tasks time to hit the barrier and try to acquire
+
+            # Release the holder
+            hold.set()
+
+        # Verify: exactly one task should have been allowed to queue and acquire
+        # The rest should have been rejected
+        acquired = [r for r in results if r.startswith('acquired-')]
+        rejected = [r for r in results if r.startswith('rejected-')]
+        assert len(acquired) == 1, f'Expected exactly 1 acquired, got {len(acquired)}: {acquired}'
+        assert len(rejected) == num_concurrent - 1, f'Expected {num_concurrent - 1} rejected, got {len(rejected)}'
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:224-226
+    def release(self) -> None:
+        """Release a slot."""
+        self._limiter.release()
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:146-148
+    def waiting_count(self) -> int:
+        """Number of operations currently waiting to acquire a slot."""
+        return self._waiting_count
+
+# tests/test_concurrency.py:44-60
+    async def test_basic_acquisition(self):
+        """Test that limiter limits concurrent access."""
+        limiter = ConcurrencyLimiter(max_running=2)
+        acquired: list[int] = []
+
+        async def acquire_and_hold(id: int, hold_time: float):
+            async with get_concurrency_context(limiter, 'test'):
+                acquired.append(id)
+                await anyio.sleep(hold_time)
+
+        # Start 3 tasks with limit of 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(acquire_and_hold, i, 0.1)
+            await anyio.sleep(0.05)
+            assert len(acquired) == 2  # Only 2 can proceed
+        assert len(acquired) == 3
+
+# tests/test_concurrency.py:33-38
+    async def wait(self) -> None:
+        async with self._lock:
+            self._count += 1
+            if self._count >= self._parties:
+                self._event.set()
+        await self._event.wait()
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:60-62
+    def release(self) -> None:
+        """Release a slot."""
+        ...
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:11-18
+from ..concurrency import (
+    AbstractConcurrencyLimiter,
+    AnyConcurrencyLimit,
+    ConcurrencyLimit,
+    ConcurrencyLimiter,
+    get_concurrency_context,
+    normalize_to_limiter,
+)
+
+# tests/test_concurrency.py:13-13
+from pydantic_ai.concurrency import get_concurrency_context
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:114-142
+def limit_model_concurrency(
+    model: Model | KnownModelName,
+    limiter: AnyConcurrencyLimit,
+) -> Model:
+    """Wrap a model with concurrency limiting.
+
+    This is a convenience function to wrap a model with concurrency limiting.
+    If the limiter is None, the model is returned unchanged.
+
+    Args:
+        model: The model to wrap.
+        limiter: The concurrency limit configuration.
+
+    Returns:
+        The wrapped model with concurrency limiting, or the original model if limiter is None.
+
+    Example:
+    ```python
+    from pydantic_ai.models.concurrency import limit_model_concurrency
+
+    model = limit_model_concurrency('openai:gpt-4o', limiter=5)
+    ```
+    """
+    normalized_limiter = normalize_to_limiter(limiter)
+    if normalized_limiter is None:
+        from . import infer_model
+
+        return infer_model(model) if isinstance(model, str) else model
+    return ConcurrencyLimitedModel(model, normalized_limiter)
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:247-253
+async def _limiter_context(limiter: AbstractConcurrencyLimiter, source: str) -> AsyncIterator[None]:
+    """Context manager that acquires and releases a limiter with the given source."""
+    await limiter.acquire(source)
+    try:
+        yield
+    finally:
+        limiter.release()
+
+# pydantic_ai_slim/pydantic_ai/common_tools/duckduckgo.py:4-4
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py:12-12
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/models/bedrock.py:13-13
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/providers/google_vertex.py:9-9
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:141-143
+    def name(self) -> str | None:
+        """Name of the limiter for observability."""
+        return self._name
+
+# pydantic_ai_slim/pydantic_ai/retries.py:72-72
+    wait: WaitBaseT
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:58-76
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        limiter: int | ConcurrencyLimit | AbstractConcurrencyLimiter,
+    ):
+        """Initialize the ConcurrencyLimitedModel.
+
+        Args:
+            wrapped: The model to wrap, either a Model instance or a known model name.
+            limiter: The concurrency limit configuration. Can be:
+                - An `int`: Simple limit on concurrent operations (unlimited queue).
+                - A `ConcurrencyLimit`: Full configuration with optional backpressure.
+                - An `AbstractConcurrencyLimiter`: A pre-created limiter for sharing across models.
+        """
+        super().__init__(wrapped)
+        if isinstance(limiter, AbstractConcurrencyLimiter):
+            self._limiter = limiter
+        else:
+            self._limiter = ConcurrencyLimiter.from_limit(limiter)
+
+# tests/test_concurrency.py:456-459
+    async def test_limiter_with_name(self):
+        """Test that limiter name is properly set and accessible."""
+        limiter = ConcurrencyLimiter(max_running=5, name='my-limiter')
+        assert limiter.name == 'my-limiter'
+
+# tests/test_concurrency.py:338-344
+    async def test_with_int_limiter(self):
+        """Test ConcurrencyLimitedModel with int limiter."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        model = ConcurrencyLimitedModel(TestModel(), limiter=5)
+        assert model._limiter.max_running == 5
+        assert model._limiter._max_queued is None
+
+# tests/test_concurrency.py:461-464
+    async def test_limiter_without_name(self):
+        """Test that limiter name is None by default."""
+        limiter = ConcurrencyLimiter(max_running=5)
+        assert limiter.name is None
+
+# tests/test_concurrency.py:466-470
+    async def test_from_limit_with_name(self):
+        """Test creating limiter from limit with name."""
+        limiter = ConcurrencyLimiter.from_limit(5, name='my-limit')
+        assert limiter.name == 'my-limit'
+        assert limiter.max_running == 5
+
+# tests/models/test_model_test.py:13-13
+from anyio import Event
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/__init__.py:36-36
+import anyio._backends._asyncio  # pyright: ignore[reportUnusedImport]  #noqa: F401
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py:51-51
+    event: _messages.AgentStreamEvent
+
+# examples/pydantic_ai_examples/rag.py:33-33
+from anyio import create_task_group
+
+# pydantic_graph/pydantic_graph/beta/graph.py:16-16
+from anyio import BrokenResourceError, CancelScope, create_memory_object_stream, create_task_group

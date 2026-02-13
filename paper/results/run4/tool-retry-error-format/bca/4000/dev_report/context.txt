@@ -1,0 +1,408 @@
+## pydantic_ai_slim/pydantic_ai/agent/__init__.py
+
+    def name(self, value: str | None) -> None:
+        """Set the name of the agent, used for logging."""
+        self._name = value
+
+## pydantic_ai_slim/pydantic_ai/exceptions.py
+
+class ToolRetryError(Exception):
+    """Exception used to signal a `ToolRetry` message should be returned to the LLM."""
+
+    def __init__(self, tool_retry: RetryPromptPart):
+        self.tool_retry = tool_retry
+        message = (
+            tool_retry.content
+            if isinstance(tool_retry.content, str)
+            else self._format_error_details(tool_retry.content, tool_retry.tool_name)
+        )
+        super().__init__(message)
+
+    @staticmethod
+    def _format_error_details(errors: list[pydantic_core.ErrorDetails], tool_name: str | None) -> str:
+        """Format ErrorDetails as a human-readable message.
+
+        We format manually rather than using ValidationError.from_exception_data because
+        some error types (value_error, assertion_error, etc.) require an 'error' key in ctx,
+        but when ErrorDetails are serialized, exception objects are stripped from ctx.
+        The 'msg' field already contains the human-readable message, so we use that directly.
+        """
+        error_count = len(errors)
+        lines = [
+            f'{error_count} validation error{"s" if error_count == 1 else ""}{f" for {tool_name!r}" if tool_name else ""}'
+        ]
+        for e in errors:
+            loc = '.'.join(str(x) for x in e['loc']) if e['loc'] else '__root__'
+            lines.append(loc)
+            lines.append(f'  {e["msg"]} [type={e["type"]}, input_value={e["input"]!r}]')
+        return '\n'.join(lines)
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class RetryPromptPart:
+    """A message back to a model asking it to try again.
+
+    This can be sent for a number of reasons:
+
+    * Pydantic validation of tool arguments failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * a tool raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    * no tool was found for the tool name
+    * the model returned plain text when a structured response was expected
+    * Pydantic validation of a structured response failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * an output validator raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    """
+
+    content: list[pydantic_core.ErrorDetails] | str
+    """Details of why and how the model should retry.
+
+    If the retry was triggered by a [`ValidationError`][pydantic_core.ValidationError], this will be a list of
+    error details.
+    """
+
+    _: KW_ONLY
+
+    tool_name: str | None = None
+    """The name of the tool that was called, if any."""
+
+    tool_call_id: str = field(default_factory=_generate_tool_call_id)
+    """The tool call identifier, this is used by some models including OpenAI.
+
+    In case the tool call id is not provided by the model, Pydantic AI will generate a random one.
+    """
+
+    timestamp: datetime = field(default_factory=_now_utc)
+    """The timestamp, when the retry was triggered."""
+
+    part_kind: Literal['retry-prompt'] = 'retry-prompt'
+    """Part type identifier, this is available on all parts as a discriminator."""
+
+    def model_response(self) -> str:
+        """Return a string message describing why the retry is requested."""
+        if isinstance(self.content, str):
+            if self.tool_name is None:
+                description = f'Validation feedback:\n{self.content}'
+            else:
+                description = self.content
+        else:
+            json_errors = error_details_ta.dump_json(self.content, exclude={'__all__': {'ctx'}}, indent=2)
+            plural = isinstance(self.content, list) and len(self.content) != 1
+            description = (
+                f'{len(self.content)} validation error{"s" if plural else ""}:\n```json\n{json_errors.decode()}\n```'
+            )
+        return f'{description}\n\nFix the errors and try again.'
+
+    def otel_event(self, settings: InstrumentationSettings) -> LogRecord:
+        if self.tool_name is None:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.user.message'},
+                body={'content': self.model_response(), 'role': 'user'},
+            )
+        else:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.tool.message'},
+                body={
+                    **({'content': self.model_response()} if settings.include_content else {}),
+                    'role': 'tool',
+                    'id': self.tool_call_id,
+                    'name': self.tool_name,
+                },
+            )
+
+    def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
+        if self.tool_name is None:
+            return [_otel_messages.TextPart(type='text', content=self.model_response())]
+        else:
+            part = _otel_messages.ToolCallResponsePart(
+                type='tool_call_response',
+                id=self.tool_call_id,
+                name=self.tool_name,
+            )
+
+            if settings.include_content:
+                part['result'] = self.model_response()
+
+            return [part]
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+## pydantic_evals/pydantic_evals/evaluators/evaluator.py
+
+    def name(cls) -> str:
+        """`name` has been renamed, use `get_serialization_name` instead."""
+        return cls.get_serialization_name()
+
+## tests/models/test_model_function.py
+
+def test_call_all():
+    result = agent_all.run_sync('Hello', model=TestModel())
+    assert result.output == snapshot('{"foo":"1","bar":"2","baz":"3","qux":"4","quz":"a"}')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(content='foobar', timestamp=IsNow(tz=timezone.utc)),
+                    UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc)),
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name='foo', args={'x': 0}, tool_call_id=IsStr()),
+                    ToolCallPart(tool_name='bar', args={'x': 0}, tool_call_id=IsStr()),
+                    ToolCallPart(tool_name='baz', args={'x': 0}, tool_call_id=IsStr()),
+                    ToolCallPart(tool_name='qux', args={'x': 0}, tool_call_id=IsStr()),
+                    ToolCallPart(tool_name='quz', args={'x': 'a'}, tool_call_id=IsStr()),
+                ],
+                usage=RequestUsage(input_tokens=52, output_tokens=21),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='foo', content='1', timestamp=IsNow(tz=timezone.utc), tool_call_id=IsStr()
+                    ),
+                    ToolReturnPart(
+                        tool_name='bar', content='2', timestamp=IsNow(tz=timezone.utc), tool_call_id=IsStr()
+                    ),
+                    ToolReturnPart(
+                        tool_name='baz', content='3', timestamp=IsNow(tz=timezone.utc), tool_call_id=IsStr()
+                    ),
+                    ToolReturnPart(
+                        tool_name='qux', content='4', timestamp=IsNow(tz=timezone.utc), tool_call_id=IsStr()
+                    ),
+                    ToolReturnPart(
+                        tool_name='quz', content='a', timestamp=IsNow(tz=timezone.utc), tool_call_id=IsStr()
+                    ),
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='{"foo":"1","bar":"2","baz":"3","qux":"4","quz":"a"}')],
+                usage=RequestUsage(input_tokens=57, output_tokens=33),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_model_test.py
+
+def test_custom_output_args_model():
+    class Foo(BaseModel):
+        foo: str
+        bar: int
+
+    agent = Agent(output_type=Foo)
+    result = agent.run_sync('x', model=TestModel(custom_output_args={'foo': 'a', 'bar': 1}))
+    assert result.output == Foo(foo='a', bar=1)
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='x',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args={'foo': 'a', 'bar': 1},
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=51, output_tokens=6),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_openai.py
+
+async def test_openai_auto_mode_reasoning_field_different_provider_uses_tags(allow_model_requests: None):
+    """Test that auto mode falls back to tags when provider_name doesn't match."""
+    # This test verifies behavior by checking that when thinking comes from a different provider, auto mode falls back to tags.
+    c1 = completion_message(ChatCompletionMessage.model_construct(content='response2', role='assistant'))
+    m = OpenAIChatModel(
+        'foobar',
+        provider=OpenAIProvider(openai_client=MockOpenAI.create_mock(c1)),
+        profile=OpenAIModelProfile(
+            openai_chat_thinking_field='reasoning_content',
+            openai_chat_send_back_thinking_parts='auto',
+        ),
+    )
+
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='question')]),
+        ModelResponse(
+            parts=[
+                ThinkingPart(
+                    content='reasoning from different provider',
+                    id='reasoning_content',
+                    provider_name='different-provider',
+                ),
+            ]
+        ),
+    ]
+
+    settings = ModelSettings()
+    params = ModelRequestParameters()
+    await m.request(messages=messages, model_settings=settings, model_request_parameters=params)
+
+    mapped = m._map_model_response(messages[1])  # type: ignore[reportPrivateUsage]
+    assert mapped == snapshot(
+        {
+            'role': 'assistant',
+            'content': """<think>
+reasoning from different provider
+</think>""",
+        }
+    )
+
+## tests/test_exceptions.py
+
+def test_tool_retry_error_str_with_string_content():
+    """Test that ToolRetryError uses string content as message automatically."""
+    part = RetryPromptPart(content='error from tool', tool_name='my_tool')
+    error = ToolRetryError(part)
+    assert str(error) == 'error from tool'
+
+def test_tool_retry_error_str_with_value_error_type():
+    """Test that ToolRetryError handles value_error type without ctx.error.
+
+    When ErrorDetails are serialized, the exception object in ctx is stripped.
+    This test ensures we handle error types that normally require ctx.error.
+    """
+    # Simulate serialized ErrorDetails where ctx.error has been stripped
+    error_details: list[ErrorDetails] = [
+        {
+            'type': 'value_error',
+            'loc': ('field',),
+            'msg': 'Value error, must not be foo',
+            'input': 'foo',
+        }
+    ]
+    part = RetryPromptPart(content=error_details, tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nfield\n  Value error, must not be foo [type=value_error, input_value='foo']"
+    )
+
+## tests/test_streaming.py
+
+async def test_tool_raises_call_deferred():
+    agent = Agent(TestModel(), output_type=[str, DeferredToolRequests])
+
+    @agent.tool_plain()
+    def my_tool(x: int) -> int:
+        raise CallDeferred
+
+    async with agent.run_stream('Hello') as result:
+        assert not result.is_complete
+        assert isinstance(result.run_id, str)
+        assert [c async for c in result.stream_output(debounce_by=None)] == snapshot(
+            [DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])]
+        )
+        assert await result.get_output() == snapshot(
+            DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])
+        )
+        responses = [c async for c, _is_last in result.stream_responses(debounce_by=None)]
+        assert responses == snapshot(
+            [
+                ModelResponse(
+                    parts=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())],
+                    usage=RequestUsage(input_tokens=51),
+                    model_name='test',
+                    timestamp=IsDatetime(),
+                    provider_name='test',
+                    run_id=IsStr(),
+                )
+            ]
+        )
+        assert await result.validate_response_output(responses[0]) == snapshot(
+            DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])
+        )
+        assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=0))
+        assert result.timestamp() == IsNow(tz=timezone.utc)
+        assert result.is_complete
+
+async def test_get_output_after_stream_output():
+    """Verify that we don't get duplicate messages in history when using tool output and `get_output` is called after `stream_output`."""
+    m = TestModel()
+
+    agent = Agent(m, output_type=bool)
+
+    async with agent.run_stream('Hello') as result:
+        outputs: list[bool] = []
+        async for o in result.stream_output():
+            outputs.append(o)
+        o = await result.get_output()
+        outputs.append(o)
+
+    assert outputs == snapshot([False, False, False])
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Hello',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args={'response': False},
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=51),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )

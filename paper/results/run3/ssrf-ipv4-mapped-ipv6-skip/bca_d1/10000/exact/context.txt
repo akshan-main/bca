@@ -1,0 +1,999 @@
+## docs/.hooks/algolia.py
+
+from typing_extensions import TypedDict
+
+## pydantic_ai_slim/pydantic_ai/_a2a.py
+
+from typing import Any, Generic, TypeVar
+
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+class ResolvedUrl:
+    """Result of URL validation and DNS resolution."""
+
+    resolved_ip: str
+    """The resolved IP address to connect to."""
+
+    hostname: str
+    """The original hostname (used for Host header)."""
+
+    port: int
+    """The port number."""
+
+    is_https: bool
+    """Whether to use HTTPS."""
+
+    path: str
+    """The path including query string and fragment."""
+
+def is_cloud_metadata_ip(ip_str: str) -> bool:
+    """Check if an IP address is a cloud metadata endpoint.
+
+    These are always blocked for security reasons, even with allow_local=True.
+    """
+    return ip_str in _CLOUD_METADATA_IPS
+
+def is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address is in a private/internal range.
+
+    Handles both IPv4 and IPv6 addresses, including IPv4-mapped IPv6 addresses.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:192.168.1.1)
+        if isinstance(ip, ipaddress.IPv6Address) and not ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        return any(ip in network for network in _PRIVATE_NETWORKS)
+    except ValueError:
+        # Invalid IP address, treat as potentially dangerous
+        return True
+
+async def resolve_hostname(hostname: str) -> list[str]:
+    """Resolve a hostname to its IP addresses using DNS.
+
+    Uses run_in_executor to run DNS resolution in a thread pool to avoid blocking.
+
+    Returns:
+        List of IP address strings, preserving DNS order with duplicates removed.
+
+    Raises:
+        ValueError: If DNS resolution fails.
+    """
+    try:
+        # getaddrinfo returns list of (family, type, proto, canonname, sockaddr)
+        # sockaddr is (ip, port) for IPv4 or (ip, port, flowinfo, scope_id) for IPv6
+        results = await run_in_executor(socket.getaddrinfo, hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        # Extract unique IP addresses, preserving order (first IP is typically preferred)
+        seen: set[str] = set()
+        ips: list[str] = []
+        for result in results:
+            ip = str(result[4][0])
+            if ip not in seen:
+                seen.add(ip)
+                ips.append(ip)
+        if not ips:
+            raise ValueError(f'DNS resolution failed for hostname: {hostname}')  # pragma: no cover
+        return ips
+    except socket.gaierror as e:
+        raise ValueError(f'DNS resolution failed for hostname "{hostname}": {e}') from e
+
+def extract_host_and_port(url: str) -> tuple[str, str, int, bool]:
+    """Extract hostname, path, port, and protocol info from a URL.
+
+    Returns:
+        Tuple of (hostname, path_with_query, port, is_https)
+
+    Raises:
+        ValueError: If the URL is malformed or uses an unsupported protocol.
+    """
+    # Validate protocol first, before trying to extract hostname
+    _, is_https = validate_url_protocol(url)
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+
+    if not hostname:
+        raise ValueError(f'Invalid URL: no hostname found in "{url}"')
+
+    default_port = 443 if is_https else 80
+    port = parsed.port or default_port
+
+    # Reconstruct path with query string
+    path = parsed.path or '/'
+    if parsed.query:
+        path = f'{path}?{parsed.query}'
+    if parsed.fragment:
+        path = f'{path}#{parsed.fragment}'
+
+    return hostname, path, port, is_https
+
+async def validate_and_resolve_url(url: str, allow_local: bool) -> ResolvedUrl:
+    """Validate URL and resolve hostname to IP addresses.
+
+    Performs protocol validation, DNS resolution, and IP validation.
+
+    Args:
+        url: The URL to validate.
+        allow_local: Whether to allow private/internal IP addresses.
+
+    Returns:
+        ResolvedUrl with all the information needed to make the request.
+
+    Raises:
+        ValueError: If the URL fails validation.
+    """
+    hostname, path, port, is_https = extract_host_and_port(url)
+
+    # Check if hostname is already an IP address
+    try:
+        # Handle IPv6 addresses in brackets
+        ip_str = hostname.strip('[]')
+        ipaddress.ip_address(ip_str)
+        ips = [ip_str]
+    except ValueError:
+        # It's a hostname, resolve it
+        ips = await resolve_hostname(hostname)
+
+    # Validate all resolved IPs
+    for ip in ips:
+        # Cloud metadata IPs are always blocked
+        if is_cloud_metadata_ip(ip):
+            raise ValueError(f'Access to cloud metadata service ({ip}) is blocked for security reasons.')
+
+        # Private IPs are blocked unless allow_local is True
+        if not allow_local and is_private_ip(ip):
+            raise ValueError(
+                f'Access to private/internal IP address ({ip}) is blocked. '
+                f'Use force_download="allow-local" to allow local network access.'
+            )
+
+    # Use the first resolved IP
+    return ResolvedUrl(
+        resolved_ip=ips[0],
+        hostname=hostname,
+        port=port,
+        is_https=is_https,
+        path=path,
+    )
+
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+class DownloadedItem(TypedDict, Generic[DataT]):
+    """The downloaded data and its type."""
+
+    data: DataT
+    """The downloaded data."""
+
+    data_type: str
+    """The type of data that was downloaded.
+
+    Extracted from header "content-type", but defaults to the media type inferred from the file URL if content-type is "application/octet-stream".
+    """
+
+async def download_item(
+    item: FileUrl,
+    data_format: Literal['bytes', 'base64', 'base64_uri', 'text'] = 'bytes',
+    type_format: Literal['mime', 'extension'] = 'mime',
+) -> DownloadedItem[str] | DownloadedItem[bytes]:
+    """Download an item by URL and return the content as a bytes object or a (base64-encoded) string.
+
+    This function includes SSRF (Server-Side Request Forgery) protection:
+    - Only http:// and https:// protocols are allowed
+    - Private/internal IP addresses are blocked by default
+    - Cloud metadata endpoints (169.254.169.254) are always blocked
+    - Hostnames are resolved before requests to prevent DNS rebinding
+
+    Set `item.force_download='allow-local'` to allow private IP addresses.
+
+    Args:
+        item: The item to download.
+        data_format: The format to return the content in:
+            - `bytes`: The raw bytes of the content.
+            - `base64`: The base64-encoded content.
+            - `base64_uri`: The base64-encoded content as a data URI.
+            - `text`: The content as a string.
+        type_format: The format to return the media type in:
+            - `mime`: The media type as a MIME type.
+            - `extension`: The media type as an extension.
+
+    Raises:
+        UserError: If the URL points to a YouTube video.
+        ValueError: If the URL uses an unsupported protocol or targets a private/internal
+            IP address (unless allow-local is set).
+    """
+    if isinstance(item, VideoUrl) and item.is_youtube:
+        raise UserError('Downloading YouTube videos is not supported.')
+
+    from .._ssrf import safe_download
+
+    allow_local = item.force_download == 'allow-local'
+    response = await safe_download(item.url, allow_local=allow_local)
+
+    if content_type := response.headers.get('content-type'):
+        content_type = content_type.split(';')[0]
+        if content_type == 'application/octet-stream':
+            content_type = None
+
+    media_type = content_type or item.media_type
+
+    data_type = media_type
+    if type_format == 'extension':
+        data_type = item.format
+
+    data = response.content
+    if data_format in ('base64', 'base64_uri'):
+        data = base64.b64encode(data).decode('utf-8')
+        if data_format == 'base64_uri':
+            data = f'data:{media_type};base64,{data}'
+        return DownloadedItem[str](data=data, data_type=data_type)
+    elif data_format == 'text':
+        return DownloadedItem[str](data=data.decode('utf-8'), data_type=data_type)
+    else:
+        return DownloadedItem[bytes](data=data, data_type=data_type)
+
+def _customize_tool_def(transformer: type[JsonSchemaTransformer], tool_def: ToolDefinition):
+    """Customize the tool definition using the given transformer.
+
+    If the tool definition has `strict` set to None, the strictness will be inferred from the transformer.
+    """
+    schema_transformer = transformer(tool_def.parameters_json_schema, strict=tool_def.strict)
+    parameters_json_schema = schema_transformer.walk()
+    return replace(
+        tool_def,
+        parameters_json_schema=parameters_json_schema,
+        strict=schema_transformer.is_strict_compatible if tool_def.strict is None else tool_def.strict,
+    )
+
+def _customize_output_object(transformer: type[JsonSchemaTransformer], output_object: OutputObjectDefinition):
+    schema_transformer = transformer(output_object.json_schema, strict=output_object.strict)
+    json_schema = schema_transformer.walk()
+    return replace(
+        output_object,
+        json_schema=json_schema,
+        strict=schema_transformer.is_strict_compatible if output_object.strict is None else output_object.strict,
+    )
+
+## pydantic_ai_slim/pydantic_ai/models/xai.py
+
+def _map_json_schema(o: OutputObjectDefinition) -> chat_pb2.ResponseFormat:
+    """Convert OutputObjectDefinition to xAI ResponseFormat protobuf object."""
+    return chat_pb2.ResponseFormat(
+        format_type=chat_pb2.FORMAT_TYPE_JSON_SCHEMA,
+        schema=json.dumps(o.json_schema),
+    )
+
+def _map_json_object() -> chat_pb2.ResponseFormat:
+    """Create a ResponseFormat for JSON object mode (prompted output)."""
+    return chat_pb2.ResponseFormat(format_type=chat_pb2.FORMAT_TYPE_JSON_OBJECT)
+
+## pydantic_evals/pydantic_evals/dataset.py
+
+    def _infer_fmt(cls, path: Path, fmt: Literal['yaml', 'json'] | None) -> Literal['yaml', 'json']:
+        """Infer the format to use for a file based on its extension.
+
+        Args:
+            path: The path to infer the format for.
+            fmt: The explicitly provided format, if any.
+
+        Returns:
+            The inferred format ('yaml' or 'json').
+
+        Raises:
+            ValueError: If the format cannot be inferred from the file extension.
+        """
+        if fmt is not None:
+            return fmt
+        suffix = path.suffix.lower()
+        if suffix in {'.yaml', '.yml'}:
+            return 'yaml'
+        elif suffix == '.json':
+            return 'json'
+        raise ValueError(
+            f'Could not infer format for filename {path.name!r}. Use the `fmt` argument to specify the format.'
+        )
+
+## pydantic_evals/pydantic_evals/otel/span_tree.py
+
+class SpanTree:
+    """A container that builds a hierarchy of SpanNode objects from a list of finished spans.
+
+    You can then search or iterate the tree to make your assertions (using DFS for traversal).
+    """
+
+    roots: list[SpanNode] = field(default_factory=list[SpanNode])
+    nodes_by_id: dict[str, SpanNode] = field(default_factory=dict[str, SpanNode])
+
+    # -------------------------------------------------------------------------
+    # Construction
+    # -------------------------------------------------------------------------
+    def __post_init__(self):
+        self._rebuild_tree()
+
+    def add_spans(self, spans: list[SpanNode]) -> None:
+        """Add a list of spans to the tree, rebuilding the tree structure."""
+        for span in spans:
+            self.nodes_by_id[span.node_key] = span
+        self._rebuild_tree()
+
+    def add_readable_spans(self, readable_spans: list[ReadableSpan]):
+        self.add_spans([SpanNode.from_readable_span(span) for span in readable_spans])
+
+    def _rebuild_tree(self):
+        # Ensure spans are ordered by start_timestamp so that roots and children end up in the right order
+        nodes = list(self.nodes_by_id.values())
+        nodes.sort(key=lambda node: node.start_timestamp or datetime.min)
+        self.nodes_by_id = {node.node_key: node for node in nodes}
+
+        # Build the parent/child relationships
+        for node in self.nodes_by_id.values():
+            parent_node_key = node.parent_node_key
+            if parent_node_key is not None:
+                parent_node = self.nodes_by_id.get(parent_node_key)
+                if parent_node is not None:
+                    parent_node.add_child(node)
+
+        # Determine the roots
+        # A node is a "root" if its parent is None or if its parent's span_id is not in the current set of spans.
+        self.roots = []
+        for node in self.nodes_by_id.values():
+            parent_node_key = node.parent_node_key
+            if parent_node_key is None or parent_node_key not in self.nodes_by_id:
+                self.roots.append(node)
+
+    # -------------------------------------------------------------------------
+    # Node filtering and iteration
+    # -------------------------------------------------------------------------
+    def find(self, predicate: SpanQuery | SpanPredicate) -> list[SpanNode]:
+        """Find all nodes in the entire tree that match the predicate, scanning from each root in DFS order."""
+        return list(self._filter(predicate))
+
+    def first(self, predicate: SpanQuery | SpanPredicate) -> SpanNode | None:
+        """Find the first node that matches a predicate, scanning from each root in DFS order. Returns `None` if not found."""
+        return next(self._filter(predicate), None)
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+    def _filter(self, predicate: SpanQuery | SpanPredicate) -> Iterator[SpanNode]:
+        for node in self:
+            if node.matches(predicate):
+                yield node
+
+    def __iter__(self) -> Iterator[SpanNode]:
+        """Return an iterator over all nodes in the tree."""
+        return iter(self.nodes_by_id.values())
+
+    # -------------------------------------------------------------------------
+    # String representation
+    # -------------------------------------------------------------------------
+    def repr_xml(
+        self,
+        include_children: bool = True,
+        include_trace_id: bool = False,
+        include_span_id: bool = False,
+        include_start_timestamp: bool = False,
+        include_duration: bool = False,
+    ) -> str:
+        """Return an XML-like string representation of the tree, optionally including children, trace_id, span_id, duration, and timestamps."""
+        if not self.roots:
+            return '<SpanTree />'
+        repr_parts = [
+            '<SpanTree>',
+            *[
+                indent(
+                    root.repr_xml(
+                        include_children=include_children,
+                        include_trace_id=include_trace_id,
+                        include_span_id=include_span_id,
+                        include_start_timestamp=include_start_timestamp,
+                        include_duration=include_duration,
+                    ),
+                    '  ',
+                )
+                for root in self.roots
+            ],
+            '</SpanTree>',
+        ]
+        return '\n'.join(repr_parts)
+
+    def __str__(self):
+        return f'<SpanTree num_roots={len(self.roots)} total_spans={len(self.nodes_by_id)} />'
+
+    def __repr__(self):
+        return self.repr_xml()
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+## tests/evals/test_dataset.py
+
+async def test_evaluate_with_failing_task(
+    example_dataset: Dataset[TaskInput, TaskOutput, TaskMetadata],
+    simple_evaluator: type[Evaluator[TaskInput, TaskOutput, TaskMetadata]],
+):
+    """Test evaluating a dataset with a failing task."""
+    example_dataset.add_evaluator(simple_evaluator())
+
+    async def failing_task(inputs: TaskInput) -> TaskOutput:
+        if inputs.query == 'What is 2+2?':
+            raise ValueError('Task error')
+        return TaskOutput(answer='Paris')
+
+    report = await example_dataset.evaluate(failing_task)
+    assert report.cases == snapshot(
+        [
+            ReportCase(
+                name='case2',
+                inputs=TaskInput(query='What is the capital of France?'),
+                metadata=TaskMetadata(difficulty='medium', category='geography'),
+                expected_output=TaskOutput(answer='Paris', confidence=1.0),
+                output=TaskOutput(answer='Paris', confidence=1.0),
+                metrics={},
+                attributes={},
+                scores={
+                    'confidence': EvaluationResult(
+                        name='confidence', value=1.0, reason=None, source=simple_evaluator().as_spec()
+                    )
+                },
+                labels={},
+                assertions={
+                    'correct': EvaluationResult(
+                        name='correct', value=True, reason=None, source=simple_evaluator().as_spec()
+                    )
+                },
+                task_duration=1.0,
+                total_duration=5.0,
+                trace_id='00000000000000000000000000000001',
+                span_id='0000000000000007',
+                evaluator_failures=[],
+            )
+        ]
+    )
+    assert report.failures == snapshot(
+        [
+            ReportCaseFailure(
+                name='case1',
+                inputs=TaskInput(query='What is 2+2?'),
+                metadata=TaskMetadata(difficulty='easy', category='general'),
+                expected_output=TaskOutput(answer='4', confidence=1.0),
+                error_message='ValueError: Task error',
+                error_stacktrace=IsStr(),
+                trace_id='00000000000000000000000000000001',
+                span_id='0000000000000003',
+            )
+        ]
+    )
+
+async def test_dataset_evaluate_with_failing_task(example_dataset: Dataset[TaskInput, TaskOutput, TaskMetadata]):
+    """Test evaluating a dataset with a failing task."""
+
+    async def failing_task(inputs: TaskInput) -> TaskOutput:
+        raise ValueError('Task failed')
+
+    report = await example_dataset.evaluate(failing_task)
+    assert report.cases == snapshot([])
+    assert report.failures == snapshot(
+        [
+            ReportCaseFailure(
+                name='case1',
+                inputs=TaskInput(query='What is 2+2?'),
+                metadata=TaskMetadata(difficulty='easy', category='general'),
+                expected_output=TaskOutput(answer='4', confidence=1.0),
+                error_message='ValueError: Task failed',
+                error_stacktrace=IsStr(),
+                trace_id='00000000000000000000000000000001',
+                span_id='0000000000000003',
+            ),
+            ReportCaseFailure(
+                name='case2',
+                inputs=TaskInput(query='What is the capital of France?'),
+                metadata=TaskMetadata(difficulty='medium', category='geography'),
+                expected_output=TaskOutput(answer='Paris', confidence=1.0),
+                error_message='ValueError: Task failed',
+                error_stacktrace=IsStr(),
+                trace_id='00000000000000000000000000000001',
+                span_id='0000000000000007',
+            ),
+        ]
+    )
+
+async def test_dataset_evaluate_with_failing_evaluator(example_dataset: Dataset[TaskInput, TaskOutput, TaskMetadata]):
+    """Test evaluating a dataset with a failing evaluator."""
+
+    class FailingEvaluator(Evaluator[TaskInput, TaskOutput, TaskMetadata]):
+        def evaluate(self, ctx: EvaluatorContext[TaskInput, TaskOutput, TaskMetadata]) -> bool:
+            raise ValueError('Evaluator failed')
+
+    example_dataset.add_evaluator(FailingEvaluator())
+
+    async def task(inputs: TaskInput) -> TaskOutput:
+        return TaskOutput(answer=inputs.query.upper())
+
+    report = await example_dataset.evaluate(task)
+    assert report.cases == snapshot(
+        [
+            ReportCase(
+                name='case1',
+                inputs=TaskInput(query='What is 2+2?'),
+                metadata=TaskMetadata(difficulty='easy', category='general'),
+                expected_output=TaskOutput(answer='4', confidence=1.0),
+                output=TaskOutput(answer='WHAT IS 2+2?', confidence=1.0),
+                metrics={},
+                attributes={},
+                scores={},
+                labels={},
+                assertions={},
+                task_duration=1.0,
+                total_duration=12.0,
+                trace_id='00000000000000000000000000000001',
+                span_id='0000000000000003',
+                evaluator_failures=[
+                    EvaluatorFailure(
+                        name='FailingEvaluator',
+                        error_message='ValueError: Evaluator failed',
+                        error_stacktrace=IsStr(),
+                        source=FailingEvaluator().as_spec(),
+                    )
+                ],
+            ),
+            ReportCase(
+                name='case2',
+                inputs=TaskInput(query='What is the capital of France?'),
+                metadata=TaskMetadata(difficulty='medium', category='geography'),
+                expected_output=TaskOutput(answer='Paris', confidence=1.0),
+                output=TaskOutput(answer='WHAT IS THE CAPITAL OF FRANCE?', confidence=1.0),
+                metrics={},
+                attributes={},
+                scores={},
+                labels={},
+                assertions={},
+                task_duration=1.0,
+                total_duration=10.0,
+                trace_id='00000000000000000000000000000001',
+                span_id='0000000000000007',
+                evaluator_failures=[
+                    EvaluatorFailure(
+                        name='FailingEvaluator',
+                        error_message='ValueError: Evaluator failed',
+                        error_stacktrace=IsStr(),
+                        source=FailingEvaluator().as_spec(),
+                    )
+                ],
+            ),
+        ]
+    )
+    assert report.failures == snapshot([])
+
+## tests/evals/test_report_evaluators.py
+
+def test_confusion_matrix_evaluator_skips_none():
+    cases = [
+        _make_report_case('c1', output='cat', expected_output='cat'),
+        _make_report_case('c2', output='dog', expected_output=None),  # should be skipped
+    ]
+    report = _make_report(cases)
+
+    evaluator = ConfusionMatrixEvaluator(predicted_from='output', expected_from='expected_output')
+    ctx = ReportEvaluatorContext(name='test', report=report, experiment_metadata=None)
+    result = evaluator.evaluate(ctx)
+
+    assert isinstance(result, ConfusionMatrix)
+    assert result.class_labels == ['cat']
+    assert result.matrix == [[1]]
+
+def test_precision_recall_evaluator_skips_missing_scores():
+    """PrecisionRecallEvaluator skips cases missing score or positive data."""
+    cases = [
+        _make_report_case('c1', scores={'confidence': 0.9}, assertions={'is_correct': True}),
+        _make_report_case('c2', scores={}, assertions={'is_correct': False}),  # missing score
+        _make_report_case('c3', scores={'confidence': 0.3}, assertions={}),  # missing assertion
+    ]
+    report = _make_report(cases)
+
+    evaluator = PrecisionRecallEvaluator(
+        score_key='confidence',
+        positive_from='assertions',
+        positive_key='is_correct',
+    )
+    ctx = ReportEvaluatorContext(name='test', report=report, experiment_metadata=None)
+    result = evaluator.evaluate(ctx)
+
+    assert isinstance(result, PrecisionRecall)
+    assert len(result.curves) == 1
+
+## tests/models/anthropic/test_output.py
+
+class CityInfo(BaseModel):
+    """Information about a city."""
+
+    city: str
+    country: str
+    population: int
+
+## tests/models/test_download_item.py
+
+async def test_download_item_raises_user_error_with_unsupported_protocol(
+    url: AudioUrl | DocumentUrl | ImageUrl | VideoUrl,
+    protocol: str,
+) -> None:
+    with pytest.raises(ValueError, match=f'URL protocol "{protocol}" is not allowed'):
+        _ = await download_item(url, data_format='bytes')
+
+async def test_download_item_raises_user_error_with_youtube_url() -> None:
+    with pytest.raises(UserError, match='Downloading YouTube videos is not supported.'):
+        _ = await download_item(VideoUrl(url='https://youtu.be/lCdaVNyHtjU'), data_format='bytes')
+
+async def test_download_item_application_octet_stream(disable_ssrf_protection_for_vcr: None) -> None:
+    downloaded_item = await download_item(
+        VideoUrl(
+            url='https://raw.githubusercontent.com/pydantic/pydantic-ai/refs/heads/main/tests/assets/small_video.mp4'
+        ),
+        data_format='bytes',
+    )
+    assert downloaded_item['data_type'] == 'video/mp4'
+    assert downloaded_item['data'] == IsInstance(bytes)
+
+async def test_download_item_audio_mpeg(disable_ssrf_protection_for_vcr: None) -> None:
+    downloaded_item = await download_item(
+        AudioUrl(url='https://smokeshow.helpmanual.io/4l1l1s0s6q4741012x1w/common_voice_en_537507.mp3'),
+        data_format='bytes',
+    )
+    assert downloaded_item['data_type'] == 'audio/mpeg'
+    assert downloaded_item['data'] == IsInstance(bytes)
+
+async def test_download_item_no_content_type(disable_ssrf_protection_for_vcr: None) -> None:
+    downloaded_item = await download_item(
+        DocumentUrl(url='https://raw.githubusercontent.com/pydantic/pydantic-ai/refs/heads/main/docs/help.md'),
+        data_format='text',
+    )
+    assert downloaded_item['data_type'] == 'text/markdown'
+    assert downloaded_item['data'] == IsStr()
+
+## tests/test_ag_ui.py
+
+def current_time() -> str:
+    """Get the current time in ISO format.
+
+    Returns:
+        The current UTC time in ISO format string.
+    """
+    return '2023-06-21T12:08:45.485981+00:00'
+
+## tests/test_ssrf.py
+
+class TestIsPrivateIp:
+    """Tests for is_private_ip function."""
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # IPv4 loopback
+            '127.0.0.1',
+            '127.0.0.2',
+            '127.255.255.255',
+            # IPv4 private class A
+            '10.0.0.1',
+            '10.255.255.255',
+            # IPv4 private class B
+            '172.16.0.1',
+            '172.31.255.255',
+            # IPv4 private class C
+            '192.168.0.1',
+            '192.168.255.255',
+            # IPv4 link-local
+            '169.254.0.1',
+            '169.254.255.255',
+            # IPv4 "this" network
+            '0.0.0.0',
+            '0.255.255.255',
+            # IPv4 CGNAT (RFC 6598)
+            '100.64.0.1',
+            '100.127.255.255',
+            '100.100.100.200',  # Alibaba Cloud metadata
+            # IPv6 loopback
+            '::1',
+            # IPv6 link-local
+            'fe80::1',
+            'fe80::ffff:ffff:ffff:ffff',
+            # IPv6 unique local
+            'fc00::1',
+            'fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+            # IPv6 6to4 (can embed private IPv4)
+            '2002::1',
+            '2002:c0a8:0101::1',  # Embeds 192.168.1.1
+            '2002:0a00:0001::1',  # Embeds 10.0.0.1
+        ],
+    )
+    def test_private_ips_detected(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # Public IPv4
+            '8.8.8.8',
+            '1.1.1.1',
+            '203.0.113.50',
+            '198.51.100.1',
+            # Public IPv6
+            '2001:4860:4860::8888',
+            '2606:4700:4700::1111',
+        ],
+    )
+    def test_public_ips_allowed(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # IPv4-mapped IPv6 private addresses
+            '::ffff:127.0.0.1',
+            '::ffff:10.0.0.1',
+            '::ffff:192.168.1.1',
+            '::ffff:172.16.0.1',
+        ],
+    )
+    def test_ipv4_mapped_ipv6_private(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # IPv4-mapped IPv6 public addresses
+            '::ffff:8.8.8.8',
+            '::ffff:1.1.1.1',
+        ],
+    )
+    def test_ipv4_mapped_ipv6_public(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+    def test_invalid_ip_treated_as_private(self) -> None:
+        """Invalid IP addresses should be treated as potentially dangerous."""
+        assert is_private_ip('not-an-ip') is True
+        assert is_private_ip('') is True
+
+    def test_private_ips_detected(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+    def test_public_ips_allowed(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+    def test_ipv4_mapped_ipv6_private(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+    def test_ipv4_mapped_ipv6_public(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+    def test_invalid_ip_treated_as_private(self) -> None:
+        """Invalid IP addresses should be treated as potentially dangerous."""
+        assert is_private_ip('not-an-ip') is True
+        assert is_private_ip('') is True
+
+    async def test_public_ip_allowed(self) -> None:
+        """Test that public IPs are allowed."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+            resolved = await validate_and_resolve_url('https://example.com/path', allow_local=False)
+            assert resolved.resolved_ip == '93.184.215.14'
+            assert resolved.hostname == 'example.com'
+            assert resolved.port == 443
+            assert resolved.is_https is True
+            assert resolved.path == '/path'
+
+    async def test_private_ip_blocked_by_default(self) -> None:
+        """Test that private IPs are blocked by default."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('192.168.1.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://internal.local/path', allow_local=False)
+
+    async def test_private_ip_allowed_with_allow_local(self) -> None:
+        """Test that private IPs are allowed with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('192.168.1.1', 0))]
+            resolved = await validate_and_resolve_url('http://internal.local/path', allow_local=True)
+            assert resolved.resolved_ip == '192.168.1.1'
+
+    async def test_cloud_metadata_always_blocked(self) -> None:
+        """Test that cloud metadata IPs are always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('169.254.169.254', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.google.internal/path', allow_local=True)
+
+    async def test_alibaba_cloud_metadata_always_blocked(self) -> None:
+        """Test that Alibaba Cloud metadata IP is always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.100.100.200', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.aliyun.internal/path', allow_local=True)
+
+    async def test_literal_ip_address_in_url(self) -> None:
+        """Test handling of literal IP addresses in URLs."""
+        # Public IP - should work
+        resolved = await validate_and_resolve_url('http://8.8.8.8/path', allow_local=False)
+        assert resolved.resolved_ip == '8.8.8.8'
+        assert resolved.hostname == '8.8.8.8'
+
+    async def test_literal_private_ip_blocked(self) -> None:
+        """Test that literal private IPs in URLs are blocked."""
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://192.168.1.1/path', allow_local=False)
+
+    async def test_any_private_ip_blocks_request(self) -> None:
+        """Test that if any resolved IP is private, the request is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Return both public and private IPs
+            mock_executor.return_value = [
+                (2, 1, 6, '', ('93.184.215.14', 0)),
+                (2, 1, 6, '', ('192.168.1.1', 0)),
+            ]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://example.com/path', allow_local=False)
+
+    async def test_6to4_address_blocked(self) -> None:
+        """Test that 6to4 addresses (which can embed private IPv4) are blocked."""
+        # 2002:c0a8:0101::1 embeds 192.168.1.1
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://[2002:c0a8:0101::1]/path', allow_local=False)
+
+    async def test_cgnat_range_blocked(self) -> None:
+        """Test that CGNAT range (100.64.0.0/10) is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.64.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://cgnat-host.internal/path', allow_local=False)
+
+class TestDnsRebindingPrevention:
+    """Tests specifically for DNS rebinding attack prevention."""
+
+    async def test_hostname_resolving_to_private_ip_blocked(self) -> None:
+        """Test that a hostname resolving to a private IP is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Attacker's DNS returns private IP
+            mock_executor.return_value = [(2, 1, 6, '', ('127.0.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=False)
+
+    async def test_hostname_resolving_to_cloud_metadata_blocked(self) -> None:
+        """Test that a hostname resolving to cloud metadata IP is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Attacker's DNS returns cloud metadata IP
+            mock_executor.return_value = [(2, 1, 6, '', ('169.254.169.254', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=True)
+
+    async def test_multiple_ips_with_any_private_blocked(self) -> None:
+        """Test that if any IP in the resolution is private, request is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # DNS returns multiple IPs, one of which is private
+            mock_executor.return_value = [
+                (2, 1, 6, '', ('8.8.8.8', 0)),  # Public
+                (10, 1, 6, '', ('::1', 0)),  # Private IPv6 loopback
+            ]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=False)
+
+    async def test_hostname_resolving_to_private_ip_blocked(self) -> None:
+        """Test that a hostname resolving to a private IP is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Attacker's DNS returns private IP
+            mock_executor.return_value = [(2, 1, 6, '', ('127.0.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=False)
+
+    async def test_hostname_resolving_to_cloud_metadata_blocked(self) -> None:
+        """Test that a hostname resolving to cloud metadata IP is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Attacker's DNS returns cloud metadata IP
+            mock_executor.return_value = [(2, 1, 6, '', ('169.254.169.254', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=True)
+
+    async def test_multiple_ips_with_any_private_blocked(self) -> None:
+        """Test that if any IP in the resolution is private, request is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # DNS returns multiple IPs, one of which is private
+            mock_executor.return_value = [
+                (2, 1, 6, '', ('8.8.8.8', 0)),  # Public
+                (10, 1, 6, '', ('::1', 0)),  # Private IPv6 loopback
+            ]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=False)
+
+## tests/test_temporal.py
+
+class MockPayloadCodec(PayloadCodec):
+    """A mock payload codec for testing (simulates encryption codec)."""
+
+    async def encode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:  # pragma: no cover
+        return list(payloads)
+
+    async def decode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:  # pragma: no cover
+        return list(payloads)
+
+    async def decode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:  # pragma: no cover
+        return list(payloads)

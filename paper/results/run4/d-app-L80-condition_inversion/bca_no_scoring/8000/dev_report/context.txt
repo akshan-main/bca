@@ -1,0 +1,865 @@
+## pydantic_ai_slim/pydantic_ai/ui/_web/app.py
+
+def _get_cache_dir() -> Path:
+    """Get the cache directory for storing UI HTML files.
+
+    Uses XDG_CACHE_HOME on Unix, LOCALAPPDATA on Windows, or falls back to ~/.cache.
+    """
+    if os.name == 'nt':  # pragma: no cover
+        base = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
+    else:
+        base = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache'))
+
+    cache_dir = base / 'pydantic-ai' / 'web-ui'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+## tests/graph/test_file_persistence.py
+
+class String2Length(BaseNode):
+    input_data: str
+
+    async def run(self, ctx: GraphRunContext) -> Double:
+        return Double(len(self.input_data))
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_streaming_error(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    """Test that errors during streaming convert to ModelHTTPError."""
+    model_id = 'us.does-not-exist-model-v1:0'
+    model = BedrockConverseModel(model_id, provider=bedrock_provider)
+    agent = Agent(model)
+
+    with pytest.raises(ModelHTTPError) as exc_info:
+        async with agent.run_stream('hello'):
+            pass
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.model_name == model_id
+    assert exc_info.value.body.get('Error', {}).get('Message') == 'The provided model identifier is invalid.'  # type: ignore[union-attr]
+
+## tests/models/test_google.py
+
+async def test_google_system_prompts_and_instructions_ordering(google_provider: GoogleProvider):
+    """Test that instructions are appended after all system prompts in the system instruction."""
+    m = GoogleModel('gemini-2.0-flash', provider=google_provider)
+
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart(content='System prompt 1'),
+                SystemPromptPart(content='System prompt 2'),
+                UserPromptPart(content='Hello'),
+            ],
+            instructions='Instructions content',
+        ),
+    ]
+
+    system_instruction, contents = await m._map_messages(messages, ModelRequestParameters())  # pyright: ignore[reportPrivateUsage]
+
+    # Verify system parts are in order: system1, system2, instructions
+    assert system_instruction == snapshot(
+        {
+            'role': 'user',
+            'parts': [{'text': 'System prompt 1'}, {'text': 'System prompt 2'}, {'text': 'Instructions content'}],
+        }
+    )
+    assert contents == snapshot([{'role': 'user', 'parts': [{'text': 'Hello'}]}])
+
+## tests/models/test_xai.py
+
+async def test_xai_stream_no_usage_no_finish_reason(allow_model_requests: None):
+    """Test streaming handles responses without usage or finish reason."""
+    # Create streaming chunks where intermediate chunks have no usage/finish_reason
+    # First chunk: no usage, no finish_reason (UNSPECIFIED = 0 = falsy)
+    chunk1 = create_stream_chunk(content='Hello', finish_reason=None)
+    response1 = create_response_without_usage(content='Hello', finish_reason=None)
+
+    # Second chunk: with usage and finish_reason to complete the stream
+    chunk2 = create_stream_chunk(content=' world', finish_reason='stop')
+    response2 = create_response(
+        content='Hello world', finish_reason='stop', usage=create_usage(prompt_tokens=5, completion_tokens=2)
+    )
+
+    stream = [(response1, chunk1), (response2, chunk2)]
+    mock_client = MockXai.create_mock_stream([stream])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    async with agent.run_stream('Hello') as result:
+        [c async for c in result.stream_text(debounce_by=None)]
+
+    # Verify kwargs
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [{'content': [{'text': 'Hello'}], 'role': 'ROLE_USER'}],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+    # Should complete without errors
+    assert result.is_complete
+
+## tests/test_ag_ui.py
+
+async def simple_stream(messages: list[ModelMessage], agent_info: AgentInfo) -> AsyncIterator[str]:
+    """A simple function that returns a text response without tool calls."""
+    yield 'success '
+    yield '(no tool calls)'
+
+## tests/test_cli.py
+
+def test_clai_web_generic_with_instructions(mocker: MockerFixture, env: TestEnv):
+    """Test generic agent with custom instructions."""
+    env.set('OPENAI_API_KEY', 'test')
+
+    mock_run_web = mocker.patch('pydantic_ai._cli.web.run_web_command', return_value=0)
+
+    assert cli(['web', '-m', 'openai:gpt-5', '-i', 'You are a helpful coding assistant'], prog_name='clai') == 0
+
+    mock_run_web.assert_called_once_with(
+        agent_path=None,
+        host='127.0.0.1',
+        port=7932,
+        models=['openai:gpt-5'],
+        tools=[],
+        instructions='You are a helpful coding assistant',
+        default_model='openai:gpt-5',
+        html_source=None,
+    )
+
+## tests/test_examples.py
+
+async def stream_model_logic(  # noqa: C901
+    messages: list[ModelMessage], info: AgentInfo
+) -> AsyncIterator[str | DeltaToolCalls]:  # pragma: lax no cover
+    async def stream_text_response(r: str) -> AsyncIterator[str]:
+        if isinstance(r, str):
+            words = r.split(' ')
+            chunk: list[str] = []
+            for word in words:
+                chunk.append(word)
+                if len(chunk) == 3:
+                    yield ' '.join(chunk) + ' '
+                    chunk.clear()
+            if chunk:
+                yield ' '.join(chunk)
+
+    async def stream_tool_call_response(r: ToolCallPart) -> AsyncIterator[DeltaToolCalls]:
+        json_text = r.args_as_json_str()
+
+        yield {1: DeltaToolCall(name=r.tool_name, tool_call_id=r.tool_call_id)}
+        for chunk_index in range(0, len(json_text), 15):
+            text_chunk = json_text[chunk_index : chunk_index + 15]
+            yield {1: DeltaToolCall(json_args=text_chunk)}
+
+    async def stream_part_response(
+        r: str | ToolCallPart | Sequence[ToolCallPart],
+    ) -> AsyncIterator[str | DeltaToolCalls]:
+        if isinstance(r, str):
+            async for chunk in stream_text_response(r):
+                yield chunk
+        elif isinstance(r, Sequence):
+            for part in r:
+                async for chunk in stream_tool_call_response(part):
+                    yield chunk
+        else:
+            async for chunk in stream_tool_call_response(r):
+                yield chunk
+
+    last_part = messages[-1].parts[-1]
+    if isinstance(last_part, UserPromptPart):
+        assert isinstance(last_part.content, str)
+        if response := text_responses.get(last_part.content):
+            async for chunk in stream_part_response(response):
+                yield chunk
+            return
+    elif isinstance(last_part, ToolReturnPart):
+        assert isinstance(last_part.content, str)
+        if response := tool_responses.get((last_part.tool_name, last_part.content)):
+            async for chunk in stream_part_response(response):
+                yield chunk
+            return
+
+    sys.stdout.write(str(debug.format(messages, info)))
+    raise RuntimeError(f'Unexpected message: {last_part}')
+
+## tests/test_tools.py
+
+def test_docstring_sphinx(docstring_format: Literal['sphinx', 'auto']):
+    agent = Agent(FunctionModel(get_json_schema))
+    agent.tool_plain(docstring_format=docstring_format)(sphinx_style_docstring)
+
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'sphinx_style_docstring',
+            'description': 'Sphinx style docstring.',
+            'parameters_json_schema': {
+                'properties': {'foo': {'description': 'The foo thing.', 'type': 'integer'}},
+                'required': ['foo'],
+                'type': 'object',
+                'additionalProperties': False,
+            },
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )
+
+## tests/test_ui.py
+
+async def test_run_stream_builtin_tool_call():
+    async def stream_function(
+        messages: list[ModelMessage], agent_info: AgentInfo
+    ) -> AsyncIterator[BuiltinToolCallsReturns | DeltaToolCalls | str]:
+        yield {
+            0: BuiltinToolCallPart(
+                tool_name=WebSearchTool.kind,
+                args='{"query":',
+                tool_call_id='search_1',
+                provider_name='function',
+            )
+        }
+        yield {
+            0: DeltaToolCall(
+                json_args='"Hello world"}',
+                tool_call_id='search_1',
+            )
+        }
+        yield {
+            1: BuiltinToolReturnPart(
+                tool_name=WebSearchTool.kind,
+                content={
+                    'results': [
+                        {
+                            'title': '"Hello, World!" program',
+                            'url': 'https://en.wikipedia.org/wiki/%22Hello,_World!%22_program',
+                        }
+                    ]
+                },
+                tool_call_id='search_1',
+                provider_name='function',
+            )
+        }
+        yield 'A "Hello, World!" program is usually a simple computer program that emits (or displays) to the screen (often the console) a message similar to "Hello, World!". '
+
+    agent = Agent(model=FunctionModel(stream_function=stream_function))
+
+    request = DummyUIRunInput(messages=[ModelRequest.user_text_prompt('Tell me about Hello World')])
+    adapter = DummyUIAdapter(agent, request)
+    events = [event async for event in adapter.run_stream()]
+
+    assert events == snapshot(
+        [
+            '<stream>',
+            '<response>',
+            '<builtin-tool-call name=\'web_search\'>{"query":',
+            '"Hello world"}',
+            "</builtin-tool-call name='web_search'>",
+            "<builtin-tool-return name='web_search'>{'results': [{'title': '\"Hello, World!\" program', 'url': 'https://en.wikipedia.org/wiki/%22Hello,_World!%22_program'}]}</builtin-tool-return>",
+            '<text follows_text=False>A "Hello, World!" program is usually a simple computer program that emits (or displays) to the screen (often the console) a message similar to "Hello, World!". ',
+            '<final-result tool_name=None />',
+            '</text followed_by_text=False>',
+            '</response>',
+            '<run-result>A "Hello, World!" program is usually a simple computer program that emits (or displays) to the screen (often the console) a message similar to "Hello, World!". </run-result>',
+            '</stream>',
+        ]
+    )
+
+## tests/test_ui_web.py
+
+def test_agent_to_web():
+    """Test the Agent.to_web() method."""
+    agent = Agent('test')
+    app = agent.to_web()
+
+    assert isinstance(app, Starlette)
+
+def test_agent_to_web_with_model_instances():
+    """Test to_web() accepts model instances, not just strings."""
+    agent = Agent(TestModel())
+    model_instance = TestModel()
+
+    # List with instances
+    app = agent.to_web(models=[model_instance, 'test'])
+    assert isinstance(app, Starlette)
+
+    # Dict with instances
+    app = agent.to_web(models={'Custom': model_instance, 'Test': 'test'})
+    assert isinstance(app, Starlette)
+
+async def test_model_instance_preserved_in_dispatch(monkeypatch: pytest.MonkeyPatch):
+    """Test that model instances are preserved and used in dispatch, not reconstructed from string."""
+    model_instance = TestModel(custom_output_text='Custom output')
+    agent: Agent[None, str] = Agent()
+    app = create_web_app(agent, models=[model_instance])
+
+    # Mock dispatch_request to capture the model parameter
+    mock_dispatch = AsyncMock(return_value=Response(content=b'', status_code=200))
+    monkeypatch.setattr(VercelAIAdapter, 'dispatch_request', mock_dispatch)
+
+    with TestClient(app) as client:
+        client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:test',
+                'builtinTools': [],
+            },
+        )
+
+    # Verify dispatch_request was called with the original model instance
+    mock_dispatch.assert_called_once()
+    call_kwargs = mock_dispatch.call_args.kwargs
+    assert call_kwargs['model'] is model_instance, 'Model instance should be preserved, not reconstructed from string'
+
+def test_agent_to_web_with_deps():
+    """Test to_web() accepts deps parameter."""
+
+    @dataclass
+    class MyDeps:
+        api_key: str
+
+    agent: Agent[MyDeps, str] = Agent(TestModel(), deps_type=MyDeps)
+    deps = MyDeps(api_key='test-key')
+
+    app = agent.to_web(deps=deps)
+    assert isinstance(app, Starlette)
+
+def test_agent_to_web_with_model_settings():
+    """Test to_web() accepts model_settings parameter."""
+    agent = Agent(TestModel())
+    settings = ModelSettings(temperature=0.5, max_tokens=100)
+
+    app = agent.to_web(model_settings=settings)
+    assert isinstance(app, Starlette)
+
+def test_chat_app_health_endpoint():
+    """Test the /api/health endpoint."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.get('/api/health')
+        assert response.status_code == 200
+        assert response.json() == {'ok': True}
+
+def test_chat_app_configure_endpoint():
+    """Test the /api/configure endpoint with explicit models and tools."""
+
+    agent = Agent('test')
+    app = create_web_app(
+        agent,
+        models=['test'],
+        builtin_tools=[WebSearchTool()],
+    )
+
+    with TestClient(app) as client:
+        response = client.get('/api/configure')
+        assert response.status_code == 200
+        assert response.json() == snapshot(
+            {
+                'models': [
+                    {'id': 'test:test', 'name': 'Test', 'builtinTools': ['web_search']},
+                    {'id': 'test', 'name': 'Test', 'builtinTools': ['web_search']},
+                ],
+                'builtinTools': [{'id': 'web_search', 'name': 'Web Search'}],
+            }
+        )
+
+def test_chat_app_configure_endpoint_empty():
+    """Test the /api/configure endpoint with no models or tools."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.get('/api/configure')
+        assert response.status_code == 200
+        assert response.json() == snapshot(
+            {'models': [{'id': 'test:test', 'name': 'Test', 'builtinTools': []}], 'builtinTools': []}
+        )
+
+def test_chat_app_configure_preserves_chat_vs_responses(monkeypatch: pytest.MonkeyPatch):
+    """Test that openai-chat: and openai-responses: models are kept as separate entries."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+
+    agent = Agent('test')
+    app = create_web_app(
+        agent,
+        models=['openai-chat:gpt-4o', 'openai-responses:gpt-4o'],
+    )
+
+    with TestClient(app) as client:
+        response = client.get('/api/configure')
+        assert response.status_code == 200
+        data = response.json()
+        model_ids = [m['id'] for m in data['models']]
+        assert 'openai-chat:gpt-4o' in model_ids
+        assert 'openai-responses:gpt-4o' in model_ids
+        assert len([m for m in model_ids if 'gpt-4o' in m]) == 2
+
+def test_chat_app_index_endpoint():
+    """Test that the index endpoint serves HTML with proper caching headers."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.get('/')
+        assert response.status_code == 200
+        assert response.headers['content-type'] == 'text/html; charset=utf-8'
+        assert 'cache-control' in response.headers
+        assert response.headers['cache-control'] == 'public, max-age=3600'
+        assert len(response.content) > 0
+
+async def test_get_ui_html_cdn_fetch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html fetches from CDN when filesystem cache misses."""
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: tmp_path)
+
+    test_content = b'<html>Test UI</html>'
+
+    class MockResponse:
+        content = test_content
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class MockAsyncClient:
+        async def __aenter__(self) -> MockAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> MockResponse:
+            return MockResponse()
+
+    monkeypatch.setattr(app_module.httpx, 'AsyncClient', MockAsyncClient)
+
+    result = await _get_ui_html()
+
+    assert result == test_content
+    cache_file: Path = tmp_path / f'{app_module.CHAT_UI_VERSION}.html'
+    assert cache_file.exists()
+    assert cache_file.read_bytes() == test_content
+
+async def test_get_ui_html_filesystem_cache_hit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html returns cached content from filesystem."""
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: tmp_path)
+
+    test_content = b'<html>Cached UI</html>'
+    cache_file = tmp_path / f'{app_module.CHAT_UI_VERSION}.html'
+    cache_file.write_bytes(test_content)
+
+    result = await _get_ui_html()
+
+    assert result == test_content
+
+def test_chat_app_index_caching():
+    """Test that the UI HTML is cached after first fetch."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response1 = client.get('/')
+        response2 = client.get('/')
+
+        assert response1.content == response2.content
+        assert response1.status_code == 200
+        assert response2.status_code == 200
+
+async def test_post_chat_endpoint():
+    """Test the POST /api/chat endpoint."""
+    agent = Agent(TestModel(custom_output_text='Hello from test!'))
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-message-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:test',
+                'builtinTools': [],
+            },
+        )
+
+        assert response.status_code == 200
+
+def test_chat_app_options_endpoint():
+    """Test the OPTIONS /api/chat endpoint (CORS preflight)."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.options('/api/chat')
+        assert response.status_code == 200
+
+def test_mcp_server_tool_label():
+    """Test MCPServerTool.label property."""
+    tool = MCPServerTool(id='test-server', url='https://example.com')
+    assert tool.label == 'MCP: test-server'
+
+def test_model_profile():
+    """Test Model.profile cached property."""
+    model = TestModel()
+    assert model.profile is not None
+
+def test_supported_builtin_tools(profile_name: str):
+    """Test profile.supported_builtin_tools returns proper tool types."""
+    if profile_name == 'base':
+        profile: ModelProfile = ModelProfile()
+    elif profile_name == 'openai':
+        profile = OpenAIModelProfile()
+    elif profile_name == 'google':
+        profile = GoogleModelProfile()
+    else:
+        profile = GroqModelProfile()
+
+    result = profile.supported_builtin_tools
+    assert isinstance(result, frozenset)
+    assert all(issubclass(t, AbstractBuiltinTool) for t in result)
+
+def test_post_chat_invalid_model():
+    """Test POST /api/chat returns 400 when model is not in allowed list."""
+    agent = Agent(TestModel(custom_output_text='Hello'))
+    # Use 'test' as the allowed model, then send a different model in the request
+    app = create_web_app(agent, models=['test'])
+
+    with TestClient(app) as client:
+        response = client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:different_model',
+                'builtinTools': [],
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json() == snapshot({'error': 'Model "test:different_model" is not in the allowed models list'})
+
+def test_post_chat_invalid_builtin_tool():
+    """Test POST /api/chat returns 400 when builtin tool is not in allowed list."""
+    agent = Agent(TestModel(custom_output_text='Hello'))
+    app = create_web_app(agent, builtin_tools=[WebSearchTool()])
+
+    with TestClient(app) as client:
+        response = client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:test',
+                'builtinTools': ['code_execution'],  # Not in allowed list
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json() == snapshot(
+            {'error': "Builtin tool(s) ['code_execution'] not in the allowed tools list"}
+        )
+
+def test_model_label_openrouter():
+    """Test Model.label handles OpenRouter-style names with /."""
+    model = TestModel(model_name='meta-llama/llama-3-70b')
+    assert model.label == snapshot('Llama 3 70b')
+
+def test_agent_to_web_with_instructions():
+    """Test to_web() accepts instructions parameter."""
+    agent = Agent(TestModel())
+    app = agent.to_web(instructions='Always respond in Spanish')
+    assert isinstance(app, Starlette)
+
+async def test_instructions_passed_to_dispatch(monkeypatch: pytest.MonkeyPatch):
+    """Test that instructions from create_web_app are passed to dispatch_request."""
+    agent = Agent(TestModel(custom_output_text='Hello'))
+    app = create_web_app(agent, instructions='Always respond in Spanish')
+
+    # Mock dispatch_request to capture the instructions parameter
+    mock_dispatch = AsyncMock(return_value=Response(content=b'', status_code=200))
+    monkeypatch.setattr(VercelAIAdapter, 'dispatch_request', mock_dispatch)
+
+    with TestClient(app) as client:
+        client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:test',
+                'builtinTools': [],
+            },
+        )
+
+    # Verify dispatch_request was called with instructions
+    mock_dispatch.assert_called_once()
+    call_kwargs = mock_dispatch.call_args.kwargs
+    assert call_kwargs['instructions'] == 'Always respond in Spanish'
+
+async def test_get_ui_html_custom_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html fetches from custom URL when provided."""
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: tmp_path)
+
+    test_content = b'<html>Custom CDN UI</html>'
+    captured_url: list[str] = []
+
+    class MockResponse:
+        content = test_content
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class MockAsyncClient:
+        async def __aenter__(self) -> MockAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> MockResponse:
+            captured_url.append(url)
+            return MockResponse()
+
+    monkeypatch.setattr(app_module.httpx, 'AsyncClient', MockAsyncClient)
+
+    # URL is used directly, no version templating
+    custom_url = 'https://my-internal-cdn.example.com/ui/index.html'
+    result = await _get_ui_html(html_source=custom_url)
+
+    assert result == test_content
+    assert len(captured_url) == 1
+    assert captured_url[0] == custom_url
+
+async def test_get_ui_html_custom_url_caching(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that custom URLs are cached to filesystem and not re-fetched."""
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: tmp_path)
+
+    test_content = b'<html>Cached Custom UI</html>'
+    fetch_count = 0
+
+    class MockResponse:
+        content = test_content
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class MockAsyncClient:
+        async def __aenter__(self) -> MockAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> MockResponse:
+            nonlocal fetch_count
+            fetch_count += 1
+            return MockResponse()
+
+    monkeypatch.setattr(app_module.httpx, 'AsyncClient', MockAsyncClient)
+
+    custom_url = 'https://my-internal-cdn.example.com/ui/cached.html'
+
+    # First call should fetch from URL
+    result1 = await _get_ui_html(html_source=custom_url)
+    assert result1 == test_content
+    assert fetch_count == 1
+
+    # Verify cache file was created
+    url_hash = hashlib.sha256(custom_url.encode()).hexdigest()[:16]
+    cache_file = tmp_path / f'url_{url_hash}.html'
+    assert cache_file.exists()
+    assert cache_file.read_bytes() == test_content
+
+    # Second call should use cache, not fetch again
+    result2 = await _get_ui_html(html_source=custom_url)
+    assert result2 == test_content
+    assert fetch_count == 1  # Still 1, not 2
+
+def test_agent_to_web_with_html_source():
+    """Test that Agent.to_web() accepts html_source parameter."""
+    agent = Agent('test')
+    app = agent.to_web(html_source='https://custom-cdn.example.com/ui/index.html')
+
+    assert isinstance(app, Starlette)
+
+async def test_get_ui_html_local_file_path_string(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html supports local file paths as strings."""
+    # Create a test HTML file
+    test_html = b'<html><body>Local UI Content</body></html>'
+    local_file = tmp_path / 'custom-ui.html'
+    local_file.write_bytes(test_html)
+
+    result = await app_module._get_ui_html(html_source=str(local_file))  # pyright: ignore[reportPrivateUsage]
+
+    assert result == test_html
+
+async def test_get_ui_html_local_file_path_instance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html supports Path instances."""
+    # Create a test HTML file
+    test_html = b'<html><body>Path Instance UI</body></html>'
+    local_file = tmp_path / 'path-ui.html'
+    local_file.write_bytes(test_html)
+
+    result = await app_module._get_ui_html(html_source=local_file)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == test_html
+
+async def test_get_ui_html_local_file_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html raises FileNotFoundError for missing local file paths."""
+    # Try to use a non-existent local file path
+    nonexistent_path = str(tmp_path / 'nonexistent-ui.html')
+
+    with pytest.raises(FileNotFoundError, match='Local UI file not found'):
+        await app_module._get_ui_html(html_source=nonexistent_path)  # pyright: ignore[reportPrivateUsage]
+
+async def test_get_ui_html_source_instance_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html raises FileNotFoundError for missing Path instances."""
+    # Try to use a non-existent Path instance
+    nonexistent_path = tmp_path / 'nonexistent-ui.html'
+
+    with pytest.raises(FileNotFoundError, match='Local UI file not found'):
+        await app_module._get_ui_html(html_source=nonexistent_path)  # pyright: ignore[reportPrivateUsage]
+
+def test_chat_app_index_file_not_found(tmp_path: Path):
+    """Test that index endpoint raises FileNotFoundError for non-existent html_source file."""
+    agent = Agent('test')
+    nonexistent_file = tmp_path / 'nonexistent-ui.html'
+    app = create_web_app(agent, html_source=str(nonexistent_file))
+
+    with TestClient(app, raise_server_exceptions=True) as client:
+        with pytest.raises(FileNotFoundError, match='Local UI file not found'):
+            client.get('/')
+
+def test_chat_app_index_http_error(monkeypatch: pytest.MonkeyPatch):
+    """Test that index endpoint raises HTTPStatusError when CDN fetch fails."""
+
+    class MockResponse:
+        status_code = 500
+
+    class MockAsyncClient:
+        async def __aenter__(self) -> MockAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> None:
+            response = MockResponse()
+            raise httpx.HTTPStatusError('Server error', request=None, response=response)  # type: ignore
+
+    monkeypatch.setattr(app_module.httpx, 'AsyncClient', MockAsyncClient)
+    # Use a fresh temp dir so there's no cached file
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: Path('/tmp/nonexistent-cache-dir-for-test'))
+
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app, raise_server_exceptions=True) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            client.get('/')
+
+## tests/test_vercel_ai.py
+
+async def test_event_stream_tool_call_end_with_provider_metadata_v5():
+    """Test that tool-input-start events exclude provider_metadata for SDK v5."""
+
+    async def event_generator():
+        part = ToolCallPart(
+            tool_name='my_tool',
+            tool_call_id='tc_meta',
+            args={'key': 'value'},
+            id='tool_call_id_123',
+            provider_name='anthropic',
+            provider_details={'tool_index': 0},
+        )
+        yield PartStartEvent(index=0, part=part)
+        yield PartEndEvent(index=0, part=part)
+
+    request = SubmitMessage(
+        id='foo',
+        messages=[
+            UIMessage(
+                id='bar',
+                role='user',
+                parts=[TextUIPart(text='Test')],
+            ),
+        ],
+    )
+    event_stream = VercelAIEventStream(run_input=request, sdk_version=5)
+    events = [
+        '[DONE]' if '[DONE]' in event else json.loads(event.removeprefix('data: '))
+        async for event in event_stream.encode_stream(event_stream.transform_stream(event_generator()))
+    ]
+
+    assert events == snapshot(
+        [
+            {'type': 'start'},
+            {'type': 'start-step'},
+            {'type': 'tool-input-start', 'toolCallId': 'tc_meta', 'toolName': 'my_tool'},
+            {'type': 'tool-input-delta', 'toolCallId': 'tc_meta', 'inputTextDelta': '{"key":"value"}'},
+            {
+                'type': 'tool-input-available',
+                'toolCallId': 'tc_meta',
+                'toolName': 'my_tool',
+                'input': {'key': 'value'},
+                'providerMetadata': {
+                    'pydantic_ai': {
+                        'id': 'tool_call_id_123',
+                        'provider_name': 'anthropic',
+                        'provider_details': {'tool_index': 0},
+                    }
+                },
+            },
+            {'type': 'finish-step'},
+            {'type': 'finish'},
+            '[DONE]',
+        ]
+    )

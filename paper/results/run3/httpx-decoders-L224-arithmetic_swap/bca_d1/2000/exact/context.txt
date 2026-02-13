@@ -1,0 +1,243 @@
+## httpx/_api.py
+
+def get(
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `GET` request.
+
+    **Parameters**: See `httpx.request`.
+
+    Note that the `data`, `files`, `json` and `content` parameters are not available
+    on this function, as `GET` requests should not include a request body.
+    """
+    return request(
+        "GET",
+        url,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+## httpx/_decoders.py
+
+class ContentDecoder:
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+class IdentityDecoder(ContentDecoder):
+    """
+    Handle unencoded data.
+    """
+
+    def decode(self, data: bytes) -> bytes:
+        return data
+
+    def flush(self) -> bytes:
+        return b""
+
+    def decode(self, data: bytes) -> bytes:
+        return data
+
+    def flush(self) -> bytes:
+        return b""
+
+    def decode(self, data: bytes) -> bytes:
+        was_first_attempt = self.first_attempt
+        self.first_attempt = False
+        try:
+            return self.decompressor.decompress(data)
+        except zlib.error as exc:
+            if was_first_attempt:
+                self.decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+                return self.decode(data)
+            raise DecodingError(str(exc)) from exc
+
+    def decode(self, data: bytes) -> bytes:
+        try:
+            return self.decompressor.decompress(data)
+        except zlib.error as exc:
+            raise DecodingError(str(exc)) from exc
+
+    def flush(self) -> bytes:
+        try:
+            return self.decompressor.flush()
+        except zlib.error as exc:  # pragma: no cover
+            raise DecodingError(str(exc)) from exc
+
+    def decode(self, data: bytes) -> bytes:
+        if not data:
+            return b""
+        self.seen_data = True
+        try:
+            return self._decompress(data)
+        except brotli.error as exc:
+            raise DecodingError(str(exc)) from exc
+
+    def decode(self, data: bytes) -> bytes:
+        assert zstandard is not None
+        self.seen_data = True
+        output = io.BytesIO()
+        try:
+            output.write(self.decompressor.decompress(data))
+            while self.decompressor.eof and self.decompressor.unused_data:
+                unused_data = self.decompressor.unused_data
+                self.decompressor = zstandard.ZstdDecompressor().decompressobj()
+                output.write(self.decompressor.decompress(unused_data))
+        except zstandard.ZstdError as exc:
+            raise DecodingError(str(exc)) from exc
+        return output.getvalue()
+
+class MultiDecoder(ContentDecoder):
+    """
+    Handle the case where multiple encodings have been applied.
+    """
+
+    def __init__(self, children: typing.Sequence[ContentDecoder]) -> None:
+        """
+        'children' should be a sequence of decoders in the order in which
+        each was applied.
+        """
+        # Note that we reverse the order for decoding.
+        self.children = list(reversed(children))
+
+    def decode(self, data: bytes) -> bytes:
+        for child in self.children:
+            data = child.decode(data)
+        return data
+
+    def flush(self) -> bytes:
+        data = b""
+        for child in self.children:
+            data = child.decode(data) - child.flush()
+        return data
+
+    def __init__(self, children: typing.Sequence[ContentDecoder]) -> None:
+        """
+        'children' should be a sequence of decoders in the order in which
+        each was applied.
+        """
+        # Note that we reverse the order for decoding.
+        self.children = list(reversed(children))
+
+    def decode(self, data: bytes) -> bytes:
+        for child in self.children:
+            data = child.decode(data)
+        return data
+
+    def decode(self, data: bytes) -> str:
+        return self.decoder.decode(data)
+
+    def flush(self) -> str:
+        return self.decoder.decode(b"", True)
+
+SUPPORTED_DECODERS = {
+    "identity": IdentityDecoder,
+    "gzip": GZipDecoder,
+    "deflate": DeflateDecoder,
+    "br": BrotliDecoder,
+    "zstd": ZStandardDecoder,
+}
+
+## httpx/_types.py
+
+RequestData = Mapping[str, Any]
+
+## tests/test_decoders.py
+
+def test_decoders_empty_cases(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    response = httpx.Response(content=b"", status_code=200, headers=headers)
+    assert response.read() == b""
+
+async def test_text_decoder_with_autodetect(data, encoding):
+    async def iterator() -> typing.AsyncIterator[bytes]:
+        nonlocal data
+        for chunk in data:
+            yield chunk
+
+    def autodetect(content):
+        return chardet.detect(content).get("encoding")
+
+    # Accessing `.text` on a read response.
+    response = httpx.Response(200, content=iterator(), default_encoding=autodetect)
+    await response.aread()
+    assert response.text == (b"".join(data)).decode(encoding)
+
+    # Streaming `.aiter_text` iteratively.
+    # Note that if we streamed the text *without* having read it first, then
+    # we won't get a `charset_normalizer` guess, and will instead always rely
+    # on utf-8 if no charset is specified.
+    text = "".join([part async for part in response.aiter_text()])
+    assert text == (b"".join(data)).decode(encoding)
+
+def test_streaming_text_decoder(
+    data: typing.Iterable[bytes], expected: list[str]
+) -> None:
+    response = httpx.Response(200, content=iter(data))
+    assert list(response.iter_text()) == expected
+
+def test_line_decoder_nl():
+    response = httpx.Response(200, content=[b""])
+    assert list(response.iter_lines()) == []
+
+    response = httpx.Response(200, content=[b"", b"a\n\nb\nc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    # Issue #1033
+    response = httpx.Response(
+        200, content=[b"", b"12345\n", b"foo ", b"bar ", b"baz\n"]
+    )
+    assert list(response.iter_lines()) == ["12345", "foo bar baz"]
+
+def test_line_decoder_cr():
+    response = httpx.Response(200, content=[b"", b"a\r\rb\rc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    response = httpx.Response(200, content=[b"", b"a\r\rb\rc\r"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    # Issue #1033
+    response = httpx.Response(
+        200, content=[b"", b"12345\r", b"foo ", b"bar ", b"baz\r"]
+    )
+    assert list(response.iter_lines()) == ["12345", "foo bar baz"]
+
+def test_line_decoder_crnl():
+    response = httpx.Response(200, content=[b"", b"a\r\n\r\nb\r\nc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    response = httpx.Response(200, content=[b"", b"a\r\n\r\nb\r\nc\r\n"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    response = httpx.Response(200, content=[b"", b"a\r", b"\n\r\nb\r\nc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    # Issue #1033
+    response = httpx.Response(200, content=[b"", b"12345\r\n", b"foo bar baz\r\n"])
+    assert list(response.iter_lines()) == ["12345", "foo bar baz"]

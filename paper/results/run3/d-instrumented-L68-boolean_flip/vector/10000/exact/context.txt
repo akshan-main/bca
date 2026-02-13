@@ -1,0 +1,1181 @@
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/models/fallback.py:12-12
+from pydantic_ai.models.instrumented import InstrumentedModel
+
+# tests/models/test_instrumented.py:43-43
+from pydantic_ai.models.instrumented import InstrumentationSettings, InstrumentedModel
+
+# tests/models/test_model_settings.py:12-12
+from pydantic_ai.models.instrumented import InstrumentedModel
+
+# tests/test_direct.py:32-32
+from pydantic_ai.models.instrumented import InstrumentedModel
+
+# tests/test_logfire.py:17-17
+from pydantic_ai.models.instrumented import InstrumentationSettings, InstrumentedModel
+
+# pydantic_evals/pydantic_evals/evaluators/__init__.py:1-10
+from .common import (
+    Contains,
+    Equals,
+    EqualsExpected,
+    HasMatchingSpan,
+    IsInstance,
+    LLMJudge,
+    MaxDuration,
+    OutputConfig,
+)
+
+# tests/models/test_anthropic.py:60-60
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, TestEnv, raise_if_exception, try_import
+
+# tests/models/test_bedrock.py:54-54
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, try_import
+
+# tests/models/test_cohere.py:33-33
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, raise_if_exception, try_import
+
+# tests/models/test_download_item.py:6-6
+from ..conftest import IsInstance, IsStr
+
+# tests/models/test_gemini_vertex.py:23-23
+from ..conftest import IsDatetime, IsInstance, IsStr, try_import
+
+# tests/models/test_google.py:79-79
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, try_import
+
+# tests/models/test_groq.py:52-52
+from ..conftest import IsDatetime, IsInstance, IsStr, raise_if_exception, try_import
+
+# tests/models/test_huggingface.py:41-41
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, raise_if_exception, try_import
+
+# tests/models/test_outlines.py:42-42
+from ..conftest import IsDatetime, IsInstance, IsStr, try_import
+
+# tests/models/test_xai.py:73-73
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, try_import
+
+# tests/test_cli.py:8-8
+from dirty_equals import IsInstance, IsStr
+
+# tests/test_mcp.py:47-47
+from .conftest import IsDatetime, IsInstance, IsNow, IsStr, try_import
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:144-144
+    instrument: InstrumentationSettings | bool | None
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:157-157
+    instrument: InstrumentationSettings | bool | None
+
+# pydantic_evals/pydantic_evals/evaluators/common.py:132-147
+class IsInstance(Evaluator[object, object, object]):
+    """Check if the output is an instance of a type with the given name."""
+
+    type_name: str
+    evaluation_name: str | None = field(default=None)
+
+    def evaluate(self, ctx: EvaluatorContext[object, object, object]) -> EvaluationReason:
+        output = ctx.output
+        for cls in type(output).__mro__:
+            if cls.__name__ == self.type_name or cls.__qualname__ == self.type_name:
+                return EvaluationReason(value=True)
+
+        reason = f'output is of type {type(output).__name__}'
+        if type(output).__qualname__ != type(output).__name__:
+            reason += f' (qualname: {type(output).__qualname__})'
+        return EvaluationReason(value=False, reason=reason)
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:371-566
+class InstrumentedModel(WrapperModel):
+    """Model which wraps another model so that requests are instrumented with OpenTelemetry.
+
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    instrumentation_settings: InstrumentationSettings
+    """Instrumentation settings for this model."""
+
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        options: InstrumentationSettings | None = None,
+    ) -> None:
+        super().__init__(wrapped)
+        self.instrumentation_settings = options or InstrumentationSettings()
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        prepared_settings, prepared_parameters = self.wrapped.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        with self._instrument(messages, prepared_settings, prepared_parameters) as finish:
+            response = await self.wrapped.request(messages, model_settings, model_request_parameters)
+            finish(response, prepared_parameters)
+            return response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        prepared_settings, prepared_parameters = self.wrapped.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        with self._instrument(messages, prepared_settings, prepared_parameters) as finish:
+            response_stream: StreamedResponse | None = None
+            try:
+                async with self.wrapped.request_stream(
+                    messages, model_settings, model_request_parameters, run_context
+                ) as response_stream:
+                    yield response_stream
+            finally:
+                if response_stream:  # pragma: no branch
+                    finish(response_stream.get(), prepared_parameters)
+
+    @contextmanager
+    def _instrument(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> Iterator[Callable[[ModelResponse, ModelRequestParameters], None]]:
+        operation = 'chat'
+        span_name = f'{operation} {self.model_name}'
+        # TODO Missing attributes:
+        #  - error.type: unclear if we should do something here or just always rely on span exceptions
+        #  - gen_ai.request.stop_sequences/top_k: model_settings doesn't include these
+        attributes: dict[str, AttributeValue] = {
+            'gen_ai.operation.name': operation,
+            **self.model_attributes(self.wrapped),
+            **self.model_request_parameters_attributes(model_request_parameters),
+            'logfire.json_schema': json.dumps(
+                {
+                    'type': 'object',
+                    'properties': {'model_request_parameters': {'type': 'object'}},
+                }
+            ),
+        }
+
+        tool_definitions = _build_tool_definitions(model_request_parameters)
+        if tool_definitions:
+            attributes['gen_ai.tool.definitions'] = json.dumps(tool_definitions)
+
+        if model_settings:
+            for key in MODEL_SETTING_ATTRIBUTES:
+                if isinstance(value := model_settings.get(key), float | int):
+                    attributes[f'gen_ai.request.{key}'] = value
+
+        record_metrics: Callable[[], None] | None = None
+        try:
+            with self.instrumentation_settings.tracer.start_as_current_span(
+                span_name, attributes=attributes, kind=SpanKind.CLIENT
+            ) as span:
+
+                def finish(response: ModelResponse, parameters: ModelRequestParameters):
+                    # FallbackModel updates these span attributes.
+                    attributes.update(getattr(span, 'attributes', {}))
+                    request_model = attributes[GEN_AI_REQUEST_MODEL_ATTRIBUTE]
+                    system = cast(str, attributes[GEN_AI_SYSTEM_ATTRIBUTE])
+
+                    response_model = response.model_name or request_model
+                    price_calculation = None
+
+                    def _record_metrics():
+                        metric_attributes = {
+                            GEN_AI_PROVIDER_NAME_ATTRIBUTE: system,  # New OTel standard attribute
+                            GEN_AI_SYSTEM_ATTRIBUTE: system,  # Preserved for backward compatibility (deprecated)
+                            'gen_ai.operation.name': operation,
+                            'gen_ai.request.model': request_model,
+                            'gen_ai.response.model': response_model,
+                        }
+                        self.instrumentation_settings.record_metrics(response, price_calculation, metric_attributes)
+
+                    nonlocal record_metrics
+                    record_metrics = _record_metrics
+
+                    if not span.is_recording():
+                        return
+
+                    self.instrumentation_settings.handle_messages(messages, response, system, span, parameters)
+
+                    attributes_to_set = {
+                        **response.usage.opentelemetry_attributes(),
+                        'gen_ai.response.model': response_model,
+                    }
+                    try:
+                        price_calculation = response.cost()
+                    except LookupError:
+                        # The cost of this provider/model is unknown, which is common.
+                        pass
+                    except Exception as e:
+                        warnings.warn(
+                            f'Failed to get cost from response: {type(e).__name__}: {e}', CostCalculationFailedWarning
+                        )
+                    else:
+                        attributes_to_set['operation.cost'] = float(price_calculation.total_price)
+
+                    if response.provider_response_id is not None:
+                        attributes_to_set['gen_ai.response.id'] = response.provider_response_id
+                    if response.finish_reason is not None:
+                        attributes_to_set['gen_ai.response.finish_reasons'] = [response.finish_reason]
+                    span.set_attributes(attributes_to_set)
+                    span.update_name(f'{operation} {request_model}')
+
+                yield finish
+        finally:
+            if record_metrics:
+                # We only want to record metrics after the span is finished,
+                # to prevent them from being redundantly recorded in the span itself by logfire.
+                record_metrics()
+
+    @staticmethod
+    def model_attributes(model: Model) -> dict[str, AttributeValue]:
+        attributes: dict[str, AttributeValue] = {
+            GEN_AI_PROVIDER_NAME_ATTRIBUTE: model.system,  # New OTel standard attribute
+            GEN_AI_SYSTEM_ATTRIBUTE: model.system,  # Preserved for backward compatibility (deprecated)
+            GEN_AI_REQUEST_MODEL_ATTRIBUTE: model.model_name,
+        }
+        if base_url := model.base_url:
+            try:
+                parsed = urlparse(base_url)
+            except Exception:  # pragma: no cover
+                pass
+            else:
+                if parsed.hostname:  # pragma: no branch
+                    attributes['server.address'] = parsed.hostname
+                if parsed.port:  # pragma: no branch
+                    attributes['server.port'] = parsed.port
+
+        return attributes
+
+    @staticmethod
+    def model_request_parameters_attributes(
+        model_request_parameters: ModelRequestParameters,
+    ) -> dict[str, AttributeValue]:
+        return {'model_request_parameters': json.dumps(InstrumentedModel.serialize_any(model_request_parameters))}
+
+    @staticmethod
+    def event_to_dict(event: LogRecord) -> dict[str, Any]:
+        if not event.body:
+            body = {}  # pragma: no cover
+        elif isinstance(event.body, Mapping):
+            body = event.body
+        else:
+            body = {'body': event.body}
+        return {**body, **(event.attributes or {})}
+
+    @staticmethod
+    def serialize_any(value: Any) -> str:
+        try:
+            return ANY_ADAPTER.dump_python(value, mode='json')
+        except Exception:
+            try:
+                return str(value)
+            except Exception as e:
+                return f'Unable to serialize: {e}'
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:66-74
+def instrument_model(model: Model, instrument: InstrumentationSettings | bool) -> Model:
+    """Instrument a model with OpenTelemetry/logfire."""
+    if instrument or not isinstance(model, InstrumentedModel):
+        if instrument is True:
+            instrument = InstrumentationSettings()
+
+        model = InstrumentedModel(model, instrument)
+
+    return model
+
+# tests/test_usage_limits.py:3-3
+import operator
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:78-339
+class InstrumentationSettings:
+    """Options for instrumenting models and agents with OpenTelemetry.
+
+    Used in:
+
+    - `Agent(instrument=...)`
+    - [`Agent.instrument_all()`][pydantic_ai.agent.Agent.instrument_all]
+    - [`InstrumentedModel`][pydantic_ai.models.instrumented.InstrumentedModel]
+
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    tracer: Tracer = field(repr=False)
+    logger: Logger = field(repr=False)
+    event_mode: Literal['attributes', 'logs'] = 'attributes'
+    include_binary_content: bool = True
+    include_content: bool = True
+    version: Literal[1, 2, 3] = DEFAULT_INSTRUMENTATION_VERSION
+
+    def __init__(
+        self,
+        *,
+        tracer_provider: TracerProvider | None = None,
+        meter_provider: MeterProvider | None = None,
+        include_binary_content: bool = True,
+        include_content: bool = True,
+        version: Literal[1, 2, 3] = DEFAULT_INSTRUMENTATION_VERSION,
+        event_mode: Literal['attributes', 'logs'] = 'attributes',
+        logger_provider: LoggerProvider | None = None,
+    ):
+        """Create instrumentation options.
+
+        Args:
+            tracer_provider: The OpenTelemetry tracer provider to use.
+                If not provided, the global tracer provider is used.
+                Calling `logfire.configure()` sets the global tracer provider, so most users don't need this.
+            meter_provider: The OpenTelemetry meter provider to use.
+                If not provided, the global meter provider is used.
+                Calling `logfire.configure()` sets the global meter provider, so most users don't need this.
+            include_binary_content: Whether to include binary content in the instrumentation events.
+            include_content: Whether to include prompts, completions, and tool call arguments and responses
+                in the instrumentation events.
+            version: Version of the data format. This is unrelated to the Pydantic AI package version.
+                Version 1 is based on the legacy event-based OpenTelemetry GenAI spec
+                    and will be removed in a future release.
+                    The parameters `event_mode` and `logger_provider` are only relevant for version 1.
+                Version 2 uses the newer OpenTelemetry GenAI spec and stores messages in the following attributes:
+                    - `gen_ai.system_instructions` for instructions passed to the agent.
+                    - `gen_ai.input.messages` and `gen_ai.output.messages` on model request spans.
+                    - `pydantic_ai.all_messages` on agent run spans.
+            event_mode: The mode for emitting events in version 1.
+                If `'attributes'`, events are attached to the span as attributes.
+                If `'logs'`, events are emitted as OpenTelemetry log-based events.
+            logger_provider: The OpenTelemetry logger provider to use.
+                If not provided, the global logger provider is used.
+                Calling `logfire.configure()` sets the global logger provider, so most users don't need this.
+                This is only used if `event_mode='logs'` and `version=1`.
+        """
+        from pydantic_ai import __version__
+
+        tracer_provider = tracer_provider or get_tracer_provider()
+        meter_provider = meter_provider or get_meter_provider()
+        logger_provider = logger_provider or get_logger_provider()
+        scope_name = 'pydantic-ai'
+        self.tracer = tracer_provider.get_tracer(scope_name, __version__)
+        self.meter = meter_provider.get_meter(scope_name, __version__)
+        self.logger = logger_provider.get_logger(scope_name, __version__)
+        self.event_mode = event_mode
+        self.include_binary_content = include_binary_content
+        self.include_content = include_content
+
+        if event_mode == 'logs' and version != 1:
+            warnings.warn(
+                'event_mode is only relevant for version=1 which is deprecated and will be removed in a future release.',
+                stacklevel=2,
+            )
+            version = 1
+
+        self.version = version
+
+        # As specified in the OpenTelemetry GenAI metrics spec:
+        # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/#metric-gen_aiclienttokenusage
+        tokens_histogram_kwargs = dict(
+            name='gen_ai.client.token.usage',
+            unit='{token}',
+            description='Measures number of input and output tokens used',
+        )
+        try:
+            self.tokens_histogram = self.meter.create_histogram(
+                **tokens_histogram_kwargs,
+                explicit_bucket_boundaries_advisory=TOKEN_HISTOGRAM_BOUNDARIES,
+            )
+        except TypeError:  # pragma: lax no cover
+            # Older OTel/logfire versions don't support explicit_bucket_boundaries_advisory
+            self.tokens_histogram = self.meter.create_histogram(
+                **tokens_histogram_kwargs,  # pyright: ignore
+            )
+        self.cost_histogram = self.meter.create_histogram(
+            'operation.cost',
+            unit='{USD}',
+            description='Monetary cost',
+        )
+
+    def messages_to_otel_events(
+        self, messages: list[ModelMessage], parameters: ModelRequestParameters | None = None
+    ) -> list[LogRecord]:
+        """Convert a list of model messages to OpenTelemetry events.
+
+        Args:
+            messages: The messages to convert.
+            parameters: The model request parameters.
+
+        Returns:
+            A list of OpenTelemetry events.
+        """
+        events: list[LogRecord] = []
+        instructions = InstrumentedModel._get_instructions(messages, parameters)  # pyright: ignore [reportPrivateUsage]
+        if instructions is not None:
+            events.append(
+                LogRecord(
+                    attributes={'event.name': 'gen_ai.system.message'},
+                    body={**({'content': instructions} if self.include_content else {}), 'role': 'system'},
+                )
+            )
+
+        for message_index, message in enumerate(messages):
+            message_events: list[LogRecord] = []
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if hasattr(part, 'otel_event'):
+                        message_events.append(part.otel_event(self))
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                message_events = message.otel_events(self)
+            for event in message_events:
+                event.attributes = {
+                    'gen_ai.message.index': message_index,
+                    **(event.attributes or {}),
+                }
+            events.extend(message_events)
+
+        for event in events:
+            event.body = InstrumentedModel.serialize_any(event.body)
+        return events
+
+    def messages_to_otel_messages(self, messages: list[ModelMessage]) -> list[_otel_messages.ChatMessage]:
+        result: list[_otel_messages.ChatMessage] = []
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for is_system, group in itertools.groupby(message.parts, key=lambda p: isinstance(p, SystemPromptPart)):
+                    message_parts: list[_otel_messages.MessagePart] = []
+                    for part in group:
+                        if hasattr(part, 'otel_message_parts'):
+                            message_parts.extend(part.otel_message_parts(self))
+
+                    result.append(
+                        _otel_messages.ChatMessage(role='system' if is_system else 'user', parts=message_parts)
+                    )
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                otel_message = _otel_messages.OutputMessage(role='assistant', parts=message.otel_message_parts(self))
+                if message.finish_reason is not None:
+                    otel_message['finish_reason'] = message.finish_reason
+                result.append(otel_message)
+        return result
+
+    def handle_messages(
+        self,
+        input_messages: list[ModelMessage],
+        response: ModelResponse,
+        system: str,
+        span: Span,
+        parameters: ModelRequestParameters | None = None,
+    ):
+        if self.version == 1:
+            events = self.messages_to_otel_events(input_messages, parameters)
+            for event in self.messages_to_otel_events([response], parameters):
+                events.append(
+                    LogRecord(
+                        attributes={'event.name': 'gen_ai.choice'},
+                        body={
+                            'index': 0,
+                            'message': event.body,
+                        },
+                    )
+                )
+            for event in events:
+                event.attributes = {
+                    GEN_AI_SYSTEM_ATTRIBUTE: system,
+                    **(event.attributes or {}),
+                }
+            self._emit_events(span, events)
+        else:
+            output_messages = self.messages_to_otel_messages([response])
+            assert len(output_messages) == 1
+            output_message = output_messages[0]
+
+            instructions = InstrumentedModel._get_instructions(input_messages, parameters)  # pyright: ignore [reportPrivateUsage]
+            system_instructions_attributes = self.system_instructions_attributes(instructions)
+
+            attributes: dict[str, AttributeValue] = {
+                'gen_ai.input.messages': json.dumps(self.messages_to_otel_messages(input_messages)),
+                'gen_ai.output.messages': json.dumps([output_message]),
+                **system_instructions_attributes,
+                'logfire.json_schema': json.dumps(
+                    {
+                        'type': 'object',
+                        'properties': {
+                            'gen_ai.input.messages': {'type': 'array'},
+                            'gen_ai.output.messages': {'type': 'array'},
+                            **(
+                                {'gen_ai.system_instructions': {'type': 'array'}}
+                                if system_instructions_attributes
+                                else {}
+                            ),
+                            'model_request_parameters': {'type': 'object'},
+                        },
+                    }
+                ),
+            }
+            span.set_attributes(attributes)
+
+    def system_instructions_attributes(self, instructions: str | None) -> dict[str, str]:
+        if instructions and self.include_content:
+            return {
+                'gen_ai.system_instructions': json.dumps([_otel_messages.TextPart(type='text', content=instructions)]),
+            }
+        return {}
+
+    def _emit_events(self, span: Span, events: list[LogRecord]) -> None:
+        if self.event_mode == 'logs':
+            for event in events:
+                self.logger.emit(event)
+        else:
+            attr_name = 'events'
+            span.set_attributes(
+                {
+                    attr_name: json.dumps([InstrumentedModel.event_to_dict(event) for event in events]),
+                    'logfire.json_schema': json.dumps(
+                        {
+                            'type': 'object',
+                            'properties': {
+                                attr_name: {'type': 'array'},
+                                'model_request_parameters': {'type': 'object'},
+                            },
+                        }
+                    ),
+                }
+            )
+
+    def record_metrics(
+        self,
+        response: ModelResponse,
+        price_calculation: PriceCalculation | None,
+        attributes: dict[str, AttributeValue],
+    ):
+        for typ in ['input', 'output']:
+            if not (tokens := getattr(response.usage, f'{typ}_tokens', 0)):  # pragma: no cover
+                continue
+            token_attributes = {**attributes, 'gen_ai.token.type': typ}
+            self.tokens_histogram.record(tokens, token_attributes)
+            if price_calculation:
+                cost = float(getattr(price_calculation, f'{typ}_price'))
+                self.cost_histogram.record(cost, token_attributes)
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:1429-1459
+    def _get_model(self, model: models.Model | models.KnownModelName | str | None) -> models.Model:
+        """Create a model configured for this agent.
+
+        Args:
+            model: model to use for this run, required if `model` was not set when creating the agent.
+
+        Returns:
+            The model used
+        """
+        model_: models.Model
+        if some_model := self._override_model.get():
+            # we don't want `override()` to cover up errors from the model not being defined, hence this check
+            if model is None and self.model is None:
+                raise exceptions.UserError(
+                    '`model` must either be set on the agent or included when calling it. '
+                    '(Even when `override(model=...)` is customizing the model that will actually be called)'
+                )
+            model_ = some_model.value
+        elif model is not None:
+            model_ = models.infer_model(model)
+        elif self.model is not None:
+            # noinspection PyTypeChecker
+            model_ = self.model = models.infer_model(self.model)
+        else:
+            raise exceptions.UserError('`model` must either be set on the agent or included when calling it.')
+
+        instrument = self.instrument
+        if instrument is None:
+            instrument = self._instrument_default
+
+        return instrument_model(model_, instrument)
+
+# examples/pydantic_ai_examples/pydantic_model.py:25-25
+model = os.getenv('PYDANTIC_AI_MODEL', 'openai:gpt-5.2')
+
+# pydantic_ai_slim/pydantic_ai/ag_ui.py:18-18
+from .models import KnownModelName, Model
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_agent.py:29-29
+from pydantic_ai.models import Model
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_model.py:16-16
+from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_agent.py:25-25
+from pydantic_ai.models import Model
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py:30-30
+from pydantic_ai.models import Model
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py:19-19
+from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
+
+# pydantic_ai_slim/pydantic_ai/models/anthropic.py:52-52
+from . import Model, ModelRequestParameters, StreamedResponse, check_allow_model_requests, download_item, get_user_agent
+
+# pydantic_ai_slim/pydantic_ai/models/bedrock.py:46-46
+from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse, download_item
+
+# pydantic_ai_slim/pydantic_ai/models/cohere.py:34-34
+from . import Model, ModelRequestParameters, check_allow_model_requests
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:22-22
+from . import KnownModelName, Model, ModelRequestParameters, StreamedResponse
+
+# pydantic_ai_slim/pydantic_ai/models/fallback.py:16-16
+from . import KnownModelName, Model, ModelRequestParameters, StreamedResponse, infer_model
+
+# pydantic_ai_slim/pydantic_ai/models/function.py:39-39
+from . import Model, ModelRequestParameters, StreamedResponse
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:53-53
+from . import Model, ModelRequestParameters, StreamedResponse, check_allow_model_requests, download_item, get_user_agent
+
+# pydantic_ai_slim/pydantic_ai/models/google.py:53-60
+from . import (
+    Model,
+    ModelRequestParameters,
+    StreamedResponse,
+    check_allow_model_requests,
+    download_item,
+    get_user_agent,
+)
+
+# pydantic_ai_slim/pydantic_ai/models/groq.py:46-52
+from . import (
+    Model,
+    ModelRequestParameters,
+    StreamedResponse,
+    check_allow_model_requests,
+    get_user_agent,
+)
+
+# pydantic_ai_slim/pydantic_ai/models/huggingface.py:43-48
+from . import (
+    Model,
+    ModelRequestParameters,
+    StreamedResponse,
+    check_allow_model_requests,
+)
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:35-35
+from . import KnownModelName, Model, ModelRequestParameters, StreamedResponse
+
+# pydantic_ai_slim/pydantic_ai/models/mcp_sampling.py:12-12
+from . import Model, ModelRequestParameters, StreamedResponse
+
+# pydantic_ai_slim/pydantic_ai/models/mistral.py:44-51
+from . import (
+    Model,
+    ModelRequestParameters,
+    StreamedResponse,
+    check_allow_model_requests,
+    download_item,
+    get_user_agent,
+)
+
+# pydantic_ai_slim/pydantic_ai/models/openai.py:64-73
+from . import (
+    Model,
+    ModelRequestParameters,
+    OpenAIChatCompatibleProvider,
+    OpenAIResponsesCompatibleProvider,
+    StreamedResponse,
+    check_allow_model_requests,
+    download_item,
+    get_user_agent,
+)
+
+# pydantic_ai_slim/pydantic_ai/models/outlines.py:43-49
+from . import (
+    DownloadedItem,
+    Model,
+    ModelRequestParameters,
+    StreamedResponse,
+    download_item,
+)
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:37-37
+from . import Model, ModelRequestParameters, StreamedResponse
+
+# pydantic_ai_slim/pydantic_ai/models/wrapper.py:14-14
+from . import KnownModelName, Model, ModelRequestParameters, StreamedResponse, infer_model
+
+# pydantic_ai_slim/pydantic_ai/models/xai.py:43-49
+from ..models import (
+    Model,
+    ModelRequestParameters,
+    StreamedResponse,
+    check_allow_model_requests,
+    download_item,
+)
+
+# pydantic_ai_slim/pydantic_ai/ui/_adapter.py:27-27
+from pydantic_ai.models import KnownModelName, Model
+
+# pydantic_ai_slim/pydantic_ai/ui/_web/api.py:15-15
+from pydantic_ai.models import KnownModelName, Model, infer_model
+
+# pydantic_ai_slim/pydantic_ai/ui/ag_ui/app.py:15-15
+from pydantic_ai.models import KnownModelName, Model
+
+# tests/conftest.py:28-28
+from pydantic_ai.models import Model
+
+# tests/evals/test_evaluators.py:12-12
+from pydantic_ai.models import Model, ModelRequestParameters
+
+# tests/models/test_instrumented.py:42-42
+from pydantic_ai.models import Model, ModelRequestParameters, StreamedResponse
+
+# tests/models/test_model.py:9-9
+from pydantic_ai.models import Model, infer_model
+
+# tests/test_a2a.py:48-48
+model = FunctionModel(return_string)
+
+# tests/test_builtin_tools.py:16-16
+from pydantic_ai.models import Model
+
+# tests/test_dbos.py:129-135
+model = OpenAIChatModel(
+    'gpt-4o',
+    provider=OpenAIProvider(
+        api_key=os.getenv('OPENAI_API_KEY', 'mock-api-key'),
+        http_client=http_client,
+    ),
+)
+
+# tests/test_examples.py:44-44
+from pydantic_ai.models import KnownModelName, Model, infer_model
+
+# tests/test_mcp.py:42-42
+from pydantic_ai.models import Model, cached_async_http_client
+
+# tests/test_prefect.py:119-125
+model = OpenAIChatModel(
+    'gpt-4o',
+    provider=OpenAIProvider(
+        api_key=os.getenv('OPENAI_API_KEY', 'mock-api-key'),
+        http_client=http_client,
+    ),
+)
+
+# tests/test_settings.py:6-6
+from pydantic_ai.models import Model
+
+# tests/test_temporal.py:50-50
+from pydantic_ai.models import Model, ModelRequestParameters, cached_async_http_client
+
+# tests/test_temporal.py:201-207
+model = OpenAIChatModel(
+    'gpt-4o',
+    provider=OpenAIProvider(
+        api_key=os.getenv('OPENAI_API_KEY', 'mock-api-key'),
+        http_client=http_client,
+    ),
+)
+
+# pydantic_ai_slim/pydantic_ai/direct.py:88-141
+def model_request_sync(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> messages.ModelResponse:
+    """Make a Synchronous, non-streamed request to a model.
+
+    This is a convenience method that wraps [`model_request`][pydantic_ai.direct.model_request] with
+    `loop.run_until_complete(...)`. You therefore can't use this method inside async code or if there's an active event loop.
+
+    ```py title="model_request_sync_example.py"
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_sync
+
+    model_response = model_request_sync(
+        'anthropic:claude-haiku-4-5',
+        [ModelRequest.user_text_prompt('What is the capital of France?')]  # (1)!
+    )
+    print(model_response)
+    '''
+    ModelResponse(
+        parts=[TextPart(content='The capital of France is Paris.')],
+        usage=RequestUsage(input_tokens=56, output_tokens=7),
+        model_name='claude-haiku-4-5',
+        timestamp=datetime.datetime(...),
+    )
+    '''
+    ```
+
+    1. See [`ModelRequest.user_text_prompt`][pydantic_ai.messages.ModelRequest.user_text_prompt] for details.
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        The model response and token usage associated with the request.
+    """
+    return _get_event_loop().run_until_complete(
+        model_request(
+            model,
+            list(messages),
+            model_settings=model_settings,
+            model_request_parameters=model_request_parameters,
+            instrument=instrument,
+        )
+    )
+
+# pydantic_ai_slim/pydantic_ai/direct.py:36-85
+async def model_request(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> messages.ModelResponse:
+    """Make a non-streamed request to a model.
+
+    ```py title="model_request_example.py"
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request
+
+
+    async def main():
+        model_response = await model_request(
+            'anthropic:claude-haiku-4-5',
+            [ModelRequest.user_text_prompt('What is the capital of France?')]  # (1)!
+        )
+        print(model_response)
+        '''
+        ModelResponse(
+            parts=[TextPart(content='The capital of France is Paris.')],
+            usage=RequestUsage(input_tokens=56, output_tokens=7),
+            model_name='claude-haiku-4-5',
+            timestamp=datetime.datetime(...),
+        )
+        '''
+    ```
+
+    1. See [`ModelRequest.user_text_prompt`][pydantic_ai.messages.ModelRequest.user_text_prompt] for details.
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        The model response and token usage associated with the request.
+    """
+    model_instance = _prepare_model(model, instrument)
+    return await model_instance.request(
+        list(messages),
+        model_settings,
+        model_request_parameters or models.ModelRequestParameters(),
+    )
+
+# pydantic_ai_slim/pydantic_ai/models/__init__.py:1069-1079
+def check_allow_model_requests() -> None:
+    """Check if model requests are allowed.
+
+    If you're defining your own models that have costs or latency associated with their use, you should call this in
+    [`Model.request`][pydantic_ai.models.Model.request] and [`Model.request_stream`][pydantic_ai.models.Model.request_stream].
+
+    Raises:
+        RuntimeError: If model requests are not allowed.
+    """
+    if not ALLOW_MODEL_REQUESTS:
+        raise RuntimeError('Model requests are not allowed, since ALLOW_MODEL_REQUESTS is False')
+
+# pydantic_ai_slim/pydantic_ai/direct.py:206-267
+def model_request_stream_sync(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> StreamedResponseSync:
+    """Make a streamed synchronous request to a model.
+
+    This is the synchronous version of [`model_request_stream`][pydantic_ai.direct.model_request_stream].
+    It uses threading to run the asynchronous stream in the background while providing a synchronous iterator interface.
+
+    ```py {title="model_request_stream_sync_example.py"}
+
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_stream_sync
+
+    messages = [ModelRequest.user_text_prompt('Who was Albert Einstein?')]
+    with model_request_stream_sync('openai:gpt-5-mini', messages) as stream:
+        chunks = []
+        for chunk in stream:
+            chunks.append(chunk)
+        print(chunks)
+        '''
+        [
+            PartStartEvent(index=0, part=TextPart(content='Albert Einstein was ')),
+            FinalResultEvent(tool_name=None, tool_call_id=None),
+            PartDeltaEvent(
+                index=0, delta=TextPartDelta(content_delta='a German-born theoretical ')
+            ),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='physicist.')),
+            PartEndEvent(
+                index=0,
+                part=TextPart(
+                    content='Albert Einstein was a German-born theoretical physicist.'
+                ),
+            ),
+        ]
+        '''
+    ```
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        A [sync stream response][pydantic_ai.direct.StreamedResponseSync] context manager.
+    """
+    async_stream_cm = model_request_stream(
+        model=model,
+        messages=list(messages),
+        model_settings=model_settings,
+        model_request_parameters=model_request_parameters,
+        instrument=instrument,
+    )
+
+    return StreamedResponseSync(async_stream_cm)
+
+# tests/test_mcp.py:83-84
+def model(openai_api_key: str) -> Model:
+    return OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py:216-217
+    def model(self) -> Model:
+        return self._temporal_model
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_agent.py:133-134
+    def model(self) -> Model:
+        return self._model
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_agent.py:241-242
+    def model(self) -> Model:
+        return self._model
+
+# pydantic_ai_slim/pydantic_ai/_run_context.py:35-35
+    model: Model
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:86-88
+    def model(self) -> models.Model | models.KnownModelName | str | None:
+        """The default model configured for this agent."""
+        raise NotImplementedError
+
+# pydantic_ai_slim/pydantic_ai/embeddings/instrumented.py:30-38
+def instrument_embedding_model(model: EmbeddingModel, instrument: InstrumentationSettings | bool) -> EmbeddingModel:
+    """Instrument an embedding model with OpenTelemetry/logfire."""
+    if instrument and not isinstance(model, InstrumentedEmbeddingModel):
+        if instrument is True:
+            instrument = InstrumentationSettings()
+
+        model = InstrumentedEmbeddingModel(model, instrument)
+
+    return model
+
+# pydantic_ai_slim/pydantic_ai/direct.py:144-203
+def model_request_stream(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> AbstractAsyncContextManager[models.StreamedResponse]:
+    """Make a streamed async request to a model.
+
+    ```py {title="model_request_stream_example.py"}
+
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_stream
+
+
+    async def main():
+        messages = [ModelRequest.user_text_prompt('Who was Albert Einstein?')]  # (1)!
+        async with model_request_stream('openai:gpt-5-mini', messages) as stream:
+            chunks = []
+            async for chunk in stream:
+                chunks.append(chunk)
+            print(chunks)
+            '''
+            [
+                PartStartEvent(index=0, part=TextPart(content='Albert Einstein was ')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(
+                    index=0, delta=TextPartDelta(content_delta='a German-born theoretical ')
+                ),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='physicist.')),
+                PartEndEvent(
+                    index=0,
+                    part=TextPart(
+                        content='Albert Einstein was a German-born theoretical physicist.'
+                    ),
+                ),
+            ]
+            '''
+    ```
+
+    1. See [`ModelRequest.user_text_prompt`][pydantic_ai.messages.ModelRequest.user_text_prompt] for details.
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        A [stream response][pydantic_ai.models.StreamedResponse] async context manager.
+    """
+    model_instance = _prepare_model(model, instrument)
+    return model_instance.request_stream(
+        list(messages),
+        model_settings,
+        model_request_parameters or models.ModelRequestParameters(),
+    )
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:202-213
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the default instrumentation options for all embedders where `instrument` is not explicitly set.
+
+        This is useful for enabling instrumentation globally without modifying each embedder individually.
+
+        Args:
+            instrument: Instrumentation settings to use as the default. Set to `True` for default settings,
+                `False` to disable, or pass an
+                [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize.
+        """
+        Embedder._instrument_default = instrument
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:421-423
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the instrumentation options for all agents where `instrument` is not set."""
+        Agent._instrument_default = instrument
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py:264-284
+    def resolve_model(self, model: models.Model | models.KnownModelName | str | None = None) -> Model:
+        """Resolve a model parameter to a Model instance.
+
+        This is typically used outside of a workflow to resolve model parameters
+        before passing them to the underlying agent methods.
+
+        Args:
+            model: The model to resolve. Can be a Model instance, model name string,
+                   or None for the default model.
+
+        Returns:
+            The resolved Model instance.
+        """
+        # Handle Model instances directly - outside a workflow, unregistered
+        # Model instances are allowed since there's no serialization constraint.
+        if isinstance(model, Model):
+            return model
+
+        # For strings and None, use _get_model_id + _resolve_model
+        model_id = self._get_model_id(model)
+        return self._resolve_model_id(model_id)
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:431-436
+    def model(self, value: models.Model | models.KnownModelName | str | None) -> None:
+        """Set the default model configured for this agent.
+
+        We allow `str` here since the actual list of allowed models changes frequently.
+        """
+        self._model = value
+
+# pydantic_evals/pydantic_evals/evaluators/llm_as_a_judge.py:96-112
+async def judge_input_output(
+    inputs: Any,
+    output: Any,
+    rubric: str,
+    model: models.Model | models.KnownModelName | str | None = None,
+    model_settings: ModelSettings | None = None,
+) -> GradingOutput:
+    """Judge the output of a model based on the inputs and a rubric.
+
+    If the model is not specified, a default model is used. The default model starts as 'openai:gpt-5.2',
+    but this can be changed using the `set_default_judge_model` function.
+    """
+    user_prompt = _build_prompt(inputs=inputs, output=output, rubric=rubric)
+
+    return (
+        await _judge_input_output_agent.run(user_prompt, model=model or _default_model, model_settings=model_settings)
+    ).output
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py:243-262
+    def _get_model_id(self, model: models.Model | models.KnownModelName | str | None = None) -> str | None:
+        """Get the model ID for the given model parameter.
+
+        Returns a string that will be checked against registered model IDs,
+        or passed to infer_model if not found. Returns None to use the default model.
+        """
+        if model in (None, 'default'):
+            return None
+
+        if isinstance(model, Model):
+            # Check if this model instance is already registered
+            model_id = next((model_id for model_id, m in self._models_by_id.items() if m is model), ...)
+            if model_id is ...:
+                raise UserError(
+                    'Arbitrary model instances cannot be used at runtime inside a Temporal workflow. '
+                    'Register the model via `models` or reference a registered model by id.'
+                )
+            return None if model_id == 'default' else model_id
+
+        return model
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:136-136
+    model: models.Model
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:216-218
+    def model(self) -> EmbeddingModel | KnownEmbeddingModelName | str:
+        """The embedding model used by this embedder."""
+        return self._model
+
+# pydantic_evals/pydantic_evals/evaluators/common.py:194-194
+    model: models.Model | models.KnownModelName | str | None = None
+
+# pydantic_evals/pydantic_evals/evaluators/llm_as_a_judge.py:205-211
+def set_default_judge_model(model: models.Model | models.KnownModelName) -> None:
+    """Set the default model used for judging.
+
+    This model is used if `None` is passed to the `model` argument of `judge_output` and `judge_input_output`.
+    """
+    global _default_model
+    _default_model = model
+
+# tests/models/test_huggingface.py:83-83
+    model: str = 'https://api-inference.huggingface.co'

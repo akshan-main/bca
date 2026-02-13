@@ -1,0 +1,209 @@
+## pydantic_ai_slim/pydantic_ai/_function_schema.py
+
+    json_schema: ObjectJsonSchema
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def check_object_json_schema(schema: JsonSchemaValue) -> ObjectJsonSchema:
+    from .exceptions import UserError
+
+    if schema.get('type') == 'object':
+        return schema
+    elif ref := schema.get('$ref'):
+        prefix = '#/$defs/'
+        # Return the referenced schema unless it contains additional nested references.
+        if (
+            ref.startswith(prefix)
+            and (resolved := schema.get('$defs', {}).get(ref[len(prefix) :]))
+            and resolved.get('type') == 'object'
+            and not _contains_ref(resolved)
+        ):
+            return resolved
+        return schema
+    else:
+        raise UserError('Schema must be an object')
+
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+class LangChainToolset(FunctionToolset):
+    """A toolset that wraps LangChain tools."""
+
+    def __init__(self, tools: list[LangChainTool], *, id: str | None = None):
+        super().__init__([tool_from_langchain(tool) for tool in tools], id=id)
+
+## pydantic_ai_slim/pydantic_ai/output.py
+
+    json_schema: ObjectJsonSchema
+
+## pydantic_ai_slim/pydantic_ai/toolsets/combined.py
+
+class CombinedToolset(AbstractToolset[AgentDepsT]):
+    """A toolset that combines multiple toolsets.
+
+    See [toolset docs](../toolsets.md#combining-toolsets) for more information.
+    """
+
+    toolsets: Sequence[AbstractToolset[AgentDepsT]]
+
+    _enter_lock: Lock = field(compare=False, init=False, default_factory=Lock)
+    _entered_count: int = field(init=False, default=0)
+    _exit_stack: AsyncExitStack | None = field(init=False, default=None)
+
+    @property
+    def id(self) -> str | None:
+        return None  # pragma: no cover
+
+    @property
+    def label(self) -> str:
+        return f'{self.__class__.__name__}({", ".join(toolset.label for toolset in self.toolsets)})'  # pragma: no cover
+
+    async def __aenter__(self) -> Self:
+        async with self._enter_lock:
+            if self._entered_count == 0:
+                async with AsyncExitStack() as exit_stack:
+                    for toolset in self.toolsets:
+                        await exit_stack.enter_async_context(toolset)
+                    self._exit_stack = exit_stack.pop_all()
+            self._entered_count += 1
+        return self
+
+    async def __aexit__(self, *args: Any) -> bool | None:
+        async with self._enter_lock:
+            self._entered_count -= 1
+            if self._entered_count == 0 and self._exit_stack is not None:
+                await self._exit_stack.aclose()
+                self._exit_stack = None
+
+    async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
+        toolsets_tools = await asyncio.gather(*(toolset.get_tools(ctx) for toolset in self.toolsets))
+        all_tools: dict[str, ToolsetTool[AgentDepsT]] = {}
+
+        for toolset, tools in zip(self.toolsets, toolsets_tools):
+            for name, tool in tools.items():
+                tool_toolset = tool.toolset
+                if existing_tool := all_tools.get(name):
+                    capitalized_toolset_label = tool_toolset.label[0].upper() + tool_toolset.label[1:]
+                    raise UserError(
+                        f'{capitalized_toolset_label} defines a tool whose name conflicts with existing tool from {existing_tool.toolset.label}: {name!r}. {toolset.tool_name_conflict_hint}'
+                    )
+
+                all_tools[name] = _CombinedToolsetTool(
+                    toolset=tool_toolset,
+                    tool_def=tool.tool_def,
+                    max_retries=tool.max_retries,
+                    args_validator=tool.args_validator,
+                    source_toolset=toolset,
+                    source_tool=tool,
+                )
+        return all_tools
+
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+    ) -> Any:
+        assert isinstance(tool, _CombinedToolsetTool)
+        return await tool.source_toolset.call_tool(name, tool_args, ctx, tool.source_tool)
+
+    def apply(self, visitor: Callable[[AbstractToolset[AgentDepsT]], None]) -> None:
+        for toolset in self.toolsets:
+            toolset.apply(visitor)
+
+    def visit_and_replace(
+        self, visitor: Callable[[AbstractToolset[AgentDepsT]], AbstractToolset[AgentDepsT]]
+    ) -> AbstractToolset[AgentDepsT]:
+        return replace(self, toolsets=[toolset.visit_and_replace(visitor) for toolset in self.toolsets])
+
+## pydantic_graph/pydantic_graph/beta/graph.py
+
+    def value(self) -> OutputT:
+        return self._value
+
+## tests/models/anthropic/test_output.py
+
+def test_mixed_tools_no_output(
+    allow_model_requests: None,
+    anthropic_model: ANTHROPIC_MODEL_FIXTURE,
+) -> None:
+    """Mixed tools (one strict=True, one strict=None), no output_type → beta, only strict=True has strict field."""
+    model = anthropic_model('claude-sonnet-4-5')
+    hook = create_header_verification_hook(expect_beta=True, test_name='test_mixed_tools_no_output')
+    model.client._client.event_hooks['request'].append(hook)  # pyright: ignore[reportPrivateUsage]
+
+    agent = Agent(model)
+
+    @agent.tool_plain(strict=True)
+    def get_weather(city: str) -> str:
+        return f'Weather in {city}: Sunny, 22°C'
+
+    @agent.tool_plain
+    def get_elevation(city: str) -> str:
+        return f'Elevation of {city}: 650m above sea level'
+
+    agent.run_sync("What's the weather and elevation in Denver?")
+
+    if errors := hook.errors:  # type: ignore[attr-defined]
+        assert False, '\n'.join(sorted(errors))
+
+def test_mixed_tools_basemodel_output(
+    allow_model_requests: None,
+    anthropic_model: ANTHROPIC_MODEL_FIXTURE,
+) -> None:
+    """Mixed tools (one strict=True, one strict=None), BaseModel output_type → beta, only strict=True has strict field."""
+    model = anthropic_model('claude-sonnet-4-5')
+    hook = create_header_verification_hook(expect_beta=True, test_name='test_mixed_tools_basemodel_output')
+    model.client._client.event_hooks['request'].append(hook)  # pyright: ignore[reportPrivateUsage]
+
+    agent = Agent(model, output_type=CityInfo)
+
+    @agent.tool_plain(strict=True)
+    def get_population(city: str) -> int:
+        return 8_900_000 if city == 'London' else 1_000_000
+
+    @agent.tool_plain
+    def get_area(city: str) -> str:
+        return f'Area of {city}: 1,572 km²'
+
+    agent.run_sync('Tell me about London including population and area')
+
+    if errors := hook.errors:  # type: ignore[attr-defined]
+        assert False, '\n'.join(sorted(errors))
+
+def test_mixed_tools_native_output(
+    allow_model_requests: None,
+    anthropic_model: ANTHROPIC_MODEL_FIXTURE,
+) -> None:
+    """Mixed tools (one strict=True, one strict=None), NativeOutput → beta, only strict=True has strict field + output_format."""
+    model = anthropic_model('claude-sonnet-4-5')
+    hook = create_header_verification_hook(expect_beta=True, test_name='test_mixed_tools_native_output')
+    model.client._client.event_hooks['request'].append(hook)  # pyright: ignore[reportPrivateUsage]
+
+    agent = Agent(model, output_type=NativeOutput(CityInfo))
+
+    @agent.tool_plain(strict=True)
+    def lookup_country(city: str) -> str:
+        return 'Japan' if city == 'Tokyo' else 'Unknown'
+
+    @agent.tool_plain
+    def get_founded_year(city: str) -> str:
+        return '1457' if city == 'Tokyo' else 'Unknown'
+
+    result = agent.run_sync('Give me complete details about Tokyo')
+
+    assert isinstance(result.output, CityInfo)
+    if errors := hook.errors:  # type: ignore[attr-defined]
+        assert False, '\n'.join(sorted(errors))
+
+## tests/test_mcp.py
+
+async def test_tools_no_caching_when_disabled() -> None:
+    """Test that list_tools() does not cache when cache_tools=False."""
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'], cache_tools=False)
+    async with server:
+        # First call - should not populate cache
+        tools1 = await server.list_tools()
+        assert len(tools1) > 0
+        assert server._cached_tools is None  # pyright: ignore[reportPrivateUsage]
+
+        # Second call - cache should still be None
+        tools2 = await server.list_tools()
+        assert tools2 == tools1
+        assert server._cached_tools is None  # pyright: ignore[reportPrivateUsage]

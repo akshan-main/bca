@@ -1,0 +1,1067 @@
+# tests/test_tenacity.py:540-552
+    def test_default_fallback_strategy(self):
+        """Test that default fallback strategy is used when none is provided."""
+        wait_func = wait_retry_after(max_wait=300)
+
+        # Create a retry state with no exception to trigger fallback
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = None
+        retry_state.attempt_number = 1
+
+        # Should use default exponential backoff, exact value depends on retry state
+        result = wait_func(retry_state)
+
+        assert result == 1  # first backoff
+
+# tests/test_tenacity.py:347-593
+class TestWaitRetryAfter:
+    """Tests for the wait_retry_after wait strategy."""
+
+    def test_no_exception_uses_fallback(self):
+        """Test that fallback strategy is used when there's no exception."""
+        fallback = Mock(return_value=5.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a retry state with no exception
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = None
+
+        result = wait_func(retry_state)
+
+        assert result == 5.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_non_http_exception_uses_fallback(self):
+        """Test that fallback strategy is used for non-HTTP exceptions."""
+        fallback = Mock(return_value=3.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a retry state with a non-HTTP exception
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = ValueError('Some error')
+
+        result = wait_func(retry_state)
+
+        assert result == 3.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_http_exception_no_retry_after_uses_fallback(self):
+        """Test that fallback strategy is used when there's no Retry-After header."""
+        fallback = Mock(return_value=2.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error without Retry-After header
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 2.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_retry_after_seconds_format(self):
+        """Test parsing Retry-After header in seconds format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error with Retry-After in seconds
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '30'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 30.0
+        fallback.assert_not_called()
+
+    def test_retry_after_seconds_respects_max_wait(self):
+        """Test that max_wait is respected for seconds format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=60)
+
+        # Create HTTP status error with Retry-After > max_wait
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '120'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 60.0  # Capped at max_wait
+        fallback.assert_not_called()
+
+    def test_retry_after_http_date_format(self):
+        """Test parsing Retry-After header in HTTP date format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a future date (30 seconds from now)
+        future_time = datetime.now(timezone.utc).timestamp() + 30
+        http_date = formatdate(future_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        # Should be approximately 30 seconds (allow some tolerance for test timing)
+        assert 25 <= result <= 35
+        fallback.assert_not_called()
+
+    def test_retry_after_http_date_past_time_uses_fallback(self):
+        """Test that past dates in Retry-After fall back to fallback strategy."""
+        fallback = Mock(return_value=1.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a past date
+        past_time = datetime.now(timezone.utc).timestamp() - 30
+        http_date = formatdate(past_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 1.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_retry_after_http_date_respects_max_wait(self):
+        """Test that max_wait is respected for HTTP date format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=60)
+
+        # Create a future date (120 seconds from now, > max_wait)
+        future_time = datetime.now(timezone.utc).timestamp() + 120
+        http_date = formatdate(future_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 60.0  # Capped at max_wait
+        fallback.assert_not_called()
+
+    def test_retry_after_invalid_format_uses_fallback(self):
+        """Test that invalid Retry-After values fall back to fallback strategy."""
+        fallback = Mock(return_value=4.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error with invalid Retry-After
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': 'invalid-value'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 4.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_default_fallback_strategy(self):
+        """Test that default fallback strategy is used when none is provided."""
+        wait_func = wait_retry_after(max_wait=300)
+
+        # Create a retry state with no exception to trigger fallback
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = None
+        retry_state.attempt_number = 1
+
+        # Should use default exponential backoff, exact value depends on retry state
+        result = wait_func(retry_state)
+
+        assert result == 1  # first backoff
+
+    def test_default_max_wait(self):
+        """Test that default max_wait of 300 seconds is used."""
+        wait_func = wait_retry_after()  # Use all defaults
+
+        # Create HTTP status error with large Retry-After value
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '600'}  # 10 minutes
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 300.0  # Capped at default max_wait
+
+    def test_case_insensitive_header_access(self):
+        """Test that Retry-After header access is case insensitive."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error with uppercase Retry-After header
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        # httpx headers are case-insensitive, so this should work
+        response.headers = httpx.Headers({'Retry-After': '45'})
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 45.0
+        fallback.assert_not_called()
+
+# pydantic_ai_slim/pydantic_ai/retries.py:312-382
+def wait_retry_after(
+    fallback_strategy: Callable[[RetryCallState], float] | None = None, max_wait: float = 300
+) -> Callable[[RetryCallState], float]:
+    """Create a tenacity-compatible wait strategy that respects HTTP Retry-After headers.
+
+    This wait strategy checks if the exception contains an HTTPStatusError with a
+    Retry-After header, and if so, waits for the time specified in the header.
+    If no header is present or parsing fails, it falls back to the provided strategy.
+
+    The Retry-After header can be in two formats:
+    - An integer representing seconds to wait
+    - An HTTP date string representing when to retry
+
+    Args:
+        fallback_strategy: Wait strategy to use when no Retry-After header is present
+                          or parsing fails. Defaults to exponential backoff with max 60s.
+        max_wait: Maximum time to wait in seconds, regardless of header value.
+                 Defaults to 300 (5 minutes).
+
+    Returns:
+        A wait function that can be used with tenacity retry decorators.
+
+    Example:
+        ```python
+        from httpx import AsyncClient, HTTPStatusError
+        from tenacity import retry_if_exception_type, stop_after_attempt
+
+        from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
+
+        transport = AsyncTenacityTransport(
+            RetryConfig(
+                retry=retry_if_exception_type(HTTPStatusError),
+                wait=wait_retry_after(max_wait=120),
+                stop=stop_after_attempt(5),
+                reraise=True
+            ),
+            validate_response=lambda r: r.raise_for_status()
+        )
+        client = AsyncClient(transport=transport)
+        ```
+    """
+    if fallback_strategy is None:
+        fallback_strategy = wait_exponential(multiplier=0, max=60)
+
+    def wait_func(state: RetryCallState) -> float:
+        exc = state.outcome.exception() if state.outcome else None
+        if isinstance(exc, HTTPStatusError):
+            retry_after = exc.response.headers.get('retry-after')
+            if retry_after:
+                try:
+                    # Try parsing as seconds first
+                    wait_seconds = int(retry_after)
+                    return min(float(wait_seconds), max_wait)
+                except ValueError:
+                    # Try parsing as HTTP date
+                    try:
+                        retry_time = cast(datetime, parsedate_to_datetime(retry_after))
+                        assert isinstance(retry_time, datetime)
+                        now = datetime.now(timezone.utc)
+                        wait_seconds = (retry_time - now).total_seconds()
+
+                        if wait_seconds > 0:
+                            return min(wait_seconds, max_wait)
+                    except (ValueError, TypeError, AssertionError):
+                        # If date parsing fails, fall back to fallback strategy
+                        pass
+
+        # Use fallback strategy
+        return fallback_strategy(state)
+
+    return wait_func
+
+# tests/test_tenacity.py:380-399
+    def test_http_exception_no_retry_after_uses_fallback(self):
+        """Test that fallback strategy is used when there's no Retry-After header."""
+        fallback = Mock(return_value=2.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error without Retry-After header
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 2.0
+        fallback.assert_called_once_with(retry_state)
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:136-384
+class Embedder:
+    """High-level interface for generating text embeddings.
+
+    The `Embedder` class provides a convenient way to generate vector embeddings from text
+    using various embedding model providers. It handles model inference, settings management,
+    and optional OpenTelemetry instrumentation.
+
+    Example:
+    ```python
+    from pydantic_ai import Embedder
+
+    embedder = Embedder('openai:text-embedding-3-small')
+
+
+    async def main():
+        result = await embedder.embed_query('What is machine learning?')
+        print(result.embeddings[0][:5])  # First 5 dimensions
+        #> [1.0, 1.0, 1.0, 1.0, 1.0]
+    ```
+    """
+
+    instrument: InstrumentationSettings | bool | None
+    """Options to automatically instrument with OpenTelemetry.
+
+    Set to `True` to use default instrumentation settings, which will use Logfire if it's configured.
+    Set to an instance of [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings] to customize.
+    If this isn't set, then the last value set by
+    [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all]
+    will be used, which defaults to False.
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    _instrument_default: ClassVar[InstrumentationSettings | bool] = False
+
+    def __init__(
+        self,
+        model: EmbeddingModel | KnownEmbeddingModelName | str,
+        *,
+        settings: EmbeddingSettings | None = None,
+        defer_model_check: bool = True,
+        instrument: InstrumentationSettings | bool | None = None,
+    ) -> None:
+        """Initialize an Embedder.
+
+        Args:
+            model: The embedding model to use. Can be specified as:
+
+                - A model name string in the format `'provider:model-name'`
+                  (e.g., `'openai:text-embedding-3-small'`)
+                - An [`EmbeddingModel`][pydantic_ai.embeddings.EmbeddingModel] instance
+            settings: Optional [`EmbeddingSettings`][pydantic_ai.embeddings.EmbeddingSettings]
+                to use as defaults for all embed calls.
+            defer_model_check: Whether to defer model validation until first use.
+                Set to `False` to validate the model immediately on construction.
+            instrument: OpenTelemetry instrumentation settings. Set to `True` to enable with defaults,
+                or pass an [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize. If `None`, uses the value from
+                [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all].
+        """
+        self._model = model if defer_model_check else infer_embedding_model(model)
+        self._settings = settings
+        self.instrument = instrument
+
+        self._override_model: ContextVar[EmbeddingModel | None] = ContextVar('_override_model', default=None)
+
+    @staticmethod
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the default instrumentation options for all embedders where `instrument` is not explicitly set.
+
+        This is useful for enabling instrumentation globally without modifying each embedder individually.
+
+        Args:
+            instrument: Instrumentation settings to use as the default. Set to `True` for default settings,
+                `False` to disable, or pass an
+                [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize.
+        """
+        Embedder._instrument_default = instrument
+
+    @property
+    def model(self) -> EmbeddingModel | KnownEmbeddingModelName | str:
+        """The embedding model used by this embedder."""
+        return self._model
+
+    @contextmanager
+    def override(
+        self,
+        *,
+        model: EmbeddingModel | KnownEmbeddingModelName | str | _utils.Unset = _utils.UNSET,
+    ) -> Iterator[None]:
+        """Context manager to temporarily override the embedding model.
+
+        Useful for testing or dynamically switching models.
+
+        Args:
+            model: The embedding model to use within this context.
+
+        Example:
+        ```python
+        from pydantic_ai import Embedder
+
+        embedder = Embedder('openai:text-embedding-3-small')
+
+
+        async def main():
+            # Temporarily use a different model
+            with embedder.override(model='openai:text-embedding-3-large'):
+                result = await embedder.embed_query('test')
+                print(len(result.embeddings[0]))  # 3072 dimensions for large model
+                #> 3072
+        ```
+        """
+        if _utils.is_set(model):
+            model_token = self._override_model.set(infer_embedding_model(model))
+        else:
+            model_token = None
+
+        try:
+            yield
+        finally:
+            if model_token is not None:
+                self._override_model.reset(model_token)
+
+    async def embed_query(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more query texts.
+
+        Use this method when embedding search queries that will be compared against document embeddings.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            query: A single query string or sequence of query strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(query, input_type='query', settings=settings)
+
+    async def embed_documents(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more document texts.
+
+        Use this method when embedding documents that will be stored and later searched against.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            documents: A single document string or sequence of document strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(documents, input_type='document', settings=settings)
+
+    async def embed(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed text inputs with explicit input type specification.
+
+        This is the low-level embedding method. For most use cases, prefer
+        [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query] or
+        [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents].
+
+        Args:
+            inputs: A single string or sequence of strings to embed.
+            input_type: The type of input, either `'query'` or `'document'`.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        model = self._get_model()
+        settings = merge_embedding_settings(self._settings, settings)
+        return await model.embed(inputs, input_type=input_type, settings=settings)
+
+    async def max_input_tokens(self) -> int | None:
+        """Get the maximum number of tokens the model can accept as input.
+
+        Returns:
+            The maximum token count, or `None` if the limit is unknown for this model.
+        """
+        model = self._get_model()
+        return await model.max_input_tokens()
+
+    async def count_tokens(self, text: str) -> int:
+        """Count the number of tokens in the given text.
+
+        Args:
+            text: The text to tokenize and count.
+
+        Returns:
+            The number of tokens in the text.
+
+        Raises:
+            NotImplementedError: If the model doesn't support token counting.
+            UserError: If the model or tokenizer is not supported.
+        """
+        model = self._get_model()
+        return await model.count_tokens(text)
+
+    def embed_query_sync(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_query(query, settings=settings))
+
+    def embed_documents_sync(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_documents(documents, settings=settings))
+
+    def embed_sync(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed()`][pydantic_ai.embeddings.Embedder.embed]."""
+        return _utils.get_event_loop().run_until_complete(self.embed(inputs, input_type=input_type, settings=settings))
+
+    def max_input_tokens_sync(self) -> int | None:
+        """Synchronous version of [`max_input_tokens()`][pydantic_ai.embeddings.Embedder.max_input_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.max_input_tokens())
+
+    def count_tokens_sync(self, text: str) -> int:
+        """Synchronous version of [`count_tokens()`][pydantic_ai.embeddings.Embedder.count_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.count_tokens(text))
+
+    def _get_model(self) -> EmbeddingModel:
+        """Create a model configured for this embedder.
+
+        Returns:
+            The embedding model to use, with instrumentation applied if configured.
+        """
+        model_: EmbeddingModel
+        if some_model := self._override_model.get():
+            model_ = some_model
+        else:
+            model_ = self._model = infer_embedding_model(self.model)
+
+        instrument = self.instrument
+        if instrument is None:
+            instrument = self._instrument_default
+
+        return instrument_embedding_model(model_, instrument)
+
+# tests/test_tenacity.py:350-362
+    def test_no_exception_uses_fallback(self):
+        """Test that fallback strategy is used when there's no exception."""
+        fallback = Mock(return_value=5.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a retry state with no exception
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = None
+
+        result = wait_func(retry_state)
+
+        assert result == 5.0
+        fallback.assert_called_once_with(retry_state)
+
+# tests/test_tenacity.py:554-571
+    def test_default_max_wait(self):
+        """Test that default max_wait of 300 seconds is used."""
+        wait_func = wait_retry_after()  # Use all defaults
+
+        # Create HTTP status error with large Retry-After value
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '600'}  # 10 minutes
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 300.0  # Capped at default max_wait
+
+# tests/test_tenacity.py:519-538
+    def test_retry_after_invalid_format_uses_fallback(self):
+        """Test that invalid Retry-After values fall back to fallback strategy."""
+        fallback = Mock(return_value=4.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error with invalid Retry-After
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': 'invalid-value'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 4.0
+        fallback.assert_called_once_with(retry_state)
+
+# tests/test_tenacity.py:364-378
+    def test_non_http_exception_uses_fallback(self):
+        """Test that fallback strategy is used for non-HTTP exceptions."""
+        fallback = Mock(return_value=3.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a retry state with a non-HTTP exception
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = ValueError('Some error')
+
+        result = wait_func(retry_state)
+
+        assert result == 3.0
+        fallback.assert_called_once_with(retry_state)
+
+# tests/test_tenacity.py:469-492
+    def test_retry_after_http_date_past_time_uses_fallback(self):
+        """Test that past dates in Retry-After fall back to fallback strategy."""
+        fallback = Mock(return_value=1.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a past date
+        past_time = datetime.now(timezone.utc).timestamp() - 30
+        http_date = formatdate(past_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 1.0
+        fallback.assert_called_once_with(retry_state)
+
+# pydantic_ai_slim/pydantic_ai/_run_context.py:57-57
+    retry: int = 0
+
+# pydantic_ai_slim/pydantic_ai/models/fallback.py:35-54
+    def __init__(
+        self,
+        default_model: Model | KnownModelName | str,
+        *fallback_models: Model | KnownModelName | str,
+        fallback_on: Callable[[Exception], bool] | tuple[type[Exception], ...] = (ModelAPIError,),
+    ):
+        """Initialize a fallback model instance.
+
+        Args:
+            default_model: The name or instance of the default model to use.
+            fallback_models: The names or instances of the fallback models to use upon failure.
+            fallback_on: A callable or tuple of exceptions that should trigger a fallback.
+        """
+        super().__init__()
+        self.models = [infer_model(default_model), *[infer_model(m) for m in fallback_models]]
+
+        if isinstance(fallback_on, tuple):
+            self._fallback_on = _default_fallback_condition_factory(fallback_on)  # pyright: ignore[reportUnknownArgumentType]
+        else:
+            self._fallback_on = fallback_on
+
+# pydantic_ai_slim/pydantic_ai/ui/_adapter.py:80-89
+    def state(self, state: Any) -> None:
+        """Set the state of the agent run.
+
+        This method is called to update the state of the agent run with the
+        provided state.
+
+        Args:
+            state: The run state.
+        """
+        ...
+
+# pydantic_ai_slim/pydantic_ai/retries.py:78-78
+    retry: SyncRetryBaseT | RetryBaseT
+
+# tests/test_ui.py:106-107
+    def state(self) -> dict[str, Any] | None:
+        return self.run_input.state
+
+# pydantic_ai_slim/pydantic_ai/result.py:434-436
+    async def stream(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[OutputDataT]:
+        async for output in self.stream_output(debounce_by=debounce_by):
+            yield output
+
+# pydantic_ai_slim/pydantic_ai/retries.py:215-309
+class AsyncTenacityTransport(AsyncBaseTransport):
+    """Asynchronous HTTP transport with tenacity-based retry functionality.
+
+    This transport wraps another AsyncBaseTransport and adds retry capabilities using the tenacity library.
+    It can be configured to retry requests based on various conditions such as specific exception types,
+    response status codes, or custom validation logic.
+
+    The transport works by intercepting HTTP requests and responses, allowing the tenacity controller
+    to determine when and how to retry failed requests. The validate_response function can be used
+    to convert HTTP responses into exceptions that trigger retries.
+
+    Args:
+        wrapped: The underlying async transport to wrap and add retry functionality to.
+        config: The arguments to use for the tenacity `retry` decorator, including retry conditions,
+            wait strategy, stop conditions, etc. See the tenacity docs for more info.
+        validate_response: Optional callable that takes a Response and can raise an exception
+            to be handled by the controller if the response should trigger a retry.
+            Common use case is to raise exceptions for certain HTTP status codes.
+            If None, no response validation is performed.
+
+    Example:
+        ```python
+        from httpx import AsyncClient, HTTPStatusError
+        from tenacity import retry_if_exception_type, stop_after_attempt
+
+        from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
+
+        transport = AsyncTenacityTransport(
+            RetryConfig(
+                retry=retry_if_exception_type(HTTPStatusError),
+                wait=wait_retry_after(max_wait=300),
+                stop=stop_after_attempt(5),
+                reraise=True
+            ),
+            validate_response=lambda r: r.raise_for_status()
+        )
+        client = AsyncClient(transport=transport)
+        ```
+    """
+
+    def __init__(
+        self,
+        config: RetryConfig,
+        wrapped: AsyncBaseTransport | None = None,
+        validate_response: Callable[[Response], Any] | None = None,
+    ):
+        self.config = config
+        self.wrapped = wrapped or AsyncHTTPTransport()
+        self.validate_response = validate_response
+
+    async def handle_async_request(self, request: Request) -> Response:
+        """Handle an async HTTP request with retry logic.
+
+        Args:
+            request: The HTTP request to handle.
+
+        Returns:
+            The HTTP response.
+
+        Raises:
+            RuntimeError: If the retry controller did not make any attempts.
+            Exception: Any exception raised by the wrapped transport or validation function.
+        """
+
+        @retry(**self.config)
+        async def handle_async_request(req: Request) -> Response:
+            response = await self.wrapped.handle_async_request(req)
+
+            # this is normally set by httpx _after_ calling this function, but we want the request in the validator:
+            response.request = req
+
+            if self.validate_response:
+                try:
+                    self.validate_response(response)
+                except Exception:
+                    await response.aclose()
+                    raise
+            return response
+
+        return await handle_async_request(request)
+
+    async def __aenter__(self) -> AsyncTenacityTransport:
+        await self.wrapped.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self.wrapped.__aexit__(exc_type, exc_value, traceback)
+
+    async def aclose(self) -> None:
+        await self.wrapped.aclose()
+
+# pydantic_graph/pydantic_graph/beta/step.py:50-51
+    def state(self) -> StateT:
+        return self._state
+
+# pydantic_ai_slim/pydantic_ai/retries.py:117-212
+class TenacityTransport(BaseTransport):
+    """Synchronous HTTP transport with tenacity-based retry functionality.
+
+    This transport wraps another BaseTransport and adds retry capabilities using the tenacity library.
+    It can be configured to retry requests based on various conditions such as specific exception types,
+    response status codes, or custom validation logic.
+
+    The transport works by intercepting HTTP requests and responses, allowing the tenacity controller
+    to determine when and how to retry failed requests. The validate_response function can be used
+    to convert HTTP responses into exceptions that trigger retries.
+
+    Args:
+        wrapped: The underlying transport to wrap and add retry functionality to.
+        config: The arguments to use for the tenacity `retry` decorator, including retry conditions,
+            wait strategy, stop conditions, etc. See the tenacity docs for more info.
+        validate_response: Optional callable that takes a Response and can raise an exception
+            to be handled by the controller if the response should trigger a retry.
+            Common use case is to raise exceptions for certain HTTP status codes.
+            If None, no response validation is performed.
+
+    Example:
+        ```python
+        from httpx import Client, HTTPStatusError, HTTPTransport
+        from tenacity import retry_if_exception_type, stop_after_attempt
+
+        from pydantic_ai.retries import RetryConfig, TenacityTransport, wait_retry_after
+
+        transport = TenacityTransport(
+            RetryConfig(
+                retry=retry_if_exception_type(HTTPStatusError),
+                wait=wait_retry_after(max_wait=300),
+                stop=stop_after_attempt(5),
+                reraise=True
+            ),
+            HTTPTransport(),
+            validate_response=lambda r: r.raise_for_status()
+        )
+        client = Client(transport=transport)
+        ```
+    """
+
+    def __init__(
+        self,
+        config: RetryConfig,
+        wrapped: BaseTransport | None = None,
+        validate_response: Callable[[Response], Any] | None = None,
+    ):
+        self.config = config
+        self.wrapped = wrapped or HTTPTransport()
+        self.validate_response = validate_response
+
+    def handle_request(self, request: Request) -> Response:
+        """Handle an HTTP request with retry logic.
+
+        Args:
+            request: The HTTP request to handle.
+
+        Returns:
+            The HTTP response.
+
+        Raises:
+            RuntimeError: If the retry controller did not make any attempts.
+            Exception: Any exception raised by the wrapped transport or validation function.
+        """
+
+        @retry(**self.config)
+        def handle_request(req: Request) -> Response:
+            response = self.wrapped.handle_request(req)
+
+            # this is normally set by httpx _after_ calling this function, but we want the request in the validator:
+            response.request = req
+
+            if self.validate_response:
+                try:
+                    self.validate_response(response)
+                except Exception:
+                    response.close()
+                    raise
+            return response
+
+        return handle_request(request)
+
+    def __enter__(self) -> TenacityTransport:
+        self.wrapped.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        self.wrapped.__exit__(exc_type, exc_value, traceback)
+
+    def close(self) -> None:
+        self.wrapped.close()  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:28-28
+from . import _output, _system_prompt, exceptions, messages as _messages, models, result, usage as _usage
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:17-27
+from .. import (
+    _agent_graph,
+    _system_prompt,
+    _tool_manager,
+    _utils,
+    exceptions,
+    messages as _messages,
+    models,
+    result,
+    usage as _usage,
+)
+
+# tests/typed_agent.py:317-317
+result = greet_agent.run_sync('testing...', deps='human')
+
+# pydantic_graph/pydantic_graph/beta/join.py:64-66
+    def state(self) -> StateT:
+        """The state of the graph run."""
+        return self._state
+
+# pydantic_graph/pydantic_graph/graph.py:106-157
+    async def run(
+        self,
+        start_node: BaseNode[StateT, DepsT, RunEndT],
+        *,
+        state: StateT = None,
+        deps: DepsT = None,
+        persistence: BaseStatePersistence[StateT, RunEndT] | None = None,
+        infer_name: bool = True,
+    ) -> GraphRunResult[StateT, RunEndT]:
+        """Run the graph from a starting node until it ends.
+
+        Args:
+            start_node: the first node to run, since the graph definition doesn't define the entry point in the graph,
+                you need to provide the starting node.
+            state: The initial state of the graph.
+            deps: The dependencies of the graph.
+            persistence: State persistence interface, defaults to
+                [`SimpleStatePersistence`][pydantic_graph.SimpleStatePersistence] if `None`.
+            infer_name: Whether to infer the graph name from the calling frame.
+
+        Returns:
+            A `GraphRunResult` containing information about the run, including its final result.
+
+        Here's an example of running the graph from [above][pydantic_graph.graph.Graph]:
+
+        ```py {title="run_never_42.py" noqa="I001" requires="never_42.py"}
+        from never_42 import Increment, MyState, never_42_graph
+
+        async def main():
+            state = MyState(1)
+            await never_42_graph.run(Increment(), state=state)
+            print(state)
+            #> MyState(number=2)
+
+            state = MyState(41)
+            await never_42_graph.run(Increment(), state=state)
+            print(state)
+            #> MyState(number=43)
+        ```
+        """
+        if infer_name and self.name is None:
+            self._infer_name(inspect.currentframe())
+
+        async with self.iter(
+            start_node, state=state, deps=deps, persistence=persistence, infer_name=False
+        ) as graph_run:
+            async for _node in graph_run:
+                pass
+
+        result = graph_run.result
+        assert result is not None, 'GraphRun should have a result'
+        return result
+
+# pydantic_ai_slim/pydantic_ai/ui/_adapter.py:173-175
+    def state(self) -> dict[str, Any] | None:
+        """Frontend state from the protocol-specific run input."""
+        return None
+
+# pydantic_graph/pydantic_graph/nodes.py:31-31
+    state: StateT
+
+# pydantic_graph/pydantic_graph/beta/graph.py:546-546
+    state: StateT
+
+# pydantic_graph/pydantic_graph/persistence/__init__.py:48-48
+    state: StateT
+
+# pydantic_graph/pydantic_graph/persistence/__init__.py:73-73
+    state: StateT
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:154-154
+    state: Literal['output-error'] = 'output-error'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:141-141
+    state: Literal['output-available'] = 'output-available'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:195-195
+    state: Literal['output-available'] = 'output-available'
+
+# pydantic_graph/pydantic_graph/graph.py:777-777
+    state: StateT
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:130-130
+    state: Literal['input-available'] = 'input-available'

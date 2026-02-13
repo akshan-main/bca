@@ -1,0 +1,757 @@
+## examples/pydantic_ai_examples/flight_booking.py
+
+class Failed(BaseModel):
+    """Unable to extract a seat selection."""
+
+## examples/pydantic_ai_examples/question_graph.py
+
+from pydantic_graph import (
+    BaseNode,
+    End,
+    Graph,
+    GraphRunContext,
+)
+
+class Ask(BaseNode[QuestionState]):
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+from abc import ABC, abstractmethod
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def generate_tool_call_id() -> str:
+    """Generate a tool call id.
+
+    Ensure that the tool call id is unique.
+    """
+    return f'pyd_ai_{uuid.uuid4().hex}'
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    async def run_stream(  # noqa: C901
+        self,
+        user_prompt: str | Sequence[_messages.UserContent] | None = None,
+        *,
+        output_type: OutputSpec[RunOutputDataT] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: models.Model | models.KnownModelName | str | None = None,
+        instructions: Instructions[AgentDepsT] = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+        usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool | BuiltinToolFunc[AgentDepsT]] | None = None,
+        event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+    ) -> AsyncIterator[result.StreamedRunResult[AgentDepsT, Any]]:
+        """Run the agent with a user prompt in async streaming mode.
+
+        This method builds an internal agent graph (using system prompts, tools and output schemas) and then
+        runs the graph until the model produces output matching the `output_type`, for example text or structured data.
+        At this point, a streaming run result object is yielded from which you can stream the output as it comes in,
+        and -- once this output has completed streaming -- get the complete output, message history, and usage.
+
+        As this method will consider the first output matching the `output_type` to be the final output,
+        it will stop running the agent graph and will not execute any tool calls made by the model after this "final" output.
+        If you want to always run the agent graph to completion and stream events and output at the same time,
+        use [`agent.run()`][pydantic_ai.agent.AbstractAgent.run] with an `event_stream_handler` or [`agent.iter()`][pydantic_ai.agent.AbstractAgent.iter] instead.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+
+        async def main():
+            async with agent.run_stream('What is the capital of the UK?') as response:
+                print(await response.get_output())
+                #> The capital of the UK is London.
+        ```
+
+        Args:
+            user_prompt: User input to start/continue the conversation.
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has no
+                output validators since output validators would expect an argument that matches the agent's output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            instructions: Optional additional instructions to use for this run.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            metadata: Optional metadata to attach to this run. Accepts a dictionary or a callable taking
+                [`RunContext`][pydantic_ai.tools.RunContext]; merged with the agent's configured metadata.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            event_stream_handler: Optional handler for events from the model's streaming response and the agent's execution of tools to use for this run.
+                It will receive all the events up until the final result is found, which you can then read or stream from inside the context manager.
+                Note that it does _not_ receive any events after the final result is found.
+
+        Returns:
+            The result of the run.
+        """
+        if infer_name and self.name is None:
+            # f_back because `asynccontextmanager` adds one frame
+            if frame := inspect.currentframe():  # pragma: no branch
+                self._infer_name(frame.f_back)
+
+        event_stream_handler = event_stream_handler or self.event_stream_handler
+
+        yielded = False
+        async with self.iter(
+            user_prompt,
+            output_type=output_type,
+            message_history=message_history,
+            deferred_tool_results=deferred_tool_results,
+            model=model,
+            deps=deps,
+            instructions=instructions,
+            model_settings=model_settings,
+            usage_limits=usage_limits,
+            usage=usage,
+            metadata=metadata,
+            infer_name=False,
+            toolsets=toolsets,
+            builtin_tools=builtin_tools,
+        ) as agent_run:
+            first_node = agent_run.next_node  # start with the first node
+            assert isinstance(first_node, _agent_graph.UserPromptNode)  # the first node should be a user prompt node
+            node = first_node
+            while True:
+                graph_ctx = agent_run.ctx
+                if self.is_model_request_node(node):
+                    async with node.stream(graph_ctx) as stream:
+                        final_result_event = None
+
+                        async def stream_to_final(
+                            stream: AgentStream,
+                        ) -> AsyncIterator[_messages.ModelResponseStreamEvent]:
+                            nonlocal final_result_event
+                            async for event in stream:
+                                yield event
+                                if isinstance(event, _messages.FinalResultEvent):
+                                    final_result_event = event
+                                    break
+
+                        if event_stream_handler is not None:
+                            await event_stream_handler(
+                                _agent_graph.build_run_context(graph_ctx), stream_to_final(stream)
+                            )
+                        else:
+                            async for _ in stream_to_final(stream):
+                                pass
+
+                        if final_result_event is not None:
+                            final_result = FinalResult(
+                                None, final_result_event.tool_name, final_result_event.tool_call_id
+                            )
+                            if yielded:
+                                raise exceptions.AgentRunError('Agent run produced final results')  # pragma: no cover
+                            yielded = True
+
+                            messages = graph_ctx.state.message_history.copy()
+
+                            async def on_complete() -> None:
+                                """Called when the stream has completed.
+
+                                The model response will have been added to messages by now
+                                by `StreamedRunResult._marked_completed`.
+                                """
+                                nonlocal final_result
+                                final_result = FinalResult(
+                                    await stream.get_output(), final_result.tool_name, final_result.tool_call_id
+                                )
+
+                                # When we get here, the `ModelRequestNode` has completed streaming after the final result was found.
+                                # When running an agent with `agent.run`, we'd then move to `CallToolsNode` to execute the tool calls and
+                                # find the final result.
+                                # We also want to execute tool calls (in case `agent.end_strategy == 'exhaustive'`) here, but
+                                # we don't want to use run the `CallToolsNode` logic to determine the final output, as it would be
+                                # wasteful and could produce a different result (e.g. when text output is followed by tool calls).
+                                # So we call `process_tool_calls` directly and then end the run with the found final result.
+
+                                parts: list[_messages.ModelRequestPart] = []
+                                async for _event in _agent_graph.process_tool_calls(
+                                    tool_manager=graph_ctx.deps.tool_manager,
+                                    tool_calls=stream.response.tool_calls,
+                                    tool_call_results=None,
+                                    tool_call_metadata=None,
+                                    final_result=final_result,
+                                    ctx=graph_ctx,
+                                    output_parts=parts,
+                                ):
+                                    pass
+
+                                # To allow this message history to be used in a future run without dangling tool calls,
+                                # append a new ModelRequest using the tool returns and retries
+                                if parts:
+                                    messages.append(
+                                        _messages.ModelRequest(
+                                            parts, run_id=graph_ctx.state.run_id, timestamp=_utils.now_utc()
+                                        )
+                                    )
+
+                                await agent_run.next(_agent_graph.SetFinalResult(final_result))
+
+                            yield StreamedRunResult(
+                                messages,
+                                graph_ctx.deps.new_message_index,
+                                stream,
+                                on_complete,
+                            )
+                            break
+                elif self.is_call_tools_node(node) and event_stream_handler is not None:
+                    async with node.stream(agent_run.ctx) as stream:
+                        await event_stream_handler(_agent_graph.build_run_context(agent_run.ctx), stream)
+
+                next_node = await agent_run.next(node)
+                if isinstance(next_node, End) and agent_run.result is not None:
+                    # A final output could have been produced by the CallToolsNode rather than the ModelRequestNode,
+                    # if a tool function raised CallDeferred or ApprovalRequired.
+                    # In this case there's no response to stream, but we still let the user access the output etc as normal.
+                    yield StreamedRunResult(
+                        graph_ctx.state.message_history,
+                        graph_ctx.deps.new_message_index,
+                        run_result=agent_run.result,
+                    )
+                    yielded = True
+                    break
+                if not isinstance(next_node, _agent_graph.AgentNode):
+                    raise exceptions.AgentRunError(  # pragma: no cover
+                        'Should have produced a StreamedRunResult before getting here'
+                    )
+                node = cast(_agent_graph.AgentNode[Any, Any], next_node)
+
+        if not yielded:
+            raise exceptions.AgentRunError('Agent run finished without producing a final result')  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/builtin_tools.py
+
+class AbstractBuiltinTool(ABC):
+    """A builtin tool that can be used by an agent.
+
+    This class is abstract and cannot be instantiated directly.
+
+    The builtin tools are passed to the model as part of the `ModelRequestParameters`.
+    """
+
+    kind: str = 'unknown_builtin_tool'
+    """Built-in tool identifier, this should be available on all built-in tools as a discriminator."""
+
+    @property
+    def unique_id(self) -> str:
+        """A unique identifier for the builtin tool.
+
+        If multiple instances of the same builtin tool can be passed to the model, subclasses should override this property to allow them to be distinguished.
+        """
+        return self.kind
+
+    @property
+    def label(self) -> str:
+        """Human-readable label for UI display.
+
+        Subclasses should override this to provide a meaningful label.
+        """
+        return self.kind.replace('_', ' ').title()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        BUILTIN_TOOL_TYPES[cls.kind] = cls
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, _source_type: Any, handler: pydantic.GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        if cls is not AbstractBuiltinTool:
+            return handler(cls)
+
+        tools = BUILTIN_TOOL_TYPES.values()
+        if len(tools) != 1:  # pragma: no cover
+            tools_type = next(iter(tools))
+        else:
+            tools_annotated = [Annotated[tool, pydantic.Tag(tool.kind)] for tool in tools]
+            tools_type = Annotated[Union[tuple(tools_annotated)], pydantic.Discriminator(_tool_discriminator)]  # noqa: UP007
+
+        return handler(tools_type)
+
+    def unique_id(self) -> str:
+        """A unique identifier for the builtin tool.
+
+        If multiple instances of the same builtin tool can be passed to the model, subclasses should override this property to allow them to be distinguished.
+        """
+        return self.kind
+
+    def label(self) -> str:
+        """Human-readable label for UI display.
+
+        Subclasses should override this to provide a meaningful label.
+        """
+        return self.kind.replace('_', ' ').title()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        BUILTIN_TOOL_TYPES[cls.kind] = cls
+
+    def __get_pydantic_core_schema__(
+        cls, _source_type: Any, handler: pydantic.GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        if cls is not AbstractBuiltinTool:
+            return handler(cls)
+
+        tools = BUILTIN_TOOL_TYPES.values()
+        if len(tools) != 1:  # pragma: no cover
+            tools_type = next(iter(tools))
+        else:
+            tools_annotated = [Annotated[tool, pydantic.Tag(tool.kind)] for tool in tools]
+            tools_type = Annotated[Union[tuple(tools_annotated)], pydantic.Discriminator(_tool_discriminator)]  # noqa: UP007
+
+        return handler(tools_type)
+
+class WebFetchTool(AbstractBuiltinTool):
+    """Allows your agent to access contents from URLs.
+
+    The parameters that PydanticAI passes depend on the model, as some parameters may not be supported by certain models.
+
+    Supported by:
+
+    * Anthropic
+    * Google
+    """
+
+    max_uses: int | None = None
+    """If provided, the tool will stop fetching URLs after the given number of uses.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    allowed_domains: list[str] | None = None
+    """If provided, only these domains will be fetched.
+
+    With Anthropic, you can only use one of `blocked_domains` or `allowed_domains`, not both.
+
+    Supported by:
+
+    * Anthropic, see <https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-fetch-tool#domain-filtering>
+    """
+
+    blocked_domains: list[str] | None = None
+    """If provided, these domains will never be fetched.
+
+    With Anthropic, you can only use one of `blocked_domains` or `allowed_domains`, not both.
+
+    Supported by:
+
+    * Anthropic, see <https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-fetch-tool#domain-filtering>
+    """
+
+    enable_citations: bool = False
+    """If True, enables citations for fetched content.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    max_content_tokens: int | None = None
+    """Maximum content length in tokens for fetched content.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    kind: str = 'web_fetch'
+    """The kind of tool."""
+
+class UrlContextTool(WebFetchTool):
+    """Deprecated alias for WebFetchTool. Use WebFetchTool instead.
+
+    Overrides kind to 'url_context' so old serialized payloads with {"kind": "url_context", ...}
+    can be deserialized to UrlContextTool for backward compatibility.
+    """
+
+    kind: str = 'url_context'
+    """The kind of tool (deprecated value for backward compatibility)."""
+
+    kind: str = 'file_search'
+
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+from typing import Any, Protocol
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    kind: Literal['binary'] = 'binary'
+
+    kind: Literal['cache-point'] = 'cache-point'
+
+## pydantic_ai_slim/pydantic_ai/models/google.py
+
+def _process_response_from_parts(
+    parts: list[Part],
+    grounding_metadata: GroundingMetadata | None,
+    model_name: GoogleModelName,
+    provider_name: str,
+    provider_url: str,
+    usage: usage.RequestUsage,
+    vendor_id: str | None,
+    vendor_details: dict[str, Any] | None = None,
+    finish_reason: FinishReason | None = None,
+    url_context_metadata: UrlContextMetadata | None = None,
+) -> ModelResponse:
+    items: list[ModelResponsePart] = []
+
+    web_search_call, web_search_return = _map_grounding_metadata(grounding_metadata, provider_name)
+    if web_search_call and web_search_return:
+        items.append(web_search_call)
+        items.append(web_search_return)
+
+    file_search_call, file_search_return = _map_file_search_grounding_metadata(grounding_metadata, provider_name)
+    if file_search_call and file_search_return:
+        items.append(file_search_call)
+        items.append(file_search_return)
+    web_fetch_call, web_fetch_return = _map_url_context_metadata(url_context_metadata, provider_name)
+    if web_fetch_call and web_fetch_return:
+        items.append(web_fetch_call)
+        items.append(web_fetch_return)
+
+    item: ModelResponsePart | None = None
+    code_execution_tool_call_id: str | None = None
+    for part in parts:
+        item, code_execution_tool_call_id = _process_part(part, code_execution_tool_call_id, provider_name)
+        if item is not None:
+            items.append(item)
+
+    return ModelResponse(
+        parts=items,
+        model_name=model_name,
+        usage=usage,
+        provider_response_id=vendor_id,
+        provider_details=vendor_details,
+        provider_name=provider_name,
+        provider_url=provider_url,
+        finish_reason=finish_reason,
+    )
+
+def _map_url_context_metadata(
+    url_context_metadata: UrlContextMetadata | None, provider_name: str
+) -> tuple[BuiltinToolCallPart, BuiltinToolReturnPart] | tuple[None, None]:
+    if url_context_metadata and (url_metadata := url_context_metadata.url_metadata):
+        tool_call_id = _utils.generate_tool_call_id()
+        # Extract URLs from the metadata
+        urls = [meta.retrieved_url for meta in url_metadata if meta.retrieved_url]
+        return (
+            BuiltinToolCallPart(
+                provider_name=provider_name,
+                tool_name=WebFetchTool.kind,
+                tool_call_id=tool_call_id,
+                args={'urls': urls} if urls else None,
+            ),
+            BuiltinToolReturnPart(
+                provider_name=provider_name,
+                tool_name=WebFetchTool.kind,
+                tool_call_id=tool_call_id,
+                content=[meta.model_dump(mode='json') for meta in url_metadata],
+            ),
+        )
+    else:
+        return None, None
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+class SchemaValidatorProt(Protocol):
+    """Protocol for a Pydantic Core `SchemaValidator` or `PluggableSchemaValidator` (which is private but API-compatible)."""
+
+    def validate_json(
+        self,
+        input: str | bytes | bytearray,
+        *,
+        allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
+        **kwargs: Any,
+    ) -> Any: ...
+
+    def validate_python(
+        self, input: Any, *, allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False, **kwargs: Any
+    ) -> Any: ...
+
+    def validate_python(
+        self, input: Any, *, allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False, **kwargs: Any
+    ) -> Any: ...
+
+## tests/json_body_serializer.py
+
+def deserialize(cassette_string: str):
+    cassette_dict = yaml.load(cassette_string, Loader=SafeLoader)
+    for interaction in cassette_dict['interactions']:
+        for kind, data in interaction.items():
+            parsed_body = data.pop('parsed_body', None)
+            if parsed_body is not None:
+                dumped_body = json.dumps(parsed_body)
+                data['body'] = {'string': dumped_body} if kind == 'response' else dumped_body
+    return cassette_dict
+
+## tests/models/xai_proto_cassettes.py
+
+class XaiProtoCassette:
+    """Cassette storing an ordered list of request/response interactions.
+
+    Each interaction pairs a request with its response, using `SampleInteraction`
+    for `chat.sample()` calls and `StreamInteraction` for `chat.stream()` calls.
+    """
+
+    interactions: list[Interaction] = field(default_factory=list[Interaction])
+    version: int = 1
+
+    @classmethod
+    def load(cls, path: Path) -> XaiProtoCassette:
+        data = yaml.safe_load(path.read_text(encoding='utf-8'))
+
+        interactions: list[Interaction] = []
+        for item in data.get('interactions', []):
+            if 'request_sample' in item:
+                req = item['request_sample']
+                resp = item['response_sample']
+                interactions.append(
+                    SampleInteraction(
+                        request_raw=req['raw'],
+                        response_raw=resp['raw'],
+                        request_json=req.get('json'),
+                        response_json=resp.get('json'),
+                    )
+                )
+            elif 'request_stream' in item:
+                req = item['request_stream']
+                resp = item['response_stream']
+                interactions.append(
+                    StreamInteraction(
+                        request_raw=req['raw'],
+                        chunks_raw=resp['chunks_raw'],
+                        request_json=req.get('json'),
+                        chunks_json=resp.get('chunks_json'),
+                    )
+                )
+        return cls(interactions=interactions)
+
+    def dump(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        interactions_data: list[dict[str, Any]] = []
+
+        for interaction in self.interactions:
+            if isinstance(interaction, SampleInteraction):
+                # Build request_sample: json first (if present), then raw
+                req: dict[str, Any] = {}
+                if interaction.request_json:
+                    req['json'] = interaction.request_json
+                req['raw'] = interaction.request_raw
+
+                # Build response_sample: json first (if present), then raw
+                resp: dict[str, Any] = {}
+                if interaction.response_json:
+                    resp['json'] = interaction.response_json
+                resp['raw'] = interaction.response_raw
+
+                interactions_data.append(
+                    {
+                        'request_sample': req,
+                        'response_sample': resp,
+                    }
+                )
+
+            elif isinstance(interaction, StreamInteraction):
+                # Build request_stream: json first (if present), then raw
+                req = {}
+                if interaction.request_json:
+                    req['json'] = interaction.request_json
+                req['raw'] = interaction.request_raw
+
+                # Build response_stream: chunks_json first (if present), then chunks_raw
+                resp = {}
+                if interaction.chunks_json:
+                    resp['chunks_json'] = interaction.chunks_json
+                resp['chunks_raw'] = interaction.chunks_raw
+
+                interactions_data.append(
+                    {
+                        'request_stream': req,
+                        'response_stream': resp,
+                    }
+                )
+
+        data: dict[str, Any] = {
+            'version': self.version,
+            'interactions': interactions_data,
+        }
+        path.write_text(
+            yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+            encoding='utf-8',
+        )
+
+    def load(cls, path: Path) -> XaiProtoCassette:
+        data = yaml.safe_load(path.read_text(encoding='utf-8'))
+
+        interactions: list[Interaction] = []
+        for item in data.get('interactions', []):
+            if 'request_sample' in item:
+                req = item['request_sample']
+                resp = item['response_sample']
+                interactions.append(
+                    SampleInteraction(
+                        request_raw=req['raw'],
+                        response_raw=resp['raw'],
+                        request_json=req.get('json'),
+                        response_json=resp.get('json'),
+                    )
+                )
+            elif 'request_stream' in item:
+                req = item['request_stream']
+                resp = item['response_stream']
+                interactions.append(
+                    StreamInteraction(
+                        request_raw=req['raw'],
+                        chunks_raw=resp['chunks_raw'],
+                        request_json=req.get('json'),
+                        chunks_json=resp.get('chunks_json'),
+                    )
+                )
+        return cls(interactions=interactions)
+
+## tests/test_builtin_tools.py
+
+async def test_builtin_tools_not_supported_web_search(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[WebSearchTool()])
+
+    with pytest.raises(UserError):
+        await agent.run('What day is tomorrow?')
+
+async def test_builtin_tools_not_supported_web_search_stream(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[WebSearchTool()])
+
+    with pytest.raises(UserError):
+        async with agent.run_stream('What day is tomorrow?'):
+            ...  # pragma: no cover
+
+async def test_builtin_tools_not_supported_code_execution(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[CodeExecutionTool()])
+
+    with pytest.raises(UserError):
+        await agent.run('What day is tomorrow?')
+
+async def test_builtin_tools_not_supported_code_execution_stream(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[CodeExecutionTool()])
+
+    with pytest.raises(UserError):
+        async with agent.run_stream('What day is tomorrow?'):
+            ...  # pragma: no cover
+
+async def test_builtin_tools_not_supported_file_search(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[FileSearchTool(file_store_ids=['test-id'])])
+
+    with pytest.raises(UserError):
+        await agent.run('Search my files')
+
+async def test_builtin_tools_not_supported_file_search_stream(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[FileSearchTool(file_store_ids=['test-id'])])
+
+    with pytest.raises(UserError):
+        async with agent.run_stream('Search my files'):
+            ...  # pragma: no cover
+
+def test_url_context_tool_is_deprecated():
+    """Test that UrlContextTool is deprecated and warns users to use WebFetchTool instead."""
+    with pytest.warns(DeprecationWarning, match='Use `WebFetchTool` instead.'):
+        UrlContextTool()  # pyright: ignore[reportDeprecated]
+
+def test_url_context_tool_backward_compatibility():
+    """Test that old payloads with 'url_context' kind can be deserialized."""
+    adapter = TypeAdapter(AbstractBuiltinTool)
+
+    # Test 1: Old payload with url_context should deserialize to UrlContextTool (which is deprecated)
+    old_payload = {'kind': 'url_context', 'max_uses': 5, 'enable_citations': True}
+    with pytest.warns(DeprecationWarning, match='Use `WebFetchTool` instead.'):
+        result = adapter.validate_python(old_payload)
+    assert isinstance(result, UrlContextTool)  # pyright: ignore[reportDeprecated]
+    assert isinstance(result, WebFetchTool)  # UrlContextTool is a subclass of WebFetchTool
+    assert result.kind == 'url_context'  # Preserves the original kind from payload
+    assert result.max_uses == 5
+    assert result.enable_citations is True
+
+    # Test 2: Re-serialization should preserve the kind
+    serialized = adapter.dump_python(result)
+    assert serialized['kind'] == 'url_context'
+    assert serialized['max_uses'] == 5
+    assert serialized['enable_citations'] is True
+
+    # Test 3: New payload with web_fetch should work normally
+    new_payload = {'kind': 'web_fetch', 'max_uses': 10}
+    result2 = adapter.validate_python(new_payload)
+    assert isinstance(result2, WebFetchTool)
+    assert result2.kind == 'web_fetch'
+    assert result2.max_uses == 10
+
+def test_url_context_tool_instance_behavior():
+    """Test that UrlContextTool instances work correctly with deprecation warning."""
+    adapter = TypeAdapter(AbstractBuiltinTool)
+
+    # Create instance with deprecation warning
+    with pytest.warns(DeprecationWarning, match='Use `WebFetchTool` instead.'):
+        tool = UrlContextTool(max_uses=3, enable_citations=True)  # pyright: ignore[reportDeprecated]
+
+    # UrlContextTool inherits from WebFetchTool and overrides kind to 'url_context'
+    assert isinstance(tool, WebFetchTool)
+    assert tool.kind == 'url_context'
+    assert tool.max_uses == 3
+    assert tool.enable_citations is True
+
+    # Serialization should use 'url_context'
+    serialized = adapter.dump_python(tool)
+    assert serialized['kind'] == 'url_context'
+    assert serialized['max_uses'] == 3
+
+def test_url_context_discriminated_union():
+    """Test that the discriminated union correctly handles both url_context and web_fetch."""
+    adapter = TypeAdapter(list[AbstractBuiltinTool])
+
+    # Mix of old and new payloads
+    payloads = [
+        {'kind': 'url_context', 'max_uses': 1},
+        {'kind': 'web_fetch', 'max_uses': 2},
+        {'kind': 'web_search'},
+        {'kind': 'code_execution'},
+    ]
+
+    # Old url_context payloads will trigger deprecation warnings
+    with pytest.warns(DeprecationWarning, match='Use `WebFetchTool` instead.'):
+        results = adapter.validate_python(payloads)
+    assert len(results) == 4
+    assert isinstance(results[0], UrlContextTool)  # pyright: ignore[reportDeprecated]
+    assert isinstance(results[0], WebFetchTool)  # UrlContextTool is a subclass
+    assert results[0].kind == 'url_context'
+    assert results[0].max_uses == 1
+    assert isinstance(results[1], WebFetchTool)
+    assert results[1].kind == 'web_fetch'
+    assert results[1].max_uses == 2

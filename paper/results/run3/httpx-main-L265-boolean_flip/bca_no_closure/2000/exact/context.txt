@@ -1,0 +1,240 @@
+## httpx/_client.py
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+## httpx/_decoders.py
+
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+## httpx/_models.py
+
+    def keys(self) -> typing.KeysView[str]:
+        return {key.decode(self.encoding): None for _, key, value in self._list}.keys()
+
+    def update(self, headers: HeaderTypes | None = None) -> None:  # type: ignore
+        headers = Headers(headers)
+        for key in headers.keys():
+            if key in self:
+                self.pop(key)
+        self._list.extend(headers._list)
+
+    def content(self) -> bytes:
+        if not hasattr(self, "_content"):
+            raise RequestNotRead()
+        return self._content
+
+## httpx/_multipart.py
+
+    def render_headers(self) -> bytes:
+        if not hasattr(self, "_headers"):
+            name = _format_form_param("name", self.name)
+            self._headers = b"".join(
+                [b"Content-Disposition: form-data; ", name, b"\r\n\r\n"]
+            )
+
+        return self._headers
+
+    def render_data(self) -> bytes:
+        if not hasattr(self, "_data"):
+            self._data = to_bytes(self.value)
+
+        return self._data
+
+    def get_length(self) -> int:
+        headers = self.render_headers()
+        data = self.render_data()
+        return len(headers) + len(data)
+
+    def render(self) -> typing.Iterator[bytes]:
+        yield self.render_headers()
+        yield self.render_data()
+
+    def render(self) -> typing.Iterator[bytes]:
+        yield self.render_headers()
+        yield from self.render_data()
+
+    def get_content_length(self) -> int | None:
+        """
+        Return the length of the multipart encoded content, or `None` if
+        any of the files have a length that cannot be determined upfront.
+        """
+        boundary_length = len(self.boundary)
+        length = 0
+
+        for field in self.fields:
+            field_length = field.get_length()
+            if field_length is None:
+                return None
+
+            length += 2 + boundary_length + 2  # b"--{boundary}\r\n"
+            length += field_length
+            length += 2  # b"\r\n"
+
+        length += 2 + boundary_length + 4  # b"--{boundary}--\r\n"
+        return length
+
+    def get_headers(self) -> dict[str, str]:
+        content_length = self.get_content_length()
+        content_type = self.content_type
+        if content_length is None:
+            return {"Transfer-Encoding": "chunked", "Content-Type": content_type}
+        return {"Content-Length": str(content_length), "Content-Type": content_type}
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        for chunk in self.iter_chunks():
+            yield chunk
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        for chunk in self.iter_chunks():
+            yield chunk
+
+## tests/client/test_auth.py
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        headers = {"www-authenticate": self.auth_header} if self.auth_header else {}
+        data = {"auth": request.headers.get("Authorization")}
+        return httpx.Response(self.status_code, headers=headers, json=data)
+
+async def test_digest_auth_qop_must_be_auth_or_auth_int() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="not-auth")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+class ConsumeBodyTransport(httpx.MockTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.AsyncByteStream)
+        [_ async for _ in request.stream]
+        return self.handler(request)  # type: ignore[return-value]
+
+## tests/models/test_requests.py
+
+def test_content_length_header():
+    request = httpx.Request("POST", "http://example.org", content=b"test 123")
+    assert request.headers["Content-Length"] == "8"
+
+def test_generator_with_transfer_encoding_header():
+    def content() -> typing.Iterator[bytes]:
+        yield b"test 123"  # pragma: no cover
+
+    request = httpx.Request("POST", "http://example.org", content=content())
+    assert request.headers == {"Host": "example.org", "Transfer-Encoding": "chunked"}
+
+def test_generator_with_content_length_header():
+    def content() -> typing.Iterator[bytes]:
+        yield b"test 123"  # pragma: no cover
+
+    headers = {"Content-Length": "8"}
+    request = httpx.Request(
+        "POST", "http://example.org", content=content(), headers=headers
+    )
+    assert request.headers == {"Host": "example.org", "Content-Length": "8"}
+
+def test_ignore_transfer_encoding_header_if_content_length_exists():
+    """
+    `Transfer-Encoding` should be ignored if `Content-Length` has been set explicitly.
+    See https://github.com/encode/httpx/issues/1168
+    """
+
+    def streaming_body(data: bytes) -> typing.Iterator[bytes]:
+        yield data  # pragma: no cover
+
+    data = streaming_body(b"abcd")
+
+    headers = {"Content-Length": "4"}
+    request = httpx.Request("POST", "http://example.org", content=data, headers=headers)
+    assert "Transfer-Encoding" not in request.headers
+    assert request.headers["Content-Length"] == "4"
+
+def test_override_content_length_header():
+    async def streaming_body(data: bytes) -> typing.AsyncIterator[bytes]:
+        yield data  # pragma: no cover
+
+    data = streaming_body(b"test 123")
+    headers = {"Content-Length": "8"}
+
+    request = httpx.Request("POST", "http://example.org", content=data, headers=headers)
+    assert request.headers["Content-Length"] == "8"
+
+## tests/models/test_responses.py
+
+def streaming_body() -> typing.Iterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+def test_iter_raw_increments_updates_counter():
+    response = httpx.Response(200, content=streaming_body())
+
+    num_downloaded = response.num_bytes_downloaded
+    for part in response.iter_raw():
+        assert len(part) == (response.num_bytes_downloaded - num_downloaded)
+        num_downloaded = response.num_bytes_downloaded
+
+async def test_aiter_raw_on_sync():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    with pytest.raises(RuntimeError):
+        [part async for part in response.aiter_raw()]
+
+async def test_aclose_on_sync():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    with pytest.raises(RuntimeError):
+        await response.aclose()
+
+def test_generator_with_transfer_encoding_header():
+    def content() -> typing.Iterator[bytes]:
+        yield b"test 123"  # pragma: no cover
+
+    response = httpx.Response(200, content=content())
+    assert response.headers == {"Transfer-Encoding": "chunked"}
+
+def test_generator_with_content_length_header():
+    def content() -> typing.Iterator[bytes]:
+        yield b"test 123"  # pragma: no cover
+
+    headers = {"Content-Length": "8"}
+    response = httpx.Response(200, content=content(), headers=headers)
+    assert response.headers == {"Content-Length": "8"}
+
+## tests/models/test_url.py
+
+def test_url_non_printing_character_in_url():
+    with pytest.raises(httpx.InvalidURL) as exc:
+        httpx.URL("https://www.example.com/\n")
+    assert str(exc.value) == (
+        "Invalid non-printable ASCII character in URL, '\\n' at position 24."
+    )
+
+def test_url_non_printing_character_in_component():
+    with pytest.raises(httpx.InvalidURL) as exc:
+        httpx.URL("https://www.example.com", path="/\n")
+    assert str(exc.value) == (
+        "Invalid non-printable ASCII character in URL path component, "
+        "'\\n' at position 1."
+    )
+
+## tests/test_status_codes.py
+
+def test_status_code_as_int():
+    # mypy doesn't (yet) recognize that IntEnum members are ints, so ignore it here
+    assert httpx.codes.NOT_FOUND == 404  # type: ignore[comparison-overlap]
+    assert str(httpx.codes.NOT_FOUND) == "404"

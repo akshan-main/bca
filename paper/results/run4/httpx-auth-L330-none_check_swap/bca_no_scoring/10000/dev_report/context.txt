@@ -1,0 +1,1095 @@
+## httpx/_api.py
+
+def get(
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `GET` request.
+
+    **Parameters**: See `httpx.request`.
+
+    Note that the `data`, `files`, `json` and `content` parameters are not available
+    on this function, as `GET` requests should not include a request body.
+    """
+    return request(
+        "GET",
+        url,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+## httpx/_auth.py
+
+    def sync_auth_flow(
+        self, request: Request
+    ) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow synchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            request.read()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                response.read()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+class DigestAuth(Auth):
+    _ALGORITHM_TO_HASH_FUNCTION: dict[str, typing.Callable[[bytes], _Hash]] = {
+        "MD5": hashlib.md5,
+        "MD5-SESS": hashlib.md5,
+        "SHA": hashlib.sha1,
+        "SHA-SESS": hashlib.sha1,
+        "SHA-256": hashlib.sha256,
+        "SHA-256-SESS": hashlib.sha256,
+        "SHA-512": hashlib.sha512,
+        "SHA-512-SESS": hashlib.sha512,
+    }
+
+    def __init__(self, username: str | bytes, password: str | bytes) -> None:
+        self._username = to_bytes(username)
+        self._password = to_bytes(password)
+        self._last_challenge: _DigestAuthChallenge | None = None
+        self._nonce_count = 1
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        if self._last_challenge:
+            request.headers["Authorization"] = self._build_auth_header(
+                request, self._last_challenge
+            )
+
+        response = yield request
+
+        if response.status_code != 401 or "www-authenticate" not in response.headers:
+            # If the response is not a 401 then we don't
+            # need to build an authenticated request.
+            return
+
+        for auth_header in response.headers.get_list("www-authenticate"):
+            if auth_header.lower().startswith("digest "):
+                break
+        else:
+            # If the response does not include a 'WWW-Authenticate: Digest ...'
+            # header, then we don't need to build an authenticated request.
+            return
+
+        self._last_challenge = self._parse_challenge(request, response, auth_header)
+        self._nonce_count = 1
+
+        request.headers["Authorization"] = self._build_auth_header(
+            request, self._last_challenge
+        )
+        if response.cookies:
+            Cookies(response.cookies).set_cookie_header(request=request)
+        yield request
+
+    def _parse_challenge(
+        self, request: Request, response: Response, auth_header: str
+    ) -> _DigestAuthChallenge:
+        """
+        Returns a challenge from a Digest WWW-Authenticate header.
+        These take the form of:
+        `Digest realm="realm@host.com",qop="auth,auth-int",nonce="abc",opaque="xyz"`
+        """
+        scheme, _, fields = auth_header.partition(" ")
+
+        # This method should only ever have been called with a Digest auth header.
+        assert scheme.lower() == "digest"
+
+        header_dict: dict[str, str] = {}
+        for field in parse_http_list(fields):
+            key, value = field.strip().split("=", 1)
+            header_dict[key] = unquote(value)
+
+        try:
+            realm = header_dict["realm"].encode()
+            nonce = header_dict["nonce"].encode()
+            algorithm = header_dict.get("algorithm", "MD5")
+            opaque = header_dict["opaque"].encode() if "opaque" in header_dict else None
+            qop = header_dict["qop"].encode() if "qop" in header_dict else None
+            return _DigestAuthChallenge(
+                realm=realm, nonce=nonce, algorithm=algorithm, opaque=opaque, qop=qop
+            )
+        except KeyError as exc:
+            message = "Malformed Digest WWW-Authenticate header"
+            raise ProtocolError(message, request=request) from exc
+
+    def _build_auth_header(
+        self, request: Request, challenge: _DigestAuthChallenge
+    ) -> str:
+        hash_func = self._ALGORITHM_TO_HASH_FUNCTION[challenge.algorithm.upper()]
+
+        def digest(data: bytes) -> bytes:
+            return hash_func(data).hexdigest().encode()
+
+        A1 = b":".join((self._username, challenge.realm, self._password))
+
+        path = request.url.raw_path
+        A2 = b":".join((request.method.encode(), path))
+        # TODO: implement auth-int
+        HA2 = digest(A2)
+
+        nc_value = b"%08x" % self._nonce_count
+        cnonce = self._get_client_nonce(self._nonce_count, challenge.nonce)
+        self._nonce_count += 1
+
+        HA1 = digest(A1)
+        if challenge.algorithm.lower().endswith("-sess"):
+            HA1 = digest(b":".join((HA1, challenge.nonce, cnonce)))
+
+        qop = self._resolve_qop(challenge.qop, request=request)
+        if qop is None:
+            # Following RFC 2069
+            digest_data = [HA1, challenge.nonce, HA2]
+        else:
+            # Following RFC 2617/7616
+            digest_data = [HA1, challenge.nonce, nc_value, cnonce, qop, HA2]
+
+        format_args = {
+            "username": self._username,
+            "realm": challenge.realm,
+            "nonce": challenge.nonce,
+            "uri": path,
+            "response": digest(b":".join(digest_data)),
+            "algorithm": challenge.algorithm.encode(),
+        }
+        if challenge.opaque:
+            format_args["opaque"] = challenge.opaque
+        if qop:
+            format_args["qop"] = b"auth"
+            format_args["nc"] = nc_value
+            format_args["cnonce"] = cnonce
+
+        return "Digest " + self._get_header_value(format_args)
+
+    def _get_client_nonce(self, nonce_count: int, nonce: bytes) -> bytes:
+        s = str(nonce_count).encode()
+        s += nonce
+        s += time.ctime().encode()
+        s += os.urandom(8)
+
+        return hashlib.sha1(s).hexdigest()[:16].encode()
+
+    def _get_header_value(self, header_fields: dict[str, bytes]) -> str:
+        NON_QUOTED_FIELDS = ("algorithm", "qop", "nc")
+        QUOTED_TEMPLATE = '{}="{}"'
+        NON_QUOTED_TEMPLATE = "{}={}"
+
+        header_value = ""
+        for i, (field, value) in enumerate(header_fields.items()):
+            if i > 0:
+                header_value += ", "
+            template = (
+                QUOTED_TEMPLATE
+                if field not in NON_QUOTED_FIELDS
+                else NON_QUOTED_TEMPLATE
+            )
+            header_value += template.format(field, to_str(value))
+
+        return header_value
+
+    def _resolve_qop(self, qop: bytes | None, request: Request) -> bytes | None:
+        if qop is not None:
+            return None
+        qops = re.split(b", ?", qop)
+        if b"auth" in qops:
+            return b"auth"
+
+        if qops == [b"auth-int"]:
+            raise NotImplementedError("Digest auth-int support is not yet implemented")
+
+        message = f'Unexpected qop value "{qop!r}" in digest auth'
+        raise ProtocolError(message, request=request)
+
+## httpx/_client.py
+
+class BoundAsyncStream(AsyncByteStream):
+    """
+    An async byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: AsyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    def auth(self, auth: AuthTypes) -> None:
+        self._auth = self._build_auth(auth)
+
+    def get(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `GET` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return self.request(
+            "GET",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+## httpx/_content.py
+
+class AsyncIteratorByteStream(AsyncByteStream):
+    CHUNK_SIZE = 65_536
+
+    def __init__(self, stream: AsyncIterable[bytes]) -> None:
+        self._stream = stream
+        self._is_stream_consumed = False
+        self._is_generator = inspect.isasyncgen(stream)
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        if self._is_stream_consumed and self._is_generator:
+            raise StreamConsumed()
+
+        self._is_stream_consumed = True
+        if hasattr(self._stream, "aread"):
+            # File-like interfaces should use 'aread' directly.
+            chunk = await self._stream.aread(self.CHUNK_SIZE)
+            while chunk:
+                yield chunk
+                chunk = await self._stream.aread(self.CHUNK_SIZE)
+        else:
+            # Otherwise iterate.
+            async for part in self._stream:
+                yield part
+
+def encode_urlencoded_data(
+    data: RequestData,
+) -> tuple[dict[str, str], ByteStream]:
+    plain_data = []
+    for key, value in data.items():
+        if isinstance(value, (list, tuple)):
+            plain_data.extend([(key, primitive_value_to_str(item)) for item in value])
+        else:
+            plain_data.append((key, primitive_value_to_str(value)))
+    body = urlencode(plain_data, doseq=True).encode("utf-8")
+    content_length = str(len(body))
+    content_type = "application/x-www-form-urlencoded"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+def encode_multipart_data(
+    data: RequestData, files: RequestFiles, boundary: bytes | None
+) -> tuple[dict[str, str], MultipartStream]:
+    multipart = MultipartStream(data=data, files=files, boundary=boundary)
+    headers = multipart.get_headers()
+    return headers, multipart
+
+## httpx/_models.py
+
+def _is_known_encoding(encoding: str) -> bool:
+    """
+    Return `True` if `encoding` is a known codec.
+    """
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        return False
+    return True
+
+    def get(self, key: str, default: typing.Any = None) -> typing.Any:
+        """
+        Return a header value. If multiple occurrences of the header occur
+        then concatenate them together with commas.
+        """
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def get(  # type: ignore
+        self,
+        name: str,
+        default: str | None = None,
+        domain: str | None = None,
+        path: str | None = None,
+    ) -> str | None:
+        """
+        Get a cookie by name. May optionally include domain and path
+        in order to specify exactly which cookie to retrieve.
+        """
+        value = None
+        for cookie in self.jar:
+            if cookie.name == name:
+                if domain is None or cookie.domain == domain:
+                    if path is None or cookie.path == path:
+                        if value is not None:
+                            message = f"Multiple cookies exist with name={name}"
+                            raise CookieConflict(message)
+                        value = cookie.value
+
+        if value is None:
+            return default
+        return value
+
+## httpx/_transports/default.py
+
+class AsyncResponseStream(AsyncByteStream):
+    def __init__(self, httpcore_stream: typing.AsyncIterable[bytes]) -> None:
+        self._httpcore_stream = httpcore_stream
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        with map_httpcore_exceptions():
+            async for part in self._httpcore_stream:
+                yield part
+
+    async def aclose(self) -> None:
+        if hasattr(self._httpcore_stream, "aclose"):
+            await self._httpcore_stream.aclose()
+
+## httpx/_types.py
+
+class SyncByteStream:
+    def __iter__(self) -> Iterator[bytes]:
+        raise NotImplementedError(
+            "The '__iter__' method must be implemented."
+        )  # pragma: no cover
+        yield b""  # pragma: no cover
+
+    def close(self) -> None:
+        """
+        Subclasses can override this method to release any network resources
+        after a request/response cycle is complete.
+        """
+
+class AsyncByteStream:
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        raise NotImplementedError(
+            "The '__aiter__' method must be implemented."
+        )  # pragma: no cover
+        yield b""  # pragma: no cover
+
+    async def aclose(self) -> None:
+        pass
+
+## httpx/_urls.py
+
+    def get(self, key: typing.Any, default: typing.Any = None) -> typing.Any:
+        """
+        Get a value from the query param for a given key. If the key occurs
+        more than once, then only the first value is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get("a") == "123"
+        """
+        if key in self._dict:
+            return self._dict[str(key)][0]
+        return default
+
+## tests/client/test_async_client.py
+
+async def test_cannot_stream_sync_request(server):
+    def hello_world() -> typing.Iterator[bytes]:  # pragma: no cover
+        yield b"Hello, "
+        yield b"world!"
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(RuntimeError):
+            await client.post(server.url, content=hello_world())
+
+## tests/client/test_auth.py
+
+class SyncOrAsyncAuth(httpx.Auth):
+    """
+    A mock authentication scheme that uses a different implementation for the
+    sync and async cases.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._async_lock = anyio.Lock()
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.AsyncGenerator[httpx.Request, httpx.Response]:
+        async with self._async_lock:
+            request.headers["Authorization"] = "async-auth"
+        yield request
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+async def test_digest_auth_200_response_including_digest_auth_header() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    auth_header = 'Digest realm="realm@host.com",qop="auth",nonce="abc",opaque="xyz"'
+    app = App(auth_header=auth_header, status_code=200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+async def test_digest_auth_incorrect_credentials() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(send_response_after_attempt=2)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert len(response.history) == 1
+
+async def test_digest_auth_resets_nonce_count_after_401() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response_1 = await client.get(url, auth=auth)
+        assert response_1.status_code == 200
+        assert len(response_1.history) == 1
+
+        first_nonce = parse_keqv_list(
+            response_1.request.headers["Authorization"].split(", ")
+        )["nonce"]
+        first_nc = parse_keqv_list(
+            response_1.request.headers["Authorization"].split(", ")
+        )["nc"]
+
+        # with this we now force a 401 on a subsequent (but initial) request
+        app.send_response_after_attempt = 2
+
+        # we expect the client again to try to authenticate,
+        # i.e. the history length must be 1
+        response_2 = await client.get(url, auth=auth)
+        assert response_2.status_code == 200
+        assert len(response_2.history) == 1
+
+        second_nonce = parse_keqv_list(
+            response_2.request.headers["Authorization"].split(", ")
+        )["nonce"]
+        second_nc = parse_keqv_list(
+            response_2.request.headers["Authorization"].split(", ")
+        )["nc"]
+
+    assert first_nonce != second_nonce  # ensures that the auth challenge was reset
+    assert (
+        first_nc == second_nc
+    )  # ensures the nonce count is reset when the authentication failed
+
+async def test_async_auth_history() -> None:
+    """
+    Test that intermediate requests sent as part of an authentication flow
+    are recorded in the response history.
+    """
+    url = "https://example.org/"
+    auth = RepeatAuth(repeat=2)
+    app = App(auth_header="abc")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Repeat abc.abc"}
+
+    assert len(response.history) == 2
+    resp1, resp2 = response.history
+    assert resp1.json() == {"auth": "Repeat 0"}
+    assert resp2.json() == {"auth": "Repeat 1"}
+
+    assert len(resp2.history) == 1
+    assert resp2.history == [resp1]
+
+    assert len(resp1.history) == 0
+
+def test_sync_auth_history() -> None:
+    """
+    Test that intermediate requests sent as part of an authentication flow
+    are recorded in the response history.
+    """
+    url = "https://example.org/"
+    auth = RepeatAuth(repeat=2)
+    app = App(auth_header="abc")
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Repeat abc.abc"}
+
+    assert len(response.history) == 2
+    resp1, resp2 = response.history
+    assert resp1.json() == {"auth": "Repeat 0"}
+    assert resp2.json() == {"auth": "Repeat 1"}
+
+    assert len(resp2.history) == 1
+    assert resp2.history == [resp1]
+
+    assert len(resp1.history) == 0
+
+def test_sync_auth_reads_response_body() -> None:
+    """
+    Test that we can read the response body in an auth flow if `requires_response_body`
+    is set.
+    """
+    url = "https://example.org/"
+    auth = ResponseBodyAuth("xyz")
+    app = App()
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": '{"auth":"xyz"}'}
+
+def test_sync_auth() -> None:
+    """
+    Test that we can use an auth implementation specific to the sync case.
+    """
+    url = "https://example.org/"
+    auth = SyncOrAsyncAuth()
+    app = App()
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "sync-auth"}
+
+## tests/client/test_cookies.py
+
+def test_cookie_persistence() -> None:
+    """
+    Ensure that Client instances persist cookies between requests.
+    """
+    client = httpx.Client(transport=httpx.MockTransport(get_and_set_cookies))
+
+    response = client.get("http://example.org/echo_cookies")
+    assert response.status_code == 200
+    assert response.json() == {"cookies": None}
+
+    response = client.get("http://example.org/set_cookie")
+    assert response.status_code == 200
+    assert response.cookies["example-name"] == "example-value"
+    assert client.cookies["example-name"] == "example-value"
+
+    response = client.get("http://example.org/echo_cookies")
+    assert response.status_code == 200
+    assert response.json() == {"cookies": "example-name=example-value"}
+
+## tests/client/test_event_hooks.py
+
+async def test_async_event_hooks():
+    events = []
+
+    async def on_request(request):
+        events.append({"event": "request", "headers": dict(request.headers)})
+
+    async def on_response(response):
+        events.append({"event": "response", "headers": dict(response.headers)})
+
+    event_hooks = {"request": [on_request], "response": [on_response]}
+
+    async with httpx.AsyncClient(
+        event_hooks=event_hooks, transport=httpx.MockTransport(app)
+    ) as http:
+        await http.get("http://127.0.0.1:8000/", auth=("username", "password"))
+
+    assert events == [
+        {
+            "event": "request",
+            "headers": {
+                "host": "127.0.0.1:8000",
+                "user-agent": f"python-httpx/{httpx.__version__}",
+                "accept": "*/*",
+                "accept-encoding": "gzip, deflate, br, zstd",
+                "connection": "keep-alive",
+                "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+            },
+        },
+        {
+            "event": "response",
+            "headers": {"server": "testserver"},
+        },
+    ]
+
+async def test_async_event_hooks_with_redirect():
+    """
+    A redirect request should trigger additional 'request' and 'response' event hooks.
+    """
+
+    events = []
+
+    async def on_request(request):
+        events.append({"event": "request", "headers": dict(request.headers)})
+
+    async def on_response(response):
+        events.append({"event": "response", "headers": dict(response.headers)})
+
+    event_hooks = {"request": [on_request], "response": [on_response]}
+
+    async with httpx.AsyncClient(
+        event_hooks=event_hooks,
+        transport=httpx.MockTransport(app),
+        follow_redirects=True,
+    ) as http:
+        await http.get("http://127.0.0.1:8000/redirect", auth=("username", "password"))
+
+    assert events == [
+        {
+            "event": "request",
+            "headers": {
+                "host": "127.0.0.1:8000",
+                "user-agent": f"python-httpx/{httpx.__version__}",
+                "accept": "*/*",
+                "accept-encoding": "gzip, deflate, br, zstd",
+                "connection": "keep-alive",
+                "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+            },
+        },
+        {
+            "event": "response",
+            "headers": {"location": "/", "server": "testserver"},
+        },
+        {
+            "event": "request",
+            "headers": {
+                "host": "127.0.0.1:8000",
+                "user-agent": f"python-httpx/{httpx.__version__}",
+                "accept": "*/*",
+                "accept-encoding": "gzip, deflate, br, zstd",
+                "connection": "keep-alive",
+                "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+            },
+        },
+        {
+            "event": "response",
+            "headers": {"server": "testserver"},
+        },
+    ]
+
+## tests/client/test_redirects.py
+
+async def test_async_too_many_redirects():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        with pytest.raises(httpx.TooManyRedirects):
+            await client.get(
+                "https://example.org/multiple_redirects?count=21", follow_redirects=True
+            )
+
+def test_sync_too_many_redirects():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get(
+            "https://example.org/multiple_redirects?count=21", follow_redirects=True
+        )
+
+async def test_async_invalid_redirect():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        with pytest.raises(httpx.RemoteProtocolError):
+            await client.get(
+                "http://example.org/invalid_redirect", follow_redirects=True
+            )
+
+## tests/conftest.py
+
+async def status_code(scope: Scope, receive: Receive, send: Send) -> None:
+    status_code = int(scope["path"].replace("/status/", ""))
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [[b"content-type", b"text/plain"]],
+        }
+    )
+    await send({"type": "http.response.body", "body": b"Hello, world!"})
+
+## tests/models/test_requests.py
+
+def test_json_encoded_data():
+    request = httpx.Request("POST", "http://example.org", json={"test": 123})
+    request.read()
+
+    assert request.headers["Content-Type"] == "application/json"
+    assert request.content == b'{"test":123}'
+
+def test_ignore_transfer_encoding_header_if_content_length_exists():
+    """
+    `Transfer-Encoding` should be ignored if `Content-Length` has been set explicitly.
+    See https://github.com/encode/httpx/issues/1168
+    """
+
+    def streaming_body(data: bytes) -> typing.Iterator[bytes]:
+        yield data  # pragma: no cover
+
+    data = streaming_body(b"abcd")
+
+    headers = {"Content-Length": "4"}
+    request = httpx.Request("POST", "http://example.org", content=data, headers=headers)
+    assert "Transfer-Encoding" not in request.headers
+    assert request.headers["Content-Length"] == "4"
+
+## tests/models/test_responses.py
+
+def test_response_fallback_to_utf8_encoding():
+    """
+    Fallback to utf-8 if we get an invalid charset in the Content-Type header.
+    """
+    headers = {"Content-Type": "text-plain; charset=invalid-codec-name"}
+    content = "おはようございます。".encode("utf-8")
+    response = httpx.Response(
+        200,
+        content=content,
+        headers=headers,
+    )
+    assert response.text == "おはようございます。"
+    assert response.encoding == "utf-8"
+
+def test_iter_raw_increments_updates_counter():
+    response = httpx.Response(200, content=streaming_body())
+
+    num_downloaded = response.num_bytes_downloaded
+    for part in response.iter_raw():
+        assert len(part) == (response.num_bytes_downloaded - num_downloaded)
+        num_downloaded = response.num_bytes_downloaded
+
+async def test_aiter_raw_on_sync():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    with pytest.raises(RuntimeError):
+        [part async for part in response.aiter_raw()]
+
+def test_sync_streaming_response():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    assert response.status_code == 200
+    assert not response.is_closed
+
+    content = response.read()
+
+    assert content == b"Hello, world!"
+    assert response.content == b"Hello, world!"
+    assert response.is_closed
+
+async def test_async_streaming_response():
+    response = httpx.Response(
+        200,
+        content=async_streaming_body(),
+    )
+
+    assert response.status_code == 200
+    assert not response.is_closed
+
+    content = await response.aread()
+
+    assert content == b"Hello, world!"
+    assert response.content == b"Hello, world!"
+    assert response.is_closed
+
+## tests/models/test_url.py
+
+def test_param_with_existing_escape_requires_encoding():
+    # Params passed as form key-value pairs should always be escaped,
+    # even if they include a valid escape sequence.
+    # We want to match browser form behaviour here.
+    url = httpx.URL("http://webservice", params={"u": "http://example.com?q=foo%2Fa"})
+    assert str(url) == "http://webservice?u=http%3A%2F%2Fexample.com%3Fq%3Dfoo%252Fa"
+
+def test_query_with_mixed_percent_encoding():
+    # When a mix of encoded and unencoded characters are present,
+    # characters that require percent encoding should be encoded,
+    # while existing sequences should not be double encoded.
+    url = httpx.URL("http://webservice?u=phrase%20with spaces")
+    assert str(url) == "http://webservice?u=phrase%20with%20spaces"
+
+## tests/test_asgi.py
+
+async def test_asgi_raw_path_should_not_include_querystring_portion():
+    """
+    See https://github.com/encode/httpx/issues/2810
+    """
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/path?query")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/path"}
+
+## tests/test_auth.py
+
+def test_digest_auth_with_401_nonce_counting():
+    auth = httpx.DigestAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    # The initial request should not include an auth header.
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    # If a 401 response is returned, then a digest auth request is made.
+    headers = {
+        "WWW-Authenticate": 'Digest realm="...", qop="auth", nonce="...", opaque="..."'
+    }
+    response = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers, request=request
+    )
+    first_request = flow.send(response)
+    assert first_request.headers["Authorization"].startswith("Digest")
+
+    # Each subsequent request contains the digest header by default...
+    request = httpx.Request("GET", "https://www.example.com")
+    flow = auth.sync_auth_flow(request)
+    second_request = next(flow)
+    assert second_request.headers["Authorization"].startswith("Digest")
+
+    # ... and the client nonce count (nc) is increased
+    first_nc = parse_keqv_list(first_request.headers["Authorization"].split(", "))["nc"]
+    second_nc = parse_keqv_list(second_request.headers["Authorization"].split(", "))[
+        "nc"
+    ]
+    assert int(first_nc, 16) + 1 == int(second_nc, 16)
+
+    # No other requests are made.
+    response = httpx.Response(content=b"Hello, world!", status_code=200)
+    with pytest.raises(StopIteration):
+        flow.send(response)
+
+## tests/test_content.py
+
+async def test_urlencoded_content():
+    request = httpx.Request(method, url, data={"Hello": "world!"})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "14",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"Hello=world%21"
+    assert async_content == b"Hello=world%21"
+
+async def test_urlencoded_boolean():
+    request = httpx.Request(method, url, data={"example": True})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "12",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"example=true"
+    assert async_content == b"example=true"
+
+async def test_urlencoded_none():
+    request = httpx.Request(method, url, data={"example": None})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "8",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"example="
+    assert async_content == b"example="
+
+def test_ensure_ascii_false_with_french_characters():
+    data = {"greeting": "Bonjour, ça va ?"}
+    response = httpx.Response(200, json=data)
+    assert "ça va" in response.text, (
+        "ensure_ascii=False should preserve French accented characters"
+    )
+    assert response.headers["Content-Type"] == "application/json"
+
+## tests/test_multipart.py
+
+def test_multipart_headers_include_content_type() -> None:
+    """
+    Content-Type from 4th tuple parameter (headers) should
+    override the 3rd parameter (content_type)
+    """
+    file_name = "test.txt"
+    file_content = io.BytesIO(b"<file content>")
+    file_content_type = "text/plain"
+    file_headers = {"Content-Type": "image/png"}
+
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": (file_name, file_content, file_content_type, file_headers)}
+
+    request = httpx.Request("POST", url, headers=headers, files=files)
+    request.read()
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Content-Length": str(len(request.content)),
+    }
+    assert request.content == (
+        f'--BOUNDARY\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{file_name}"\r\nContent-Type: '
+        f"image/png\r\n\r\n<file content>\r\n--BOUNDARY--\r\n"
+        "".encode("ascii")
+    )
+
+def test_multipart_encode_files_guesses_correct_content_type(
+    file_name: str, expected_content_type: str
+) -> None:
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": (file_name, io.BytesIO(b"<file content>"))}
+
+    request = httpx.Request("POST", url, headers=headers, data={}, files=files)
+    request.read()
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Content-Length": str(len(request.content)),
+    }
+    assert request.content == (
+        f'--BOUNDARY\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{file_name}"\r\nContent-Type: '
+        f"{expected_content_type}\r\n\r\n<file content>\r\n--BOUNDARY--\r\n"
+        "".encode("ascii")
+    )
+
+def test_multipart_encode_files_raises_exception_with_StringIO_content() -> None:
+    url = "https://www.example.com"
+    files = {"file": ("test.txt", io.StringIO("content"), "text/plain")}
+    with pytest.raises(TypeError):
+        httpx.Request("POST", url, data={}, files=files)  # type: ignore
+
+def test_multipart_encode_non_seekable_filelike() -> None:
+    """
+    Test that special readable but non-seekable filelike objects are supported.
+    In this case uploads with use 'Transfer-Encoding: chunked', instead of
+    a 'Content-Length' header.
+    """
+
+    class IteratorIO(io.IOBase):
+        def __init__(self, iterator: typing.Iterator[bytes]) -> None:
+            self._iterator = iterator
+
+        def read(self, *args: typing.Any) -> bytes:
+            return b"".join(self._iterator)
+
+    def data() -> typing.Iterator[bytes]:
+        yield b"Hello"
+        yield b"World"
+
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    fileobj: typing.Any = IteratorIO(data())
+    files = {"file": fileobj}
+
+    request = httpx.Request("POST", url, headers=headers, files=files)
+    request.read()
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Transfer-Encoding": "chunked",
+    }
+    assert request.content == (
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="upload"\r\n'
+        b"Content-Type: application/octet-stream\r\n"
+        b"\r\n"
+        b"HelloWorld\r\n"
+        b"--BOUNDARY--\r\n"
+    )
+
+## tests/test_timeouts.py
+
+async def test_async_client_new_request_send_timeout(server):
+    timeout = httpx.Timeout(1e-6)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with pytest.raises(httpx.TimeoutException):
+            await client.send(
+                httpx.Request("GET", server.url.copy_with(path="/slow_response"))
+            )

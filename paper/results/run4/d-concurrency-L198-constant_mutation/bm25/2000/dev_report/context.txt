@@ -1,0 +1,233 @@
+# tests/test_concurrency.py:69-97
+    async def test_waiting_count_tracking(self):
+        """Test that waiting_count is accurately tracked."""
+        limiter = ConcurrencyLimiter(max_running=1)
+        started = anyio.Event()
+        release = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                started.set()
+                await release.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Now limiter is held, check waiting count as we add waiters
+            assert limiter.waiting_count == 0
+
+            for _ in range(3):
+                tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+            assert limiter.waiting_count == 3
+
+            release.set()
+        assert limiter.waiting_count == 0
+
+# tests/test_concurrency.py:571-590
+class TestConcurrencyLimiterWithTracer:
+    """Tests for ConcurrencyLimiter with custom tracer."""
+
+    async def test_custom_tracer_is_stored(self):
+        """Test that custom tracer is stored and returned by _get_tracer."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter(max_running=5, tracer=custom_tracer)
+
+        # Verify the tracer is stored and returned
+        assert limiter._get_tracer() is custom_tracer
+
+    async def test_from_limit_with_tracer(self):
+        """Test that from_limit passes tracer to the created limiter."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter.from_limit(5, tracer=custom_tracer)
+        assert limiter._get_tracer() is custom_tracer
+
+# tests/test_concurrency.py:473-506
+    async def test_named_limiter_waiting_adds_limiter_name_attribute(self, capfire: CaptureLogfire):
+        """Test that waiting with a named limiter adds limiter_name to span attributes."""
+        limiter = ConcurrencyLimiter(max_running=1, name='test-pool')
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test-source'):
+                await hold.wait()
+
+        # Start a waiter - this will trigger the span with limiter_name attribute
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test-source'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            # Start holder to occupy the slot
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span was created with the correct attributes
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for test-pool concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'test-source'
+        assert attrs['limiter_name'] == 'test-pool'
+        assert attrs['max_running'] == 1
+        assert 'waiting_count' in attrs
+
+# tests/test_concurrency.py:461-464
+    async def test_limiter_without_name(self):
+        """Test that limiter name is None by default."""
+        limiter = ConcurrencyLimiter(max_running=5)
+        assert limiter.name is None
+
+# tests/test_concurrency.py:456-459
+    async def test_limiter_with_name(self):
+        """Test that limiter name is properly set and accessible."""
+        limiter = ConcurrencyLimiter(max_running=5, name='my-limiter')
+        assert limiter.name == 'my-limiter'
+
+# tests/test_concurrency.py:509-539
+    async def test_unnamed_limiter_waiting_uses_source_in_span_name(self, capfire: CaptureLogfire):
+        """Test that waiting without a limiter name uses source for span name."""
+        limiter = ConcurrencyLimiter(max_running=1)  # No name
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span uses source in name when limiter has no name
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for model:gpt-4 concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'model:gpt-4'
+        assert 'limiter_name' not in attrs  # Should not be present when name is None
+        assert attrs['max_running'] == 1
+
+# tests/test_concurrency.py:62-67
+    async def test_nowait_acquisition(self):
+        """Test that immediate acquisition works."""
+        limiter = ConcurrencyLimiter(max_running=10)
+        # With high limit, should acquire immediately
+        async with get_concurrency_context(limiter, 'test'):
+            pass  # No waiting
+
+# tests/test_concurrency.py:439-450
+class TestAgentWithSharedLimiter:
+    """Tests for agent with shared ConcurrencyLimiter."""
+
+    async def test_agent_with_shared_limiter(self):
+        """Test that agents can share a ConcurrencyLimiter."""
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        agent1 = Agent(TestModel(), max_concurrency=shared_limiter)
+        agent2 = Agent(TestModel(), max_concurrency=shared_limiter)
+
+        # Both agents should share the same limiter
+        assert agent1._concurrency_limiter is agent2._concurrency_limiter
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:146-148
+    def waiting_count(self) -> int:
+        """Number of operations currently waiting to acquire a slot."""
+        return self._waiting_count
+
+# tests/test_concurrency.py:466-470
+    async def test_from_limit_with_name(self):
+        """Test creating limiter from limit with name."""
+        limiter = ConcurrencyLimiter.from_limit(5, name='my-limit')
+        assert limiter.name == 'my-limit'
+        assert limiter.max_running == 5
+
+# tests/models/test_outlines.py:434-443
+async def test_tool_definition_error_async_model(mock_async_model: OutlinesModel) -> None:
+    """Test that function tools raise UserError with async model."""
+    agent = Agent(mock_async_model)
+
+    @agent.tool_plain
+    def dummy_tool() -> str:  # pragma: no cover
+        return 'dummy'
+
+    with pytest.raises(UserError, match='Outlines does not support function tools yet.'):
+        await agent.run('Hello')
+
+# tests/test_concurrency.py:182-187
+    async def test_from_limiter_config(self):
+        """Test creating from ConcurrencyLimit."""
+        config = ConcurrencyLimit(max_running=5, max_queued=10)
+        limiter = ConcurrencyLimiter.from_limit(config)
+        assert limiter.max_running == 5
+        assert limiter._max_queued == 10
+
+# tests/test_concurrency.py:584-590
+    async def test_from_limit_with_tracer(self):
+        """Test that from_limit passes tracer to the created limiter."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter.from_limit(5, tracer=custom_tracer)
+        assert limiter._get_tracer() is custom_tracer
+
+# tests/test_concurrency.py:442-450
+    async def test_agent_with_shared_limiter(self):
+        """Test that agents can share a ConcurrencyLimiter."""
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        agent1 = Agent(TestModel(), max_concurrency=shared_limiter)
+        agent2 = Agent(TestModel(), max_concurrency=shared_limiter)
+
+        # Both agents should share the same limiter
+        assert agent1._concurrency_limiter is agent2._concurrency_limiter
+
+# tests/test_concurrency.py:189-204
+    async def test_properties(self):
+        """Test the various properties of ConcurrencyLimiter."""
+        limiter = ConcurrencyLimiter(max_running=5, name='test-limiter')
+        assert limiter.max_running == 5
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+        assert limiter.waiting_count == 0
+        assert limiter.name == 'test-limiter'
+
+        # After acquiring one slot
+        await limiter.acquire('test')
+        assert limiter.running_count == 1
+        assert limiter.available_count == 4
+        limiter.release()
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/__init__.py:36-36
+import anyio._backends._asyncio  # pyright: ignore[reportUnusedImport]  #noqa: F401
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:224-226
+    def release(self) -> None:
+        """Release a slot."""
+        self._limiter.release()

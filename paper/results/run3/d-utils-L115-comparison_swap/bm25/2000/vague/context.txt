@@ -1,0 +1,213 @@
+# tests/typed_agent.py:79-80
+def wrong_tool_prepare(ctx: RunContext[MyDeps], x: int, y: str) -> str:
+    return f'{ctx.deps.foo} {x} {y}'
+
+# tests/test_streaming.py:758-792
+async def test_call_tool_wrong_name():
+    async def stream_structured_function(_messages: list[ModelMessage], _: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+        yield {0: DeltaToolCall(name='foobar', json_args='{}')}
+
+    agent = Agent(
+        FunctionModel(stream_function=stream_structured_function),
+        output_type=tuple[str, int],
+        retries=0,
+    )
+
+    @agent.tool_plain
+    async def ret_a(x: str) -> str:  # pragma: no cover
+        return x
+
+    with capture_run_messages() as messages:
+        with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(0\) for output validation'):
+            async with agent.run_stream('hello'):
+                pass
+
+    assert messages == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=50, output_tokens=1),
+                model_name='function::stream_structured_function',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+# pydantic_ai_slim/pydantic_ai/usage.py:262-262
+    tool_calls_limit: int | None = None
+
+# tests/test_usage_limits.py:329-360
+async def test_output_tool_allowed_at_limit() -> None:
+    """Test that output tools can be called even when at the tool_calls_limit."""
+
+    class MyOutput(BaseModel):
+        result: str
+
+    def call_output_after_regular(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('regular_tool', {'x': 'test'}, 'call_1'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+        else:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('final_result', {'result': 'success'}, 'call_2'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+
+    test_agent = Agent(FunctionModel(call_output_after_regular), output_type=ToolOutput(MyOutput))
+
+    @test_agent.tool_plain
+    async def regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    result = await test_agent.run('test', usage_limits=UsageLimits(tool_calls_limit=1))
+
+    assert result.output.result == 'success'
+    assert result.usage() == snapshot(RunUsage(requests=2, input_tokens=20, output_tokens=10, tool_calls=1))
+
+# tests/test_tools.py:2495-2529
+async def test_tool_timeout_triggers_retry():
+    """Test that a slow tool triggers RetryPromptPart when timeout is exceeded."""
+    import asyncio
+
+    call_count = 0
+
+    async def model_logic(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal call_count
+        call_count += 1
+        # First call: try the slow tool
+        if call_count == 1:
+            return ModelResponse(parts=[ToolCallPart(tool_name='slow_tool', args={}, tool_call_id='call-1')])
+        # After receiving retry, return text
+        return ModelResponse(parts=[TextPart(content='Tool timed out, giving up')])
+
+    agent = Agent(FunctionModel(model_logic))
+
+    @agent.tool_plain(timeout=0.1)
+    async def slow_tool() -> str:
+        await asyncio.sleep(1.0)  # 1 second, but timeout is 0.1s
+        return 'done'  # pragma: no cover
+
+    result = await agent.run('call slow_tool')
+
+    # Check that retry prompt was sent to the model
+    retry_parts = [
+        part
+        for msg in result.all_messages()
+        if isinstance(msg, ModelRequest)
+        for part in msg.parts
+        if isinstance(part, RetryPromptPart) and 'Timed out' in str(part.content)
+    ]
+    assert len(retry_parts) == 1
+    assert 'Timed out after 0.1 seconds' in retry_parts[0].content
+    assert retry_parts[0].tool_name == 'slow_tool'
+
+# tests/test_usage_limits.py:287-301
+async def test_tool_call_limit() -> None:
+    test_agent = Agent(TestModel())
+
+    @test_agent.tool_plain
+    async def ret_a(x: str) -> str:
+        return f'{x}-apple'
+
+    with pytest.raises(
+        UsageLimitExceeded,
+        match=re.escape('The next tool call(s) would exceed the tool_calls_limit of 0 (tool_calls=1).'),
+    ):
+        await test_agent.run('Hello', usage_limits=UsageLimits(tool_calls_limit=0))
+
+    result = await test_agent.run('Hello', usage_limits=UsageLimits(tool_calls_limit=1))
+    assert result.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=14, tool_calls=1))
+
+# tests/test_usage_limits.py:394-455
+async def test_parallel_tool_calls_limit_enforced():
+    """Parallel tool calls must not exceed the limit and should raise immediately."""
+    executed_tools: list[str] = []
+
+    model_call_count = 0
+
+    def test_model_function(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal model_call_count
+        model_call_count += 1
+
+        if model_call_count == 1:
+            # First response: 5 parallel tool calls (within limit)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('tool_a', {}, 'call_1'),
+                    ToolCallPart('tool_b', {}, 'call_2'),
+                    ToolCallPart('tool_c', {}, 'call_3'),
+                    ToolCallPart('tool_a', {}, 'call_4'),
+                    ToolCallPart('tool_b', {}, 'call_5'),
+                ]
+            )
+        else:
+            assert model_call_count == 2
+            # Second response: 3 parallel tool calls (would exceed limit of 6)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('tool_c', {}, 'call_6'),
+                    ToolCallPart('tool_a', {}, 'call_7'),
+                    ToolCallPart('tool_b', {}, 'call_8'),
+                ]
+            )
+
+    test_model = FunctionModel(test_model_function)
+    agent = Agent(test_model)
+
+    @agent.tool_plain
+    async def tool_a() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('a')
+        return 'result a'
+
+    @agent.tool_plain
+    async def tool_b() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('b')
+        return 'result b'
+
+    @agent.tool_plain
+    async def tool_c() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('c')
+        return 'result c'
+
+    # Run with tool call limit of 6; expecting an error when trying to execute 3 more tools
+    with pytest.raises(
+        UsageLimitExceeded,
+        match=re.escape('The next tool call(s) would exceed the tool_calls_limit of 6 (tool_calls=8).'),
+    ):
+        await agent.run('Use tools', usage_limits=UsageLimits(tool_calls_limit=6))
+
+    # Only the first batch of 5 tools should have executed
+    assert len(executed_tools) == 5
+
+# pydantic_ai_slim/pydantic_ai/usage.py:400-407
+    def check_before_tool_call(self, projected_usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next tool call(s) would exceed the tool call limit."""
+        tool_calls_limit = self.tool_calls_limit
+        tool_calls = projected_usage.tool_calls
+        if tool_calls_limit is not None and tool_calls > tool_calls_limit:
+            raise UsageLimitExceeded(
+                f'The next tool call(s) would exceed the tool_calls_limit of {tool_calls_limit} ({tool_calls=}).'
+            )
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:114-114
+from .tools import DeferredToolRequests, DeferredToolResults, RunContext, Tool, ToolApproved, ToolDefinition, ToolDenied
+
+# pydantic_ai_slim/pydantic_ai/toolsets/abstract.py:113-115
+    async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
+        """The tools that are available in this toolset."""
+        raise NotImplementedError()

@@ -1,0 +1,432 @@
+## examples/pydantic_ai_examples/slack_lead_qualifier/store.py
+
+    async def add(cls, analysis: Analysis):
+        await cls._get_store().put.aio(analysis.profile.email, analysis.model_dump())
+
+    def _get_store(cls) -> modal.Dict:
+        return modal.Dict.from_name('analyses', create_if_missing=True)  # type: ignore ### [/analysis_store]
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+def build_agent_graph(
+    name: str | None,
+    deps_type: type[DepsT],
+    output_type: OutputSpec[OutputT],
+) -> Graph[
+    GraphAgentState,
+    GraphAgentDeps[DepsT, OutputT],
+    UserPromptNode[DepsT, OutputT],
+    result.FinalResult[OutputT],
+]:
+    """Build the execution [Graph][pydantic_graph.Graph] for a given agent."""
+    g = GraphBuilder(
+        name=name or 'Agent',
+        state_type=GraphAgentState,
+        deps_type=GraphAgentDeps[DepsT, OutputT],
+        input_type=UserPromptNode[DepsT, OutputT],
+        output_type=result.FinalResult[OutputT],
+        auto_instrument=False,
+    )
+
+    g.add(
+        g.edge_from(g.start_node).to(UserPromptNode[DepsT, OutputT]),
+        g.node(UserPromptNode[DepsT, OutputT]),
+        g.node(ModelRequestNode[DepsT, OutputT]),
+        g.node(CallToolsNode[DepsT, OutputT]),
+        g.node(
+            SetFinalResult[DepsT, OutputT],
+        ),
+    )
+    return g.build(validate_graph_structure=False)
+
+## pydantic_ai_slim/pydantic_ai/_cli/__init__.py
+
+async def ask_agent(
+    agent: AbstractAgent[AgentDepsT, OutputDataT],
+    prompt: str,
+    stream: bool,
+    console: Console,
+    code_theme: str,
+    deps: AgentDepsT = None,
+    messages: Sequence[ModelMessage] | None = None,
+    model_settings: ModelSettings | None = None,
+    usage_limits: _usage.UsageLimits | None = None,
+) -> list[ModelMessage]:
+    status = Status('[dim]Working on it…[/dim]', console=console)
+
+    if not stream:
+        with status:
+            result = await agent.run(prompt, message_history=messages, deps=deps)
+        content = str(result.output)
+        console.print(Markdown(content, code_theme=code_theme))
+        return result.all_messages()
+
+    with status, ExitStack() as stack:
+        async with agent.iter(
+            prompt, message_history=messages, deps=deps, model_settings=model_settings, usage_limits=usage_limits
+        ) as agent_run:
+            live = Live('', refresh_per_second=15, console=console, vertical_overflow='ellipsis')
+            async for node in agent_run:
+                if Agent.is_model_request_node(node):
+                    async with node.stream(agent_run.ctx) as handle_stream:
+                        status.stop()  # stopping multiple times is idempotent
+                        stack.enter_context(live)  # entering multiple times is idempotent
+
+                        async for content in handle_stream.stream_output(debounce_by=None):
+                            live.update(Markdown(str(content), code_theme=code_theme))
+
+        assert agent_run.result is not None
+        return agent_run.result.all_messages()
+
+    def __init__(self, special_suggestions: list[str] | None = None):
+        super().__init__()
+        self.special_suggestions = special_suggestions or []
+
+## pydantic_ai_slim/pydantic_ai/_otel_messages.py
+
+    type: Literal['text']
+
+## pydantic_ai_slim/pydantic_ai/_output.py
+
+    def label(self) -> str:
+        return "the agent's output tools"
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def is_set(t_or_unset: T | Unset) -> TypeGuard[T]:
+    return t_or_unset is not UNSET
+
+## pydantic_ai_slim/pydantic_ai/agent/__init__.py
+
+    def event_stream_handler(self) -> EventStreamHandler[AgentDepsT] | None:
+        """Optional handler for events from the model's streaming response and the agent's execution of tools."""
+        return self._event_stream_handler
+
+    def _get_toolset(
+        self,
+        output_toolset: AbstractToolset[AgentDepsT] | None | _utils.Unset = _utils.UNSET,
+        additional_toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+    ) -> AbstractToolset[AgentDepsT]:
+        """Get the complete toolset.
+
+        Args:
+            output_toolset: The output toolset to use instead of the one built at agent construction time.
+            additional_toolsets: Additional toolsets to add, unless toolsets have been overridden.
+        """
+        toolsets = self.toolsets
+        # Don't add additional toolsets if the toolsets have been overridden
+        if additional_toolsets and self._override_toolsets.get() is None:
+            toolsets = [*toolsets, *additional_toolsets]
+
+        toolset = CombinedToolset(toolsets)
+
+        def copy_dynamic_toolsets(toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
+            if isinstance(toolset, DynamicToolset):
+                return toolset.copy()
+            else:
+                return toolset
+
+        toolset = toolset.visit_and_replace(copy_dynamic_toolsets)
+
+        if self._prepare_tools:
+            toolset = PreparedToolset(toolset, self._prepare_tools)
+
+        output_toolset = output_toolset if _utils.is_set(output_toolset) else self._output_toolset
+        if output_toolset is not None:
+            if self._prepare_output_tools:
+                output_toolset = PreparedToolset(output_toolset, self._prepare_output_tools)
+            toolset = CombinedToolset([output_toolset, toolset])
+
+        return toolset
+
+    def toolsets(self) -> Sequence[AbstractToolset[AgentDepsT]]:
+        """All toolsets registered on the agent, including a function toolset holding tools that were registered on the agent directly.
+
+        Output tools are not included.
+        """
+        toolsets: list[AbstractToolset[AgentDepsT]] = []
+
+        if some_tools := self._override_tools.get():
+            function_toolset = _AgentFunctionToolset(
+                some_tools.value,
+                max_retries=self._max_tool_retries,
+                timeout=self._tool_timeout,
+                output_schema=self._output_schema,
+            )
+        else:
+            function_toolset = self._function_toolset
+        toolsets.append(function_toolset)
+
+        if some_user_toolsets := self._override_toolsets.get():
+            user_toolsets = some_user_toolsets.value
+        else:
+            user_toolsets = [*self._user_toolsets, *self._dynamic_toolsets]
+        toolsets.extend(user_toolsets)
+
+        return toolsets
+
+    def __init__(
+        self,
+        tools: Sequence[Tool[AgentDepsT] | ToolFuncEither[AgentDepsT, ...]] = [],
+        *,
+        max_retries: int = 1,
+        timeout: float | None = None,
+        id: str | None = None,
+        output_schema: _output.OutputSchema[Any],
+    ):
+        self.output_schema = output_schema
+        super().__init__(tools, max_retries=max_retries, timeout=timeout, id=id)
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    def toolsets(self) -> Sequence[AbstractToolset[AgentDepsT]]:
+        """All toolsets registered on the agent.
+
+        Output tools are not included.
+        """
+        raise NotImplementedError
+
+    def run_stream_sync(
+        self,
+        user_prompt: str | Sequence[_messages.UserContent] | None = None,
+        *,
+        output_type: OutputSpec[RunOutputDataT] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: models.Model | models.KnownModelName | str | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+        usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool | BuiltinToolFunc[AgentDepsT]] | None = None,
+        event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+    ) -> result.StreamedRunResultSync[AgentDepsT, Any]:
+        """Run the agent with a user prompt in sync streaming mode.
+
+        This is a convenience method that wraps [`run_stream()`][pydantic_ai.agent.AbstractAgent.run_stream] with `loop.run_until_complete(...)`.
+        You therefore can't use this method inside async code or if there's an active event loop.
+
+        This method builds an internal agent graph (using system prompts, tools and output schemas) and then
+        runs the graph until the model produces output matching the `output_type`, for example text or structured data.
+        At this point, a streaming run result object is yielded from which you can stream the output as it comes in,
+        and -- once this output has completed streaming -- get the complete output, message history, and usage.
+
+        As this method will consider the first output matching the `output_type` to be the final output,
+        it will stop running the agent graph and will not execute any tool calls made by the model after this "final" output.
+        If you want to always run the agent graph to completion and stream events and output at the same time,
+        use [`agent.run()`][pydantic_ai.agent.AbstractAgent.run] with an `event_stream_handler` or [`agent.iter()`][pydantic_ai.agent.AbstractAgent.iter] instead.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+
+        def main():
+            response = agent.run_stream_sync('What is the capital of the UK?')
+            print(response.get_output())
+            #> The capital of the UK is London.
+        ```
+
+        Args:
+            user_prompt: User input to start/continue the conversation.
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has no
+                output validators since output validators would expect an argument that matches the agent's output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            metadata: Optional metadata to attach to this run. Accepts a dictionary or a callable taking
+                [`RunContext`][pydantic_ai.tools.RunContext]; merged with the agent's configured metadata.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            event_stream_handler: Optional handler for events from the model's streaming response and the agent's execution of tools to use for this run.
+                It will receive all the events up until the final result is found, which you can then read or stream from inside the context manager.
+                Note that it does _not_ receive any events after the final result is found.
+
+        Returns:
+            The result of the run.
+        """
+        if infer_name and self.name is None:
+            self._infer_name(inspect.currentframe())
+
+        async def _consume_stream():
+            async with self.run_stream(
+                user_prompt,
+                output_type=output_type,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                model=model,
+                deps=deps,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+                usage=usage,
+                metadata=metadata,
+                infer_name=infer_name,
+                toolsets=toolsets,
+                builtin_tools=builtin_tools,
+                event_stream_handler=event_stream_handler,
+            ) as stream_result:
+                yield stream_result
+
+        async_result = _utils.get_event_loop().run_until_complete(anext(_consume_stream()))
+        return result.StreamedRunResultSync(async_result)
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    def user_text_prompt(cls, user_prompt: str, *, instructions: str | None = None) -> ModelRequest:
+        """Create a `ModelRequest` with a single user prompt as text."""
+        return cls(parts=[UserPromptPart(user_prompt)], instructions=instructions)
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    def close(self) -> None:
+        self.wrapped.close()  # pragma: no cover
+
+    async def aclose(self) -> None:
+        await self.wrapped.aclose()
+
+## pydantic_ai_slim/pydantic_ai/ui/_adapter.py
+
+    async def from_request(
+        cls, request: Request, *, agent: AbstractAgent[AgentDepsT, OutputDataT]
+    ) -> UIAdapter[RunInputT, MessageT, EventT, AgentDepsT, OutputDataT]:
+        """Create an adapter from a request."""
+        return cls(
+            agent=agent,
+            run_input=cls.build_run_input(await request.body()),
+            accept=request.headers.get('accept'),
+        )
+
+    def build_run_input(cls, body: bytes) -> RunInputT:
+        """Build a protocol-specific run input object from the request body."""
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py
+
+    def encode(self, sdk_version: int) -> str:
+        return self.model_dump_json(by_alias=True, exclude_none=True)
+
+## pydantic_evals/pydantic_evals/otel/span_tree.py
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+## pydantic_graph/pydantic_graph/beta/graph.py
+
+    def output(self) -> OutputT | None:
+        """Get the final output if the graph has completed.
+
+        Returns:
+            The output value if execution is complete, None otherwise
+        """
+        if isinstance(self._next, EndMarker):
+            return self._next.value
+        return None
+
+## pydantic_graph/pydantic_graph/beta/graph_builder.py
+
+    def join(
+        self,
+        reducer: ReducerFunction[StateT, DepsT, InputT, OutputT],
+        *,
+        initial: OutputT | Unset = UNSET,
+        initial_factory: Callable[[], OutputT] | Unset = UNSET,
+        node_id: str | None = None,
+        parent_fork_id: str | None = None,
+        preferred_parent_fork: Literal['farthest', 'closest'] = 'farthest',
+    ) -> Join[StateT, DepsT, InputT, OutputT]:
+        if initial_factory is UNSET:
+            initial_factory = lambda: initial  # pyright: ignore[reportAssignmentType]  # noqa: E731
+
+        return Join[StateT, DepsT, InputT, OutputT](
+            id=JoinID(NodeID(node_id or generate_placeholder_node_id(get_callable_name(reducer)))),
+            reducer=reducer,
+            initial_factory=cast(Callable[[], OutputT], initial_factory),
+            parent_fork_id=ForkID(parent_fork_id) if parent_fork_id is not None else None,
+            preferred_parent_fork=preferred_parent_fork,
+        )
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+    items: list[PathItem]
+
+## tests/conftest.py
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+## tests/evals/test_report_evaluators.py
+
+def _make_report(cases: list[ReportCase]) -> EvaluationReport:
+    return EvaluationReport(name='test', cases=cases)
+
+## tests/graph/beta/test_broadcast_and_spread.py
+
+class CounterState:
+    values: list[int] = field(default_factory=list[int])
+
+## tests/graph/beta/test_decisions.py
+
+class DecisionState:
+    path_taken: str | None = None
+    value: int = 0
+
+## tests/graph/beta/test_graph_builder.py
+
+class SimpleState:
+    counter: int = 0
+    result: str | None = None
+
+## tests/graph/beta/test_graph_edge_cases.py
+
+class MyState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_iteration.py
+
+class IterState:
+    counter: int = 0
+
+## tests/graph/test_mermaid.py
+
+class Foo(BaseNode):
+    async def run(self, ctx: GraphRunContext) -> Bar:
+        return Bar()
+
+## tests/models/mock_openai.py
+
+    def create_mock(cls, completions: MockChatCompletion | Sequence[MockChatCompletion]) -> AsyncOpenAI:
+        return cast(AsyncOpenAI, cls(completions=completions))
+
+## tests/models/test_anthropic.py
+
+    def create_mock(cls, messages_: MockAnthropicMessage | Sequence[MockAnthropicMessage]) -> AsyncAnthropic:
+        return cast(AsyncAnthropic, cls(messages_=messages_))
+
+## tests/models/test_groq.py
+
+def text_chunk(text: str, finish_reason: FinishReason | None = None) -> chat.ChatCompletionChunk:
+    return chunk([ChoiceDelta(content=text, role='assistant')], finish_reason=finish_reason)
+
+## tests/models/test_mistral.py
+
+    def create_mock(cls, completions: MockChatCompletion | Sequence[MockChatCompletion]) -> Mistral:
+        return cast(Mistral, cls(completions=completions))
+
+## tests/test_mcp.py
+
+def agent(model: Model, mcp_server: MCPServerStdio) -> Agent:
+    return Agent(model, toolsets=[mcp_server])

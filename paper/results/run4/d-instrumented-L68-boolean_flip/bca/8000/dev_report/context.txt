@@ -1,0 +1,786 @@
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+def check_allow_model_requests() -> None:
+    """Check if model requests are allowed.
+
+    If you're defining your own models that have costs or latency associated with their use, you should call this in
+    [`Model.request`][pydantic_ai.models.Model.request] and [`Model.request_stream`][pydantic_ai.models.Model.request_stream].
+
+    Raises:
+        RuntimeError: If model requests are not allowed.
+    """
+    if not ALLOW_MODEL_REQUESTS:
+        raise RuntimeError('Model requests are not allowed, since ALLOW_MODEL_REQUESTS is False')
+
+## pydantic_ai_slim/pydantic_ai/models/function.py
+
+class DeltaToolCall:
+    """Incremental change to a tool call.
+
+    Used to describe a chunk when streaming structured responses.
+    """
+
+    name: str | None = None
+    """Incremental change to the name of the tool."""
+
+    json_args: str | None = None
+    """Incremental change to the arguments as JSON"""
+
+    _: KW_ONLY
+
+    tool_call_id: str | None = None
+    """Incremental change to the tool call ID."""
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class TestModel(Model):
+    """A model specifically for testing purposes.
+
+    This will (by default) call all tools in the agent, then return a tool response if possible,
+    otherwise a plain response.
+
+    How useful this model is will vary significantly.
+
+    Apart from `__init__` derived by the `dataclass` decorator, all methods are private or match those
+    of the base class.
+    """
+
+    # NOTE: Avoid test discovery by pytest.
+    __test__ = False
+
+    call_tools: list[str] | Literal['all'] = 'all'
+    """List of tools to call. If `'all'`, all tools will be called."""
+    custom_output_text: str | None = None
+    """If set, this text is returned as the final output."""
+    custom_output_args: Any | None = None
+    """If set, these args will be passed to the output tool."""
+    seed: int = 0
+    """Seed for generating random data."""
+    last_model_request_parameters: ModelRequestParameters | None = field(default=None, init=False)
+    """The last ModelRequestParameters passed to the model in a request.
+
+    The ModelRequestParameters contains information about the function and output tools available during request handling.
+
+    This is set when a request is made, so will reflect the function tools from the last step of the last run.
+    """
+    _model_name: str = field(default='test', repr=False)
+    _system: str = field(default='test', repr=False)
+
+    def __init__(
+        self,
+        *,
+        call_tools: list[str] | Literal['all'] = 'all',
+        custom_output_text: str | None = None,
+        custom_output_args: Any | None = None,
+        seed: int = 0,
+        model_name: str = 'test',
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize TestModel with optional settings and profile."""
+        self.call_tools = call_tools
+        self.custom_output_text = custom_output_text
+        self.custom_output_args = custom_output_args
+        self.seed = seed
+        self.last_model_request_parameters = None
+        self._model_name = model_name
+        self._system = 'test'
+        super().__init__(settings=settings, profile=profile)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        model_response.usage = _estimate_usage([*messages, model_response])
+        return model_response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        yield TestStreamedResponse(
+            model_request_parameters=model_request_parameters,
+            _model_name=self._model_name,
+            _structured_response=model_response,
+            _messages=messages,
+            _provider_name=self._system,
+        )
+
+    @property
+    def model_name(self) -> str:
+        """The model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The model provider."""
+        return self._system
+
+    @classmethod
+    def supported_builtin_tools(cls) -> frozenset[type[AbstractBuiltinTool]]:
+        """TestModel supports all builtin tools for testing flexibility."""
+        return SUPPORTED_BUILTIN_TOOLS
+
+    def gen_tool_args(self, tool_def: ToolDefinition) -> Any:
+        return _JsonSchemaTestData(tool_def.parameters_json_schema, self.seed).generate()
+
+    def _get_tool_calls(self, model_request_parameters: ModelRequestParameters) -> list[tuple[str, ToolDefinition]]:
+        if self.call_tools == 'all':
+            return [(r.name, r) for r in model_request_parameters.function_tools]
+        else:
+            function_tools_lookup = {t.name: t for t in model_request_parameters.function_tools}
+            tools_to_call = (function_tools_lookup[name] for name in self.call_tools)
+            return [(r.name, r) for r in tools_to_call]
+
+    def _get_output(self, model_request_parameters: ModelRequestParameters) -> _WrappedTextOutput | _WrappedToolOutput:
+        if self.custom_output_text is not None:
+            assert model_request_parameters.output_mode != 'tool', (
+                'Plain response not allowed, but `custom_output_text` is set.'
+            )
+            assert self.custom_output_args is None, 'Cannot set both `custom_output_text` and `custom_output_args`.'
+            return _WrappedTextOutput(self.custom_output_text)
+        elif self.custom_output_args is not None:
+            assert model_request_parameters.output_tools is not None, (
+                'No output tools provided, but `custom_output_args` is set.'
+            )
+            output_tool = model_request_parameters.output_tools[0]
+
+            if k := output_tool.outer_typed_dict_key:
+                return _WrappedToolOutput({k: self.custom_output_args})
+            else:
+                return _WrappedToolOutput(self.custom_output_args)
+        elif model_request_parameters.allow_text_output:
+            return _WrappedTextOutput(None)
+        elif model_request_parameters.output_tools:
+            return _WrappedToolOutput(None)
+        else:
+            return _WrappedTextOutput(None)
+
+    def _request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        if model_request_parameters.builtin_tools:
+            raise UserError('TestModel does not support built-in tools')
+
+        tool_calls = self._get_tool_calls(model_request_parameters)
+        output_wrapper = self._get_output(model_request_parameters)
+        output_tools = model_request_parameters.output_tools
+
+        # if there are tools, the first thing we want to do is call all of them
+        if tool_calls and not any(isinstance(m, ModelResponse) for m in messages):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(name, self.gen_tool_args(args), tool_call_id=f'pyd_ai_tool_call_id__{name}')
+                    for name, args in tool_calls
+                ],
+                model_name=self._model_name,
+            )
+
+        if messages:  # pragma: no branch
+            last_message = messages[-1]
+            assert isinstance(last_message, ModelRequest), 'Expected last message to be a `ModelRequest`.'
+
+            # check if there are any retry prompts, if so retry them
+            new_retry_names = {p.tool_name for p in last_message.parts if isinstance(p, RetryPromptPart)}
+            if new_retry_names:
+                # Handle retries for both function tools and output tools
+                # Check function tools first
+                retry_parts: list[ModelResponsePart] = [
+                    ToolCallPart(name, self.gen_tool_args(args)) for name, args in tool_calls if name in new_retry_names
+                ]
+                # Check output tools
+                if output_tools:
+                    retry_parts.extend(
+                        [
+                            ToolCallPart(
+                                tool.name,
+                                output_wrapper.value
+                                if isinstance(output_wrapper, _WrappedToolOutput) and output_wrapper.value is not None
+                                else self.gen_tool_args(tool),
+                                tool_call_id=f'pyd_ai_tool_call_id__{tool.name}',
+                            )
+                            for tool in output_tools
+                            if tool.name in new_retry_names
+                        ]
+                    )
+                return ModelResponse(parts=retry_parts, model_name=self._model_name)
+
+        if isinstance(output_wrapper, _WrappedTextOutput):
+            if (response_text := output_wrapper.value) is None:
+                # build up details of tool responses
+                output: dict[str, Any] = {}
+                for message in messages:
+                    if isinstance(message, ModelRequest):
+                        for part in message.parts:
+                            if isinstance(part, ToolReturnPart):
+                                output[part.tool_name] = part.content
+                if output:
+                    return ModelResponse(
+                        parts=[TextPart(pydantic_core.to_json(output).decode())], model_name=self._model_name
+                    )
+                else:
+                    return ModelResponse(parts=[TextPart('success (no tool calls)')], model_name=self._model_name)
+            else:
+                return ModelResponse(parts=[TextPart(response_text)], model_name=self._model_name)
+        else:
+            assert output_tools, 'No output tools provided'
+            custom_output_args = output_wrapper.value
+            output_tool = output_tools[self.seed % len(output_tools)]
+            if custom_output_args is not None:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            custom_output_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+            else:
+                response_args = self.gen_tool_args(output_tool)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            response_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_model_retry(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    model = BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+    agent = Agent(
+        model=model, instructions='You are a helpful chatbot.', model_settings={'temperature': 0.0}, retries=2
+    )
+
+    @agent.tool_plain
+    async def get_capital(country: str) -> str:
+        """Get the capital of a country.
+
+        Args:
+            country: The country name.
+        """
+        raise ModelRetry('The country is not supported.')
+
+    result = await agent.run('What is the capital of France?')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='What is the capital of France?',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                instructions='You are a helpful chatbot.',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content='<thinking> To determine the capital of France, I can use the provided tool that returns the capital of a given country. Since the country in question is France, I will use the tool with the country parameter set to "France". </thinking>\n'
+                    ),
+                    ToolCallPart(
+                        tool_name='get_capital',
+                        args={'country': 'France'},
+                        tool_call_id=IsStr(),
+                    ),
+                ],
+                usage=RequestUsage(input_tokens=426, output_tokens=66),
+                model_name='us.amazon.nova-micro-v1:0',
+                timestamp=IsDatetime(),
+                provider_name='bedrock',
+                provider_url='https://bedrock-runtime.us-east-1.amazonaws.com',
+                provider_details={'finish_reason': 'tool_use'},
+                finish_reason='tool_call',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='The country is not supported.',
+                        tool_name='get_capital',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                instructions='You are a helpful chatbot.',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content="""\
+<thinking> It appears that there was an error in retrieving the capital of France as the tool indicated that the country is not supported. Since the tool is not able to provide the requested information, I will respond to the User with the information I have access to. </thinking> \n\
+
+The capital of France is Paris. If you need any further information, feel free to ask!\
+"""
+                    )
+                ],
+                usage=RequestUsage(input_tokens=531, output_tokens=76),
+                model_name='us.amazon.nova-micro-v1:0',
+                timestamp=IsDatetime(),
+                provider_name='bedrock',
+                provider_url='https://bedrock-runtime.us-east-1.amazonaws.com',
+                provider_details={'finish_reason': 'end_turn'},
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_openai.py
+
+async def test_openai_auto_mode_reasoning_field_different_provider_uses_tags(allow_model_requests: None):
+    """Test that auto mode falls back to tags when provider_name doesn't match."""
+    # This test verifies behavior by checking that when thinking comes from a different provider, auto mode falls back to tags.
+    c1 = completion_message(ChatCompletionMessage.model_construct(content='response2', role='assistant'))
+    m = OpenAIChatModel(
+        'foobar',
+        provider=OpenAIProvider(openai_client=MockOpenAI.create_mock(c1)),
+        profile=OpenAIModelProfile(
+            openai_chat_thinking_field='reasoning_content',
+            openai_chat_send_back_thinking_parts='auto',
+        ),
+    )
+
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='question')]),
+        ModelResponse(
+            parts=[
+                ThinkingPart(
+                    content='reasoning from different provider',
+                    id='reasoning_content',
+                    provider_name='different-provider',
+                ),
+            ]
+        ),
+    ]
+
+    settings = ModelSettings()
+    params = ModelRequestParameters()
+    await m.request(messages=messages, model_settings=settings, model_request_parameters=params)
+
+    mapped = m._map_model_response(messages[1])  # type: ignore[reportPrivateUsage]
+    assert mapped == snapshot(
+        {
+            'role': 'assistant',
+            'content': """<think>
+reasoning from different provider
+</think>""",
+        }
+    )
+
+## tests/models/test_xai.py
+
+async def test_xai_request_tool_call(allow_model_requests: None, xai_provider: XaiProvider):
+    """Test tool call with retry."""
+    m = XaiModel(XAI_REASONING_MODEL, provider=xai_provider)
+    agent = Agent(m)
+
+    @agent.tool_plain
+    async def get_location(loc_name: str) -> str:
+        if loc_name == 'London':
+            return json.dumps({'lat': 51, 'lng': 0})
+        else:
+            raise ModelRetry('Wrong location, I only know about "London".')
+
+    result = await agent.run('What is the location of Lodon and London?')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='What is the location of Lodon and London?', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name='get_location', args='{"loc_name":"Lodon"}', tool_call_id=IsStr()),
+                    ToolCallPart(tool_name='get_location', args='{"loc_name":"London"}', tool_call_id=IsStr()),
+                ],
+                usage=RequestUsage(
+                    input_tokens=351, output_tokens=53, details={'reasoning_tokens': 223, 'cache_read_tokens': 148}
+                ),
+                model_name='grok-4-fast-reasoning',
+                timestamp=IsDatetime(),
+                provider_name='xai',
+                provider_url='https://api.x.ai/v1',
+                provider_response_id=IsStr(),
+                finish_reason='tool_call',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Wrong location, I only know about "London".',
+                        tool_name='get_location',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    ),
+                    ToolReturnPart(
+                        tool_name='get_location',
+                        content='{"lat": 51, "lng": 0}',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content='Lodon appears to be a misspelling or non-standard variant of "London," which doesn\'t correspond to a known location based on available data. London (the capital of England and the United Kingdom) is located at approximately 51° N latitude and 0° W longitude, in southeastern England along the River Thames.'
+                    )
+                ],
+                usage=RequestUsage(
+                    input_tokens=670, output_tokens=63, details={'reasoning_tokens': 83, 'cache_read_tokens': 601}
+                ),
+                model_name='grok-4-fast-reasoning',
+                timestamp=IsDatetime(),
+                provider_name='xai',
+                provider_url='https://api.x.ai/v1',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.usage() == snapshot(
+        RunUsage(
+            requests=2,
+            input_tokens=1021,
+            details={'reasoning_tokens': 306, 'cache_read_tokens': 749},
+            output_tokens=116,
+            tool_calls=1,
+        )
+    )
+
+async def test_xai_builtin_tool_without_tool_call_id(allow_model_requests: None):
+    """Test that BuiltinToolCallPart without tool_call_id returns None."""
+    # Create a response for the call
+    response = create_response(content='Done')
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m, builtin_tools=[CodeExecutionTool()])
+
+    # Manually construct message history with BuiltinToolCallPart that has empty tool_call_id
+    # This directly tests the case when tool_call_id is empty
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Run code')]),
+        ModelResponse(
+            parts=[
+                BuiltinToolCallPart(
+                    tool_name='code_execution',
+                    args={},
+                    tool_call_id='',  # Empty - should be skipped
+                    provider_name='xai',
+                ),
+                TextPart(content='Code ran'),
+            ],
+            model_name=XAI_NON_REASONING_MODEL,
+        ),
+    ]
+
+    result = await agent.run('What happened?', message_history=message_history)
+
+    # Verify kwargs - the builtin tool call with empty id is skipped
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'Run code'}], 'role': 'ROLE_USER'},
+                    # BuiltinToolCallPart with empty tool_call_id is skipped
+                    {'content': [{'text': 'Code ran'}], 'role': 'ROLE_ASSISTANT'},
+                    {'content': [{'text': 'What happened?'}], 'role': 'ROLE_USER'},
+                ],
+                'tools': [{'code_execution': {}}],
+                'tool_choice': 'auto',
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+        ]
+    )
+
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(parts=[UserPromptPart(content='Run code', timestamp=IsDatetime())]),
+            ModelResponse(
+                parts=[
+                    BuiltinToolCallPart(tool_name='code_execution', args={}, tool_call_id='', provider_name='xai'),
+                    TextPart(content='Code ran'),
+                ],
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='What happened?', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Done')],
+                usage=RequestUsage(),
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_url='https://api.x.ai/v1',
+                provider_name='xai',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_direct.py
+
+async def test_model_request():
+    model_response = await model_request('test', [ModelRequest.user_text_prompt('x')])
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[TextPart(content='success (no tool calls)')],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=4),
+        )
+    )
+
+async def test_model_request_tool_call():
+    model_response = await model_request(
+        'test',
+        [ModelRequest.user_text_prompt('x')],
+        model_request_parameters=ModelRequestParameters(
+            function_tools=[ToolDefinition(name='tool_name', parameters_json_schema={'type': 'object'})],
+            allow_text_output=False,
+        ),
+    )
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[ToolCallPart(tool_name='tool_name', args={}, tool_call_id=IsStr(regex='pyd_ai_.*'))],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=2),
+        )
+    )
+
+def test_model_request_sync():
+    model_response = model_request_sync('test', [ModelRequest.user_text_prompt('x')])
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[TextPart(content='success (no tool calls)')],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=4),
+        )
+    )
+
+def test_model_request_stream_sync():
+    with model_request_stream_sync('test', [ModelRequest.user_text_prompt('x')]) as stream:
+        chunks = list(stream)
+        assert chunks == snapshot(
+            [
+                PartStartEvent(index=0, part=TextPart(content='')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='success ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='(no ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='tool ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='calls)')),
+                PartEndEvent(index=0, part=TextPart(content='success (no tool calls)')),
+            ]
+        )
+        assert stream.response == snapshot(
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=51, output_tokens=4),
+                model_name='test',
+                timestamp=IsDatetime(),
+                provider_name='test',
+            )
+        )
+
+        repr_str = repr(stream)
+        assert 'TestStreamedResponse' in repr_str
+        assert 'test' in repr_str
+
+async def test_model_request_stream():
+    async with model_request_stream('test', [ModelRequest.user_text_prompt('x')]) as stream:
+        chunks = [chunk async for chunk in stream]
+    assert chunks == snapshot(
+        [
+            PartStartEvent(index=0, part=TextPart(content='')),
+            FinalResultEvent(tool_name=None, tool_call_id=None),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='success ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='(no ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='tool ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='calls)')),
+            PartEndEvent(index=0, part=TextPart(content='success (no tool calls)')),
+        ]
+    )
+
+def test_model_request_stream_sync_without_context_manager():
+    """Test that accessing properties or iterating without context manager raises RuntimeError."""
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('x')]
+
+    expected_error_msg = re.escape(
+        'StreamedResponseSync must be used as a context manager. Use: `with model_request_stream_sync(...) as stream:`'
+    )
+
+    stream_cm = model_request_stream_sync('test', messages)
+
+    stream_repr = repr(stream_cm)
+    assert 'StreamedResponseSync' in stream_repr
+    assert 'context_entered=False' in stream_repr
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        _ = stream_cm.model_name
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        _ = stream_cm.timestamp
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        stream_cm.get()
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        stream_cm.usage()
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        list(stream_cm)
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        for _ in stream_cm:
+            break  # pragma: no cover
+
+def test_model_request_stream_sync_exception_in_stream():
+    """Test handling of exceptions raised during streaming."""
+    async_stream_mock = AsyncMock()
+    async_stream_mock.__aenter__ = AsyncMock(side_effect=ValueError('Stream error'))
+
+    stream_sync = StreamedResponseSync(_async_stream_cm=async_stream_mock)
+
+    with stream_sync:
+        with pytest.raises(ValueError, match='Stream error'):
+            list(stream_sync)
+
+def test_model_request_stream_sync_timeout():
+    """Test timeout when stream fails to initialize."""
+    async_stream_mock = AsyncMock()
+
+    async def slow_init():
+        await asyncio.sleep(0.1)
+
+    async_stream_mock.__aenter__ = AsyncMock(side_effect=slow_init)
+
+    stream_sync = StreamedResponseSync(_async_stream_cm=async_stream_mock)
+
+    with patch('pydantic_ai.direct.STREAM_INITIALIZATION_TIMEOUT', 0.01):
+        with stream_sync:
+            with pytest.raises(RuntimeError, match='Stream failed to initialize within timeout'):
+                stream_sync.get()
+
+def test_model_request_stream_sync_intermediate_get():
+    """Test getting properties of StreamedResponse before consuming all events."""
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('x')]
+
+    with model_request_stream_sync('test', messages) as stream:
+        response = stream.get()
+        assert response is not None
+
+        usage = stream.usage()
+        assert usage is not None
+
+def set_instrument_default(value: bool):
+    """Context manager to temporarily set the default instrumentation value."""
+    initial_value = Agent._instrument_default  # pyright: ignore[reportPrivateUsage]
+    try:
+        Agent._instrument_default = value  # pyright: ignore[reportPrivateUsage]
+        yield
+    finally:
+        Agent._instrument_default = initial_value  # pyright: ignore[reportPrivateUsage]
+
+## tests/test_streaming.py
+
+async def test_get_output_after_stream_output():
+    """Verify that we don't get duplicate messages in history when using tool output and `get_output` is called after `stream_output`."""
+    m = TestModel()
+
+    agent = Agent(m, output_type=bool)
+
+    async with agent.run_stream('Hello') as result:
+        outputs: list[bool] = []
+        async for o in result.stream_output():
+            outputs.append(o)
+        o = await result.get_output()
+        outputs.append(o)
+
+    assert outputs == snapshot([False, False, False])
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Hello',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args={'response': False},
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=51),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )

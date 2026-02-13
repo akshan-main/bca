@@ -1,0 +1,942 @@
+## examples/pydantic_ai_examples/question_graph.py
+
+from pydantic_graph import (
+    BaseNode,
+    End,
+    Graph,
+    GraphRunContext,
+)
+
+class Ask(BaseNode[QuestionState]):
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_model.py
+
+from pydantic_ai.models.wrapper import WrapperModel
+
+## pydantic_ai_slim/pydantic_ai/models/instrumented.py
+
+class InstrumentationSettings:
+    """Options for instrumenting models and agents with OpenTelemetry.
+
+    Used in:
+
+    - `Agent(instrument=...)`
+    - [`Agent.instrument_all()`][pydantic_ai.agent.Agent.instrument_all]
+    - [`InstrumentedModel`][pydantic_ai.models.instrumented.InstrumentedModel]
+
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    tracer: Tracer = field(repr=False)
+    logger: Logger = field(repr=False)
+    event_mode: Literal['attributes', 'logs'] = 'attributes'
+    include_binary_content: bool = True
+    include_content: bool = True
+    version: Literal[1, 2, 3] = DEFAULT_INSTRUMENTATION_VERSION
+
+    def __init__(
+        self,
+        *,
+        tracer_provider: TracerProvider | None = None,
+        meter_provider: MeterProvider | None = None,
+        include_binary_content: bool = True,
+        include_content: bool = True,
+        version: Literal[1, 2, 3] = DEFAULT_INSTRUMENTATION_VERSION,
+        event_mode: Literal['attributes', 'logs'] = 'attributes',
+        logger_provider: LoggerProvider | None = None,
+    ):
+        """Create instrumentation options.
+
+        Args:
+            tracer_provider: The OpenTelemetry tracer provider to use.
+                If not provided, the global tracer provider is used.
+                Calling `logfire.configure()` sets the global tracer provider, so most users don't need this.
+            meter_provider: The OpenTelemetry meter provider to use.
+                If not provided, the global meter provider is used.
+                Calling `logfire.configure()` sets the global meter provider, so most users don't need this.
+            include_binary_content: Whether to include binary content in the instrumentation events.
+            include_content: Whether to include prompts, completions, and tool call arguments and responses
+                in the instrumentation events.
+            version: Version of the data format. This is unrelated to the Pydantic AI package version.
+                Version 1 is based on the legacy event-based OpenTelemetry GenAI spec
+                    and will be removed in a future release.
+                    The parameters `event_mode` and `logger_provider` are only relevant for version 1.
+                Version 2 uses the newer OpenTelemetry GenAI spec and stores messages in the following attributes:
+                    - `gen_ai.system_instructions` for instructions passed to the agent.
+                    - `gen_ai.input.messages` and `gen_ai.output.messages` on model request spans.
+                    - `pydantic_ai.all_messages` on agent run spans.
+            event_mode: The mode for emitting events in version 1.
+                If `'attributes'`, events are attached to the span as attributes.
+                If `'logs'`, events are emitted as OpenTelemetry log-based events.
+            logger_provider: The OpenTelemetry logger provider to use.
+                If not provided, the global logger provider is used.
+                Calling `logfire.configure()` sets the global logger provider, so most users don't need this.
+                This is only used if `event_mode='logs'` and `version=1`.
+        """
+        from pydantic_ai import __version__
+
+        tracer_provider = tracer_provider or get_tracer_provider()
+        meter_provider = meter_provider or get_meter_provider()
+        logger_provider = logger_provider or get_logger_provider()
+        scope_name = 'pydantic-ai'
+        self.tracer = tracer_provider.get_tracer(scope_name, __version__)
+        self.meter = meter_provider.get_meter(scope_name, __version__)
+        self.logger = logger_provider.get_logger(scope_name, __version__)
+        self.event_mode = event_mode
+        self.include_binary_content = include_binary_content
+        self.include_content = include_content
+
+        if event_mode == 'logs' and version != 1:
+            warnings.warn(
+                'event_mode is only relevant for version=1 which is deprecated and will be removed in a future release.',
+                stacklevel=2,
+            )
+            version = 1
+
+        self.version = version
+
+        # As specified in the OpenTelemetry GenAI metrics spec:
+        # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/#metric-gen_aiclienttokenusage
+        tokens_histogram_kwargs = dict(
+            name='gen_ai.client.token.usage',
+            unit='{token}',
+            description='Measures number of input and output tokens used',
+        )
+        try:
+            self.tokens_histogram = self.meter.create_histogram(
+                **tokens_histogram_kwargs,
+                explicit_bucket_boundaries_advisory=TOKEN_HISTOGRAM_BOUNDARIES,
+            )
+        except TypeError:  # pragma: lax no cover
+            # Older OTel/logfire versions don't support explicit_bucket_boundaries_advisory
+            self.tokens_histogram = self.meter.create_histogram(
+                **tokens_histogram_kwargs,  # pyright: ignore
+            )
+        self.cost_histogram = self.meter.create_histogram(
+            'operation.cost',
+            unit='{USD}',
+            description='Monetary cost',
+        )
+
+    def messages_to_otel_events(
+        self, messages: list[ModelMessage], parameters: ModelRequestParameters | None = None
+    ) -> list[LogRecord]:
+        """Convert a list of model messages to OpenTelemetry events.
+
+        Args:
+            messages: The messages to convert.
+            parameters: The model request parameters.
+
+        Returns:
+            A list of OpenTelemetry events.
+        """
+        events: list[LogRecord] = []
+        instructions = InstrumentedModel._get_instructions(messages, parameters)  # pyright: ignore [reportPrivateUsage]
+        if instructions is not None:
+            events.append(
+                LogRecord(
+                    attributes={'event.name': 'gen_ai.system.message'},
+                    body={**({'content': instructions} if self.include_content else {}), 'role': 'system'},
+                )
+            )
+
+        for message_index, message in enumerate(messages):
+            message_events: list[LogRecord] = []
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if hasattr(part, 'otel_event'):
+                        message_events.append(part.otel_event(self))
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                message_events = message.otel_events(self)
+            for event in message_events:
+                event.attributes = {
+                    'gen_ai.message.index': message_index,
+                    **(event.attributes or {}),
+                }
+            events.extend(message_events)
+
+        for event in events:
+            event.body = InstrumentedModel.serialize_any(event.body)
+        return events
+
+    def messages_to_otel_messages(self, messages: list[ModelMessage]) -> list[_otel_messages.ChatMessage]:
+        result: list[_otel_messages.ChatMessage] = []
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for is_system, group in itertools.groupby(message.parts, key=lambda p: isinstance(p, SystemPromptPart)):
+                    message_parts: list[_otel_messages.MessagePart] = []
+                    for part in group:
+                        if hasattr(part, 'otel_message_parts'):
+                            message_parts.extend(part.otel_message_parts(self))
+
+                    result.append(
+                        _otel_messages.ChatMessage(role='system' if is_system else 'user', parts=message_parts)
+                    )
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                otel_message = _otel_messages.OutputMessage(role='assistant', parts=message.otel_message_parts(self))
+                if message.finish_reason is not None:
+                    otel_message['finish_reason'] = message.finish_reason
+                result.append(otel_message)
+        return result
+
+    def handle_messages(
+        self,
+        input_messages: list[ModelMessage],
+        response: ModelResponse,
+        system: str,
+        span: Span,
+        parameters: ModelRequestParameters | None = None,
+    ):
+        if self.version == 1:
+            events = self.messages_to_otel_events(input_messages, parameters)
+            for event in self.messages_to_otel_events([response], parameters):
+                events.append(
+                    LogRecord(
+                        attributes={'event.name': 'gen_ai.choice'},
+                        body={
+                            'index': 0,
+                            'message': event.body,
+                        },
+                    )
+                )
+            for event in events:
+                event.attributes = {
+                    GEN_AI_SYSTEM_ATTRIBUTE: system,
+                    **(event.attributes or {}),
+                }
+            self._emit_events(span, events)
+        else:
+            output_messages = self.messages_to_otel_messages([response])
+            assert len(output_messages) == 1
+            output_message = output_messages[0]
+
+            instructions = InstrumentedModel._get_instructions(input_messages, parameters)  # pyright: ignore [reportPrivateUsage]
+            system_instructions_attributes = self.system_instructions_attributes(instructions)
+
+            attributes: dict[str, AttributeValue] = {
+                'gen_ai.input.messages': json.dumps(self.messages_to_otel_messages(input_messages)),
+                'gen_ai.output.messages': json.dumps([output_message]),
+                **system_instructions_attributes,
+                'logfire.json_schema': json.dumps(
+                    {
+                        'type': 'object',
+                        'properties': {
+                            'gen_ai.input.messages': {'type': 'array'},
+                            'gen_ai.output.messages': {'type': 'array'},
+                            **(
+                                {'gen_ai.system_instructions': {'type': 'array'}}
+                                if system_instructions_attributes
+                                else {}
+                            ),
+                            'model_request_parameters': {'type': 'object'},
+                        },
+                    }
+                ),
+            }
+            span.set_attributes(attributes)
+
+    def system_instructions_attributes(self, instructions: str | None) -> dict[str, str]:
+        if instructions and self.include_content:
+            return {
+                'gen_ai.system_instructions': json.dumps([_otel_messages.TextPart(type='text', content=instructions)]),
+            }
+        return {}
+
+    def _emit_events(self, span: Span, events: list[LogRecord]) -> None:
+        if self.event_mode == 'logs':
+            for event in events:
+                self.logger.emit(event)
+        else:
+            attr_name = 'events'
+            span.set_attributes(
+                {
+                    attr_name: json.dumps([InstrumentedModel.event_to_dict(event) for event in events]),
+                    'logfire.json_schema': json.dumps(
+                        {
+                            'type': 'object',
+                            'properties': {
+                                attr_name: {'type': 'array'},
+                                'model_request_parameters': {'type': 'object'},
+                            },
+                        }
+                    ),
+                }
+            )
+
+    def record_metrics(
+        self,
+        response: ModelResponse,
+        price_calculation: PriceCalculation | None,
+        attributes: dict[str, AttributeValue],
+    ):
+        for typ in ['input', 'output']:
+            if not (tokens := getattr(response.usage, f'{typ}_tokens', 0)):  # pragma: no cover
+                continue
+            token_attributes = {**attributes, 'gen_ai.token.type': typ}
+            self.tokens_histogram.record(tokens, token_attributes)
+            if price_calculation:
+                cost = float(getattr(price_calculation, f'{typ}_price'))
+                self.cost_histogram.record(cost, token_attributes)
+
+    def messages_to_otel_events(
+        self, messages: list[ModelMessage], parameters: ModelRequestParameters | None = None
+    ) -> list[LogRecord]:
+        """Convert a list of model messages to OpenTelemetry events.
+
+        Args:
+            messages: The messages to convert.
+            parameters: The model request parameters.
+
+        Returns:
+            A list of OpenTelemetry events.
+        """
+        events: list[LogRecord] = []
+        instructions = InstrumentedModel._get_instructions(messages, parameters)  # pyright: ignore [reportPrivateUsage]
+        if instructions is not None:
+            events.append(
+                LogRecord(
+                    attributes={'event.name': 'gen_ai.system.message'},
+                    body={**({'content': instructions} if self.include_content else {}), 'role': 'system'},
+                )
+            )
+
+        for message_index, message in enumerate(messages):
+            message_events: list[LogRecord] = []
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if hasattr(part, 'otel_event'):
+                        message_events.append(part.otel_event(self))
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                message_events = message.otel_events(self)
+            for event in message_events:
+                event.attributes = {
+                    'gen_ai.message.index': message_index,
+                    **(event.attributes or {}),
+                }
+            events.extend(message_events)
+
+        for event in events:
+            event.body = InstrumentedModel.serialize_any(event.body)
+        return events
+
+    def messages_to_otel_messages(self, messages: list[ModelMessage]) -> list[_otel_messages.ChatMessage]:
+        result: list[_otel_messages.ChatMessage] = []
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for is_system, group in itertools.groupby(message.parts, key=lambda p: isinstance(p, SystemPromptPart)):
+                    message_parts: list[_otel_messages.MessagePart] = []
+                    for part in group:
+                        if hasattr(part, 'otel_message_parts'):
+                            message_parts.extend(part.otel_message_parts(self))
+
+                    result.append(
+                        _otel_messages.ChatMessage(role='system' if is_system else 'user', parts=message_parts)
+                    )
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                otel_message = _otel_messages.OutputMessage(role='assistant', parts=message.otel_message_parts(self))
+                if message.finish_reason is not None:
+                    otel_message['finish_reason'] = message.finish_reason
+                result.append(otel_message)
+        return result
+
+    def event_to_dict(event: LogRecord) -> dict[str, Any]:
+        if not event.body:
+            body = {}  # pragma: no cover
+        elif isinstance(event.body, Mapping):
+            body = event.body
+        else:
+            body = {'body': event.body}
+        return {**body, **(event.attributes or {})}
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    retry_error_cls: type[RetryError]
+
+## pydantic_ai_slim/pydantic_ai/tools.py
+
+class Tool(Generic[ToolAgentDepsT]):
+    """A tool function for an agent."""
+
+    function: ToolFuncEither[ToolAgentDepsT]
+    takes_ctx: bool
+    max_retries: int | None
+    name: str
+    description: str | None
+    prepare: ToolPrepareFunc[ToolAgentDepsT] | None
+    docstring_format: DocstringFormat
+    require_parameter_descriptions: bool
+    strict: bool | None
+    sequential: bool
+    requires_approval: bool
+    metadata: dict[str, Any] | None
+    timeout: float | None
+    function_schema: _function_schema.FunctionSchema
+    """
+    The base JSON schema for the tool's parameters.
+
+    This schema may be modified by the `prepare` function or by the Model class prior to including it in an API request.
+    """
+
+    def __init__(
+        self,
+        function: ToolFuncEither[ToolAgentDepsT],
+        *,
+        takes_ctx: bool | None = None,
+        max_retries: int | None = None,
+        name: str | None = None,
+        description: str | None = None,
+        prepare: ToolPrepareFunc[ToolAgentDepsT] | None = None,
+        docstring_format: DocstringFormat = 'auto',
+        require_parameter_descriptions: bool = False,
+        schema_generator: type[GenerateJsonSchema] = GenerateToolJsonSchema,
+        strict: bool | None = None,
+        sequential: bool = False,
+        requires_approval: bool = False,
+        metadata: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        function_schema: _function_schema.FunctionSchema | None = None,
+    ):
+        """Create a new tool instance.
+
+        Example usage:
+
+        ```python {noqa="I001"}
+        from pydantic_ai import Agent, RunContext, Tool
+
+        async def my_tool(ctx: RunContext[int], x: int, y: int) -> str:
+            return f'{ctx.deps} {x} {y}'
+
+        agent = Agent('test', tools=[Tool(my_tool)])
+        ```
+
+        or with a custom prepare method:
+
+        ```python {noqa="I001"}
+
+        from pydantic_ai import Agent, RunContext, Tool
+        from pydantic_ai.tools import ToolDefinition
+
+        async def my_tool(ctx: RunContext[int], x: int, y: int) -> str:
+            return f'{ctx.deps} {x} {y}'
+
+        async def prep_my_tool(
+            ctx: RunContext[int], tool_def: ToolDefinition
+        ) -> ToolDefinition | None:
+            # only register the tool if `deps == 42`
+            if ctx.deps == 42:
+                return tool_def
+
+        agent = Agent('test', tools=[Tool(my_tool, prepare=prep_my_tool)])
+        ```
+
+
+        Args:
+            function: The Python function to call as the tool.
+            takes_ctx: Whether the function takes a [`RunContext`][pydantic_ai.tools.RunContext] first argument,
+                this is inferred if unset.
+            max_retries: Maximum number of retries allowed for this tool, set to the agent default if `None`.
+            name: Name of the tool, inferred from the function if `None`.
+            description: Description of the tool, inferred from the function if `None`.
+            prepare: custom method to prepare the tool definition for each step, return `None` to omit this
+                tool from a given step. This is useful if you want to customise a tool at call time,
+                or omit it completely from a step. See [`ToolPrepareFunc`][pydantic_ai.tools.ToolPrepareFunc].
+            docstring_format: The format of the docstring, see [`DocstringFormat`][pydantic_ai.tools.DocstringFormat].
+                Defaults to `'auto'`, such that the format is inferred from the structure of the docstring.
+            require_parameter_descriptions: If True, raise an error if a parameter description is missing. Defaults to False.
+            schema_generator: The JSON schema generator class to use. Defaults to `GenerateToolJsonSchema`.
+            strict: Whether to enforce JSON schema compliance (only affects OpenAI).
+                See [`ToolDefinition`][pydantic_ai.tools.ToolDefinition] for more info.
+            sequential: Whether the function requires a sequential/serial execution environment. Defaults to False.
+            requires_approval: Whether this tool requires human-in-the-loop approval. Defaults to False.
+                See the [tools documentation](../deferred-tools.md#human-in-the-loop-tool-approval) for more info.
+            metadata: Optional metadata for the tool. This is not sent to the model but can be used for filtering and tool behavior customization.
+            timeout: Timeout in seconds for tool execution. If the tool takes longer, a retry prompt is returned to the model.
+                Defaults to None (no timeout).
+            function_schema: The function schema to use for the tool. If not provided, it will be generated.
+        """
+        self.function = function
+        self.function_schema = function_schema or _function_schema.function_schema(
+            function,
+            schema_generator,
+            takes_ctx=takes_ctx,
+            docstring_format=docstring_format,
+            require_parameter_descriptions=require_parameter_descriptions,
+        )
+        self.takes_ctx = self.function_schema.takes_ctx
+        self.max_retries = max_retries
+        self.name = name or function.__name__
+        self.description = description or self.function_schema.description
+        self.prepare = prepare
+        self.docstring_format = docstring_format
+        self.require_parameter_descriptions = require_parameter_descriptions
+        self.strict = strict
+        self.sequential = sequential
+        self.requires_approval = requires_approval
+        self.metadata = metadata
+        self.timeout = timeout
+
+    @classmethod
+    def from_schema(
+        cls,
+        function: Callable[..., Any],
+        name: str,
+        description: str | None,
+        json_schema: JsonSchemaValue,
+        takes_ctx: bool = False,
+        sequential: bool = False,
+    ) -> Self:
+        """Creates a Pydantic tool from a function and a JSON schema.
+
+        Args:
+            function: The function to call.
+                This will be called with keywords only, and no validation of
+                the arguments will be performed.
+            name: The unique name of the tool that clearly communicates its purpose
+            description: Used to tell the model how/when/why to use the tool.
+                You can provide few-shot examples as a part of the description.
+            json_schema: The schema for the function arguments
+            takes_ctx: An optional boolean parameter indicating whether the function
+                accepts the context object as an argument.
+            sequential: Whether the function requires a sequential/serial execution environment. Defaults to False.
+
+        Returns:
+            A Pydantic tool that calls the function
+        """
+        function_schema = _function_schema.FunctionSchema(
+            function=function,
+            description=description,
+            validator=SchemaValidator(schema=core_schema.any_schema()),
+            json_schema=json_schema,
+            takes_ctx=takes_ctx,
+            is_async=_utils.is_async_callable(function),
+        )
+
+        return cls(
+            function,
+            takes_ctx=takes_ctx,
+            name=name,
+            description=description,
+            function_schema=function_schema,
+            sequential=sequential,
+        )
+
+    @property
+    def tool_def(self):
+        return ToolDefinition(
+            name=self.name,
+            description=self.description,
+            parameters_json_schema=self.function_schema.json_schema,
+            strict=self.strict,
+            sequential=self.sequential,
+            metadata=self.metadata,
+            timeout=self.timeout,
+            kind='unapproved' if self.requires_approval else 'function',
+        )
+
+    async def prepare_tool_def(self, ctx: RunContext[ToolAgentDepsT]) -> ToolDefinition | None:
+        """Get the tool definition.
+
+        By default, this method creates a tool definition, then either returns it, or calls `self.prepare`
+        if it's set.
+
+        Returns:
+            return a `ToolDefinition` or `None` if the tools should not be registered for this run.
+        """
+        base_tool_def = self.tool_def
+
+        if self.prepare is not None:
+            return await self.prepare(ctx, base_tool_def)
+        else:
+            return base_tool_def
+
+## pydantic_ai_slim/pydantic_ai/ui/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the protocol-specific run input."""
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the Vercel AI run input."""
+        return self.load_messages(self.run_input.messages)
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py
+
+    input: Any
+
+## tests/evals/test_dataset.py
+
+def test_serialization_errors(tmp_path: Path):
+    with pytest.raises(ValueError) as exc_info:
+        Dataset[TaskInput, TaskOutput, TaskMetadata].from_file(tmp_path / 'test_cases.abc')
+
+    assert str(exc_info.value) == snapshot(
+        "Could not infer format for filename 'test_cases.abc'. Use the `fmt` argument to specify the format."
+    )
+
+## tests/evals/test_evaluators.py
+
+async def test_import_errors():
+    with pytest.raises(
+        ImportError,
+        match='The `Python` evaluator has been removed for security reasons. See https://github.com/pydantic/pydantic-ai/pull/2808 for more details and a workaround.',
+    ):
+        from pydantic_evals.evaluators import Python  # pyright: ignore[reportUnusedImport]
+
+    with pytest.raises(
+        ImportError,
+        match='The `Python` evaluator has been removed for security reasons. See https://github.com/pydantic/pydantic-ai/pull/2808 for more details and a workaround.',
+    ):
+        from pydantic_evals.evaluators.common import Python  # pyright: ignore[reportUnusedImport] # noqa: F401
+
+    with pytest.raises(
+        ImportError,
+        match="cannot import name 'Foo' from 'pydantic_evals.evaluators'",
+    ):
+        from pydantic_evals.evaluators import Foo  # pyright: ignore[reportUnusedImport]
+
+    with pytest.raises(
+        ImportError,
+        match="cannot import name 'Foo' from 'pydantic_evals.evaluators.common'",
+    ):
+        from pydantic_evals.evaluators.common import Foo  # pyright: ignore[reportUnusedImport] # noqa: F401
+
+    with pytest.raises(
+        AttributeError,
+        match="module 'pydantic_evals.evaluators' has no attribute 'Foo'",
+    ):
+        import pydantic_evals.evaluators as _evaluators
+
+        _evaluators.Foo
+
+    with pytest.raises(
+        AttributeError,
+        match="module 'pydantic_evals.evaluators.common' has no attribute 'Foo'",
+    ):
+        import pydantic_evals.evaluators.common as _common
+
+        _common.Foo
+
+## tests/graph/test_mermaid.py
+
+class Foo(BaseNode):
+    async def run(self, ctx: GraphRunContext) -> Bar:
+        return Bar()
+
+class Bar(BaseNode[None, None, None]):
+    async def run(self, ctx: GraphRunContext) -> End[None]:
+        return End(None)
+
+## tests/models/test_anthropic.py
+
+    def messages(self) -> Any:
+        return type('Messages', (), {'create': self.messages_create, 'count_tokens': self.messages_count_tokens})
+
+## tests/models/test_google.py
+
+async def test_google_api_errors_are_handled(
+    allow_model_requests: None,
+    google_provider: GoogleProvider,
+    mocker: MockerFixture,
+    error_class: Any,
+    error_response: dict[str, Any],
+    expected_status: int,
+):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    mocked_error = error_class(expected_status, error_response)
+    mocker.patch.object(model.client.aio.models, 'generate_content', side_effect=mocked_error)
+
+    agent = Agent(model=model)
+
+    with pytest.raises(ModelHTTPError) as exc_info:
+        await agent.run('This prompt will trigger the mocked error.')
+
+    assert exc_info.value.status_code == expected_status
+    assert error_response['error']['message'] in str(exc_info.value.body)
+
+## tests/models/test_instrumented.py
+
+def test_messages_to_otel_events_serialization_errors():
+    class Foo:
+        def __repr__(self):
+            return 'Foo()'
+
+    class Bar:
+        def __repr__(self):
+            raise ValueError('error!')
+
+    messages = [
+        ModelResponse(parts=[ToolCallPart('tool', {'arg': Foo()}, tool_call_id='tool_call_id')]),
+        ModelRequest(parts=[ToolReturnPart('tool', Bar(), tool_call_id='return_tool_call_id')], timestamp=IsDatetime()),
+    ]
+
+    settings = InstrumentationSettings()
+    assert [InstrumentedModel.event_to_dict(e) for e in settings.messages_to_otel_events(messages)] == [
+        {
+            'body': "{'role': 'assistant', 'tool_calls': [{'id': 'tool_call_id', 'type': 'function', 'function': {'name': 'tool', 'arguments': {'arg': Foo()}}}]}",
+            'gen_ai.message.index': 0,
+            'event.name': 'gen_ai.assistant.message',
+        },
+        {
+            'body': 'Unable to serialize: error!',
+            'gen_ai.message.index': 1,
+            'event.name': 'gen_ai.tool.message',
+        },
+    ]
+    assert settings.messages_to_otel_messages(messages) == snapshot(
+        [
+            {
+                'role': 'assistant',
+                'parts': [{'type': 'tool_call', 'id': 'tool_call_id', 'name': 'tool', 'arguments': {'arg': 'Foo()'}}],
+            },
+            {
+                'role': 'user',
+                'parts': [
+                    {
+                        'type': 'tool_call_response',
+                        'id': 'return_tool_call_id',
+                        'name': 'tool',
+                        'result': 'Unable to serialize: error!',
+                    }
+                ],
+            },
+        ]
+    )
+
+## tests/models/test_openrouter.py
+
+async def test_openrouter_errors_raised(allow_model_requests: None, openrouter_api_key: str) -> None:
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('google/gemini-2.0-flash-exp:free', provider=provider)
+    agent = Agent(model, instructions='Be helpful.', retries=1)
+    with pytest.raises(ModelHTTPError) as exc_info:
+        await agent.run('Tell me a joke.')
+    assert str(exc_info.value) == snapshot(
+        "status_code: 429, model_name: google/gemini-2.0-flash-exp:free, body: {'code': 429, 'message': 'Provider returned error', 'metadata': {'provider_name': 'Google', 'raw': 'google/gemini-2.0-flash-exp:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations'}}"
+    )
+
+## tests/test_agent.py
+
+def test_capture_run_messages_with_user_exception_does_not_contain_internal_errors() -> None:
+    """Test that user exceptions within capture_run_messages context have clean stack traces."""
+    agent = Agent('test')
+
+    try:
+        with capture_run_messages():
+            agent.run_sync('Hello')
+            raise ZeroDivisionError('division by zero')
+    except Exception as e:
+        assert e.__context__ is None
+
+async def test_run_with_deferred_tool_results_errors():
+    agent = Agent('test')
+
+    message_history: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=['Hello', 'world'])])]
+
+    with pytest.raises(
+        UserError,
+        match='Tool call results were provided, but the message history does not contain a `ModelResponse`.',
+    ):
+        await agent.run(
+            'Hello again',
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(parts=[TextPart(content='Hello to you too!')]),
+    ]
+
+    with pytest.raises(
+        UserError,
+        match='Tool call results were provided, but the message history does not contain any unprocessed tool calls.',
+    ):
+        await agent.run(
+            'Hello again',
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(parts=[ToolCallPart(tool_name='say_hello')]),
+    ]
+
+    with pytest.raises(
+        UserError, match='Cannot provide a new user prompt when the message history contains unprocessed tool calls.'
+    ):
+        await agent.run('Hello', message_history=message_history)
+
+    with pytest.raises(UserError, match='Tool call results need to be provided for all deferred tool calls.'):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(),
+        )
+
+    with pytest.raises(UserError, match='Tool call results were provided, but the message history is empty.'):
+        await agent.run(
+            'Hello again',
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(tool_name='run_me', tool_call_id='run_me'),
+                ToolCallPart(tool_name='run_me_too', tool_call_id='run_me_too'),
+                ToolCallPart(tool_name='defer_me', tool_call_id='defer_me'),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name='run_me', tool_call_id='run_me', content='Success'),
+                RetryPromptPart(tool_name='run_me_too', tool_call_id='run_me_too', content='Failure'),
+            ]
+        ),
+    ]
+
+    with pytest.raises(UserError, match="Tool call 'run_me' was already executed and its result cannot be overridden."):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(
+                calls={'run_me': 'Failure', 'defer_me': 'Failure'},
+            ),
+        )
+
+    with pytest.raises(
+        UserError, match="Tool call 'run_me_too' was already executed and its result cannot be overridden."
+    ):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(
+                calls={'run_me_too': 'Success', 'defer_me': 'Failure'},
+            ),
+        )
+
+## tests/test_exceptions.py
+
+def test_tool_retry_error_str_with_error_details():
+    """Test that ToolRetryError formats ErrorDetails automatically."""
+    validation_error = ValidationError.from_exception_data(
+        'Test', [{'type': 'string_type', 'loc': ('name',), 'input': 123}]
+    )
+    part = RetryPromptPart(content=validation_error.errors(include_url=False), tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nname\n  Input should be a valid string [type=string_type, input_value=123]"
+    )
+
+## tests/test_ui.py
+
+    def messages(self) -> list[ModelMessage]:
+        return self.load_messages(self.run_input.messages)
+
+## tests/test_vercel_ai.py
+
+async def test_adapter_dump_messages_with_retry_no_tool_name():
+    """Test dumping messages with retry prompts without tool_name (e.g., output validation errors)."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Give me a number')]),
+        ModelResponse(parts=[TextPart(content='Not a valid number')]),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content='Output validation failed: expected integer',
+                    # No tool_name - this is an output validation error, not a tool error
+                )
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Give me a number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Not a valid number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'text',
+                        'text': """\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                        'state': 'done',
+                        'provider_metadata': None,
+                    }
+                ],
+            },
+        ]
+    )
+
+    # Verify roundtrip
+    # Note: This is a lossy conversion - RetryPromptPart without tool_call_id becomes a user text message.
+    # When loaded back, it creates a UserPromptPart instead of RetryPromptPart.
+    # So we check it's value and then replace it with the original RetryPromptPart to assert equality
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    assert reloaded_messages[2] == snapshot(
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content="""\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                    timestamp=IsDatetime(),
+                )
+            ]
+        )
+    )
+    # Get original tool_call_id and replace with original RetryPromptPart
+    original_retry = messages[2].parts[0]
+    assert isinstance(original_retry, RetryPromptPart)
+    reloaded_messages[2] = ModelRequest(
+        parts=[
+            RetryPromptPart(
+                content='Output validation failed: expected integer', tool_call_id=original_retry.tool_call_id
+            )
+        ]
+    )
+    _sync_timestamps(messages, reloaded_messages)
+    assert reloaded_messages == messages

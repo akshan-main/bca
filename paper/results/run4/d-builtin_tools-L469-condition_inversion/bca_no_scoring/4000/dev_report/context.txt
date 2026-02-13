@@ -1,0 +1,457 @@
+## examples/pydantic_ai_examples/ag_ui/api/predictive_state_updates.py
+
+async def document_predict_state() -> list[CustomEvent]:
+    """Enable document state prediction.
+
+    Returns:
+        CustomEvent containing the event to enable state prediction.
+    """
+    return [
+        CustomEvent(
+            type=EventType.CUSTOM,
+            name='PredictState',
+            value=[
+                {
+                    'state_key': 'document',
+                    'tool': 'write_document',
+                    'tool_argument': 'document',
+                },
+            ],
+        ),
+    ]
+
+## pydantic_ai_slim/pydantic_ai/builtin_tools.py
+
+class AbstractBuiltinTool(ABC):
+    """A builtin tool that can be used by an agent.
+
+    This class is abstract and cannot be instantiated directly.
+
+    The builtin tools are passed to the model as part of the `ModelRequestParameters`.
+    """
+
+    kind: str = 'unknown_builtin_tool'
+    """Built-in tool identifier, this should be available on all built-in tools as a discriminator."""
+
+    @property
+    def unique_id(self) -> str:
+        """A unique identifier for the builtin tool.
+
+        If multiple instances of the same builtin tool can be passed to the model, subclasses should override this property to allow them to be distinguished.
+        """
+        return self.kind
+
+    @property
+    def label(self) -> str:
+        """Human-readable label for UI display.
+
+        Subclasses should override this to provide a meaningful label.
+        """
+        return self.kind.replace('_', ' ').title()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        BUILTIN_TOOL_TYPES[cls.kind] = cls
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, _source_type: Any, handler: pydantic.GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        if cls is not AbstractBuiltinTool:
+            return handler(cls)
+
+        tools = BUILTIN_TOOL_TYPES.values()
+        if len(tools) == 1:  # pragma: no cover
+            tools_type = next(iter(tools))
+        else:
+            tools_annotated = [Annotated[tool, pydantic.Tag(tool.kind)] for tool in tools]
+            tools_type = Annotated[Union[tuple(tools_annotated)], pydantic.Discriminator(_tool_discriminator)]  # noqa: UP007
+
+        return handler(tools_type)
+
+class WebFetchTool(AbstractBuiltinTool):
+    """Allows your agent to access contents from URLs.
+
+    The parameters that PydanticAI passes depend on the model, as some parameters may not be supported by certain models.
+
+    Supported by:
+
+    * Anthropic
+    * Google
+    """
+
+    max_uses: int | None = None
+    """If provided, the tool will stop fetching URLs after the given number of uses.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    allowed_domains: list[str] | None = None
+    """If provided, only these domains will be fetched.
+
+    With Anthropic, you can only use one of `blocked_domains` or `allowed_domains`, not both.
+
+    Supported by:
+
+    * Anthropic, see <https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-fetch-tool#domain-filtering>
+    """
+
+    blocked_domains: list[str] | None = None
+    """If provided, these domains will never be fetched.
+
+    With Anthropic, you can only use one of `blocked_domains` or `allowed_domains`, not both.
+
+    Supported by:
+
+    * Anthropic, see <https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-fetch-tool#domain-filtering>
+    """
+
+    enable_citations: bool = False
+    """If True, enables citations for fetched content.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    max_content_tokens: int | None = None
+    """Maximum content length in tokens for fetched content.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    kind: str = 'web_fetch'
+    """The kind of tool."""
+
+class UrlContextTool(WebFetchTool):
+    """Deprecated alias for WebFetchTool. Use WebFetchTool instead.
+
+    Overrides kind to 'url_context' so old serialized payloads with {"kind": "url_context", ...}
+    can be deserialized to UrlContextTool for backward compatibility.
+    """
+
+    kind: str = 'url_context'
+    """The kind of tool (deprecated value for backward compatibility)."""
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_cache_policies.py
+
+def _is_dict(obj: Any) -> TypeGuard[dict[str, Any]]:
+    return isinstance(obj, dict)
+
+## pydantic_ai_slim/pydantic_ai/output.py
+
+def StructuredDict(
+    json_schema: JsonSchemaValue, name: str | None = None, description: str | None = None
+) -> type[JsonSchemaValue]:
+    """Returns a `dict[str, Any]` subclass with a JSON schema attached that will be used for structured output.
+
+    Args:
+        json_schema: A JSON schema of type `object` defining the structure of the dictionary content.
+        name: Optional name of the structured output. If not provided, the `title` field of the JSON schema will be used if it's present.
+        description: Optional description of the structured output. If not provided, the `description` field of the JSON schema will be used if it's present.
+
+    Example:
+    ```python {title="structured_dict.py"}
+    from pydantic_ai import Agent, StructuredDict
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'name': {'type': 'string'},
+            'age': {'type': 'integer'}
+        },
+        'required': ['name', 'age']
+    }
+
+    agent = Agent('openai:gpt-5.2', output_type=StructuredDict(schema))
+    result = agent.run_sync('Create a person')
+    print(result.output)
+    #> {'name': 'John Doe', 'age': 30}
+    ```
+    """
+    json_schema = _utils.check_object_json_schema(json_schema)
+
+    # Pydantic `TypeAdapter` fails when `object.__get_pydantic_json_schema__` has `$defs`, so we inline them
+    # See https://github.com/pydantic/pydantic/issues/12145
+    if '$defs' in json_schema:
+        json_schema = InlineDefsJsonSchemaTransformer(json_schema).walk()
+        if '$defs' in json_schema:
+            raise exceptions.UserError(
+                '`StructuredDict` does not currently support recursive `$ref`s and `$defs`. See https://github.com/pydantic/pydantic/issues/12145 for more information.'
+            )
+
+    if name:
+        json_schema['title'] = name
+
+    if description:
+        json_schema['description'] = description
+
+    class _StructuredDict(JsonSchemaValue):
+        __is_model_like__ = True
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls, source_type: Any, handler: GetCoreSchemaHandler
+        ) -> core_schema.CoreSchema:
+            return core_schema.dict_schema(
+                keys_schema=core_schema.str_schema(),
+                values_schema=core_schema.any_schema(),
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, core_schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler
+        ) -> JsonSchemaValue:
+            return json_schema
+
+    return _StructuredDict
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+    def validate_python(
+        self, input: Any, *, allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False, **kwargs: Any
+    ) -> Any: ...
+
+## pydantic_graph/pydantic_graph/beta/join.py
+
+def reduce_dict_update(current: dict[K, V], inputs: Mapping[K, V]) -> dict[K, V]:
+    """A reducer that updates a dict."""
+    current.update(inputs)
+    return current
+
+## tests/evals/test_evaluator_common.py
+
+async def test_contains_dict():
+    """Test Contains evaluator with dictionaries."""
+    evaluator = Contains(value={'key': 'value'})
+
+    # Test dictionary containment
+    assert evaluator.evaluate(MockContext(output={'key': 'value', 'extra': 'data'})) == snapshot(
+        EvaluationReason(value=True)
+    )
+
+    # Test dictionary key missing
+    assert evaluator.evaluate(MockContext(output={'different': 'value'})) == snapshot(
+        EvaluationReason(value=False, reason="Output dictionary does not contain expected key 'key'")
+    )
+
+    # Test dictionary value mismatch
+    assert evaluator.evaluate(MockContext(output={'key': 'different'})) == snapshot(
+        EvaluationReason(
+            value=False,
+            reason="Output dictionary has different value for key 'key': 'different' != 'value'",
+        )
+    )
+
+    # Test non-dict value in dict
+    evaluator_single = Contains(value='key')
+    assert evaluator_single.evaluate(MockContext(output={'key': 'value'})) == snapshot(EvaluationReason(value=True))
+
+## tests/evals/test_report_evaluators.py
+
+def test_confusion_matrix_evaluator_metadata_key_with_non_dict():
+    """ConfusionMatrixEvaluator with metadata key but non-dict metadata skips the case."""
+    cases = [
+        _make_report_case('c1', expected_output='A', metadata='some_string'),
+        _make_report_case('c2', expected_output='B', metadata={'pred': 'B'}),
+    ]
+    report = _make_report(cases)
+
+    evaluator = ConfusionMatrixEvaluator(
+        predicted_from='metadata',
+        predicted_key='pred',
+        expected_from='expected_output',
+    )
+    ctx = ReportEvaluatorContext(name='test', report=report, experiment_metadata=None)
+    result = evaluator.evaluate(ctx)
+
+    assert isinstance(result, ConfusionMatrix)
+    # c1 should be skipped (non-dict metadata with key), only c2 used
+    assert result.class_labels == ['B']
+    assert result.matrix == [[1]]
+
+## tests/mcp_server.py
+
+async def get_dict() -> dict[str, Any]:
+    return {'foo': 'bar', 'baz': 123}
+
+async def get_unstructured_dict() -> dict[str, Any]:
+    return {'foo': 'bar', 'baz': 123}
+
+## tests/models/test_google.py
+
+async def test_google_dict_with_additional_properties_native_output(
+    allow_model_requests: None, google_provider: GoogleProvider
+):
+    """Test dicts with additionalProperties using gemini-2.5-flash."""
+    m = GoogleModel('gemini-2.5-flash', provider=google_provider)
+
+    class ConfigResponse(BaseModel):
+        """A response with configuration metadata."""
+
+        name: str
+        metadata: dict[str, str]
+
+    agent = Agent(m, output_type=NativeOutput(ConfigResponse))
+
+    result = await agent.run('Create a config named "api-config" with metadata author="Alice" and version="1.0"')
+    assert result.output.name == snapshot('api-config')
+    assert result.output.metadata == snapshot({'author': 'Alice', 'version': '1.0'})
+
+## tests/models/test_huggingface.py
+
+class MyTypedDict(TypedDict, total=False):
+    first: str
+    second: str
+
+## tests/models/test_openai.py
+
+class MyTypedDict(TypedDict, total=False):
+    first: str
+    second: str
+
+class MyNormalTypedDict(TypedDict):
+    foo: str
+
+class MyOptionalTypedDict(TypedDict):
+    foo: NotRequired[str]
+    bar: str
+
+class MyPartialTypedDict(TypedDict, total=False):
+    foo: str
+
+def tool_with_typed_dict(x: MyNormalTypedDict) -> str:
+    return f'{x}'  # pragma: no cover
+
+## tests/models/test_xai.py
+
+class MyTypedDict(TypedDict, total=False):
+    first: str
+    second: str
+
+## tests/test_agent.py
+
+def test_output_type_structured_dict_nested():
+    """Test StructuredDict with nested JSON schemas using $ref - Issue #2466."""
+    # Schema with nested $ref that pydantic's generator can't resolve
+    CarDict = StructuredDict(
+        {
+            '$defs': {
+                'Tire': {
+                    'type': 'object',
+                    'properties': {'brand': {'type': 'string'}, 'size': {'type': 'integer'}},
+                    'required': ['brand', 'size'],
+                }
+            },
+            'type': 'object',
+            'properties': {
+                'make': {'type': 'string'},
+                'model': {'type': 'string'},
+                'tires': {'type': 'array', 'items': {'$ref': '#/$defs/Tire'}},
+            },
+            'required': ['make', 'model', 'tires'],
+        },
+        name='Car',
+        description='A car with tires',
+    )
+
+    def call_tool(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+
+        # Verify the output tool schema has been properly transformed
+        # The $refs should be inlined by InlineDefsJsonSchemaTransformer
+        output_tool = info.output_tools[0]
+        schema = output_tool.parameters_json_schema
+        assert schema is not None
+
+        assert schema == snapshot(
+            {
+                'properties': {
+                    'make': {'type': 'string'},
+                    'model': {'type': 'string'},
+                    'tires': {
+                        'items': {
+                            'properties': {'brand': {'type': 'string'}, 'size': {'type': 'integer'}},
+                            'required': ['brand', 'size'],
+                            'type': 'object',
+                        },
+                        'type': 'array',
+                    },
+                },
+                'required': ['make', 'model', 'tires'],
+                'title': 'Car',
+                'type': 'object',
+            }
+        )
+
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    output_tool.name, {'make': 'Toyota', 'model': 'Camry', 'tires': [{'brand': 'Michelin', 'size': 17}]}
+                )
+            ]
+        )
+
+    agent = Agent(FunctionModel(call_tool), output_type=CarDict)
+
+    result = agent.run_sync('Generate a car')
+
+    assert result.output == snapshot({'make': 'Toyota', 'model': 'Camry', 'tires': [{'brand': 'Michelin', 'size': 17}]})
+
+## tests/test_builtin_tools.py
+
+def test_url_context_tool_backward_compatibility():
+    """Test that old payloads with 'url_context' kind can be deserialized."""
+    adapter = TypeAdapter(AbstractBuiltinTool)
+
+    # Test 1: Old payload with url_context should deserialize to UrlContextTool (which is deprecated)
+    old_payload = {'kind': 'url_context', 'max_uses': 5, 'enable_citations': True}
+    with pytest.warns(DeprecationWarning, match='Use `WebFetchTool` instead.'):
+        result = adapter.validate_python(old_payload)
+    assert isinstance(result, UrlContextTool)  # pyright: ignore[reportDeprecated]
+    assert isinstance(result, WebFetchTool)  # UrlContextTool is a subclass of WebFetchTool
+    assert result.kind == 'url_context'  # Preserves the original kind from payload
+    assert result.max_uses == 5
+    assert result.enable_citations is True
+
+    # Test 2: Re-serialization should preserve the kind
+    serialized = adapter.dump_python(result)
+    assert serialized['kind'] == 'url_context'
+    assert serialized['max_uses'] == 5
+    assert serialized['enable_citations'] is True
+
+    # Test 3: New payload with web_fetch should work normally
+    new_payload = {'kind': 'web_fetch', 'max_uses': 10}
+    result2 = adapter.validate_python(new_payload)
+    assert isinstance(result2, WebFetchTool)
+    assert result2.kind == 'web_fetch'
+    assert result2.max_uses == 10
+
+## tests/test_logfire.py
+
+def _test_logfire_metadata_values_callable_dict(ctx: RunContext[Any]) -> dict[str, str]:
+    return {'model_name': ctx.model.model_name}
+
+## tests/test_mcp.py
+
+def test_load_mcp_servers_with_default_values_in_env_dict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test ${VAR:-default} syntax in env dictionary."""
+    config = tmp_path / 'mcp.json'
+
+    monkeypatch.delenv('API_KEY', raising=False)
+    monkeypatch.setenv('CUSTOM_VAR', 'custom_value')
+    config.write_text(
+        '{"mcpServers": {"server": {"command": "python", "args": [], '
+        '"env": {"API_KEY": "${API_KEY:-default_key}", "CUSTOM": "${CUSTOM_VAR:-fallback}"}}}}',
+        encoding='utf-8',
+    )
+
+    servers = load_mcp_servers(config)
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.env == {'API_KEY': 'default_key', 'CUSTOM': 'custom_value'}

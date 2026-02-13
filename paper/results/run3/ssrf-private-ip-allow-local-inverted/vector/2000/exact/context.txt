@@ -1,0 +1,225 @@
+# tests/test_ssrf.py:344-349
+    async def test_private_ip_allowed_with_allow_local(self) -> None:
+        """Test that private IPs are allowed with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('192.168.1.1', 0))]
+            resolved = await validate_and_resolve_url('http://internal.local/path', allow_local=True)
+            assert resolved.resolved_ip == '192.168.1.1'
+
+# tests/test_ssrf.py:351-356
+    async def test_cloud_metadata_always_blocked(self) -> None:
+        """Test that cloud metadata IPs are always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('169.254.169.254', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.google.internal/path', allow_local=True)
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:297-368
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+# tests/test_ssrf.py:358-363
+    async def test_alibaba_cloud_metadata_always_blocked(self) -> None:
+        """Test that Alibaba Cloud metadata IP is always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.100.100.200', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.aliyun.internal/path', allow_local=True)
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:74-79
+def is_cloud_metadata_ip(ip_str: str) -> bool:
+    """Check if an IP address is a cloud metadata endpoint.
+
+    These are always blocked for security reasons, even with allow_local=True.
+    """
+    return ip_str in _CLOUD_METADATA_IPS
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:207-254
+async def validate_and_resolve_url(url: str, allow_local: bool) -> ResolvedUrl:
+    """Validate URL and resolve hostname to IP addresses.
+
+    Performs protocol validation, DNS resolution, and IP validation.
+
+    Args:
+        url: The URL to validate.
+        allow_local: Whether to allow private/internal IP addresses.
+
+    Returns:
+        ResolvedUrl with all the information needed to make the request.
+
+    Raises:
+        ValueError: If the URL fails validation.
+    """
+    hostname, path, port, is_https = extract_host_and_port(url)
+
+    # Check if hostname is already an IP address
+    try:
+        # Handle IPv6 addresses in brackets
+        ip_str = hostname.strip('[]')
+        ipaddress.ip_address(ip_str)
+        ips = [ip_str]
+    except ValueError:
+        # It's a hostname, resolve it
+        ips = await resolve_hostname(hostname)
+
+    # Validate all resolved IPs
+    for ip in ips:
+        # Cloud metadata IPs are always blocked
+        if is_cloud_metadata_ip(ip):
+            raise ValueError(f'Access to cloud metadata service ({ip}) is blocked for security reasons.')
+
+        # Private IPs are blocked unless allow_local is True
+        if allow_local and is_private_ip(ip):
+            raise ValueError(
+                f'Access to private/internal IP address ({ip}) is blocked. '
+                f'Use force_download="allow-local" to allow local network access.'
+            )
+
+    # Use the first resolved IP
+    return ResolvedUrl(
+        resolved_ip=ips[0],
+        hostname=hostname,
+        port=port,
+        is_https=is_https,
+        path=path,
+    )
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:967-967
+    blocked: NotRequired[bool]
+
+# tests/test_ssrf.py:337-342
+    async def test_private_ip_blocked_by_default(self) -> None:
+        """Test that private IPs are blocked by default."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('192.168.1.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://internal.local/path', allow_local=False)
+
+# tests/test_ssrf.py:461-482
+    async def test_redirect_to_private_ip_blocked(self) -> None:
+        """Test that redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'http://internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com (public), second for internal.local (private)
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/test_ssrf.py:372-375
+    async def test_literal_private_ip_blocked(self) -> None:
+        """Test that literal private IPs in URLs are blocked."""
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://192.168.1.1/path', allow_local=False)
+
+# tests/test_ssrf.py:583-603
+    async def test_protocol_relative_redirect_to_private_blocked(self) -> None:
+        """Test that protocol-relative redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/models/test_gemini_vertex.py:6-6
+from inline_snapshot import Is, snapshot
+
+# tests/models/test_google.py:16-16
+from inline_snapshot import Is, snapshot

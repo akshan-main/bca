@@ -1,0 +1,424 @@
+## pydantic_ai_slim/pydantic_ai/builtin_tools.py
+
+class AbstractBuiltinTool(ABC):
+    """A builtin tool that can be used by an agent.
+
+    This class is abstract and cannot be instantiated directly.
+
+    The builtin tools are passed to the model as part of the `ModelRequestParameters`.
+    """
+
+    kind: str = 'unknown_builtin_tool'
+    """Built-in tool identifier, this should be available on all built-in tools as a discriminator."""
+
+    @property
+    def unique_id(self) -> str:
+        """A unique identifier for the builtin tool.
+
+        If multiple instances of the same builtin tool can be passed to the model, subclasses should override this property to allow them to be distinguished.
+        """
+        return self.kind
+
+    @property
+    def label(self) -> str:
+        """Human-readable label for UI display.
+
+        Subclasses should override this to provide a meaningful label.
+        """
+        return self.kind.replace('_', ' ').title()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        BUILTIN_TOOL_TYPES[cls.kind] = cls
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, _source_type: Any, handler: pydantic.GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        if cls is not AbstractBuiltinTool:
+            return handler(cls)
+
+        tools = BUILTIN_TOOL_TYPES.values()
+        if len(tools) == 1:  # pragma: no cover
+            tools_type = next(iter(tools))
+        else:
+            tools_annotated = [Annotated[tool, pydantic.Tag(tool.kind)] for tool in tools]
+            tools_type = Annotated[Union[tuple(tools_annotated)], pydantic.Discriminator(_tool_discriminator)]  # noqa: UP007
+
+        return handler(tools_type)
+
+class WebFetchTool(AbstractBuiltinTool):
+    """Allows your agent to access contents from URLs.
+
+    The parameters that PydanticAI passes depend on the model, as some parameters may not be supported by certain models.
+
+    Supported by:
+
+    * Anthropic
+    * Google
+    """
+
+    max_uses: int | None = None
+    """If provided, the tool will stop fetching URLs after the given number of uses.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    allowed_domains: list[str] | None = None
+    """If provided, only these domains will be fetched.
+
+    With Anthropic, you can only use one of `blocked_domains` or `allowed_domains`, not both.
+
+    Supported by:
+
+    * Anthropic, see <https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-fetch-tool#domain-filtering>
+    """
+
+    blocked_domains: list[str] | None = None
+    """If provided, these domains will never be fetched.
+
+    With Anthropic, you can only use one of `blocked_domains` or `allowed_domains`, not both.
+
+    Supported by:
+
+    * Anthropic, see <https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-fetch-tool#domain-filtering>
+    """
+
+    enable_citations: bool = False
+    """If True, enables citations for fetched content.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    max_content_tokens: int | None = None
+    """Maximum content length in tokens for fetched content.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    kind: str = 'web_fetch'
+    """The kind of tool."""
+
+class UrlContextTool(WebFetchTool):
+    """Deprecated alias for WebFetchTool. Use WebFetchTool instead.
+
+    Overrides kind to 'url_context' so old serialized payloads with {"kind": "url_context", ...}
+    can be deserialized to UrlContextTool for backward compatibility.
+    """
+
+    kind: str = 'url_context'
+    """The kind of tool (deprecated value for backward compatibility)."""
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    kind: Literal['binary'] = 'binary'
+
+    def args_as_dict(self) -> dict[str, Any]:
+        """Return the arguments as a Python dictionary.
+
+        This is just for convenience with models that require dicts as input.
+        """
+        if not self.args:
+            return {}
+        if isinstance(self.args, dict):
+            return self.args
+        args = pydantic_core.from_json(self.args)
+        assert isinstance(args, dict), 'args should be a dict'
+        return cast(dict[str, Any], args)
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+    def validate_python(
+        self, input: Any, *, allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False, **kwargs: Any
+    ) -> Any: ...
+
+## tests/models/test_mistral.py
+
+async def test_request_native_with_arguments_dict_response(allow_model_requests: None):
+    class CityLocation(BaseModel):
+        city: str
+        country: str
+
+    completion = completion_message(
+        MistralAssistantMessage(
+            content=None,
+            role='assistant',
+            tool_calls=[
+                MistralToolCall(
+                    id='123',
+                    function=MistralFunctionCall(arguments={'city': 'paris', 'country': 'france'}, name='final_result'),
+                    type='function',
+                )
+            ],
+        ),
+        usage=MistralUsageInfo(prompt_tokens=1, completion_tokens=2, total_tokens=3),
+    )
+    mock_client = MockMistralAI.create_mock(completion)
+    model = MistralModel('mistral-large-latest', provider=MistralProvider(mistral_client=mock_client))
+    agent = Agent(model=model, output_type=CityLocation)
+
+    result = await agent.run('User prompt value')
+
+    assert result.output == CityLocation(city='paris', country='france')
+    assert result.usage().input_tokens == 1
+    assert result.usage().output_tokens == 2
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='User prompt value', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args={'city': 'paris', 'country': 'france'},
+                        tool_call_id='123',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=1, output_tokens=2),
+                model_name='mistral-large-123',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='mistral',
+                provider_url='https://api.mistral.ai',
+                provider_details={
+                    'finish_reason': 'stop',
+                    'timestamp': datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc),
+                },
+                provider_response_id='123',
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id='123',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_openai.py
+
+def test_azure_400_non_dict_body(allow_model_requests: None) -> None:
+    """Test a 400 error from Azure where the body is not a dictionary."""
+    mock_client = MockOpenAI.create_mock(
+        APIStatusError(
+            'Bad Request',
+            response=httpx.Response(status_code=400, request=httpx.Request('POST', 'https://example.com/v1')),
+            body='Raw string body',
+        )
+    )
+    m = OpenAIChatModel('gpt-5-mini', provider=AzureProvider(openai_client=cast(AsyncAzureOpenAI, mock_client)))
+    agent = Agent(m)
+
+    with pytest.raises(ModelHTTPError) as exc_info:
+        agent.run_sync('hello')
+
+    assert exc_info.value.status_code == 400
+
+## tests/test_builtin_tools.py
+
+def test_url_context_tool_backward_compatibility():
+    """Test that old payloads with 'url_context' kind can be deserialized."""
+    adapter = TypeAdapter(AbstractBuiltinTool)
+
+    # Test 1: Old payload with url_context should deserialize to UrlContextTool (which is deprecated)
+    old_payload = {'kind': 'url_context', 'max_uses': 5, 'enable_citations': True}
+    with pytest.warns(DeprecationWarning, match='Use `WebFetchTool` instead.'):
+        result = adapter.validate_python(old_payload)
+    assert isinstance(result, UrlContextTool)  # pyright: ignore[reportDeprecated]
+    assert isinstance(result, WebFetchTool)  # UrlContextTool is a subclass of WebFetchTool
+    assert result.kind == 'url_context'  # Preserves the original kind from payload
+    assert result.max_uses == 5
+    assert result.enable_citations is True
+
+    # Test 2: Re-serialization should preserve the kind
+    serialized = adapter.dump_python(result)
+    assert serialized['kind'] == 'url_context'
+    assert serialized['max_uses'] == 5
+    assert serialized['enable_citations'] is True
+
+    # Test 3: New payload with web_fetch should work normally
+    new_payload = {'kind': 'web_fetch', 'max_uses': 10}
+    result2 = adapter.validate_python(new_payload)
+    assert isinstance(result2, WebFetchTool)
+    assert result2.kind == 'web_fetch'
+    assert result2.max_uses == 10
+
+## tests/test_mcp.py
+
+async def test_tool_returning_dict(allow_model_requests: None, agent: Agent):
+    async with agent:
+        result = await agent.run('Get me a dict, respond on one line')
+        assert result.output == snapshot('{"foo":"bar","baz":123}')
+        assert result.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content='Get me a dict, respond on one line',
+                            timestamp=IsDatetime(),
+                        )
+                    ],
+                    timestamp=IsDatetime(),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[ToolCallPart(tool_name='get_dict', args='{}', tool_call_id='call_oqKviITBj8PwpQjGyUu4Zu5x')],
+                    usage=RequestUsage(
+                        input_tokens=195,
+                        output_tokens=11,
+                        details={
+                            'accepted_prediction_tokens': 0,
+                            'audio_tokens': 0,
+                            'reasoning_tokens': 0,
+                            'rejected_prediction_tokens': 0,
+                        },
+                    ),
+                    model_name='gpt-4o-2024-08-06',
+                    timestamp=IsDatetime(),
+                    provider_name='openai',
+                    provider_url='https://api.openai.com/v1/',
+                    provider_details={
+                        'finish_reason': 'tool_calls',
+                        'timestamp': IsDatetime(),
+                    },
+                    provider_response_id='chatcmpl-BRloOs7Bb2tq8wJyy9Rv7SQ7L65a7',
+                    finish_reason='tool_call',
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='get_dict',
+                            content={'foo': 'bar', 'baz': 123},
+                            tool_call_id='call_oqKviITBj8PwpQjGyUu4Zu5x',
+                            timestamp=IsDatetime(),
+                        )
+                    ],
+                    timestamp=IsDatetime(),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[TextPart(content='{"foo":"bar","baz":123}')],
+                    usage=RequestUsage(
+                        input_tokens=222,
+                        output_tokens=11,
+                        details={
+                            'accepted_prediction_tokens': 0,
+                            'audio_tokens': 0,
+                            'reasoning_tokens': 0,
+                            'rejected_prediction_tokens': 0,
+                        },
+                    ),
+                    model_name='gpt-4o-2024-08-06',
+                    timestamp=IsDatetime(),
+                    provider_name='openai',
+                    provider_url='https://api.openai.com/v1/',
+                    provider_details={
+                        'finish_reason': 'stop',
+                        'timestamp': IsDatetime(),
+                    },
+                    provider_response_id='chatcmpl-BRloPczU1HSCWnreyo21DdNtdOM7L',
+                    finish_reason='stop',
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+async def test_tool_returning_unstructured_dict(allow_model_requests: None, agent: Agent):
+    async with agent:
+        result = await agent.run('Get me an unstructured dict, respond on one line')
+        assert result.output == snapshot('{"foo":"bar","baz":123}')
+        assert result.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content='Get me an unstructured dict, respond on one line',
+                            timestamp=IsDatetime(),
+                        )
+                    ],
+                    timestamp=IsDatetime(),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name='get_unstructured_dict', args='{}', tool_call_id='call_R0n2R7S9vL2aZOX25T9jahTd'
+                        )
+                    ],
+                    usage=RequestUsage(
+                        input_tokens=343,
+                        output_tokens=12,
+                        details={
+                            'accepted_prediction_tokens': 0,
+                            'audio_tokens': 0,
+                            'reasoning_tokens': 0,
+                            'rejected_prediction_tokens': 0,
+                        },
+                    ),
+                    model_name='gpt-4o-2024-08-06',
+                    timestamp=IsDatetime(),
+                    provider_name='openai',
+                    provider_url='https://api.openai.com/v1/',
+                    provider_details={
+                        'finish_reason': 'tool_calls',
+                        'timestamp': IsDatetime(),
+                    },
+                    provider_response_id='chatcmpl-CLbP82ODQMEznhobUKdq6Rjn9Aa12',
+                    finish_reason='tool_call',
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='get_unstructured_dict',
+                            content={'foo': 'bar', 'baz': 123},
+                            tool_call_id='call_R0n2R7S9vL2aZOX25T9jahTd',
+                            timestamp=IsDatetime(),
+                        )
+                    ],
+                    timestamp=IsDatetime(),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[TextPart(content='{"foo":"bar","baz":123}')],
+                    usage=RequestUsage(
+                        input_tokens=374,
+                        output_tokens=10,
+                        details={
+                            'accepted_prediction_tokens': 0,
+                            'audio_tokens': 0,
+                            'reasoning_tokens': 0,
+                            'rejected_prediction_tokens': 0,
+                        },
+                    ),
+                    model_name='gpt-4o-2024-08-06',
+                    timestamp=IsDatetime(),
+                    provider_name='openai',
+                    provider_url='https://api.openai.com/v1/',
+                    provider_details={
+                        'finish_reason': 'stop',
+                        'timestamp': IsDatetime(),
+                    },
+                    provider_response_id='chatcmpl-CLbPAOYN3jPYdvYeD8JNOOXF5N554',
+                    finish_reason='stop',
+                    run_id=IsStr(),
+                ),
+            ]
+        )

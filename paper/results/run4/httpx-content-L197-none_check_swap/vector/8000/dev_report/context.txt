@@ -1,0 +1,845 @@
+# httpx/_content.py:186-218
+def encode_request(
+    content: RequestContent | None = None,
+    data: RequestData | None = None,
+    files: RequestFiles | None = None,
+    json: Any | None = None,
+    boundary: bytes | None = None,
+) -> tuple[dict[str, str], SyncByteStream | AsyncByteStream]:
+    """
+    Handles encoding the given `content`, `data`, `files`, and `json`,
+    returning a two-tuple of (<headers>, <stream>).
+    """
+    if data is None and not isinstance(data, Mapping):
+        # We prefer to separate `content=<bytes|str|byte iterator|bytes aiterator>`
+        # for raw request content, and `data=<form data>` for url encoded or
+        # multipart form content.
+        #
+        # However for compat with requests, we *do* still support
+        # `data=<bytes...>` usages. We deal with that case here, treating it
+        # as if `content=<...>` had been supplied instead.
+        message = "Use 'content=<...>' to upload raw bytes/text content."
+        warnings.warn(message, DeprecationWarning, stacklevel=2)
+        return encode_content(data)
+
+    if content is not None:
+        return encode_content(content)
+    elif files:
+        return encode_multipart_data(data or {}, files, boundary)
+    elif data:
+        return encode_urlencoded_data(data)
+    elif json is not None:
+        return encode_json(json)
+
+    return {}, ByteStream(b"")
+
+# httpx/_content.py:221-240
+def encode_response(
+    content: ResponseContent | None = None,
+    text: str | None = None,
+    html: str | None = None,
+    json: Any | None = None,
+) -> tuple[dict[str, str], SyncByteStream | AsyncByteStream]:
+    """
+    Handles encoding the given `content`, returning a two-tuple of
+    (<headers>, <stream>).
+    """
+    if content is not None:
+        return encode_content(content)
+    elif text is not None:
+        return encode_text(text)
+    elif html is not None:
+        return encode_html(html)
+    elif json is not None:
+        return encode_json(json)
+
+    return {}, ByteStream(b"")
+
+# httpx/_models.py:516-569
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        headers: HeaderTypes | None = None,
+        content: ResponseContent | None = None,
+        text: str | None = None,
+        html: str | None = None,
+        json: typing.Any = None,
+        stream: SyncByteStream | AsyncByteStream | None = None,
+        request: Request | None = None,
+        extensions: ResponseExtensions | None = None,
+        history: list[Response] | None = None,
+        default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+    ) -> None:
+        self.status_code = status_code
+        self.headers = Headers(headers)
+
+        self._request: Request | None = request
+
+        # When follow_redirects=False and a redirect is received,
+        # the client will set `response.next_request`.
+        self.next_request: Request | None = None
+
+        self.extensions = {} if extensions is None else dict(extensions)
+        self.history = [] if history is None else list(history)
+
+        self.is_closed = False
+        self.is_stream_consumed = False
+
+        self.default_encoding = default_encoding
+
+        if stream is None:
+            headers, stream = encode_response(content, text, html, json)
+            self._prepare(headers)
+            self.stream = stream
+            if isinstance(stream, ByteStream):
+                # Load the response body, except for streaming content.
+                self.read()
+        else:
+            # There's an important distinction between `Response(content=...)`,
+            # and `Response(stream=...)`.
+            #
+            # Using `content=...` implies automatically populated content headers,
+            # of either `Content-Length: ...` or `Transfer-Encoding: chunked`.
+            #
+            # Using `stream=...` will not automatically include any content headers.
+            #
+            # As an end-user you don't really need `stream=...`. It's only
+            # useful when creating response instances having received a stream
+            # from the transport API.
+            self.stream = stream
+
+        self._num_bytes_downloaded = 0
+
+# httpx/_models.py:383-439
+    def __init__(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        stream: SyncByteStream | AsyncByteStream | None = None,
+        extensions: RequestExtensions | None = None,
+    ) -> None:
+        self.method = method.upper()
+        self.url = URL(url) if params is None else URL(url, params=params)
+        self.headers = Headers(headers)
+        self.extensions = {} if extensions is None else dict(extensions)
+
+        if cookies:
+            Cookies(cookies).set_cookie_header(self)
+
+        if stream is None:
+            content_type: str | None = self.headers.get("content-type")
+            headers, stream = encode_request(
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                boundary=get_multipart_boundary_from_content_type(
+                    content_type=content_type.encode(self.headers.encoding)
+                    if content_type
+                    else None
+                ),
+            )
+            self._prepare(headers)
+            self.stream = stream
+            # Load the request body, except for streaming content.
+            if isinstance(stream, ByteStream):
+                self.read()
+        else:
+            # There's an important distinction between `Request(content=...)`,
+            # and `Request(stream=...)`.
+            #
+            # Using `content=...` implies automatically populated `Host` and content
+            # headers, of either `Content-Length: ...` or `Transfer-Encoding: chunked`.
+            #
+            # Using `stream=...` will not automatically include *any*
+            # auto-populated headers.
+            #
+            # As an end-user you don't really need `stream=...`. It's only
+            # useful when:
+            #
+            # * Preserving the request stream when copying requests, eg for redirects.
+            # * Creating request instances on the *server-side* of the transport API.
+            self.stream = stream
+
+# httpx/_api.py:282-320
+def post(
+    url: URL | str,
+    *,
+    content: RequestContent | None = None,
+    data: RequestData | None = None,
+    files: RequestFiles | None = None,
+    json: typing.Any | None = None,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `POST` request.
+
+    **Parameters**: See `httpx.request`.
+    """
+    return request(
+        "POST",
+        url,
+        content=content,
+        data=data,
+        files=files,
+        json=json,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+# httpx/_api.py:323-361
+def put(
+    url: URL | str,
+    *,
+    content: RequestContent | None = None,
+    data: RequestData | None = None,
+    files: RequestFiles | None = None,
+    json: typing.Any | None = None,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `PUT` request.
+
+    **Parameters**: See `httpx.request`.
+    """
+    return request(
+        "PUT",
+        url,
+        content=content,
+        data=data,
+        files=files,
+        json=json,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+# httpx/_api.py:364-402
+def patch(
+    url: URL | str,
+    *,
+    content: RequestContent | None = None,
+    data: RequestData | None = None,
+    files: RequestFiles | None = None,
+    json: typing.Any | None = None,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `PATCH` request.
+
+    **Parameters**: See `httpx.request`.
+    """
+    return request(
+        "PATCH",
+        url,
+        content=content,
+        data=data,
+        files=files,
+        json=json,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+# httpx/_api.py:124-171
+def stream(
+    method: str,
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    content: RequestContent | None = None,
+    data: RequestData | None = None,
+    files: RequestFiles | None = None,
+    json: typing.Any | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    trust_env: bool = True,
+) -> typing.Iterator[Response]:
+    """
+    Alternative to `httpx.request()` that streams the response body
+    instead of loading it into memory at once.
+
+    **Parameters**: See `httpx.request`.
+
+    See also: [Streaming Responses][0]
+
+    [0]: /quickstart#streaming-responses
+    """
+    with Client(
+        cookies=cookies,
+        proxy=proxy,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    ) as client:
+        with client.stream(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            auth=auth,
+            follow_redirects=follow_redirects,
+        ) as response:
+            yield response
+
+# httpx/_client.py:1838-1873
+    async def post(
+        self,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `POST` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return await self.request(
+            "POST",
+            url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+# httpx/_client.py:1875-1910
+    async def put(
+        self,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `PUT` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return await self.request(
+            "PUT",
+            url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+# httpx/_client.py:1912-1947
+    async def patch(
+        self,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `PATCH` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return await self.request(
+            "PATCH",
+            url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+# httpx/_client.py:1123-1158
+    def post(
+        self,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `POST` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return self.request(
+            "POST",
+            url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+# httpx/_client.py:1160-1195
+    def put(
+        self,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `PUT` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return self.request(
+            "PUT",
+            url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+# httpx/_client.py:1197-1232
+    def patch(
+        self,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `PATCH` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return self.request(
+            "PATCH",
+            url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+# httpx/_client.py:1543-1592
+    async def stream(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> typing.AsyncIterator[Response]:
+        """
+        Alternative to `httpx.request()` that streams the response body
+        instead of loading it into memory at once.
+
+        **Parameters**: See `httpx.request`.
+
+        See also: [Streaming Responses][0]
+
+        [0]: /quickstart#streaming-responses
+        """
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        response = await self.send(
+            request=request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            stream=True,
+        )
+        try:
+            yield response
+        finally:
+            await response.aclose()
+
+# httpx/_client.py:828-877
+    def stream(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> typing.Iterator[Response]:
+        """
+        Alternative to `httpx.request()` that streams the response body
+        instead of loading it into memory at once.
+
+        **Parameters**: See `httpx.request`.
+
+        See also: [Streaming Responses][0]
+
+        [0]: /quickstart#streaming-responses
+        """
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        response = self.send(
+            request=request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            stream=True,
+        )
+        try:
+            yield response
+        finally:
+            response.close()
+
+# httpx/_multipart.py:229-242
+    def __init__(
+        self,
+        data: RequestData,
+        files: RequestFiles,
+        boundary: bytes | None = None,
+    ) -> None:
+        if boundary is None:
+            boundary = os.urandom(16).hex().encode("ascii")
+
+        self.boundary = boundary
+        self.content_type = "multipart/form-data; boundary=%s" % boundary.decode(
+            "ascii"
+        )
+        self.fields = list(self._iter_fields(data, files))
+
+# httpx/_config.py:202-224
+    def __init__(
+        self,
+        url: URL | str,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+        auth: tuple[str, str] | None = None,
+        headers: HeaderTypes | None = None,
+    ) -> None:
+        url = URL(url)
+        headers = Headers(headers)
+
+        if url.scheme not in ("http", "https", "socks5", "socks5h"):
+            raise ValueError(f"Unknown scheme for proxy URL {url!r}")
+
+        if url.username or url.password:
+            # Remove any auth credentials from the URL.
+            auth = (url.username, url.password)
+            url = url.copy_with(username=None, password=None)
+
+        self.url = url
+        self.auth = auth
+        self.headers = headers
+        self.ssl_context = ssl_context
+
+# httpx/_client.py:639-716
+    def __init__(
+        self,
+        *,
+        auth: AuthTypes | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        proxy: ProxyTypes | None = None,
+        mounts: None | (typing.Mapping[str, BaseTransport | None]) = None,
+        timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+        follow_redirects: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+        max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
+        base_url: URL | str = "",
+        transport: BaseTransport | None = None,
+        default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+    ) -> None:
+        super().__init__(
+            auth=auth,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            max_redirects=max_redirects,
+            event_hooks=event_hooks,
+            base_url=base_url,
+            trust_env=trust_env,
+            default_encoding=default_encoding,
+        )
+
+        if http2:
+            try:
+                import h2  # noqa
+            except ImportError:  # pragma: no cover
+                raise ImportError(
+                    "Using http2=True, but the 'h2' package is not installed. "
+                    "Make sure to install httpx using `pip install httpx[http2]`."
+                ) from None
+
+        allow_env_proxies = trust_env and transport is None
+        proxy_map = self._get_proxy_map(proxy, allow_env_proxies)
+
+        self._transport = self._init_transport(
+            verify=verify,
+            cert=cert,
+            trust_env=trust_env,
+            http1=http1,
+            http2=http2,
+            limits=limits,
+            transport=transport,
+        )
+        self._mounts: dict[URLPattern, BaseTransport | None] = {
+            URLPattern(key): None
+            if proxy is None
+            else self._init_proxy_transport(
+                proxy,
+                verify=verify,
+                cert=cert,
+                trust_env=trust_env,
+                http1=http1,
+                http2=http2,
+                limits=limits,
+            )
+            for key, proxy in proxy_map.items()
+        }
+        if mounts is not None:
+            self._mounts.update(
+                {URLPattern(key): transport for key, transport in mounts.items()}
+            )
+
+        self._mounts = dict(sorted(self._mounts.items()))
+
+# httpx/_models.py:144-164
+    def __init__(
+        self,
+        headers: HeaderTypes | None = None,
+        encoding: str | None = None,
+    ) -> None:
+        self._list = []  # type: typing.List[typing.Tuple[bytes, bytes, bytes]]
+
+        if isinstance(headers, Headers):
+            self._list = list(headers._list)
+        elif isinstance(headers, Mapping):
+            for k, v in headers.items():
+                bytes_key = _normalize_header_key(k, encoding)
+                bytes_value = _normalize_header_value(v, encoding)
+                self._list.append((bytes_key, bytes_key.lower(), bytes_value))
+        elif headers is not None:
+            for k, v in headers:
+                bytes_key = _normalize_header_key(k, encoding)
+                bytes_value = _normalize_header_value(v, encoding)
+                self._list.append((bytes_key, bytes_key.lower(), bytes_value))
+
+        self._encoding = encoding
+
+# httpx/_config.py:173-182
+    def __init__(
+        self,
+        *,
+        max_connections: int | None = None,
+        max_keepalive_connections: int | None = None,
+        keepalive_expiry: float | None = 5.0,
+    ) -> None:
+        self.max_connections = max_connections
+        self.max_keepalive_connections = max_keepalive_connections
+        self.keepalive_expiry = keepalive_expiry
+
+# httpx/_transports/base.py:69-75
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self.aclose()
+
+# httpx/_content.py:32-33
+    def __init__(self, stream: bytes) -> None:
+        self._stream = stream

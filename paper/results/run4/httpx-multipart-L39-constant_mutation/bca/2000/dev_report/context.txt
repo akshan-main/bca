@@ -1,0 +1,217 @@
+## httpx/_api.py
+
+def get(
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `GET` request.
+
+    **Parameters**: See `httpx.request`.
+
+    Note that the `data`, `files`, `json` and `content` parameters are not available
+    on this function, as `GET` requests should not include a request body.
+    """
+    return request(
+        "GET",
+        url,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+## httpx/_content.py
+
+class ByteStream(AsyncByteStream, SyncByteStream):
+    def __init__(self, stream: bytes) -> None:
+        self._stream = stream
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self._stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._stream
+
+## httpx/_models.py
+
+    def keys(self) -> typing.KeysView[str]:
+        return {key.decode(self.encoding): None for _, key, value in self._list}.keys()
+
+    def values(self) -> typing.ValuesView[str]:
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.values()
+
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return `(key, value)` items of headers. Concatenate headers
+        into a single comma separated value when a key occurs multiple times.
+        """
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.items()
+
+    def update(self, headers: HeaderTypes | None = None) -> None:  # type: ignore
+        headers = Headers(headers)
+        for key in headers.keys():
+            if key in self:
+                self.pop(key)
+        self._list.extend(headers._list)
+
+    def read(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.Iterable)
+            self._content = b"".join(self.stream)
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.AsyncIterable)
+            self._content = b"".join([part async for part in self.stream])
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    def iter_bytes(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
+        """
+        A byte-iterator over the decoded response content.
+        This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+        """
+        if hasattr(self, "_content"):
+            chunk_size = len(self._content) if chunk_size is None else chunk_size
+            for i in range(0, len(self._content), max(chunk_size, 1)):
+                yield self._content[i : i + chunk_size]
+        else:
+            decoder = self._get_content_decoder()
+            chunker = ByteChunker(chunk_size=chunk_size)
+            with request_context(request=self._request):
+                for raw_bytes in self.iter_raw():
+                    decoded = decoder.decode(raw_bytes)
+                    for chunk in chunker.decode(decoded):
+                        yield chunk
+                decoded = decoder.flush()
+                for chunk in chunker.decode(decoded):
+                    yield chunk  # pragma: no cover
+                for chunk in chunker.flush():
+                    yield chunk
+
+## httpx/_multipart.py
+
+class MultipartStream(SyncByteStream, AsyncByteStream):
+    """
+    Request content as streaming multipart encoded form data.
+    """
+
+    def __init__(
+        self,
+        data: RequestData,
+        files: RequestFiles,
+        boundary: bytes | None = None,
+    ) -> None:
+        if boundary is None:
+            boundary = os.urandom(16).hex().encode("ascii")
+
+        self.boundary = boundary
+        self.content_type = "multipart/form-data; boundary=%s" % boundary.decode(
+            "ascii"
+        )
+        self.fields = list(self._iter_fields(data, files))
+
+    def _iter_fields(
+        self, data: RequestData, files: RequestFiles
+    ) -> typing.Iterator[FileField | DataField]:
+        for name, value in data.items():
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    yield DataField(name=name, value=item)
+            else:
+                yield DataField(name=name, value=value)
+
+        file_items = files.items() if isinstance(files, typing.Mapping) else files
+        for name, value in file_items:
+            yield FileField(name=name, value=value)
+
+    def iter_chunks(self) -> typing.Iterator[bytes]:
+        for field in self.fields:
+            yield b"--%s\r\n" % self.boundary
+            yield from field.render()
+            yield b"\r\n"
+        yield b"--%s--\r\n" % self.boundary
+
+    def get_content_length(self) -> int | None:
+        """
+        Return the length of the multipart encoded content, or `None` if
+        any of the files have a length that cannot be determined upfront.
+        """
+        boundary_length = len(self.boundary)
+        length = 0
+
+        for field in self.fields:
+            field_length = field.get_length()
+            if field_length is None:
+                return None
+
+            length += 2 + boundary_length + 2  # b"--{boundary}\r\n"
+            length += field_length
+            length += 2  # b"\r\n"
+
+        length += 2 + boundary_length + 4  # b"--{boundary}--\r\n"
+        return length
+
+    # Content stream interface.
+
+    def get_headers(self) -> dict[str, str]:
+        content_length = self.get_content_length()
+        content_type = self.content_type
+        if content_length is None:
+            return {"Transfer-Encoding": "chunked", "Content-Type": content_type}
+        return {"Content-Length": str(content_length), "Content-Type": content_type}
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        for chunk in self.iter_chunks():
+            yield chunk
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        for chunk in self.iter_chunks():
+            yield chunk

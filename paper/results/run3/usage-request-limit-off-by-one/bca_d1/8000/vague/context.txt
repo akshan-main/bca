@@ -1,0 +1,867 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## examples/pydantic_ai_examples/question_graph.py
+
+from pydantic_graph import (
+    BaseNode,
+    End,
+    Graph,
+    GraphRunContext,
+)
+
+class Ask(BaseNode[QuestionState]):
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    def increment_retries(
+        self,
+        max_result_retries: int,
+        error: BaseException | None = None,
+        model_settings: ModelSettings | None = None,
+    ) -> None:
+        self.retries += 1
+        if self.retries > max_result_retries:
+            if (
+                self.message_history
+                and isinstance(model_response := self.message_history[-1], _messages.ModelResponse)
+                and model_response.finish_reason == 'length'
+                and model_response.parts
+                and isinstance(tool_call := model_response.parts[-1], _messages.ToolCallPart)
+            ):
+                try:
+                    tool_call.args_as_dict()
+                except Exception:
+                    max_tokens = model_settings.get('max_tokens') if model_settings else None
+                    raise exceptions.IncompleteToolCall(
+                        f'Model token limit ({max_tokens or "provider default"}) exceeded while generating a tool call, resulting in incomplete arguments. Increase the `max_tokens` model setting, or simplify the prompt to result in a shorter response that will fit within the limit.'
+                    )
+            message = f'Exceeded maximum retries ({max_result_retries}) for output validation'
+            if error:
+                if isinstance(error, exceptions.UnexpectedModelBehavior) and error.__cause__ is not None:
+                    error = error.__cause__
+                raise exceptions.UnexpectedModelBehavior(message) from error
+            else:
+                raise exceptions.UnexpectedModelBehavior(message)
+
+## pydantic_ai_slim/pydantic_ai/_cli/__init__.py
+
+async def run_chat(
+    stream: bool,
+    agent: AbstractAgent[AgentDepsT, OutputDataT],
+    console: Console,
+    code_theme: str,
+    prog_name: str,
+    config_dir: Path | None = None,
+    deps: AgentDepsT = None,
+    message_history: Sequence[ModelMessage] | None = None,
+    model_settings: ModelSettings | None = None,
+    usage_limits: _usage.UsageLimits | None = None,
+) -> int:
+    prompt_history_path = (config_dir or PYDANTIC_AI_HOME) / PROMPT_HISTORY_FILENAME
+    prompt_history_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_history_path.touch(exist_ok=True)
+    session: PromptSession[Any] = PromptSession(history=FileHistory(str(prompt_history_path)))
+
+    multiline = False
+    messages: list[ModelMessage] = list(message_history) if message_history else []
+
+    while True:
+        try:
+            auto_suggest = CustomAutoSuggest(['/markdown', '/multiline', '/exit', '/cp'])
+            text = await session.prompt_async(f'{prog_name} ➤ ', auto_suggest=auto_suggest, multiline=multiline)
+        except (KeyboardInterrupt, EOFError):  # pragma: no cover
+            return 0
+
+        if not text.strip():
+            continue
+
+        ident_prompt = text.lower().strip().replace(' ', '-')
+        if ident_prompt.startswith('/'):
+            exit_value, multiline = handle_slash_command(ident_prompt, messages, multiline, console, code_theme)
+            if exit_value is not None:
+                return exit_value
+        else:
+            try:
+                messages = await ask_agent(
+                    agent, text, stream, console, code_theme, deps, messages, model_settings, usage_limits
+                )
+            except CancelledError:  # pragma: no cover
+                console.print('[dim]Interrupted[/dim]')
+            except Exception as e:  # pragma: no cover
+                cause = getattr(e, '__cause__', None)
+                console.print(f'\n[red]{type(e).__name__}:[/red] {e}')
+                if cause:
+                    console.print(f'[dim]Caused by: {cause}[/dim]')
+
+async def ask_agent(
+    agent: AbstractAgent[AgentDepsT, OutputDataT],
+    prompt: str,
+    stream: bool,
+    console: Console,
+    code_theme: str,
+    deps: AgentDepsT = None,
+    messages: Sequence[ModelMessage] | None = None,
+    model_settings: ModelSettings | None = None,
+    usage_limits: _usage.UsageLimits | None = None,
+) -> list[ModelMessage]:
+    status = Status('[dim]Working on it…[/dim]', console=console)
+
+    if not stream:
+        with status:
+            result = await agent.run(prompt, message_history=messages, deps=deps)
+        content = str(result.output)
+        console.print(Markdown(content, code_theme=code_theme))
+        return result.all_messages()
+
+    with status, ExitStack() as stack:
+        async with agent.iter(
+            prompt, message_history=messages, deps=deps, model_settings=model_settings, usage_limits=usage_limits
+        ) as agent_run:
+            live = Live('', refresh_per_second=15, console=console, vertical_overflow='ellipsis')
+            async for node in agent_run:
+                if Agent.is_model_request_node(node):
+                    async with node.stream(agent_run.ctx) as handle_stream:
+                        status.stop()  # stopping multiple times is idempotent
+                        stack.enter_context(live)  # entering multiple times is idempotent
+
+                        async for content in handle_stream.stream_output(debounce_by=None):
+                            live.update(Markdown(str(content), code_theme=code_theme))
+
+        assert agent_run.result is not None
+        return agent_run.result.all_messages()
+
+class CustomAutoSuggest(AutoSuggestFromHistory):
+    def __init__(self, special_suggestions: list[str] | None = None):
+        super().__init__()
+        self.special_suggestions = special_suggestions or []
+
+    def get_suggestion(self, buffer: Buffer, document: Document) -> Suggestion | None:  # pragma: no cover
+        # Get the suggestion from history
+        suggestion = super().get_suggestion(buffer, document)
+
+        # Check for custom suggestions
+        text = document.text_before_cursor.strip()
+        for special in self.special_suggestions:
+            if special.startswith(text):
+                return Suggestion(special[len(text) :])
+        return suggestion
+
+    def __init__(self, special_suggestions: list[str] | None = None):
+        super().__init__()
+        self.special_suggestions = special_suggestions or []
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+from abc import ABC, abstractmethod
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def get_event_loop():
+    try:
+        event_loop = asyncio.get_event_loop()
+    except RuntimeError:  # pragma: lax no cover
+        event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(event_loop)
+    return event_loop
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    async def to_cli(
+        self: Self,
+        deps: AgentDepsT = None,
+        prog_name: str = 'pydantic-ai',
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+    ) -> None:
+        """Run the agent in a CLI chat interface.
+
+        Args:
+            deps: The dependencies to pass to the agent.
+            prog_name: The name of the program to use for the CLI. Defaults to 'pydantic-ai'.
+            message_history: History of the conversation so far.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+
+        Example:
+        ```python {title="agent_to_cli.py" test="skip"}
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2', instructions='You always respond in Italian.')
+
+        async def main():
+            await agent.to_cli()
+        ```
+        """
+        from rich.console import Console
+
+        from pydantic_ai._cli import run_chat
+
+        await run_chat(
+            stream=True,
+            agent=self,
+            deps=deps,
+            console=Console(),
+            code_theme='monokai',
+            prog_name=prog_name,
+            message_history=message_history,
+            model_settings=model_settings,
+            usage_limits=usage_limits,
+        )
+
+    def to_cli_sync(
+        self: Self,
+        deps: AgentDepsT = None,
+        prog_name: str = 'pydantic-ai',
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+    ) -> None:
+        """Run the agent in a CLI chat interface with the non-async interface.
+
+        Args:
+            deps: The dependencies to pass to the agent.
+            prog_name: The name of the program to use for the CLI. Defaults to 'pydantic-ai'.
+            message_history: History of the conversation so far.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+
+        ```python {title="agent_to_cli_sync.py" test="skip"}
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2', instructions='You always respond in Italian.')
+        agent.to_cli_sync()
+        agent.to_cli_sync(prog_name='assistant')
+        ```
+        """
+        return _utils.get_event_loop().run_until_complete(
+            self.to_cli(
+                deps=deps,
+                prog_name=prog_name,
+                message_history=message_history,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+            )
+        )
+
+## pydantic_ai_slim/pydantic_ai/concurrency.py
+
+async def _null_context() -> AsyncIterator[None]:
+    """A no-op async context manager."""
+    yield
+
+async def _limiter_context(limiter: AbstractConcurrencyLimiter, source: str) -> AsyncIterator[None]:
+    """Context manager that acquires and releases a limiter with the given source."""
+    await limiter.acquire(source)
+    try:
+        yield
+    finally:
+        limiter.release()
+
+def get_concurrency_context(
+    limiter: AbstractConcurrencyLimiter | None,
+    source: str = 'unnamed',
+) -> AbstractAsyncContextManager[None]:
+    """Get an async context manager for the concurrency limiter.
+
+    If limiter is None, returns a no-op context manager.
+
+    Args:
+        limiter: The AbstractConcurrencyLimiter or None.
+        source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+
+    Returns:
+        An async context manager.
+    """
+    if limiter is None:
+        return _null_context()
+    return _limiter_context(limiter, source)
+
+## pydantic_ai_slim/pydantic_ai/embeddings/base.py
+
+    def __init__(
+        self,
+        *,
+        settings: EmbeddingSettings | None = None,
+    ) -> None:
+        """Initialize the model with optional settings.
+
+        Args:
+            settings: Model-specific settings that will be used as defaults for this model.
+        """
+        self._settings = settings
+
+## pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py
+
+class _BedrockEmbeddingHandler(ABC):
+    """Abstract handler for processing different Bedrock embedding model formats."""
+
+    model_name: str
+
+    def __init__(self, model_name: str):
+        """Initialize the handler with the model name.
+
+        Args:
+            model_name: The normalized model name (e.g., 'amazon.titan-embed-text-v2:0').
+        """
+        self.model_name = model_name
+
+    @property
+    def supports_batch(self) -> bool:
+        """Whether this handler supports batch embedding in a single request."""
+        return False
+
+    @abstractmethod
+    def prepare_request(
+        self,
+        texts: list[str],
+        input_type: EmbedInputType,
+        settings: BedrockEmbeddingSettings,
+    ) -> dict[str, Any]:
+        """Prepare the request body for the embedding model."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def parse_response(
+        self,
+        response_body: dict[str, Any],
+    ) -> tuple[list[Sequence[float]], str | None]:
+        """Parse the response from the embedding model.
+
+        Args:
+            response_body: The parsed JSON response body.
+
+        Returns:
+            A tuple of (embeddings, response_id). response_id may be None.
+        """
+        raise NotImplementedError
+
+    def prepare_request(
+        self,
+        texts: list[str],
+        input_type: EmbedInputType,
+        settings: BedrockEmbeddingSettings,
+    ) -> dict[str, Any]:
+        """Prepare the request body for the embedding model."""
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class BaseToolCallPart
+    """A tool call from a model."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def args_as_dict(self) -> dict[str, Any]:
+        """Return the arguments as a Python dictionary.
+
+        This is just for convenience with models that require dicts as input.
+        """
+        if not self.args:
+            return {}
+        if isinstance(self.args, dict):
+            return self.args
+        args = pydantic_core.from_json(self.args)
+        assert isinstance(args, dict), 'args should be a dict'
+        return cast(dict[str, Any], args)
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def __init__(
+        self,
+        *,
+        settings: ModelSettings | None = None,
+        profile: ModelProfileSpec | None = None,
+    ) -> None:
+        """Initialize the model with optional settings and profile.
+
+        Args:
+            settings: Model-specific settings that will be used as defaults for this model.
+            profile: The model profile to use.
+        """
+        self._settings = settings
+        self._profile = profile
+
+## pydantic_ai_slim/pydantic_ai/models/function.py
+
+    def __init__(
+        self,
+        function: FunctionDef | None = None,
+        *,
+        stream_function: StreamFunctionDef | None = None,
+        model_name: str | None = None,
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize a `FunctionModel`.
+
+        Either `function` or `stream_function` must be provided, providing both is allowed.
+
+        Args:
+            function: The function to call for non-streamed requests.
+            stream_function: The function to call for streamed requests.
+            model_name: The name of the model. If not provided, a name is generated from the function names.
+            profile: The model profile to use.
+            settings: Model-specific settings that will be used as defaults for this model.
+        """
+        if function is None and stream_function is None:
+            raise TypeError('Either `function` or `stream_function` must be provided')
+
+        self.function = function
+        self.stream_function = stream_function
+
+        function_name = self.function.__name__ if self.function is not None else ''
+        stream_function_name = self.stream_function.__name__ if self.stream_function is not None else ''
+        self._model_name = model_name or f'function:{function_name}:{stream_function_name}'
+
+        # Use a default profile that supports JSON schema and object output if none provided
+        if profile is None:
+            profile = ModelProfile(
+                supports_json_schema_output=True,
+                supports_json_object_output=True,
+            )
+        super().__init__(settings=settings, profile=profile)
+
+## pydantic_ai_slim/pydantic_ai/models/google.py
+
+    def prepare_request(
+        self, model_settings: ModelSettings | None, model_request_parameters: ModelRequestParameters
+    ) -> tuple[ModelSettings | None, ModelRequestParameters]:
+        supports_native_output_with_builtin_tools = GoogleModelProfile.from_profile(
+            self.profile
+        ).google_supports_native_output_with_builtin_tools
+        if model_request_parameters.builtin_tools and model_request_parameters.output_tools:
+            if model_request_parameters.output_mode == 'auto':
+                output_mode = 'native' if supports_native_output_with_builtin_tools else 'prompted'
+                model_request_parameters = replace(model_request_parameters, output_mode=output_mode)
+            else:
+                output_mode = 'NativeOutput' if supports_native_output_with_builtin_tools else 'PromptedOutput'
+                raise UserError(
+                    f'Google does not support output tools and built-in tools at the same time. Use `output_type={output_mode}(...)` instead.'
+                )
+        return super().prepare_request(model_settings, model_request_parameters)
+
+## pydantic_ai_slim/pydantic_ai/profiles/__init__.py
+
+class ModelProfile
+    """Describes how requests to and responses from specific models or families of models need to be constructed and processed to get the best results, independent of the model and provider classes used."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def from_profile(cls, profile: ModelProfile | None) -> Self:
+        """Build a ModelProfile subclass instance from a ModelProfile instance."""
+        if isinstance(profile, cls):
+            return profile
+        return cls().update(profile)
+
+    def update(self, profile: ModelProfile | None) -> Self:
+        """Update this ModelProfile (subclass) instance with the non-default values from another ModelProfile instance."""
+        if not profile:
+            return self
+        field_names = set(f.name for f in fields(self))
+        non_default_attrs = {
+            f.name: getattr(profile, f.name)
+            for f in fields(profile)
+            if f.name in field_names and getattr(profile, f.name) != f.default
+        }
+        return replace(self, **non_default_attrs)
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    def requests(self):
+        return 1
+
+    request_limit: int | None = 50
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_cache_write_and_read(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    """Integration test covering all cache settings using a recorded cassette.
+
+    This test enables all 3 cache settings plus 2 manual CachePoints (5 total),
+    which triggers the _limit_cache_points logic to strip the oldest one (limit is 4).
+    """
+    model = BedrockConverseModel('us.anthropic.claude-sonnet-4-5-20250929-v1:0', provider=bedrock_provider)
+    agent = Agent(
+        model,
+        system_prompt='YOU MUST RESPONSE ONLY WITH SINGLE NUMBER\n' * 50,  # More tokens to activate a cache
+        model_settings=BedrockModelSettings(
+            bedrock_cache_instructions=True,  # 1 cache point
+            bedrock_cache_tool_definitions=True,  # 1 cache point
+            bedrock_cache_messages=True,  # 1 cache point (on last user message)
+        ),
+    )
+
+    @agent.tool_plain
+    def catalog_lookup() -> str:  # pragma: no cover - exercised via agent call
+        return 'catalog-ok'
+
+    @agent.tool_plain
+    def diagnostics() -> str:  # pragma: no cover - exercised via agent call
+        return 'diagnostics-ok'
+
+    long_context = 'Newer response with something except single number\n' * 10
+    document = BinaryContent(data=b'You are a great mathematician', media_type='text/plain')
+    # 2 CachePoints, more that maximum allowed, so will be stripped.
+    run_args = [long_context, CachePoint(), document, CachePoint(), 'What is 10 + 11?']
+
+    first = await agent.run(run_args)
+    assert first.output == snapshot('21')
+    first_usage = first.usage()
+    assert first_usage == snapshot(RunUsage(input_tokens=1324, cache_write_tokens=1322, output_tokens=5, requests=1))
+
+    second = await agent.run(run_args)
+    assert second.output == snapshot('21')
+    second_usage = second.usage()
+    assert second_usage == snapshot(RunUsage(input_tokens=1324, output_tokens=5, cache_read_tokens=1322, requests=1))
+
+## tests/models/test_outlines.py
+
+def vllm_model_offline() -> OutlinesModel:  # pragma: no cover
+    outlines_model = outlines.models.vllm_offline.from_vllm_offline(vllm.LLM('microsoft/Phi-3-mini-4k-instruct'))  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
+    return OutlinesModel(outlines_model, provider=OutlinesProvider())
+
+def test_model_settings_vllm_offline(vllm_model_offline: OutlinesModel) -> None:  # pragma: no cover
+    # unsupported arguments removed
+    kwargs = vllm_model_offline.format_inference_kwargs(
+        ModelSettings(
+            timeout=1,
+            parallel_tool_calls=True,
+            stop_sequences=['.'],
+            extra_headers={'Authorization': 'Bearer 123'},
+        )
+    )
+    assert 'timeout' not in kwargs
+    assert 'parallel_tool_calls' not in kwargs
+    assert 'stop_sequences' not in kwargs
+    assert 'extra_headers' not in kwargs
+
+    # special keys are preserved and others are in sampling params
+    kwargs = vllm_model_offline.format_inference_kwargs(
+        ModelSettings(  # type: ignore[reportCallIssue]
+            use_tqdm=True,
+            lora_request='test',
+            priority=1,
+            temperature=1,
+        )
+    )
+    assert kwargs['use_tqdm'] is True
+    assert kwargs['lora_request'] == 'test'
+    assert kwargs['priority'] == 1
+    assert 'sampling_params' in kwargs
+    assert 'temperature' in kwargs['sampling_params']
+
+## tests/test_agent.py
+
+def test_output_type_handoff_to_agent():
+    class Weather(BaseModel):
+        temperature: float
+        description: str
+
+    def get_weather(city: str) -> Weather:
+        return Weather(temperature=28.7, description='sunny')
+
+    def call_tool(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+
+        args_json = '{"city": "Mexico City"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(call_tool), output_type=get_weather)
+
+    handoff_result = None
+
+    async def handoff(city: str) -> Weather:
+        result = await agent.run(f'Get me the weather in {city}')
+        nonlocal handoff_result
+        handoff_result = result
+        return result.output
+
+    def call_handoff_tool(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+
+        args_json = '{"city": "Mexico City"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    supervisor_agent = Agent(FunctionModel(call_handoff_tool), output_type=handoff)
+
+    result = supervisor_agent.run_sync('Mexico City')
+    assert result.output == snapshot(Weather(temperature=28.7, description='sunny'))
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Mexico City',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args='{"city": "Mexico City"}',
+                        tool_call_id=IsStr(),
+                    )
+                ],
+                usage=RequestUsage(input_tokens=52, output_tokens=6),
+                model_name='function:call_handoff_tool:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert handoff_result is not None
+    assert handoff_result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Get me the weather in Mexico City',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args='{"city": "Mexico City"}',
+                        tool_call_id=IsStr(),
+                    )
+                ],
+                usage=RequestUsage(input_tokens=57, output_tokens=6),
+                model_name='function:call_tool:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_cli.py
+
+def test_agent_to_cli_sync(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+    cli_agent.to_cli_sync()
+    mock_run_chat.assert_awaited_once_with(
+        stream=True,
+        agent=IsInstance(Agent),
+        console=IsInstance(Console),
+        code_theme='monokai',
+        prog_name='pydantic-ai',
+        deps=None,
+        message_history=None,
+        model_settings=None,
+        usage_limits=None,
+    )
+
+async def test_agent_to_cli_async(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+    await cli_agent.to_cli()
+    mock_run_chat.assert_awaited_once_with(
+        stream=True,
+        agent=IsInstance(Agent),
+        console=IsInstance(Console),
+        code_theme='monokai',
+        prog_name='pydantic-ai',
+        deps=None,
+        message_history=None,
+        model_settings=None,
+        usage_limits=None,
+    )
+
+async def test_agent_to_cli_with_message_history(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+
+    # Create some test message history - cast to the proper base type
+    test_messages: list[ModelMessage] = [ModelResponse(parts=[TextPart('Hello!')])]
+
+    await cli_agent.to_cli(message_history=test_messages)
+    mock_run_chat.assert_awaited_once_with(
+        stream=True,
+        agent=IsInstance(Agent),
+        console=IsInstance(Console),
+        code_theme='monokai',
+        prog_name='pydantic-ai',
+        deps=None,
+        message_history=test_messages,
+        model_settings=None,
+        usage_limits=None,
+    )
+
+def test_agent_to_cli_sync_with_message_history(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+
+    # Create some test message history - cast to the proper base type
+    test_messages: list[ModelMessage] = [ModelResponse(parts=[TextPart('Hello!')])]
+
+    cli_agent.to_cli_sync(message_history=test_messages)
+    mock_run_chat.assert_awaited_once_with(
+        stream=True,
+        agent=IsInstance(Agent),
+        console=IsInstance(Console),
+        code_theme='monokai',
+        prog_name='pydantic-ai',
+        deps=None,
+        message_history=test_messages,
+        model_settings=None,
+        usage_limits=None,
+    )
+
+def test_agent_to_cli_sync_with_args(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+
+    model_settings = ModelSettings(temperature=0.5)
+    usage_limits = UsageLimits(request_limit=10)
+
+    cli_agent.to_cli_sync(model_settings=model_settings, usage_limits=usage_limits)
+
+    mock_run_chat.assert_awaited_once_with(
+        stream=True,
+        agent=IsInstance(Agent),
+        console=IsInstance(Console),
+        code_theme='monokai',
+        prog_name='pydantic-ai',
+        deps=None,
+        message_history=None,
+        model_settings=model_settings,
+        usage_limits=usage_limits,
+    )
+
+async def test_agent_to_cli_async_with_args(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+
+    model_settings = ModelSettings(temperature=0.5)
+    usage_limits = UsageLimits(request_limit=10)
+
+    await cli_agent.to_cli(model_settings=model_settings, usage_limits=usage_limits)
+
+    mock_run_chat.assert_awaited_once_with(
+        stream=True,
+        agent=IsInstance(Agent),
+        console=IsInstance(Console),
+        code_theme='monokai',
+        prog_name='pydantic-ai',
+        deps=None,
+        message_history=None,
+        model_settings=model_settings,
+        usage_limits=usage_limits,
+    )
+
+## tests/test_concurrency.py
+
+    async def test_returns_context_when_provided(self):
+        """Test that get_concurrency_context returns a working context."""
+        limiter = ConcurrencyLimiter(max_running=1)
+        async with get_concurrency_context(limiter, 'test'):
+            pass  # Should acquire and release
+
+    async def test_returns_null_context_when_none(self):
+        """Test that get_concurrency_context returns a no-op context when None."""
+        async with get_concurrency_context(None, 'test'):
+            pass  # Should be a no-op
+
+class TestConcurrencyLimiterName
+    """Tests for ConcurrencyLimiter name parameter."""
+    ...  # (skeleton: full source omitted for budget)
+
+    async def test_limiter_with_max_queued_includes_attribute_in_span(self, capfire: CaptureLogfire):
+        """Test that max_queued is included in span attributes when set."""
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=5, name='queued-pool')
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify max_queued is in span attributes
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        attrs = spans[0]['attributes']
+        assert attrs['max_queued'] == 5

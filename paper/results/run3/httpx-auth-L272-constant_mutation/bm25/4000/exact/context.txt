@@ -1,0 +1,473 @@
+# tests/test_auth.py:69-104
+def test_digest_auth_with_401_nonce_counting():
+    auth = httpx.DigestAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    # The initial request should not include an auth header.
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    # If a 401 response is returned, then a digest auth request is made.
+    headers = {
+        "WWW-Authenticate": 'Digest realm="...", qop="auth", nonce="...", opaque="..."'
+    }
+    response = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers, request=request
+    )
+    first_request = flow.send(response)
+    assert first_request.headers["Authorization"].startswith("Digest")
+
+    # Each subsequent request contains the digest header by default...
+    request = httpx.Request("GET", "https://www.example.com")
+    flow = auth.sync_auth_flow(request)
+    second_request = next(flow)
+    assert second_request.headers["Authorization"].startswith("Digest")
+
+    # ... and the client nonce count (nc) is increased
+    first_nc = parse_keqv_list(first_request.headers["Authorization"].split(", "))["nc"]
+    second_nc = parse_keqv_list(second_request.headers["Authorization"].split(", "))[
+        "nc"
+    ]
+    assert int(first_nc, 16) + 1 == int(second_nc, 16)
+
+    # No other requests are made.
+    response = httpx.Response(content=b"Hello, world!", status_code=200)
+    with pytest.raises(StopIteration):
+        flow.send(response)
+
+# tests/client/test_auth.py:557-593
+async def test_digest_auth_resets_nonce_count_after_401() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response_1 = await client.get(url, auth=auth)
+        assert response_1.status_code == 200
+        assert len(response_1.history) == 1
+
+        first_nonce = parse_keqv_list(
+            response_1.request.headers["Authorization"].split(", ")
+        )["nonce"]
+        first_nc = parse_keqv_list(
+            response_1.request.headers["Authorization"].split(", ")
+        )["nc"]
+
+        # with this we now force a 401 on a subsequent (but initial) request
+        app.send_response_after_attempt = 2
+
+        # we expect the client again to try to authenticate,
+        # i.e. the history length must be 1
+        response_2 = await client.get(url, auth=auth)
+        assert response_2.status_code == 200
+        assert len(response_2.history) == 1
+
+        second_nonce = parse_keqv_list(
+            response_2.request.headers["Authorization"].split(", ")
+        )["nonce"]
+        second_nc = parse_keqv_list(
+            response_2.request.headers["Authorization"].split(", ")
+        )["nc"]
+
+    assert first_nonce != second_nonce  # ensures that the auth challenge was reset
+    assert (
+        first_nc == second_nc
+    )  # ensures the nonce count is reset when the authentication failed
+
+# tests/client/test_auth.py:516-523
+async def test_digest_auth_qop_must_be_auth_or_auth_int() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="not-auth")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+# tests/test_main.py:145-168
+def test_auth(server):
+    url = str(server.url)
+    runner = CliRunner()
+    result = runner.invoke(httpx.main, [url, "-v", "--auth", "username", "password"])
+    print(result.output)
+    assert result.exit_code == 0
+    assert remove_date_header(splitlines(result.output)) == [
+        "* Connecting to '127.0.0.1'",
+        "* Connected to '127.0.0.1' on port 8000",
+        "GET / HTTP/1.1",
+        f"Host: {server.url.netloc.decode('ascii')}",
+        "Accept: */*",
+        "Accept-Encoding: gzip, deflate, br, zstd",
+        "Connection: keep-alive",
+        f"User-Agent: python-httpx/{httpx.__version__}",
+        "Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+        "",
+        "HTTP/1.1 200 OK",
+        "server: uvicorn",
+        "content-type: text/plain",
+        "Transfer-Encoding: chunked",
+        "",
+        "Hello, world!",
+    ]
+
+# httpx/_config.py:227-233
+    def raw_auth(self) -> tuple[bytes, bytes] | None:
+        # The proxy authentication as raw bytes.
+        return (
+            None
+            if self.auth is None
+            else (self.auth[0].encode("utf-8"), self.auth[1].encode("utf-8"))
+        )
+
+# tests/client/test_auth.py:370-381
+def test_digest_auth_returns_no_auth_if_alternate_auth_scheme() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    auth_header = "Token ..."
+    app = App(auth_header=auth_header, status_code=401)
+
+    client = httpx.Client(transport=httpx.MockTransport(app))
+    response = client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+# tests/client/test_auth.py:492-501
+async def test_digest_auth_qop_including_spaces_and_auth_returns_auth(qop: str) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop=qop)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+# httpx/_main.py:287-298
+def validate_auth(
+    ctx: click.Context,
+    param: click.Option | click.Parameter,
+    value: typing.Any,
+) -> typing.Any:
+    if value == (None, None):
+        return None
+
+    username, password = value
+    if password == "-":  # pragma: no cover
+        password = click.prompt("Password", hide_input=True)
+    return (username, password)
+
+# tests/conftest.py:186-187
+def cert_authority():
+    return trustme.CA()
+
+# tests/client/test_auth.py:163-172
+async def test_basic_auth() -> None:
+    url = "https://example.org/"
+    auth = ("user", "password123")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+# tests/client/test_auth.py:163-172
+async def test_basic_auth() -> None:
+    url = "https://example.org/"
+    auth = ("user", "password123")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+# tests/client/test_auth.py:222-234
+async def test_custom_auth() -> None:
+    url = "https://example.org/"
+    app = App()
+
+    def auth(request: httpx.Request) -> httpx.Request:
+        request.headers["Authorization"] = "Token 123"
+        return request
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Token 123"}
+
+# tests/client/test_auth.py:427-456
+async def test_digest_auth(
+    algorithm: str, expected_hash_length: int, expected_response_length: int
+) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(algorithm=algorithm)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+    authorization = typing.cast(typing.Dict[str, typing.Any], response.json())["auth"]
+    scheme, _, fields = authorization.partition(" ")
+    assert scheme == "Digest"
+
+    response_fields = [field.strip() for field in fields.split(",")]
+    digest_data = dict(field.split("=") for field in response_fields)
+
+    assert digest_data["username"] == '"user"'
+    assert digest_data["realm"] == '"httpx@example.org"'
+    assert "nonce" in digest_data
+    assert digest_data["uri"] == '"/"'
+    assert len(digest_data["response"]) == expected_response_length + 2  # extra quotes
+    assert len(digest_data["opaque"]) == expected_hash_length + 2
+    assert digest_data["algorithm"] == algorithm
+    assert digest_data["qop"] == "auth"
+    assert digest_data["nc"] == "00000001"
+    assert len(digest_data["cnonce"]) == 16 + 2
+
+# httpx/_client.py:445-455
+    def _build_auth(self, auth: AuthTypes | None) -> Auth | None:
+        if auth is None:
+            return None
+        elif isinstance(auth, tuple):
+            return BasicAuth(username=auth[0], password=auth[1])
+        elif isinstance(auth, Auth):
+            return auth
+        elif callable(auth):
+            return FunctionAuth(func=auth)
+        else:
+            raise TypeError(f'Invalid "auth" argument: {auth!r}')
+
+# tests/client/test_auth.py:505-512
+async def test_digest_auth_qop_auth_int_not_implemented() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="auth-int")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(NotImplementedError):
+            await client.get(url, auth=auth)
+
+# tests/client/test_auth.py:323-335
+async def test_auth_property() -> None:
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        assert client.auth is None
+
+        client.auth = ("user", "password123")
+        assert isinstance(client.auth, httpx.BasicAuth)
+
+        url = "https://example.org/"
+        response = await client.get(url)
+        assert response.status_code == 200
+        assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+# tests/client/test_auth.py:303-307
+def test_auth_hidden_url() -> None:
+    url = "http://example-username:example-password@example.org/"
+    expected = "URL('http://example-username:[secure]@example.org/')"
+    assert url == httpx.URL(url)
+    assert expected == repr(httpx.URL(url))
+
+# tests/models/test_url.py:63-67
+def test_url_no_authority():
+    url = httpx.URL("http://")
+    assert url.scheme == "http"
+    assert url.host == ""
+    assert url.path == "/"
+
+# tests/client/test_auth.py:147-152
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+# tests/client/test_auth.py:195-203
+async def test_basic_auth_in_url() -> None:
+    url = "https://user:password123@example.org/"
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+# tests/client/test_auth.py:339-353
+async def test_auth_invalid_type() -> None:
+    app = App()
+
+    with pytest.raises(TypeError):
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(app),
+            auth="not a tuple, not a callable",  # type: ignore
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(TypeError):
+            await client.get(auth="not a tuple, not a callable")  # type: ignore
+
+        with pytest.raises(TypeError):
+            client.auth = "not a tuple, not a callable"  # type: ignore
+
+# tests/client/test_auth.py:400-410
+async def test_digest_auth_401_response_without_digest_auth_header() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App(auth_header="", status_code=401)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+# httpx/_client.py:930-962
+    def _send_handling_auth(
+        self,
+        request: Request,
+        auth: Auth,
+        follow_redirects: bool,
+        history: list[Response],
+    ) -> Response:
+        auth_flow = auth.sync_auth_flow(request)
+        try:
+            request = next(auth_flow)
+
+            while True:
+                response = self._send_handling_redirects(
+                    request,
+                    follow_redirects=follow_redirects,
+                    history=history,
+                )
+                try:
+                    try:
+                        next_request = auth_flow.send(response)
+                    except StopIteration:
+                        return response
+
+                    response.history = list(history)
+                    response.read()
+                    request = next_request
+                    history.append(response)
+
+                except BaseException as exc:
+                    response.close()
+                    raise exc
+        finally:
+            auth_flow.close()
+
+# httpx/_auth.py:139-142
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
+# httpx/_auth.py:169-172
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
+# tests/client/test_auth.py:154-159
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.AsyncGenerator[httpx.Request, httpx.Response]:
+        async with self._async_lock:
+            request.headers["Authorization"] = "async-auth"
+        yield request
+
+# tests/client/test_auth.py:311-319
+async def test_auth_hidden_header() -> None:
+    url = "https://example.org/"
+    auth = ("example-username", "example-password")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert "'authorization': '[secure]'" in str(response.request.headers)
+
+# tests/client/test_auth.py:385-396
+async def test_digest_auth_200_response_including_digest_auth_header() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    auth_header = 'Digest realm="realm@host.com",qop="auth",nonce="abc",opaque="xyz"'
+    app = App(auth_header=auth_header, status_code=200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+# httpx/_client.py:457-473
+    def _build_request_auth(
+        self,
+        request: Request,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+    ) -> Auth:
+        auth = (
+            self._auth if isinstance(auth, UseClientDefault) else self._build_auth(auth)
+        )
+
+        if auth is not None:
+            return auth
+
+        username, password = request.url.username, request.url.password
+        if username or password:
+            return BasicAuth(username=username, password=password)
+
+        return Auth()
+
+# tests/test_auth.py:29-41
+def test_digest_auth_with_200():
+    auth = httpx.DigestAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    # The initial request should not include an auth header.
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    # If a 200 response is returned, then no other requests are made.
+    response = httpx.Response(content=b"Hello, world!", status_code=200)
+    with pytest.raises(StopIteration):
+        flow.send(response)
+
+# httpx/_status_codes.py:97-97
+    NON_AUTHORITATIVE_INFORMATION = 203, "Non-Authoritative Information"
+
+# httpx/_status_codes.py:123-123
+    PROXY_AUTHENTICATION_REQUIRED = 407, "Proxy Authentication Required"
+
+# httpx/_status_codes.py:157-157
+    NETWORK_AUTHENTICATION_REQUIRED = 511, "Network Authentication Required"
+
+# httpx/_models.py:33-33
+from ._multipart import get_multipart_boundary_from_content_type
+
+# httpx/_client.py:14-21
+from ._config import (
+    DEFAULT_LIMITS,
+    DEFAULT_MAX_REDIRECTS,
+    DEFAULT_TIMEOUT_CONFIG,
+    Limits,
+    Proxy,
+    Timeout,
+)

@@ -1,0 +1,846 @@
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py
+
+    def provider_url(self) -> str | None:
+        return self.response.provider_url  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def provider_url(self) -> str | None:
+        """Get the provider base URL."""
+        raise NotImplementedError()
+
+## pydantic_ai_slim/pydantic_ai/models/outlines.py
+
+    def provider_url(self) -> str | None:
+        """Get the provider base URL."""
+        return self._provider_url
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+class RequestUsage(UsageBase):
+    """LLM usage associated with a single request.
+
+    This is an implementation of `genai_prices.types.AbstractUsage` so it can be used to calculate the price of the
+    request using [genai-prices](https://github.com/pydantic/genai-prices).
+    """
+
+    @property
+    def requests(self):
+        return 1
+
+    def incr(self, incr_usage: RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        return _incr_usage_tokens(self, incr_usage)
+
+    def __add__(self, other: RequestUsage) -> RequestUsage:
+        """Add two RequestUsages together.
+
+        This is provided so it's trivial to sum usage information from multiple parts of a response.
+
+        **WARNING:** this CANNOT be used to sum multiple requests without breaking some pricing calculations.
+        """
+        new_usage = copy(self)
+        new_usage.incr(other)
+        return new_usage
+
+    @classmethod
+    def extract(
+        cls,
+        data: Any,
+        *,
+        provider: str,
+        provider_url: str,
+        provider_fallback: str,
+        api_flavor: str = 'default',
+        details: dict[str, Any] | None = None,
+    ) -> RequestUsage:
+        """Extract usage information from the response data using genai-prices.
+
+        Args:
+            data: The response data from the model API.
+            provider: The actual provider ID
+            provider_url: The provider base_url
+            provider_fallback: The fallback provider ID to use if the actual provider is not found in genai-prices.
+                For example, an OpenAI model should set this to "openai" in case it has an obscure provider ID.
+            api_flavor: The API flavor to use when extracting usage information,
+                e.g. 'chat' or 'responses' for OpenAI.
+            details: Becomes the `details` field on the returned `RequestUsage` for convenience.
+        """
+        details = details and {}
+        for provider_id, provider_api_url in [(None, provider_url), (provider, None), (provider_fallback, None)]:
+            try:
+                provider_obj = get_snapshot().find_provider(None, provider_id, provider_api_url)
+                _model_ref, extracted_usage = provider_obj.extract_usage(data, api_flavor=api_flavor)
+                return cls(**{k: v for k, v in extracted_usage.__dict__.items() if v is not None}, details=details)
+            except Exception:
+                pass
+        return cls(details=details)
+
+## tests/models/test_xai.py
+
+async def test_xai_stream_server_side_tool_call_ignored_for_unknown_role(allow_model_requests: None):
+    """Server-side tool deltas with an unknown role should be ignored."""
+
+    server_tool_call = create_server_tool_call(
+        tool_name='web_search',
+        arguments={'query': 'x'},
+        tool_call_id='server_tool_1',
+        tool_type=chat_pb2.ToolCallType.TOOL_CALL_TYPE_WEB_SEARCH_TOOL,
+        status=chat_pb2.ToolCallStatus.TOOL_CALL_STATUS_COMPLETED,
+    )
+
+    stream: list[tuple[chat_types.Response, chat_types.Chunk]] = [
+        (
+            create_response(content='', tool_calls=[server_tool_call], finish_reason='stop'),
+            create_stream_chunk(role=chat_pb2.MessageRole.ROLE_USER, tool_calls=[server_tool_call]),
+        ),
+        (
+            create_response(content='done', finish_reason='stop'),
+            create_stream_chunk(role=chat_pb2.MessageRole.ROLE_ASSISTANT, content='done'),
+        ),
+    ]
+
+    mock_client = MockXai.create_mock_stream([stream])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    async with agent.run_stream('') as result:
+        final_response: ModelResponse | None = None
+        async for response, is_last in result.stream_responses(debounce_by=None):
+            if is_last:
+                final_response = response
+
+    assert final_response is not None
+    assert not any(isinstance(p, BuiltinToolCallPart) for p in final_response.parts)
+    assert not any(isinstance(p, BuiltinToolReturnPart) for p in final_response.parts)
+
+async def test_xai_map_builtin_tool_call_part_unknown_tool_name_ignored(allow_model_requests: None):
+    """Cover the fallback path where a builtin tool call part has an unknown tool name."""
+    response = create_response(content='ok', usage=create_usage(prompt_tokens=1, completion_tokens=1))
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    message_history: list[ModelMessage] = [
+        ModelResponse(
+            parts=[
+                BuiltinToolCallPart(
+                    tool_name='unknown_builtin_tool',
+                    args={'x': 1},
+                    tool_call_id='unknown_tool_1',
+                    provider_name='xai',
+                )
+            ],
+            model_name=XAI_NON_REASONING_MODEL,
+            timestamp=IsNow(tz=timezone.utc),
+            provider_name='xai',
+        )
+    ]
+
+    result = await agent.run('hello', message_history=message_history)
+    assert result.output == 'ok'
+
+async def test_xai_unknown_tool_type_in_response(allow_model_requests: None):
+    """Test handling of unknown tool types like x_search or collections_search."""
+    # Create a server-side tool call with an unknown/other type
+    unknown_tool_call = chat_pb2.ToolCall(
+        id='unknown_001',
+        type=chat_pb2.ToolCallType.TOOL_CALL_TYPE_X_SEARCH_TOOL,  # x_search is not directly mapped
+        status=chat_pb2.ToolCallStatus.TOOL_CALL_STATUS_COMPLETED,
+        function=chat_pb2.FunctionCall(
+            name='x_search',
+            arguments='{"query": "test"}',
+        ),
+    )
+
+    # Create response with unknown tool
+    response = create_mixed_tools_response([unknown_tool_call], text_content='Search results here')
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Search for something')
+
+    # Verify kwargs sent to xAI
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [{'content': [{'text': 'Search for something'}], 'role': 'ROLE_USER'}],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+    # Verify the unknown tool type is handled gracefully using the function name
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Search for something', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    BuiltinToolCallPart(
+                        tool_name='x_search', args={'query': 'test'}, tool_call_id=IsStr(), provider_name='xai'
+                    ),
+                    TextPart(content='Search results here'),
+                ],
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_name='xai',
+                provider_url='https://api.x.ai/v1',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_agent.py
+
+def test_unknown_tool():
+    def empty(_: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart('foobar', '{}')])
+
+    agent = Agent(FunctionModel(empty))
+
+    with capture_run_messages() as messages:
+        with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(1\) for output validation'):
+            agent.run_sync('Hello')
+    assert messages == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=51, output_tokens=2),
+                model_name='function:empty:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        tool_name='foobar',
+                        content="Unknown tool name: 'foobar'. No tools available.",
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=65, output_tokens=4),
+                model_name='function:empty:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+def test_unknown_tool_fix():
+    def empty(m: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        if len(m) > 1:
+            return ModelResponse(parts=[TextPart('success')])
+        else:
+            return ModelResponse(parts=[ToolCallPart('foobar', '{}')])
+
+    agent = Agent(FunctionModel(empty))
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'success'
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=51, output_tokens=2),
+                model_name='function:empty:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        tool_name='foobar',
+                        content="Unknown tool name: 'foobar'. No tools available.",
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success')],
+                usage=RequestUsage(input_tokens=65, output_tokens=3),
+                model_name='function:empty:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+def test_unknown_tool_multiple_retries():
+    num_retries = 2
+
+    def empty(_: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart('foobar', '{}')])
+
+    agent = Agent(FunctionModel(empty), retries=num_retries)
+
+    with capture_run_messages() as messages:
+        with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(2\) for output validation'):
+            agent.run_sync('Hello')
+    assert messages == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=51, output_tokens=2),
+                model_name='function:empty:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        tool_name='foobar',
+                        content="Unknown tool name: 'foobar'. No tools available.",
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=65, output_tokens=4),
+                model_name='function:empty:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        tool_name='foobar',
+                        content="Unknown tool name: 'foobar'. No tools available.",
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=79, output_tokens=6),
+                model_name='function:empty:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_streaming.py
+
+async def test_unknown_tool_call_events():
+    """Test that unknown tool calls emit both FunctionToolCallEvent and FunctionToolResultEvent during streaming."""
+
+    def call_mixed_tools(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        """Mock function that calls both known and unknown tools."""
+        return ModelResponse(
+            parts=[
+                ToolCallPart('unknown_tool', {'arg': 'value'}),
+                ToolCallPart('known_tool', {'x': 5}),
+            ]
+        )
+
+    agent = Agent(FunctionModel(call_mixed_tools))
+
+    @agent.tool_plain
+    def known_tool(x: int) -> int:
+        return x * 2
+
+    event_parts: list[Any] = []
+
+    try:
+        async with agent.iter('test') as agent_run:
+            async for node in agent_run:  # pragma: no branch
+                if Agent.is_call_tools_node(node):
+                    async with node.stream(agent_run.ctx) as event_stream:
+                        async for event in event_stream:
+                            event_parts.append(event)
+
+    except UnexpectedModelBehavior:
+        pass
+
+    assert event_parts == snapshot(
+        [
+            FunctionToolCallEvent(
+                part=ToolCallPart(
+                    tool_name='known_tool',
+                    args={'x': 5},
+                    tool_call_id=IsStr(),
+                )
+            ),
+            FunctionToolCallEvent(
+                part=ToolCallPart(
+                    tool_name='unknown_tool',
+                    args={'arg': 'value'},
+                    tool_call_id=IsStr(),
+                ),
+            ),
+            FunctionToolResultEvent(
+                result=RetryPromptPart(
+                    content="Unknown tool name: 'unknown_tool'. Available tools: 'known_tool'",
+                    tool_name='unknown_tool',
+                    tool_call_id=IsStr(),
+                    timestamp=IsNow(tz=timezone.utc),
+                ),
+            ),
+            FunctionToolResultEvent(
+                result=ToolReturnPart(
+                    tool_name='known_tool',
+                    content=10,
+                    tool_call_id=IsStr(),
+                    timestamp=IsNow(tz=timezone.utc),
+                ),
+            ),
+        ]
+    )
+
+## tests/test_usage_limits.py
+
+pytestmark = pytest.mark.anyio
+
+def test_genai_prices():
+    usage = GenaiPricesUsage(input_tokens=100, output_tokens=50)
+    assert calc_price(usage, model_ref='gpt-4o').total_price == snapshot(Decimal('0.00075'))
+
+def test_request_token_limit() -> None:
+    test_agent = Agent(TestModel())
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('Exceeded the input_tokens_limit of 5 (input_tokens=59)')):
+        test_agent.run_sync(
+            'Hello, this prompt exceeds the request tokens limit.', usage_limits=UsageLimits(input_tokens_limit=5)
+        )
+
+def test_response_token_limit() -> None:
+    test_agent = Agent(
+        TestModel(custom_output_text='Unfortunately, this response exceeds the response tokens limit by a few!')
+    )
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('Exceeded the output_tokens_limit of 5 (output_tokens=11)')):
+        test_agent.run_sync('Hello', usage_limits=UsageLimits(output_tokens_limit=5))
+
+def test_total_token_limit() -> None:
+    test_agent = Agent(TestModel(custom_output_text='This utilizes 4 tokens!'))
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('Exceeded the total_tokens_limit of 50 (total_tokens=55)')):
+        test_agent.run_sync('Hello', usage_limits=UsageLimits(total_tokens_limit=50))
+
+def test_retry_limit() -> None:
+    test_agent = Agent(TestModel())
+
+    @test_agent.tool_plain
+    async def foo(x: str) -> str:
+        return x
+
+    @test_agent.tool_plain
+    async def bar(y: str) -> str:
+        return y
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('The next request would exceed the request_limit of 1')):
+        test_agent.run_sync('Hello', usage_limits=UsageLimits(request_limit=1))
+
+async def test_streamed_text_limits() -> None:
+    m = TestModel()
+
+    test_agent = Agent(m)
+    assert test_agent.name is None
+
+    @test_agent.tool_plain
+    async def ret_a(x: str) -> str:
+        return f'{x}-apple'
+
+    succeeded = False
+
+    with pytest.raises(
+        UsageLimitExceeded, match=re.escape('Exceeded the output_tokens_limit of 10 (output_tokens=11)')
+    ):
+        async with test_agent.run_stream('Hello', usage_limits=UsageLimits(output_tokens_limit=10)) as result:
+            assert test_agent.name == 'test_agent'
+            assert not result.is_complete
+            assert result.all_messages() == snapshot(
+                [
+                    ModelRequest(
+                        parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                        timestamp=IsNow(tz=timezone.utc),
+                        run_id=IsStr(),
+                    ),
+                    ModelResponse(
+                        parts=[
+                            ToolCallPart(
+                                tool_name='ret_a',
+                                args={'x': 'a'},
+                                tool_call_id=IsStr(),
+                            )
+                        ],
+                        usage=RequestUsage(input_tokens=51),
+                        model_name='test',
+                        timestamp=IsNow(tz=timezone.utc),
+                        provider_name='test',
+                        run_id=IsStr(),
+                    ),
+                    ModelRequest(
+                        parts=[
+                            ToolReturnPart(
+                                tool_name='ret_a',
+                                content='a-apple',
+                                timestamp=IsNow(tz=timezone.utc),
+                                tool_call_id=IsStr(),
+                            )
+                        ],
+                        timestamp=IsNow(tz=timezone.utc),
+                        run_id=IsStr(),
+                    ),
+                ]
+            )
+            assert result.usage() == snapshot(
+                RunUsage(
+                    requests=2,
+                    input_tokens=103,
+                    output_tokens=5,
+                    tool_calls=1,
+                )
+            )
+            succeeded = True
+
+    assert succeeded
+
+def test_usage_so_far() -> None:
+    test_agent = Agent(TestModel())
+
+    with pytest.raises(
+        UsageLimitExceeded, match=re.escape('Exceeded the total_tokens_limit of 105 (total_tokens=163)')
+    ):
+        test_agent.run_sync(
+            'Hello, this prompt exceeds the request tokens limit.',
+            usage_limits=UsageLimits(total_tokens_limit=105),
+            usage=RunUsage(input_tokens=50, output_tokens=50),
+        )
+
+async def test_multi_agent_usage_no_incr():
+    delegate_agent = Agent(TestModel(), output_type=int)
+
+    controller_agent1 = Agent(TestModel())
+    run_1_usages: list[RunUsage] = []
+
+    @controller_agent1.tool
+    async def delegate_to_other_agent1(ctx: RunContext[None], sentence: str) -> int:
+        delegate_result = await delegate_agent.run(sentence)
+        delegate_usage = delegate_result.usage()
+        run_1_usages.append(delegate_usage)
+        assert delegate_usage == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=4))
+        return delegate_result.output
+
+    result1 = await controller_agent1.run('foobar')
+    assert result1.output == snapshot('{"delegate_to_other_agent1":0}')
+    run_1_usages.append(result1.usage())
+    assert result1.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=13, tool_calls=1))
+
+    controller_agent2 = Agent(TestModel())
+
+    @controller_agent2.tool
+    async def delegate_to_other_agent2(ctx: RunContext[None], sentence: str) -> int:
+        delegate_result = await delegate_agent.run(sentence, usage=ctx.usage)
+        delegate_usage = delegate_result.usage()
+        assert delegate_usage == snapshot(RunUsage(requests=2, input_tokens=102, output_tokens=9))
+        return delegate_result.output
+
+    result2 = await controller_agent2.run('foobar')
+    assert result2.output == snapshot('{"delegate_to_other_agent2":0}')
+    assert result2.usage() == snapshot(RunUsage(requests=3, input_tokens=154, output_tokens=17, tool_calls=1))
+
+    # confirm the usage from result2 is the sum of the usage from result1
+    assert result2.usage() == functools.reduce(operator.add, run_1_usages)
+
+    result1_usage = result1.usage()
+    result1_usage.details = {'custom1': 10, 'custom2': 20, 'custom3': 0}
+    assert result1_usage.opentelemetry_attributes() == {
+        'gen_ai.usage.input_tokens': 103,
+        'gen_ai.usage.output_tokens': 13,
+        'gen_ai.usage.details.custom1': 10,
+        'gen_ai.usage.details.custom2': 20,
+    }
+
+async def test_multi_agent_usage_sync():
+    """As in `test_multi_agent_usage_async`, with a sync tool."""
+    controller_agent = Agent(TestModel())
+
+    @controller_agent.tool
+    def delegate_to_other_agent(ctx: RunContext[None], sentence: str) -> int:
+        new_usage = RunUsage(requests=5, input_tokens=2, output_tokens=3)
+        ctx.usage.incr(new_usage)
+        return 0
+
+    result = await controller_agent.run('foobar')
+    assert result.output == snapshot('{"delegate_to_other_agent":0}')
+    assert result.usage() == snapshot(RunUsage(requests=7, input_tokens=105, output_tokens=16, tool_calls=1))
+
+def test_request_usage_basics():
+    usage = RequestUsage()
+    assert usage.output_audio_tokens == 0
+    assert usage.requests == 1
+
+def test_add_usages():
+    usage = RunUsage(
+        requests=2,
+        input_tokens=10,
+        output_tokens=20,
+        cache_read_tokens=30,
+        cache_write_tokens=40,
+        input_audio_tokens=50,
+        cache_audio_read_tokens=60,
+        tool_calls=3,
+        details={
+            'custom1': 10,
+            'custom2': 20,
+        },
+    )
+    assert usage + usage == snapshot(
+        RunUsage(
+            requests=4,
+            input_tokens=20,
+            output_tokens=40,
+            cache_write_tokens=80,
+            cache_read_tokens=60,
+            input_audio_tokens=100,
+            cache_audio_read_tokens=120,
+            tool_calls=6,
+            details={'custom1': 20, 'custom2': 40},
+        )
+    )
+    assert usage + RunUsage() == usage
+    assert RunUsage() + RunUsage() == RunUsage()
+
+def test_add_usages_with_none_detail_value():
+    """Test that None values in details are skipped when incrementing usage."""
+    usage = RunUsage(
+        requests=1,
+        input_tokens=10,
+        output_tokens=20,
+        details={'reasoning_tokens': 5},
+    )
+
+    # Create a usage with None in details (simulating model response with missing detail)
+    incr_usage = RunUsage(
+        requests=1,
+        input_tokens=5,
+        output_tokens=10,
+    )
+    # Manually set a None value in details to simulate edge case from model responses
+    incr_usage.details = {'reasoning_tokens': None, 'other_tokens': 10}  # type: ignore[dict-item]
+
+    result = usage + incr_usage
+    assert result == snapshot(
+        RunUsage(
+            requests=2,
+            input_tokens=15,
+            output_tokens=30,
+            details={'reasoning_tokens': 5, 'other_tokens': 10},
+        )
+    )
+
+async def test_tool_call_limit() -> None:
+    test_agent = Agent(TestModel())
+
+    @test_agent.tool_plain
+    async def ret_a(x: str) -> str:
+        return f'{x}-apple'
+
+    with pytest.raises(
+        UsageLimitExceeded,
+        match=re.escape('The next tool call(s) would exceed the tool_calls_limit of 0 (tool_calls=1).'),
+    ):
+        await test_agent.run('Hello', usage_limits=UsageLimits(tool_calls_limit=0))
+
+    result = await test_agent.run('Hello', usage_limits=UsageLimits(tool_calls_limit=1))
+    assert result.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=14, tool_calls=1))
+
+async def test_output_tool_not_counted() -> None:
+    """Test that output tools are not counted in tool_calls usage metric."""
+    test_agent = Agent(TestModel())
+
+    @test_agent.tool_plain
+    async def regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    class MyOutput(BaseModel):
+        result: str
+
+    result_regular = await test_agent.run('test')
+    assert result_regular.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=14, tool_calls=1))
+
+    test_agent_with_output = Agent(TestModel(), output_type=ToolOutput(MyOutput))
+
+    @test_agent_with_output.tool_plain
+    async def another_regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    result_output = await test_agent_with_output.run('test')
+
+    assert result_output.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=15, tool_calls=1))
+
+async def test_output_tool_allowed_at_limit() -> None:
+    """Test that output tools can be called even when at the tool_calls_limit."""
+
+    class MyOutput(BaseModel):
+        result: str
+
+    def call_output_after_regular(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('regular_tool', {'x': 'test'}, 'call_1'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+        else:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('final_result', {'result': 'success'}, 'call_2'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+
+    test_agent = Agent(FunctionModel(call_output_after_regular), output_type=ToolOutput(MyOutput))
+
+    @test_agent.tool_plain
+    async def regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    result = await test_agent.run('test', usage_limits=UsageLimits(tool_calls_limit=1))
+
+    assert result.output.result == 'success'
+    assert result.usage() == snapshot(RunUsage(requests=2, input_tokens=20, output_tokens=10, tool_calls=1))
+
+async def test_failed_tool_calls_not_counted() -> None:
+    """Test that failed tool calls (raising ModelRetry) are not counted in usage or against limits."""
+    test_agent = Agent(TestModel())
+
+    call_count = 0
+
+    @test_agent.tool_plain
+    async def flaky_tool(x: str) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ModelRetry('Temporary failure, please retry')
+        return f'{x}-success'
+
+    result = await test_agent.run('test', usage_limits=UsageLimits(tool_calls_limit=1))
+    assert call_count == 2
+    assert result.usage() == snapshot(RunUsage(requests=3, input_tokens=176, output_tokens=29, tool_calls=1))
+
+def test_deprecated_usage_limits():
+    with warns(
+        snapshot(['DeprecationWarning: `request_tokens_limit` is deprecated, use `input_tokens_limit` instead'])
+    ):
+        assert UsageLimits(input_tokens_limit=100).request_tokens_limit == 100  # type: ignore
+
+    with warns(
+        snapshot(['DeprecationWarning: `response_tokens_limit` is deprecated, use `output_tokens_limit` instead'])
+    ):
+        assert UsageLimits(output_tokens_limit=100).response_tokens_limit == 100  # type: ignore
+
+async def test_parallel_tool_calls_limit_enforced():
+    """Parallel tool calls must not exceed the limit and should raise immediately."""
+    executed_tools: list[str] = []
+
+    model_call_count = 0
+
+    def test_model_function(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal model_call_count
+        model_call_count += 1
+
+        if model_call_count == 1:
+            # First response: 5 parallel tool calls (within limit)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('tool_a', {}, 'call_1'),
+                    ToolCallPart('tool_b', {}, 'call_2'),
+                    ToolCallPart('tool_c', {}, 'call_3'),
+                    ToolCallPart('tool_a', {}, 'call_4'),
+                    ToolCallPart('tool_b', {}, 'call_5'),
+                ]
+            )
+        else:
+            assert model_call_count == 2
+            # Second response: 3 parallel tool calls (would exceed limit of 6)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('tool_c', {}, 'call_6'),
+                    ToolCallPart('tool_a', {}, 'call_7'),
+                    ToolCallPart('tool_b', {}, 'call_8'),
+                ]
+            )
+
+    test_model = FunctionModel(test_model_function)
+    agent = Agent(test_model)
+
+    @agent.tool_plain
+    async def tool_a() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('a')
+        return 'result a'
+
+    @agent.tool_plain
+    async def tool_b() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('b')
+        return 'result b'
+
+    @agent.tool_plain
+    async def tool_c() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('c')
+        return 'result c'
+
+    # Run with tool call limit of 6; expecting an error when trying to execute 3 more tools
+    with pytest.raises(
+        UsageLimitExceeded,
+        match=re.escape('The next tool call(s) would exceed the tool_calls_limit of 6 (tool_calls=8).'),
+    ):
+        await agent.run('Use tools', usage_limits=UsageLimits(tool_calls_limit=6))
+
+    # Only the first batch of 5 tools should have executed
+    assert len(executed_tools) == 5
+
+def test_usage_unknown_provider():
+    assert RequestUsage.extract({}, provider='unknown', provider_url='', provider_fallback='') == RequestUsage()

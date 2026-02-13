@@ -1,0 +1,1090 @@
+## docs/.hooks/algolia.py
+
+from typing_extensions import TypedDict
+
+## examples/pydantic_ai_examples/chat_app.py
+
+class ChatMessage(TypedDict):
+    """Format of messages sent to the browser."""
+
+    role: Literal['user', 'model']
+    timestamp: str
+    content: str
+
+## pydantic_ai_slim/pydantic_ai/_a2a.py
+
+from typing import Any, Generic, TypeVar
+
+## pydantic_ai_slim/pydantic_ai/_mcp.py
+
+def map_from_pai_messages(pai_messages: list[messages.ModelMessage]) -> tuple[str, list[mcp_types.SamplingMessage]]:
+    """Convert from pydantic-ai messages to MCP sampling messages.
+
+    Returns:
+        A tuple containing the system prompt and a list of sampling messages.
+    """
+    sampling_msgs: list[mcp_types.SamplingMessage] = []
+
+    def add_msg(
+        role: Literal['user', 'assistant'],
+        content: mcp_types.TextContent | mcp_types.ImageContent | mcp_types.AudioContent,
+    ):
+        sampling_msgs.append(mcp_types.SamplingMessage(role=role, content=content))
+
+    system_prompt: list[str] = []
+    for pai_message in pai_messages:
+        if isinstance(pai_message, messages.ModelRequest):
+            if pai_message.instructions is not None:
+                system_prompt.append(pai_message.instructions)
+
+            for part in pai_message.parts:
+                if isinstance(part, messages.SystemPromptPart):
+                    system_prompt.append(part.content)
+                if isinstance(part, messages.UserPromptPart):
+                    if isinstance(part.content, str):
+                        add_msg('user', mcp_types.TextContent(type='text', text=part.content))
+                    else:
+                        for chunk in part.content:
+                            if isinstance(chunk, str):
+                                add_msg('user', mcp_types.TextContent(type='text', text=chunk))
+                            elif isinstance(chunk, messages.BinaryContent) and chunk.is_image:
+                                add_msg(
+                                    'user',
+                                    mcp_types.ImageContent(
+                                        type='image',
+                                        data=chunk.base64,
+                                        mimeType=chunk.media_type,
+                                    ),
+                                )
+                            # TODO(Marcelo): Add support for audio content.
+                            else:
+                                raise NotImplementedError(f'Unsupported content type: {type(chunk)}')
+        else:
+            add_msg('assistant', map_from_model_response(pai_message))
+    return ''.join(system_prompt), sampling_msgs
+
+def map_from_model_response(model_response: messages.ModelResponse) -> mcp_types.TextContent:
+    """Convert from a model response to MCP text content."""
+    text_parts: list[str] = []
+    for part in model_response.parts:
+        if isinstance(part, messages.TextPart):
+            text_parts.append(part.content)
+        elif isinstance(part, messages.ThinkingPart):
+            continue
+        else:
+            raise exceptions.UnexpectedModelBehavior(f'Unexpected part type: {type(part).__name__}, expected TextPart')
+    return mcp_types.TextContent(type='text', text=''.join(text_parts))
+
+## pydantic_ai_slim/pydantic_ai/_otel_messages.py
+
+class OutputMessage(ChatMessage):
+    finish_reason: NotRequired[str]
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def guard_tool_call_id(
+    t: _messages.ToolCallPart
+    | _messages.ToolReturnPart
+    | _messages.RetryPromptPart
+    | _messages.BuiltinToolCallPart
+    | _messages.BuiltinToolReturnPart,
+) -> str:
+    """Type guard that either returns the tool call id or generates a new one if it's None."""
+    return t.tool_call_id or generate_tool_call_id()
+
+def generate_tool_call_id() -> str:
+    """Generate a tool call id.
+
+    Ensure that the tool call id is unique.
+    """
+    return f'pyd_ai_{uuid.uuid4().hex}'
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class SystemPromptPart:
+    """A system prompt, generally written by the application developer.
+
+    This gives the model context and guidance on how to respond.
+    """
+
+    content: str
+    """The content of the prompt."""
+
+    _: KW_ONLY
+
+    timestamp: datetime = field(default_factory=_now_utc)
+    """The timestamp of the prompt."""
+
+    dynamic_ref: str | None = None
+    """The ref of the dynamic system prompt function that generated this part.
+
+    Only set if system prompt is dynamic, see [`system_prompt`][pydantic_ai.agent.Agent.system_prompt] for more information.
+    """
+
+    part_kind: Literal['system-prompt'] = 'system-prompt'
+    """Part type identifier, this is available on all parts as a discriminator."""
+
+    def otel_event(self, settings: InstrumentationSettings) -> LogRecord:
+        return LogRecord(
+            attributes={'event.name': 'gen_ai.system.message'},
+            body={'role': 'system', **({'content': self.content} if settings.include_content else {})},
+        )
+
+    def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
+        return [_otel_messages.TextPart(type='text', **{'content': self.content} if settings.include_content else {})]
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
+        return [_otel_messages.TextPart(type='text', **{'content': self.content} if settings.include_content else {})]
+
+## pydantic_ai_slim/pydantic_ai/models/instrumented.py
+
+    def messages_to_otel_messages(self, messages: list[ModelMessage]) -> list[_otel_messages.ChatMessage]:
+        result: list[_otel_messages.ChatMessage] = []
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for is_system, group in itertools.groupby(message.parts, key=lambda p: isinstance(p, SystemPromptPart)):
+                    message_parts: list[_otel_messages.MessagePart] = []
+                    for part in group:
+                        if hasattr(part, 'otel_message_parts'):
+                            message_parts.extend(part.otel_message_parts(self))
+
+                    result.append(
+                        _otel_messages.ChatMessage(role='system' if is_system else 'user', parts=message_parts)
+                    )
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                otel_message = _otel_messages.OutputMessage(role='assistant', parts=message.otel_message_parts(self))
+                if message.finish_reason is not None:
+                    otel_message['finish_reason'] = message.finish_reason
+                result.append(otel_message)
+        return result
+
+## pydantic_ai_slim/pydantic_ai/models/mistral.py
+
+    def _map_tool_call(t: ToolCallPart) -> MistralToolCall:
+        """Maps a pydantic-ai ToolCall to a MistralToolCall."""
+        return MistralToolCall(
+            id=_utils.guard_tool_call_id(t=t),
+            type='function',
+            function=MistralFunctionCall(name=t.tool_name, arguments=t.args or {}),
+        )
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def all_messages(self) -> list[_messages.ModelMessage]:
+        """Return all messages for the run so far.
+
+        Messages from older runs are included.
+        """
+        return self.ctx.state.message_history
+
+    def all_messages_json(self, *, output_tool_return_content: str | None = None) -> bytes:
+        """Return all messages from [`all_messages`][pydantic_ai.agent.AgentRun.all_messages] as JSON bytes.
+
+        Returns:
+            JSON bytes representing the messages.
+        """
+        return _messages.ModelMessagesTypeAdapter.dump_json(self.all_messages())
+
+    def new_messages(self) -> list[_messages.ModelMessage]:
+        """Return new messages for the run so far.
+
+        Messages from older runs are excluded.
+        """
+        return self.all_messages()[self.ctx.deps.new_message_index :]
+
+    def new_messages_json(self) -> bytes:
+        """Return new messages from [`new_messages`][pydantic_ai.agent.AgentRun.new_messages] as JSON bytes.
+
+        Returns:
+            JSON bytes representing the new messages.
+        """
+        return _messages.ModelMessagesTypeAdapter.dump_json(self.new_messages())
+
+class AgentRunResult
+    """The final result of an agent run."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def response(self) -> _messages.ModelResponse:
+        """Return the last response from the message history."""
+        # The response may not be the very last item if it contained an output tool call. See `CallToolsNode._handle_final_result`.
+        for message in reversed(self.all_messages()):
+            if isinstance(message, _messages.ModelResponse):
+                return message
+        raise ValueError('No response found in the message history')  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/ui/__init__.py
+
+from ._adapter import StateDeps, StateHandler, UIAdapter
+
+## pydantic_ai_slim/pydantic_ai/ui/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the protocol-specific run input."""
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/ui/ag_ui/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the AG-UI run input."""
+        return self.load_messages(self.run_input.messages)
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the Vercel AI run input."""
+        return self.load_messages(self.run_input.messages)
+
+    def dump_messages(
+        cls,
+        messages: Sequence[ModelMessage],
+    ) -> list[UIMessage]:
+        """Transform Pydantic AI messages into Vercel AI messages.
+
+        Args:
+            messages: A sequence of ModelMessage objects to convert
+
+        Returns:
+            A list of UIMessage objects in Vercel AI format
+        """
+        tool_results: dict[str, ToolReturnPart | RetryPromptPart] = {}
+
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                for part in msg.parts:
+                    if isinstance(part, ToolReturnPart):
+                        tool_results[part.tool_call_id] = part
+                    elif isinstance(part, RetryPromptPart) and part.tool_name:
+                        tool_results[part.tool_call_id] = part
+
+        result: list[UIMessage] = []
+
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                system_ui_parts, user_ui_parts = cls._dump_request_message(msg)
+                if system_ui_parts:
+                    result.append(UIMessage(id=str(uuid.uuid4()), role='system', parts=system_ui_parts))
+
+                if user_ui_parts:
+                    result.append(UIMessage(id=str(uuid.uuid4()), role='user', parts=user_ui_parts))
+
+            elif isinstance(  # pragma: no branch
+                msg, ModelResponse
+            ):
+                ui_parts: list[UIMessagePart] = cls._dump_response_message(msg, tool_results)
+                if ui_parts:  # pragma: no branch
+                    result.append(UIMessage(id=str(uuid.uuid4()), role='assistant', parts=ui_parts))
+            else:
+                assert_never(msg)
+
+        return result
+
+## pydantic_graph/pydantic_graph/graph.py
+
+from .persistence import BaseStatePersistence
+
+## pydantic_graph/pydantic_graph/persistence/in_mem.py
+
+class FullStatePersistence
+    """In memory state persistence that hold a list of snapshots."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def dump_json(self, *, indent: int | None = None) -> bytes:
+        """Dump the history to JSON bytes."""
+        assert self._snapshots_type_adapter is not None, 'type adapter must be set to use `dump_json`'
+        return self._snapshots_type_adapter.dump_json(self.history, indent=indent)
+
+## tests/models/test_anthropic.py
+
+    def messages(self) -> Any:
+        return type('Messages', (), {'create': self.messages_create, 'count_tokens': self.messages_count_tokens})
+
+## tests/models/test_instrumented.py
+
+def test_messages_to_otel_events_serialization_errors():
+    class Foo:
+        def __repr__(self):
+            return 'Foo()'
+
+    class Bar:
+        def __repr__(self):
+            raise ValueError('error!')
+
+    messages = [
+        ModelResponse(parts=[ToolCallPart('tool', {'arg': Foo()}, tool_call_id='tool_call_id')]),
+        ModelRequest(parts=[ToolReturnPart('tool', Bar(), tool_call_id='return_tool_call_id')], timestamp=IsDatetime()),
+    ]
+
+    settings = InstrumentationSettings()
+    assert [InstrumentedModel.event_to_dict(e) for e in settings.messages_to_otel_events(messages)] == [
+        {
+            'body': "{'role': 'assistant', 'tool_calls': [{'id': 'tool_call_id', 'type': 'function', 'function': {'name': 'tool', 'arguments': {'arg': Foo()}}}]}",
+            'gen_ai.message.index': 0,
+            'event.name': 'gen_ai.assistant.message',
+        },
+        {
+            'body': 'Unable to serialize: error!',
+            'gen_ai.message.index': 1,
+            'event.name': 'gen_ai.tool.message',
+        },
+    ]
+    assert settings.messages_to_otel_messages(messages) == snapshot(
+        [
+            {
+                'role': 'assistant',
+                'parts': [{'type': 'tool_call', 'id': 'tool_call_id', 'name': 'tool', 'arguments': {'arg': 'Foo()'}}],
+            },
+            {
+                'role': 'user',
+                'parts': [
+                    {
+                        'type': 'tool_call_response',
+                        'id': 'return_tool_call_id',
+                        'name': 'tool',
+                        'result': 'Unable to serialize: error!',
+                    }
+                ],
+            },
+        ]
+    )
+
+def test_messages_to_otel_events_instructions():
+    messages = [
+        ModelRequest(instructions='instructions', parts=[UserPromptPart('user_prompt')], timestamp=IsDatetime()),
+        ModelResponse(parts=[TextPart('text1')]),
+    ]
+    settings = InstrumentationSettings()
+    assert [InstrumentedModel.event_to_dict(e) for e in settings.messages_to_otel_events(messages)] == snapshot(
+        [
+            {'content': 'instructions', 'role': 'system', 'event.name': 'gen_ai.system.message'},
+            {'content': 'user_prompt', 'role': 'user', 'gen_ai.message.index': 0, 'event.name': 'gen_ai.user.message'},
+            {
+                'role': 'assistant',
+                'content': 'text1',
+                'gen_ai.message.index': 1,
+                'event.name': 'gen_ai.assistant.message',
+            },
+        ]
+    )
+    assert settings.messages_to_otel_messages(messages) == snapshot(
+        [
+            {'role': 'user', 'parts': [{'type': 'text', 'content': 'user_prompt'}]},
+            {'role': 'assistant', 'parts': [{'type': 'text', 'content': 'text1'}]},
+        ]
+    )
+
+def test_messages_to_otel_events_instructions_multiple_messages():
+    messages = [
+        ModelRequest(instructions='instructions', parts=[UserPromptPart('user_prompt')], timestamp=IsDatetime()),
+        ModelResponse(parts=[TextPart('text1')]),
+        ModelRequest(instructions='instructions2', parts=[UserPromptPart('user_prompt2')], timestamp=IsDatetime()),
+    ]
+    settings = InstrumentationSettings()
+    assert [InstrumentedModel.event_to_dict(e) for e in settings.messages_to_otel_events(messages)] == snapshot(
+        [
+            {'content': 'instructions2', 'role': 'system', 'event.name': 'gen_ai.system.message'},
+            {'content': 'user_prompt', 'role': 'user', 'gen_ai.message.index': 0, 'event.name': 'gen_ai.user.message'},
+            {
+                'role': 'assistant',
+                'content': 'text1',
+                'gen_ai.message.index': 1,
+                'event.name': 'gen_ai.assistant.message',
+            },
+            {'content': 'user_prompt2', 'role': 'user', 'gen_ai.message.index': 2, 'event.name': 'gen_ai.user.message'},
+        ]
+    )
+    assert settings.messages_to_otel_messages(messages) == snapshot(
+        [
+            {'role': 'user', 'parts': [{'type': 'text', 'content': 'user_prompt'}]},
+            {'role': 'assistant', 'parts': [{'type': 'text', 'content': 'text1'}]},
+            {'role': 'user', 'parts': [{'type': 'text', 'content': 'user_prompt2'}]},
+        ]
+    )
+
+def test_messages_to_otel_events_without_binary_content(document_content: BinaryContent):
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content=['user_prompt6', document_content])], timestamp=IsDatetime()),
+    ]
+    settings = InstrumentationSettings(include_binary_content=False)
+    assert [InstrumentedModel.event_to_dict(e) for e in settings.messages_to_otel_events(messages)] == snapshot(
+        [
+            {
+                'content': ['user_prompt6', {'kind': 'binary', 'media_type': 'application/pdf'}],
+                'role': 'user',
+                'gen_ai.message.index': 0,
+                'event.name': 'gen_ai.user.message',
+            }
+        ]
+    )
+    assert settings.messages_to_otel_messages(messages) == snapshot(
+        [
+            {
+                'role': 'user',
+                'parts': [
+                    {'type': 'text', 'content': 'user_prompt6'},
+                    {'type': 'binary', 'media_type': 'application/pdf'},
+                ],
+            }
+        ]
+    )
+
+## tests/test_mcp.py
+
+def test_map_from_pai_messages_with_binary_content():
+    """Test that map_from_pai_messages correctly converts image and audio content to MCP format.
+
+    Note: `data` in this case are base64-encoded bytes (e.g., base64.b64encode(b'raw')).
+    map_from_pai_messages decodes this to get the base64 string for MCP.
+    """
+
+    message = ModelRequest(
+        parts=[
+            UserPromptPart(content='text message'),
+            UserPromptPart(content=[BinaryContent(data=b'raw_image_bytes', media_type='image/png')]),
+            # TODO uncomment when audio content is supported
+            # UserPromptPart(content=[BinaryContent(data=b'raw_audio_bytes', media_type='audio/wav'), 'text after audio']),
+        ]
+    )
+    system_prompt, sampling_msgs = map_from_pai_messages([message])
+    assert system_prompt == ''
+    assert [m.model_dump(by_alias=True) for m in sampling_msgs] == snapshot(
+        [
+            {
+                'role': 'user',
+                'content': {'type': 'text', 'text': 'text message', 'annotations': None, '_meta': None},
+                '_meta': None,
+            },
+            {
+                'role': 'user',
+                'content': {
+                    'type': 'image',
+                    'data': 'cmF3X2ltYWdlX2J5dGVz',
+                    'mimeType': 'image/png',
+                    'annotations': None,
+                    '_meta': None,
+                },
+                '_meta': None,
+            },
+        ]
+    )
+
+    # Unsupported content type raises NotImplementedError
+    message_with_video = ModelRequest(
+        parts=[UserPromptPart(content=[BinaryContent(data=b'raw_video_bytes', media_type='video/mp4')])]
+    )
+    with pytest.raises(
+        NotImplementedError, match="Unsupported content type: <class 'pydantic_ai.messages.BinaryContent'>"
+    ):
+        map_from_pai_messages([message_with_video])
+
+## tests/test_ui.py
+
+class DummyUIAdapter(UIAdapter[DummyUIRunInput, ModelMessage, str, AgentDepsT, OutputDataT]):
+    @classmethod
+    def build_run_input(cls, body: bytes) -> DummyUIRunInput:
+        return DummyUIRunInput.model_validate_json(body)
+
+    @classmethod
+    def dump_messages(cls, messages: Sequence[ModelMessage]) -> list[ModelMessage]:
+        return list(messages)
+
+    @classmethod
+    def load_messages(cls, messages: Sequence[ModelMessage]) -> list[ModelMessage]:
+        return list(messages)
+
+    def build_event_stream(self) -> UIEventStream[DummyUIRunInput, str, AgentDepsT, OutputDataT]:
+        return DummyUIEventStream[AgentDepsT, OutputDataT](self.run_input, accept=self.accept)
+
+    @cached_property
+    def messages(self) -> list[ModelMessage]:
+        return self.load_messages(self.run_input.messages)
+
+    @cached_property
+    def state(self) -> dict[str, Any] | None:
+        return self.run_input.state
+
+    @cached_property
+    def toolset(self) -> AbstractToolset[AgentDepsT] | None:
+        return ExternalToolset(self.run_input.tool_defs) if self.run_input.tool_defs else None
+
+    def dump_messages(cls, messages: Sequence[ModelMessage]) -> list[ModelMessage]:
+        return list(messages)
+
+    def messages(self) -> list[ModelMessage]:
+        return self.load_messages(self.run_input.messages)
+
+def test_dummy_adapter_dump_messages():
+    """Test that DummyUIAdapter.dump_messages returns messages as-is."""
+    from pydantic_ai.messages import UserPromptPart
+
+    messages = [ModelRequest(parts=[UserPromptPart(content='Hello')])]
+    result = DummyUIAdapter.dump_messages(messages)
+    assert result == messages
+
+## tests/test_vercel_ai.py
+
+async def test_adapter_dump_messages():
+    """Test dumping Pydantic AI messages to Vercel AI format."""
+    messages = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart(content='You are a helpful assistant.'),
+                UserPromptPart(content='Hello, world!'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                TextPart(content='Hi there!'),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+
+    # we need to dump the BaseModels to dicts for `IsStr` to work properly in snapshot
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'system',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'You are a helpful assistant.', 'state': 'done', 'provider_metadata': None}
+                ],
+            },
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Hello, world!', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Hi there!', 'state': 'done', 'provider_metadata': None}],
+            },
+        ]
+    )
+
+async def test_adapter_dump_messages_with_tools():
+    """Test dumping messages with tool calls and returns."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Search for something')]),
+        ModelResponse(
+            parts=[
+                TextPart(content='Let me search for that.'),
+                ToolCallPart(
+                    tool_name='web_search',
+                    args={'query': 'test query'},
+                    tool_call_id='tool_123',
+                ),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='web_search',
+                    content={'results': ['result1', 'result2']},
+                    tool_call_id='tool_123',
+                )
+            ]
+        ),
+        ModelResponse(parts=[TextPart(content='Here are the results.')]),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Search for something', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'Let me search for that.', 'state': 'done', 'provider_metadata': None},
+                    {
+                        'type': 'dynamic-tool',
+                        'tool_name': 'web_search',
+                        'tool_call_id': 'tool_123',
+                        'state': 'output-available',
+                        'input': '{"query":"test query"}',
+                        'output': '{"results":["result1","result2"]}',
+                        'call_provider_metadata': None,
+                        'preliminary': None,
+                    },
+                ],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'Here are the results.', 'state': 'done', 'provider_metadata': None}
+                ],
+            },
+        ]
+    )
+
+async def test_adapter_dump_messages_with_builtin_tool_without_return():
+    """Test dumping messages with a builtin tool call that has no return in the same message."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Search for something')]),
+        ModelResponse(
+            parts=[
+                BuiltinToolCallPart(
+                    tool_name='web_search',
+                    args={'query': 'orphan query'},
+                    tool_call_id='orphan_tool_id',
+                    provider_name='openai',
+                ),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Search for something', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'tool-web_search',
+                        'tool_call_id': 'orphan_tool_id',
+                        'state': 'input-available',
+                        'input': '{"query":"orphan query"}',
+                        'provider_executed': True,
+                        'call_provider_metadata': {
+                            'pydantic_ai': {'provider_name': 'openai'}
+                        },  # No return part, so defaults to normal call provider name
+                    }
+                ],
+            },
+        ]
+    )
+
+async def test_adapter_dump_messages_with_thinking():
+    """Test dumping messages with thinking parts."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Tell me something')]),
+        ModelResponse(
+            parts=[
+                ThinkingPart(content='Let me think about this...'),
+                TextPart(content='Here is my answer.'),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Tell me something', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'reasoning',
+                        'text': 'Let me think about this...',
+                        'state': 'done',
+                        'provider_metadata': None,
+                    },
+                    {'type': 'text', 'text': 'Here is my answer.', 'state': 'done', 'provider_metadata': None},
+                ],
+            },
+        ]
+    )
+
+async def test_adapter_dump_messages_consecutive_text():
+    """Test that consecutive text parts are concatenated correctly."""
+    messages = [
+        ModelResponse(
+            parts=[
+                TextPart(content='First '),
+                TextPart(content='second'),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'First second', 'state': 'done', 'provider_metadata': None}],
+            }
+        ]
+    )
+
+async def test_adapter_dump_load_roundtrip():
+    """Test that dump_messages and load_messages are approximately inverse operations."""
+    original_messages = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart(content='System message'),
+                UserPromptPart(content='User message'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                TextPart(content='Response text'),
+                ToolCallPart(tool_name='tool1', args={'key': 'value'}, tool_call_id='tc1'),
+            ]
+        ),
+        ModelRequest(parts=[ToolReturnPart(tool_name='tool1', content='tool result', tool_call_id='tc1')]),
+        ModelResponse(
+            parts=[
+                TextPart(content='Final response'),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(original_messages)
+
+    # Load back to Pydantic AI format
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    _sync_timestamps(original_messages, reloaded_messages)
+
+    assert reloaded_messages == original_messages
+
+async def test_adapter_dump_load_roundtrip_without_timestamps():
+    """Test that dump_messages and load_messages work when messages don't have timestamps."""
+    original_messages = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='User message'),
+            ]
+        ),
+        ModelResponse(
+            parts=[
+                TextPart(content='Response text'),
+            ]
+        ),
+    ]
+
+    for msg in original_messages:
+        delattr(msg, 'timestamp')
+
+    ui_messages = VercelAIAdapter.dump_messages(original_messages)
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+
+    def sync_timestamps(original: list[ModelRequest | ModelResponse], new: list[ModelRequest | ModelResponse]) -> None:
+        for orig_msg, new_msg in zip(original, new):
+            for orig_part, new_part in zip(orig_msg.parts, new_msg.parts):
+                if hasattr(orig_part, 'timestamp') and hasattr(new_part, 'timestamp'):
+                    new_part.timestamp = orig_part.timestamp  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+            if hasattr(orig_msg, 'timestamp') and hasattr(new_msg, 'timestamp'):
+                new_msg.timestamp = orig_msg.timestamp  # pyright: ignore[reportAttributeAccessIssue]
+
+    sync_timestamps(original_messages, reloaded_messages)
+
+    for msg in reloaded_messages:
+        if hasattr(msg, 'timestamp'):  # pragma: no branch
+            delattr(msg, 'timestamp')
+
+    assert len(reloaded_messages) == len(original_messages)
+
+async def test_adapter_dump_messages_text_before_thinking():
+    """Test dumping messages where text precedes a thinking part."""
+    messages = [
+        ModelResponse(
+            parts=[
+                TextPart(content='Let me check.'),
+                ThinkingPart(content='Okay, I am checking now.'),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'Let me check.', 'state': 'done', 'provider_metadata': None},
+                    {
+                        'type': 'reasoning',
+                        'text': 'Okay, I am checking now.',
+                        'state': 'done',
+                        'provider_metadata': None,
+                    },
+                ],
+            }
+        ]
+    )
+
+async def test_adapter_dump_messages_tool_call_without_return():
+    """Test dumping messages with a tool call that has no corresponding result."""
+    messages = [
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name='get_weather',
+                    args={'city': 'New York'},
+                    tool_call_id='tool_abc',
+                ),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'dynamic-tool',
+                        'tool_name': 'get_weather',
+                        'tool_call_id': 'tool_abc',
+                        'state': 'input-available',
+                        'input': '{"city":"New York"}',
+                        'call_provider_metadata': None,
+                    }
+                ],
+            }
+        ]
+    )
+
+async def test_adapter_dump_messages_assistant_starts_with_tool():
+    """Test an assistant message that starts with a tool call instead of text."""
+    messages = [
+        ModelResponse(
+            parts=[
+                ToolCallPart(tool_name='t', args={}, tool_call_id='tc1'),
+                TextPart(content='Some text'),
+            ]
+        )
+    ]
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'dynamic-tool',
+                        'tool_name': 't',
+                        'tool_call_id': 'tc1',
+                        'state': 'input-available',
+                        'input': '{}',
+                        'call_provider_metadata': None,
+                    },
+                    {
+                        'type': 'text',
+                        'text': 'Some text',
+                        'state': 'done',
+                        'provider_metadata': None,
+                    },
+                ],
+            }
+        ]
+    )
+
+async def test_adapter_dump_messages_file_without_text():
+    """Test a file part appearing without any preceding text."""
+    messages = [
+        ModelResponse(
+            parts=[
+                FilePart(content=BinaryContent(data=b'file_data', media_type='image/png')),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'file',
+                        'media_type': 'image/png',
+                        'filename': None,
+                        'url': 'data:image/png;base64,ZmlsZV9kYXRh',
+                        'provider_metadata': None,
+                    }
+                ],
+            }
+        ]
+    )
+
+async def test_adapter_dump_messages_with_cache_point():
+    """Test that CachePoint in user content is skipped during conversion."""
+    from pydantic_ai.messages import CachePoint
+
+    messages = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=[
+                        'Hello',
+                        CachePoint(),  # Should be skipped
+                        'World',
+                    ]
+                )
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    # CachePoint should be omitted, only text parts remain
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'Hello', 'state': 'done', 'provider_metadata': None},
+                    {'type': 'text', 'text': 'World', 'state': 'done', 'provider_metadata': None},
+                ],
+            }
+        ]
+    )
+
+async def test_adapter_text_part_with_provider_metadata():
+    """Test TextPart with provider_name and provider_details preserves metadata and roundtrips."""
+    messages: list[ModelMessage] = [
+        ModelResponse(
+            parts=[
+                TextPart(
+                    content='Hello with metadata',
+                    id='text_123',
+                    provider_name='openai',
+                    provider_details={'model': 'gpt-4', 'finish_reason': 'stop'},
+                ),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'text',
+                        'text': 'Hello with metadata',
+                        'state': 'done',
+                        'provider_metadata': {
+                            'pydantic_ai': {
+                                'id': 'text_123',
+                                'provider_name': 'openai',
+                                'provider_details': {'model': 'gpt-4', 'finish_reason': 'stop'},
+                            }
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    # Verify roundtrip
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    _sync_timestamps(messages, reloaded_messages)
+    assert reloaded_messages == messages
+
+async def test_adapter_file_part_with_provider_metadata():
+    """Test FilePart with provider metadata preserves id, provider_name, provider_details and roundtrips."""
+    # Use BinaryImage (not BinaryContent) since that's what load_messages produces for images
+    messages: list[ModelMessage] = [
+        ModelResponse(
+            parts=[
+                FilePart(
+                    content=BinaryImage(data=b'file_data', media_type='image/png'),
+                    id='file_123',
+                    provider_name='openai',
+                    provider_details={'generation_id': 'gen_abc'},
+                ),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'file',
+                        'media_type': 'image/png',
+                        'filename': None,
+                        'url': 'data:image/png;base64,ZmlsZV9kYXRh',
+                        'provider_metadata': {
+                            'pydantic_ai': {
+                                'id': 'file_123',
+                                'provider_name': 'openai',
+                                'provider_details': {'generation_id': 'gen_abc'},
+                            }
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    # Verify roundtrip
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    _sync_timestamps(messages, reloaded_messages)
+    assert reloaded_messages == messages

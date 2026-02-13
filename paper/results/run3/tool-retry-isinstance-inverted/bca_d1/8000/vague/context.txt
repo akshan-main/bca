@@ -1,0 +1,743 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps
+    ...  # (skeleton: full source omitted for budget)
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+async def _call_tool(
+    tool_manager: ToolManager[DepsT],
+    tool_call: _messages.ToolCallPart,
+    tool_call_result: DeferredToolResult | None,
+    tool_call_metadata: dict[str, dict[str, Any]] | None,
+) -> tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None]:
+    try:
+        if tool_call_result is None:
+            tool_result = await tool_manager.handle_call(tool_call)
+        elif isinstance(tool_call_result, ToolApproved):
+            if tool_call_result.override_args is not None:
+                tool_call = dataclasses.replace(tool_call, args=tool_call_result.override_args)
+            # Get metadata from the tool_call_metadata dict by tool_call_id
+            metadata = tool_call_metadata.get(tool_call.tool_call_id) if tool_call_metadata else None
+            tool_result = await tool_manager.handle_call(tool_call, approved=True, metadata=metadata)
+        elif isinstance(tool_call_result, ToolDenied):
+            return _messages.ToolReturnPart(
+                tool_name=tool_call.tool_name,
+                content=tool_call_result.message,
+                tool_call_id=tool_call.tool_call_id,
+            ), None
+        elif isinstance(tool_call_result, exceptions.ModelRetry):
+            m = _messages.RetryPromptPart(
+                content=tool_call_result.message,
+                tool_name=tool_call.tool_name,
+                tool_call_id=tool_call.tool_call_id,
+            )
+            raise ToolRetryError(m)
+        elif isinstance(tool_call_result, _messages.RetryPromptPart):
+            tool_call_result.tool_name = tool_call.tool_name
+            tool_call_result.tool_call_id = tool_call.tool_call_id
+            raise ToolRetryError(tool_call_result)
+        else:
+            tool_result = tool_call_result
+    except ToolRetryError as e:
+        return e.tool_retry, None
+
+    if isinstance(tool_result, _messages.ToolReturn):
+        tool_return = tool_result
+    else:
+        result_is_list = isinstance(tool_result, list)
+        contents = cast(list[Any], tool_result) if result_is_list else [tool_result]
+
+        return_values: list[Any] = []
+        user_contents: list[str | _messages.UserContent] = []
+        for content in contents:
+            if isinstance(content, _messages.ToolReturn):
+                raise exceptions.UserError(
+                    f'The return value of tool {tool_call.tool_name!r} contains invalid nested `ToolReturn` objects. '
+                    f'`ToolReturn` should be used directly.'
+                )
+            elif isinstance(content, _messages.MULTI_MODAL_CONTENT_TYPES):
+                identifier = content.identifier
+
+                return_values.append(f'See file {identifier}')
+                user_contents.extend([f'This is file {identifier}:', content])
+            else:
+                return_values.append(content)
+
+        tool_return = _messages.ToolReturn(
+            return_value=return_values[0] if len(return_values) == 1 and not result_is_list else return_values,
+            content=user_contents,
+        )
+
+    if (
+        isinstance(tool_return.return_value, _messages.MULTI_MODAL_CONTENT_TYPES)
+        or isinstance(tool_return.return_value, list)
+        and any(
+            isinstance(content, _messages.MULTI_MODAL_CONTENT_TYPES)
+            for content in tool_return.return_value  # type: ignore
+        )
+    ):
+        raise exceptions.UserError(
+            f'The `return_value` of tool {tool_call.tool_name!r} contains invalid nested `MultiModalContent` objects. '
+            f'Please use `content` instead.'
+        )
+
+    return_part = _messages.ToolReturnPart(
+        tool_name=tool_call.tool_name,
+        tool_call_id=tool_call.tool_call_id,
+        content=tool_return.return_value,  # type: ignore
+        metadata=tool_return.metadata,
+    )
+
+    return return_part, tool_return.content or None
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def guard_tool_call_id(
+    t: _messages.ToolCallPart
+    | _messages.ToolReturnPart
+    | _messages.RetryPromptPart
+    | _messages.BuiltinToolCallPart
+    | _messages.BuiltinToolReturnPart,
+) -> str:
+    """Type guard that either returns the tool call id or generates a new one if it's None."""
+    return t.tool_call_id or generate_tool_call_id()
+
+def generate_tool_call_id() -> str:
+    """Generate a tool call id.
+
+    Ensure that the tool call id is unique.
+    """
+    return f'pyd_ai_{uuid.uuid4().hex}'
+
+## pydantic_ai_slim/pydantic_ai/agent/__init__.py
+
+    def tool(
+        self,
+        func: ToolFuncContext[AgentDepsT, ToolParams] | None = None,
+        /,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        retries: int | None = None,
+        prepare: ToolPrepareFunc[AgentDepsT] | None = None,
+        docstring_format: DocstringFormat = 'auto',
+        require_parameter_descriptions: bool = False,
+        schema_generator: type[GenerateJsonSchema] = GenerateToolJsonSchema,
+        strict: bool | None = None,
+        sequential: bool = False,
+        requires_approval: bool = False,
+        metadata: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """Decorator to register a tool function which takes [`RunContext`][pydantic_ai.tools.RunContext] as its first argument.
+
+        Can decorate a sync or async functions.
+
+        The docstring is inspected to extract both the tool description and description of each parameter,
+        [learn more](../tools.md#function-tools-and-schema).
+
+        We can't add overloads for every possible signature of tool, since the return type is a recursive union
+        so the signature of functions decorated with `@agent.tool` is obscured.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent, RunContext
+
+        agent = Agent('test', deps_type=int)
+
+        @agent.tool
+        def foobar(ctx: RunContext[int], x: int) -> int:
+            return ctx.deps + x
+
+        @agent.tool(retries=2)
+        async def spam(ctx: RunContext[str], y: float) -> float:
+            return ctx.deps + y
+
+        result = agent.run_sync('foobar', deps=1)
+        print(result.output)
+        #> {"foobar":1,"spam":1.0}
+        ```
+
+        Args:
+            func: The tool function to register.
+            name: The name of the tool, defaults to the function name.
+            description: The description of the tool, defaults to the function docstring.
+            retries: The number of retries to allow for this tool, defaults to the agent's default retries,
+                which defaults to 1.
+            prepare: custom method to prepare the tool definition for each step, return `None` to omit this
+                tool from a given step. This is useful if you want to customise a tool at call time,
+                or omit it completely from a step. See [`ToolPrepareFunc`][pydantic_ai.tools.ToolPrepareFunc].
+            docstring_format: The format of the docstring, see [`DocstringFormat`][pydantic_ai.tools.DocstringFormat].
+                Defaults to `'auto'`, such that the format is inferred from the structure of the docstring.
+            require_parameter_descriptions: If True, raise an error if a parameter description is missing. Defaults to False.
+            schema_generator: The JSON schema generator class to use for this tool. Defaults to `GenerateToolJsonSchema`.
+            strict: Whether to enforce JSON schema compliance (only affects OpenAI).
+                See [`ToolDefinition`][pydantic_ai.tools.ToolDefinition] for more info.
+            sequential: Whether the function requires a sequential/serial execution environment. Defaults to False.
+            requires_approval: Whether this tool requires human-in-the-loop approval. Defaults to False.
+                See the [tools documentation](../deferred-tools.md#human-in-the-loop-tool-approval) for more info.
+            metadata: Optional metadata for the tool. This is not sent to the model but can be used for filtering and tool behavior customization.
+            timeout: Timeout in seconds for tool execution. If the tool takes longer, a retry prompt is returned to the model.
+                Overrides the agent-level `tool_timeout` if set. Defaults to None (no timeout).
+        """
+
+        def tool_decorator(
+            func_: ToolFuncContext[AgentDepsT, ToolParams],
+        ) -> ToolFuncContext[AgentDepsT, ToolParams]:
+            # noinspection PyTypeChecker
+            self._function_toolset.add_function(
+                func_,
+                takes_ctx=True,
+                name=name,
+                description=description,
+                retries=retries,
+                prepare=prepare,
+                docstring_format=docstring_format,
+                require_parameter_descriptions=require_parameter_descriptions,
+                schema_generator=schema_generator,
+                strict=strict,
+                sequential=sequential,
+                requires_approval=requires_approval,
+                metadata=metadata,
+                timeout=timeout,
+            )
+            return func_
+
+        return tool_decorator if func is None else tool_decorator(func)
+
+## pydantic_ai_slim/pydantic_ai/exceptions.py
+
+class ToolRetryError(Exception):
+    """Exception used to signal a `ToolRetry` message should be returned to the LLM."""
+
+    def __init__(self, tool_retry: RetryPromptPart):
+        self.tool_retry = tool_retry
+        message = (
+            tool_retry.content
+            if not isinstance(tool_retry.content, str)
+            else self._format_error_details(tool_retry.content, tool_retry.tool_name)
+        )
+        super().__init__(message)
+
+    @staticmethod
+    def _format_error_details(errors: list[pydantic_core.ErrorDetails], tool_name: str | None) -> str:
+        """Format ErrorDetails as a human-readable message.
+
+        We format manually rather than using ValidationError.from_exception_data because
+        some error types (value_error, assertion_error, etc.) require an 'error' key in ctx,
+        but when ErrorDetails are serialized, exception objects are stripped from ctx.
+        The 'msg' field already contains the human-readable message, so we use that directly.
+        """
+        error_count = len(errors)
+        lines = [
+            f'{error_count} validation error{"" if error_count == 1 else "s"}{f" for {tool_name!r}" if tool_name else ""}'
+        ]
+        for e in errors:
+            loc = '.'.join(str(x) for x in e['loc']) if e['loc'] else '__root__'
+            lines.append(loc)
+            lines.append(f'  {e["msg"]} [type={e["type"]}, input_value={e["input"]!r}]')
+        return '\n'.join(lines)
+
+    def __init__(self, tool_retry: RetryPromptPart):
+        self.tool_retry = tool_retry
+        message = (
+            tool_retry.content
+            if not isinstance(tool_retry.content, str)
+            else self._format_error_details(tool_retry.content, tool_retry.tool_name)
+        )
+        super().__init__(message)
+
+## tests/conftest.py
+
+class TestEnv
+    ...  # (skeleton: full source omitted for budget)
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+## tests/models/test_model_test.py
+
+def test_tool_retry():
+    agent = Agent()
+    call_count = 0
+
+    @agent.tool_plain
+    async def my_ret(x: int) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ModelRetry('First call failed')
+        else:
+            return str(x + 1)
+
+    result = agent.run_sync('Hello', model=TestModel())
+    assert call_count == 2
+    assert result.output == snapshot('{"my_ret":"1"}')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='my_ret', args={'x': 0}, tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=51, output_tokens=4),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='First call failed',
+                        tool_name='my_ret',
+                        timestamp=IsNow(tz=timezone.utc),
+                        tool_call_id=IsStr(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='my_ret', args={'x': 0}, tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=61, output_tokens=8),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='my_ret', content='1', tool_call_id=IsStr(), timestamp=IsNow(tz=timezone.utc)
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='{"my_ret":"1"}')],
+                usage=RequestUsage(input_tokens=62, output_tokens=12),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_exceptions.py
+
+def test_tool_retry_error_str_with_string_content():
+    """Test that ToolRetryError uses string content as message automatically."""
+    part = RetryPromptPart(content='error from tool', tool_name='my_tool')
+    error = ToolRetryError(part)
+    assert str(error) == 'error from tool'
+
+## tests/test_streaming.py
+
+async def test_iter_stream_structured_output():
+    class CityLocation(BaseModel):
+        city: str
+        country: str | None = None
+
+    m = TestModel(custom_output_text='{"city": "Mexico City", "country": "Mexico"}')
+
+    agent = Agent(m, output_type=PromptedOutput(CityLocation))
+
+    async with agent.iter('') as run:
+        async for node in run:
+            if agent.is_model_request_node(node):
+                async with node.stream(run.ctx) as stream:
+                    assert [c async for c in stream.stream_output(debounce_by=None)] == snapshot(
+                        [
+                            CityLocation(city='Mexico '),
+                            CityLocation(city='Mexico City'),
+                            CityLocation(city='Mexico City'),
+                            CityLocation(city='Mexico City', country='Mexico'),
+                            CityLocation(city='Mexico City', country='Mexico'),
+                        ]
+                    )
+
+## tests/test_tools.py
+
+def test_retry_tool_until_last_attempt():
+    model = TestModel()
+    agent = Agent(model, retries=2)
+
+    @agent.tool
+    def always_fail(ctx: RunContext[None]) -> str:
+        if ctx.last_attempt:
+            return 'I guess you never learn'
+        else:
+            raise ModelRetry('Please try again.')
+
+    result = agent.run_sync('Always fail!')
+    assert result.output == snapshot('{"always_fail":"I guess you never learn"}')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Always fail!',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='always_fail', args={}, tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=52, output_tokens=2),
+                model_name='test',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Please try again.',
+                        tool_name='always_fail',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='always_fail', args={}, tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=62, output_tokens=4),
+                model_name='test',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Please try again.',
+                        tool_name='always_fail',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='always_fail', args={}, tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=72, output_tokens=6),
+                model_name='test',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='always_fail',
+                        content='I guess you never learn',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='{"always_fail":"I guess you never learn"}')],
+                usage=RequestUsage(input_tokens=77, output_tokens=14),
+                model_name='test',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+async def test_tool_timeout_message_format():
+    """Test the format of the retry prompt message on timeout."""
+    import asyncio
+
+    call_count = 0
+
+    async def model_logic(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return ModelResponse(parts=[ToolCallPart(tool_name='my_slow_tool', args={}, tool_call_id='call-1')])
+        return ModelResponse(parts=[TextPart(content='done')])
+
+    agent = Agent(FunctionModel(model_logic))
+
+    @agent.tool_plain(timeout=0.1)
+    async def my_slow_tool() -> str:
+        await asyncio.sleep(1.0)
+        return 'done'  # pragma: no cover
+
+    result = await agent.run('call my_slow_tool')
+
+    retry_parts = [
+        part
+        for msg in result.all_messages()
+        if isinstance(msg, ModelRequest)
+        for part in msg.parts
+        if isinstance(part, RetryPromptPart) and 'Timed out' in str(part.content)
+    ]
+    assert len(retry_parts) == 1
+    # Check message contains timeout value (tool_name is in the part, not in content)
+    assert '0.1' in retry_parts[0].content
+    assert retry_parts[0].tool_name == 'my_slow_tool'
+
+## tests/test_toolsets.py
+
+async def test_tool_manager_retry_logic():
+    """Test the retry logic with failed_tools and for_run_step method."""
+
+    @dataclass
+    class TestDeps:
+        pass
+
+    # Create a toolset with tools that can fail
+    toolset = FunctionToolset[TestDeps](max_retries=2)
+    call_count: defaultdict[str, int] = defaultdict(int)
+
+    @toolset.tool
+    def failing_tool(x: int) -> int:
+        """A tool that always fails"""
+        call_count['failing_tool'] += 1
+        raise ModelRetry('This tool always fails')
+
+    @toolset.tool
+    def other_tool(x: int) -> int:
+        """A tool that works"""
+        call_count['other_tool'] += 1
+        return x * 2
+
+    # Create initial context and tool manager
+    initial_context = build_run_context(TestDeps())
+    tool_manager = await ToolManager[TestDeps](toolset).for_run_step(initial_context)
+
+    # Initially no failed tools
+    assert tool_manager.failed_tools == set()
+    assert initial_context.retries == {}
+
+    # Call the failing tool - should add to failed_tools
+    with pytest.raises(ToolRetryError):
+        await tool_manager.handle_call(ToolCallPart(tool_name='failing_tool', args={'x': 1}))
+
+    assert tool_manager.failed_tools == {'failing_tool'}
+    assert call_count['failing_tool'] == 1
+
+    # Call the working tool - should not add to failed_tools
+    result = await tool_manager.handle_call(ToolCallPart(tool_name='other_tool', args={'x': 3}))
+    assert result == 6
+    assert tool_manager.failed_tools == {'failing_tool'}  # unchanged
+    assert call_count['other_tool'] == 1
+
+    # Test for_run_step - should create new tool manager with updated retry counts
+    new_context = build_run_context(TestDeps(), run_step=1)
+    new_tool_manager = await tool_manager.for_run_step(new_context)
+
+    # The new tool manager should have retry count for the failed tool
+    assert new_tool_manager.ctx is not None
+    assert new_tool_manager.ctx.retries == {'failing_tool': 1}
+    assert new_tool_manager.failed_tools == set()  # reset for new run step
+
+    # Call the failing tool again in the new manager - should have retry=1
+    with pytest.raises(ToolRetryError):
+        await new_tool_manager.handle_call(ToolCallPart(tool_name='failing_tool', args={'x': 1}))
+
+    # Call the failing tool another time in the new manager
+    with pytest.raises(ToolRetryError):
+        await new_tool_manager.handle_call(ToolCallPart(tool_name='failing_tool', args={'x': 1}))
+
+    # Call the failing tool a third time in the new manager
+    with pytest.raises(ToolRetryError):
+        await new_tool_manager.handle_call(ToolCallPart(tool_name='failing_tool', args={'x': 1}))
+
+    assert new_tool_manager.failed_tools == {'failing_tool'}
+    assert call_count['failing_tool'] == 4
+
+    # Create another run step
+    another_context = build_run_context(TestDeps(), run_step=2)
+    another_tool_manager = await new_tool_manager.for_run_step(another_context)
+
+    # Should now have retry count of 2 for failing_tool
+    assert another_tool_manager.ctx is not None
+    assert another_tool_manager.ctx.retries == {'failing_tool': 2}
+    assert another_tool_manager.failed_tools == set()
+
+    # Call the failing tool _again_, now we should finally hit the limit
+    with pytest.raises(UnexpectedModelBehavior, match="Tool 'failing_tool' exceeded max retries count of 2"):
+        await another_tool_manager.handle_call(ToolCallPart(tool_name='failing_tool', args={'x': 1}))
+
+## tests/test_vercel_ai.py
+
+async def test_adapter_dump_messages_with_tools():
+    """Test dumping messages with tool calls and returns."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Search for something')]),
+        ModelResponse(
+            parts=[
+                TextPart(content='Let me search for that.'),
+                ToolCallPart(
+                    tool_name='web_search',
+                    args={'query': 'test query'},
+                    tool_call_id='tool_123',
+                ),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='web_search',
+                    content={'results': ['result1', 'result2']},
+                    tool_call_id='tool_123',
+                )
+            ]
+        ),
+        ModelResponse(parts=[TextPart(content='Here are the results.')]),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Search for something', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'Let me search for that.', 'state': 'done', 'provider_metadata': None},
+                    {
+                        'type': 'dynamic-tool',
+                        'tool_name': 'web_search',
+                        'tool_call_id': 'tool_123',
+                        'state': 'output-available',
+                        'input': '{"query":"test query"}',
+                        'output': '{"results":["result1","result2"]}',
+                        'call_provider_metadata': None,
+                        'preliminary': None,
+                    },
+                ],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'Here are the results.', 'state': 'done', 'provider_metadata': None}
+                ],
+            },
+        ]
+    )
+
+async def test_adapter_dump_messages_with_retry_no_tool_name():
+    """Test dumping messages with retry prompts without tool_name (e.g., output validation errors)."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Give me a number')]),
+        ModelResponse(parts=[TextPart(content='Not a valid number')]),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content='Output validation failed: expected integer',
+                    # No tool_name - this is an output validation error, not a tool error
+                )
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Give me a number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Not a valid number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'text',
+                        'text': """\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                        'state': 'done',
+                        'provider_metadata': None,
+                    }
+                ],
+            },
+        ]
+    )
+
+    # Verify roundtrip
+    # Note: This is a lossy conversion - RetryPromptPart without tool_call_id becomes a user text message.
+    # When loaded back, it creates a UserPromptPart instead of RetryPromptPart.
+    # So we check it's value and then replace it with the original RetryPromptPart to assert equality
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    assert reloaded_messages[2] == snapshot(
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content="""\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                    timestamp=IsDatetime(),
+                )
+            ]
+        )
+    )
+    # Get original tool_call_id and replace with original RetryPromptPart
+    original_retry = messages[2].parts[0]
+    assert isinstance(original_retry, RetryPromptPart)
+    reloaded_messages[2] = ModelRequest(
+        parts=[
+            RetryPromptPart(
+                content='Output validation failed: expected integer', tool_call_id=original_retry.tool_call_id
+            )
+        ]
+    )
+    _sync_timestamps(messages, reloaded_messages)
+    assert reloaded_messages == messages
+
+def _sync_timestamps(original: list[ModelMessage], new: list[ModelMessage]) -> None:
+    """Utility function to sync timestamps between original and new messages."""
+    for orig_msg, new_msg in zip(original, new):
+        for orig_part, new_part in zip(orig_msg.parts, new_msg.parts):
+            if hasattr(orig_part, 'timestamp') and hasattr(new_part, 'timestamp'):
+                new_part.timestamp = orig_part.timestamp  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+        if hasattr(orig_msg, 'timestamp') and hasattr(new_msg, 'timestamp'):  # pragma: no branch
+            new_msg.timestamp = orig_msg.timestamp  # pyright: ignore[reportAttributeAccessIssue]

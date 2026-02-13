@@ -1,0 +1,289 @@
+# tests/test_direct.py:130-161
+def test_model_request_stream_sync_without_context_manager():
+    """Test that accessing properties or iterating without context manager raises RuntimeError."""
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('x')]
+
+    expected_error_msg = re.escape(
+        'StreamedResponseSync must be used as a context manager. Use: `with model_request_stream_sync(...) as stream:`'
+    )
+
+    stream_cm = model_request_stream_sync('test', messages)
+
+    stream_repr = repr(stream_cm)
+    assert 'StreamedResponseSync' in stream_repr
+    assert 'context_entered=False' in stream_repr
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        _ = stream_cm.model_name
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        _ = stream_cm.timestamp
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        stream_cm.get()
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        stream_cm.usage()
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        list(stream_cm)
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        for _ in stream_cm:
+            break  # pragma: no cover
+
+# tests/test_direct.py:85-111
+def test_model_request_stream_sync():
+    with model_request_stream_sync('test', [ModelRequest.user_text_prompt('x')]) as stream:
+        chunks = list(stream)
+        assert chunks == snapshot(
+            [
+                PartStartEvent(index=0, part=TextPart(content='')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='success ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='(no ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='tool ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='calls)')),
+                PartEndEvent(index=0, part=TextPart(content='success (no tool calls)')),
+            ]
+        )
+        assert stream.response == snapshot(
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=51, output_tokens=4),
+                model_name='test',
+                timestamp=IsDatetime(),
+                provider_name='test',
+            )
+        )
+
+        repr_str = repr(stream)
+        assert 'TestStreamedResponse' in repr_str
+        assert 'test' in repr_str
+
+# tests/test_direct.py:164-173
+def test_model_request_stream_sync_exception_in_stream():
+    """Test handling of exceptions raised during streaming."""
+    async_stream_mock = AsyncMock()
+    async_stream_mock.__aenter__ = AsyncMock(side_effect=ValueError('Stream error'))
+
+    stream_sync = StreamedResponseSync(_async_stream_cm=async_stream_mock)
+
+    with stream_sync:
+        with pytest.raises(ValueError, match='Stream error'):
+            list(stream_sync)
+
+# tests/test_direct.py:176-190
+def test_model_request_stream_sync_timeout():
+    """Test timeout when stream fails to initialize."""
+    async_stream_mock = AsyncMock()
+
+    async def slow_init():
+        await asyncio.sleep(0.1)
+
+    async_stream_mock.__aenter__ = AsyncMock(side_effect=slow_init)
+
+    stream_sync = StreamedResponseSync(_async_stream_cm=async_stream_mock)
+
+    with patch('pydantic_ai.direct.STREAM_INITIALIZATION_TIMEOUT', 0.01):
+        with stream_sync:
+            with pytest.raises(RuntimeError, match='Stream failed to initialize within timeout'):
+                stream_sync.get()
+
+# pydantic_ai_slim/pydantic_ai/direct.py:333-338
+    def _check_context_manager_usage(self) -> None:
+        if self._context_entered:
+            raise RuntimeError(
+                'StreamedResponseSync must be used as a context manager. '
+                'Use: `with model_request_stream_sync(...) as stream:`'
+            )
+
+# tests/test_direct.py:193-202
+def test_model_request_stream_sync_intermediate_get():
+    """Test getting properties of StreamedResponse before consuming all events."""
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('x')]
+
+    with model_request_stream_sync('test', messages) as stream:
+        response = stream.get()
+        assert response is not None
+
+        usage = stream.usage()
+        assert usage is not None
+
+# pydantic_ai_slim/pydantic_ai/direct.py:206-267
+def model_request_stream_sync(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> StreamedResponseSync:
+    """Make a streamed synchronous request to a model.
+
+    This is the synchronous version of [`model_request_stream`][pydantic_ai.direct.model_request_stream].
+    It uses threading to run the asynchronous stream in the background while providing a synchronous iterator interface.
+
+    ```py {title="model_request_stream_sync_example.py"}
+
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_stream_sync
+
+    messages = [ModelRequest.user_text_prompt('Who was Albert Einstein?')]
+    with model_request_stream_sync('openai:gpt-5-mini', messages) as stream:
+        chunks = []
+        for chunk in stream:
+            chunks.append(chunk)
+        print(chunks)
+        '''
+        [
+            PartStartEvent(index=0, part=TextPart(content='Albert Einstein was ')),
+            FinalResultEvent(tool_name=None, tool_call_id=None),
+            PartDeltaEvent(
+                index=0, delta=TextPartDelta(content_delta='a German-born theoretical ')
+            ),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='physicist.')),
+            PartEndEvent(
+                index=0,
+                part=TextPart(
+                    content='Albert Einstein was a German-born theoretical physicist.'
+                ),
+            ),
+        ]
+        '''
+    ```
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        A [sync stream response][pydantic_ai.direct.StreamedResponseSync] context manager.
+    """
+    async_stream_cm = model_request_stream(
+        model=model,
+        messages=list(messages),
+        model_settings=model_settings,
+        model_request_parameters=model_request_parameters,
+        instrument=instrument,
+    )
+
+    return StreamedResponseSync(async_stream_cm)
+
+# pydantic_ai_slim/pydantic_ai/direct.py:296-296
+    _context_entered: bool = field(default=False, init=False)
+
+# tests/test_toolsets.py:530-545
+async def test_tool_manager_reuse_self():
+    """Test the retry logic with failed_tools and for_run_step method."""
+
+    run_context = build_run_context(None, run_step=1)
+
+    tool_manager = await ToolManager[None](FunctionToolset()).for_run_step(run_context)
+
+    same_tool_manager = await tool_manager.for_run_step(ctx=run_context)
+
+    assert tool_manager is same_tool_manager
+
+    step_2_context = build_run_context(None, run_step=2)
+
+    updated_tool_manager = await tool_manager.for_run_step(ctx=step_2_context)
+
+    assert tool_manager != updated_tool_manager
+
+# tests/test_streaming.py:52-52
+from pydantic_ai.models.test import TestModel, TestStreamedResponse as ModelTestStreamedResponse
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:300-364
+class TestStreamedResponse(StreamedResponse):
+    """A structured response that streams test data."""
+
+    _model_name: str
+    _structured_response: ModelResponse
+    _messages: InitVar[Iterable[ModelMessage]]
+    _provider_name: str
+    _provider_url: str | None = None
+    _timestamp: datetime = field(default_factory=_utils.now_utc, init=False)
+
+    def __post_init__(self, _messages: Iterable[ModelMessage]):
+        self._usage = _estimate_usage(_messages)
+
+    async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        for i, part in enumerate(self._structured_response.parts):
+            if isinstance(part, TextPart):
+                text = part.content
+                *words, last_word = text.split(' ')
+                words = [f'{word} ' for word in words]
+                words.append(last_word)
+                if len(words) == 1 and len(text) > 2:
+                    mid = len(text) // 2
+                    words = [text[:mid], text[mid:]]
+                self._usage += _get_string_usage('')
+                for event in self._parts_manager.handle_text_delta(vendor_part_id=i, content=''):
+                    yield event
+                for word in words:
+                    self._usage += _get_string_usage(word)
+                    for event in self._parts_manager.handle_text_delta(vendor_part_id=i, content=word):
+                        yield event
+            elif isinstance(part, ToolCallPart):
+                yield self._parts_manager.handle_tool_call_part(
+                    vendor_part_id=i, tool_name=part.tool_name, args=part.args, tool_call_id=part.tool_call_id
+                )
+            elif isinstance(part, BuiltinToolCallPart | BuiltinToolReturnPart):  # pragma: no cover
+                # NOTE: These parts are not generated by TestModel, but we need to handle them for type checking
+                assert False, f'Unexpected part type in TestModel: {type(part).__name__}'
+            elif isinstance(part, ThinkingPart):  # pragma: no cover
+                # NOTE: There's no way to reach this part of the code, since we don't generate ThinkingPart on TestModel.
+                assert False, "This should be unreachable — we don't generate ThinkingPart on TestModel."
+            elif isinstance(part, FilePart):  # pragma: no cover
+                # NOTE: There's no way to reach this part of the code, since we don't generate FilePart on TestModel.
+                assert False, "This should be unreachable — we don't generate FilePart on TestModel."
+            else:
+                assert_never(part)
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name of the response."""
+        return self._model_name
+
+    @property
+    def provider_name(self) -> str:
+        """Get the provider name."""
+        return self._provider_name
+
+    @property
+    def provider_url(self) -> str | None:
+        """Get the provider base URL."""
+        return self._provider_url
+
+    @property
+    def timestamp(self) -> datetime:
+        """Get the timestamp of the response."""
+        return self._timestamp
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:308-308
+    _timestamp: datetime = field(default_factory=_utils.now_utc, init=False)
+
+# tests/test_streaming.py:2452-2454
+def test_streamed_run_result_metadata_none_without_run_or_stream() -> None:
+    streamed = StreamedRunResult(all_messages=[], new_message_index=0, stream_response=None, on_complete=None)
+    assert streamed.metadata is None
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:307-307
+    _provider_url: str | None = None
+
+# pydantic_ai_slim/pydantic_ai/direct.py:297-297
+    _stream_ready: threading.Event = field(default_factory=threading.Event, init=False)
+
+# pydantic_ai_slim/pydantic_ai/direct.py:289-289
+    _async_stream_cm: AbstractAsyncContextManager[StreamedResponse]
+
+# pydantic_ai_slim/pydantic_ai/direct.py:294-294
+    _stream_response: StreamedResponse | None = field(default=None, init=False)
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:305-305
+    _messages: InitVar[Iterable[ModelMessage]]

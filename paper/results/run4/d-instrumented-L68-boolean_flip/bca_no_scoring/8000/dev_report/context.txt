@@ -1,0 +1,769 @@
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def is_async_callable(obj: Any) -> Any:
+    """Correctly check if a callable is async.
+
+    This function was copied from Starlette:
+    https://github.com/encode/starlette/blob/78da9b9e218ab289117df7d62aee200ed4c59617/starlette/_utils.py#L36-L40
+    """
+    while isinstance(obj, functools.partial):
+        obj = obj.func
+
+    return inspect.iscoroutinefunction(obj) or (callable(obj) and inspect.iscoroutinefunction(obj.__call__))
+
+## pydantic_ai_slim/pydantic_ai/models/function.py
+
+class DeltaToolCall:
+    """Incremental change to a tool call.
+
+    Used to describe a chunk when streaming structured responses.
+    """
+
+    name: str | None = None
+    """Incremental change to the name of the tool."""
+
+    json_args: str | None = None
+    """Incremental change to the arguments as JSON"""
+
+    _: KW_ONLY
+
+    tool_call_id: str | None = None
+    """Incremental change to the tool call ID."""
+
+## pydantic_ai_slim/pydantic_ai/models/instrumented.py
+
+class InstrumentedModel(WrapperModel):
+    """Model which wraps another model so that requests are instrumented with OpenTelemetry.
+
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    instrumentation_settings: InstrumentationSettings
+    """Instrumentation settings for this model."""
+
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        options: InstrumentationSettings | None = None,
+    ) -> None:
+        super().__init__(wrapped)
+        self.instrumentation_settings = options or InstrumentationSettings()
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        prepared_settings, prepared_parameters = self.wrapped.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        with self._instrument(messages, prepared_settings, prepared_parameters) as finish:
+            response = await self.wrapped.request(messages, model_settings, model_request_parameters)
+            finish(response, prepared_parameters)
+            return response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        prepared_settings, prepared_parameters = self.wrapped.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        with self._instrument(messages, prepared_settings, prepared_parameters) as finish:
+            response_stream: StreamedResponse | None = None
+            try:
+                async with self.wrapped.request_stream(
+                    messages, model_settings, model_request_parameters, run_context
+                ) as response_stream:
+                    yield response_stream
+            finally:
+                if response_stream:  # pragma: no branch
+                    finish(response_stream.get(), prepared_parameters)
+
+    @contextmanager
+    def _instrument(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> Iterator[Callable[[ModelResponse, ModelRequestParameters], None]]:
+        operation = 'chat'
+        span_name = f'{operation} {self.model_name}'
+        # TODO Missing attributes:
+        #  - error.type: unclear if we should do something here or just always rely on span exceptions
+        #  - gen_ai.request.stop_sequences/top_k: model_settings doesn't include these
+        attributes: dict[str, AttributeValue] = {
+            'gen_ai.operation.name': operation,
+            **self.model_attributes(self.wrapped),
+            **self.model_request_parameters_attributes(model_request_parameters),
+            'logfire.json_schema': json.dumps(
+                {
+                    'type': 'object',
+                    'properties': {'model_request_parameters': {'type': 'object'}},
+                }
+            ),
+        }
+
+        tool_definitions = _build_tool_definitions(model_request_parameters)
+        if tool_definitions:
+            attributes['gen_ai.tool.definitions'] = json.dumps(tool_definitions)
+
+        if model_settings:
+            for key in MODEL_SETTING_ATTRIBUTES:
+                if isinstance(value := model_settings.get(key), float | int):
+                    attributes[f'gen_ai.request.{key}'] = value
+
+        record_metrics: Callable[[], None] | None = None
+        try:
+            with self.instrumentation_settings.tracer.start_as_current_span(
+                span_name, attributes=attributes, kind=SpanKind.CLIENT
+            ) as span:
+
+                def finish(response: ModelResponse, parameters: ModelRequestParameters):
+                    # FallbackModel updates these span attributes.
+                    attributes.update(getattr(span, 'attributes', {}))
+                    request_model = attributes[GEN_AI_REQUEST_MODEL_ATTRIBUTE]
+                    system = cast(str, attributes[GEN_AI_SYSTEM_ATTRIBUTE])
+
+                    response_model = response.model_name or request_model
+                    price_calculation = None
+
+                    def _record_metrics():
+                        metric_attributes = {
+                            GEN_AI_PROVIDER_NAME_ATTRIBUTE: system,  # New OTel standard attribute
+                            GEN_AI_SYSTEM_ATTRIBUTE: system,  # Preserved for backward compatibility (deprecated)
+                            'gen_ai.operation.name': operation,
+                            'gen_ai.request.model': request_model,
+                            'gen_ai.response.model': response_model,
+                        }
+                        self.instrumentation_settings.record_metrics(response, price_calculation, metric_attributes)
+
+                    nonlocal record_metrics
+                    record_metrics = _record_metrics
+
+                    if not span.is_recording():
+                        return
+
+                    self.instrumentation_settings.handle_messages(messages, response, system, span, parameters)
+
+                    attributes_to_set = {
+                        **response.usage.opentelemetry_attributes(),
+                        'gen_ai.response.model': response_model,
+                    }
+                    try:
+                        price_calculation = response.cost()
+                    except LookupError:
+                        # The cost of this provider/model is unknown, which is common.
+                        pass
+                    except Exception as e:
+                        warnings.warn(
+                            f'Failed to get cost from response: {type(e).__name__}: {e}', CostCalculationFailedWarning
+                        )
+                    else:
+                        attributes_to_set['operation.cost'] = float(price_calculation.total_price)
+
+                    if response.provider_response_id is not None:
+                        attributes_to_set['gen_ai.response.id'] = response.provider_response_id
+                    if response.finish_reason is not None:
+                        attributes_to_set['gen_ai.response.finish_reasons'] = [response.finish_reason]
+                    span.set_attributes(attributes_to_set)
+                    span.update_name(f'{operation} {request_model}')
+
+                yield finish
+        finally:
+            if record_metrics:
+                # We only want to record metrics after the span is finished,
+                # to prevent them from being redundantly recorded in the span itself by logfire.
+                record_metrics()
+
+    @staticmethod
+    def model_attributes(model: Model) -> dict[str, AttributeValue]:
+        attributes: dict[str, AttributeValue] = {
+            GEN_AI_PROVIDER_NAME_ATTRIBUTE: model.system,  # New OTel standard attribute
+            GEN_AI_SYSTEM_ATTRIBUTE: model.system,  # Preserved for backward compatibility (deprecated)
+            GEN_AI_REQUEST_MODEL_ATTRIBUTE: model.model_name,
+        }
+        if base_url := model.base_url:
+            try:
+                parsed = urlparse(base_url)
+            except Exception:  # pragma: no cover
+                pass
+            else:
+                if parsed.hostname:  # pragma: no branch
+                    attributes['server.address'] = parsed.hostname
+                if parsed.port:  # pragma: no branch
+                    attributes['server.port'] = parsed.port
+
+        return attributes
+
+    @staticmethod
+    def model_request_parameters_attributes(
+        model_request_parameters: ModelRequestParameters,
+    ) -> dict[str, AttributeValue]:
+        return {'model_request_parameters': json.dumps(InstrumentedModel.serialize_any(model_request_parameters))}
+
+    @staticmethod
+    def event_to_dict(event: LogRecord) -> dict[str, Any]:
+        if not event.body:
+            body = {}  # pragma: no cover
+        elif isinstance(event.body, Mapping):
+            body = event.body
+        else:
+            body = {'body': event.body}
+        return {**body, **(event.attributes or {})}
+
+    @staticmethod
+    def serialize_any(value: Any) -> str:
+        try:
+            return ANY_ADAPTER.dump_python(value, mode='json')
+        except Exception:
+            try:
+                return str(value)
+            except Exception as e:
+                return f'Unable to serialize: {e}'
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class TestModel(Model):
+    """A model specifically for testing purposes.
+
+    This will (by default) call all tools in the agent, then return a tool response if possible,
+    otherwise a plain response.
+
+    How useful this model is will vary significantly.
+
+    Apart from `__init__` derived by the `dataclass` decorator, all methods are private or match those
+    of the base class.
+    """
+
+    # NOTE: Avoid test discovery by pytest.
+    __test__ = False
+
+    call_tools: list[str] | Literal['all'] = 'all'
+    """List of tools to call. If `'all'`, all tools will be called."""
+    custom_output_text: str | None = None
+    """If set, this text is returned as the final output."""
+    custom_output_args: Any | None = None
+    """If set, these args will be passed to the output tool."""
+    seed: int = 0
+    """Seed for generating random data."""
+    last_model_request_parameters: ModelRequestParameters | None = field(default=None, init=False)
+    """The last ModelRequestParameters passed to the model in a request.
+
+    The ModelRequestParameters contains information about the function and output tools available during request handling.
+
+    This is set when a request is made, so will reflect the function tools from the last step of the last run.
+    """
+    _model_name: str = field(default='test', repr=False)
+    _system: str = field(default='test', repr=False)
+
+    def __init__(
+        self,
+        *,
+        call_tools: list[str] | Literal['all'] = 'all',
+        custom_output_text: str | None = None,
+        custom_output_args: Any | None = None,
+        seed: int = 0,
+        model_name: str = 'test',
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize TestModel with optional settings and profile."""
+        self.call_tools = call_tools
+        self.custom_output_text = custom_output_text
+        self.custom_output_args = custom_output_args
+        self.seed = seed
+        self.last_model_request_parameters = None
+        self._model_name = model_name
+        self._system = 'test'
+        super().__init__(settings=settings, profile=profile)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        model_response.usage = _estimate_usage([*messages, model_response])
+        return model_response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        yield TestStreamedResponse(
+            model_request_parameters=model_request_parameters,
+            _model_name=self._model_name,
+            _structured_response=model_response,
+            _messages=messages,
+            _provider_name=self._system,
+        )
+
+    @property
+    def model_name(self) -> str:
+        """The model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The model provider."""
+        return self._system
+
+    @classmethod
+    def supported_builtin_tools(cls) -> frozenset[type[AbstractBuiltinTool]]:
+        """TestModel supports all builtin tools for testing flexibility."""
+        return SUPPORTED_BUILTIN_TOOLS
+
+    def gen_tool_args(self, tool_def: ToolDefinition) -> Any:
+        return _JsonSchemaTestData(tool_def.parameters_json_schema, self.seed).generate()
+
+    def _get_tool_calls(self, model_request_parameters: ModelRequestParameters) -> list[tuple[str, ToolDefinition]]:
+        if self.call_tools == 'all':
+            return [(r.name, r) for r in model_request_parameters.function_tools]
+        else:
+            function_tools_lookup = {t.name: t for t in model_request_parameters.function_tools}
+            tools_to_call = (function_tools_lookup[name] for name in self.call_tools)
+            return [(r.name, r) for r in tools_to_call]
+
+    def _get_output(self, model_request_parameters: ModelRequestParameters) -> _WrappedTextOutput | _WrappedToolOutput:
+        if self.custom_output_text is not None:
+            assert model_request_parameters.output_mode != 'tool', (
+                'Plain response not allowed, but `custom_output_text` is set.'
+            )
+            assert self.custom_output_args is None, 'Cannot set both `custom_output_text` and `custom_output_args`.'
+            return _WrappedTextOutput(self.custom_output_text)
+        elif self.custom_output_args is not None:
+            assert model_request_parameters.output_tools is not None, (
+                'No output tools provided, but `custom_output_args` is set.'
+            )
+            output_tool = model_request_parameters.output_tools[0]
+
+            if k := output_tool.outer_typed_dict_key:
+                return _WrappedToolOutput({k: self.custom_output_args})
+            else:
+                return _WrappedToolOutput(self.custom_output_args)
+        elif model_request_parameters.allow_text_output:
+            return _WrappedTextOutput(None)
+        elif model_request_parameters.output_tools:
+            return _WrappedToolOutput(None)
+        else:
+            return _WrappedTextOutput(None)
+
+    def _request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        if model_request_parameters.builtin_tools:
+            raise UserError('TestModel does not support built-in tools')
+
+        tool_calls = self._get_tool_calls(model_request_parameters)
+        output_wrapper = self._get_output(model_request_parameters)
+        output_tools = model_request_parameters.output_tools
+
+        # if there are tools, the first thing we want to do is call all of them
+        if tool_calls and not any(isinstance(m, ModelResponse) for m in messages):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(name, self.gen_tool_args(args), tool_call_id=f'pyd_ai_tool_call_id__{name}')
+                    for name, args in tool_calls
+                ],
+                model_name=self._model_name,
+            )
+
+        if messages:  # pragma: no branch
+            last_message = messages[-1]
+            assert isinstance(last_message, ModelRequest), 'Expected last message to be a `ModelRequest`.'
+
+            # check if there are any retry prompts, if so retry them
+            new_retry_names = {p.tool_name for p in last_message.parts if isinstance(p, RetryPromptPart)}
+            if new_retry_names:
+                # Handle retries for both function tools and output tools
+                # Check function tools first
+                retry_parts: list[ModelResponsePart] = [
+                    ToolCallPart(name, self.gen_tool_args(args)) for name, args in tool_calls if name in new_retry_names
+                ]
+                # Check output tools
+                if output_tools:
+                    retry_parts.extend(
+                        [
+                            ToolCallPart(
+                                tool.name,
+                                output_wrapper.value
+                                if isinstance(output_wrapper, _WrappedToolOutput) and output_wrapper.value is not None
+                                else self.gen_tool_args(tool),
+                                tool_call_id=f'pyd_ai_tool_call_id__{tool.name}',
+                            )
+                            for tool in output_tools
+                            if tool.name in new_retry_names
+                        ]
+                    )
+                return ModelResponse(parts=retry_parts, model_name=self._model_name)
+
+        if isinstance(output_wrapper, _WrappedTextOutput):
+            if (response_text := output_wrapper.value) is None:
+                # build up details of tool responses
+                output: dict[str, Any] = {}
+                for message in messages:
+                    if isinstance(message, ModelRequest):
+                        for part in message.parts:
+                            if isinstance(part, ToolReturnPart):
+                                output[part.tool_name] = part.content
+                if output:
+                    return ModelResponse(
+                        parts=[TextPart(pydantic_core.to_json(output).decode())], model_name=self._model_name
+                    )
+                else:
+                    return ModelResponse(parts=[TextPart('success (no tool calls)')], model_name=self._model_name)
+            else:
+                return ModelResponse(parts=[TextPart(response_text)], model_name=self._model_name)
+        else:
+            assert output_tools, 'No output tools provided'
+            custom_output_args = output_wrapper.value
+            output_tool = output_tools[self.seed % len(output_tools)]
+            if custom_output_args is not None:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            custom_output_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+            else:
+                response_args = self.gen_tool_args(output_tool)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            response_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+
+## tests/graph/beta/test_paths.py
+
+async def test_path_builder_transform():
+    """Test PathBuilder.transform method."""
+
+    async def transform_func(ctx: StepContext[MyState, None, int]) -> int:
+        return ctx.inputs * 2  # pragma: no cover
+
+    builder = PathBuilder[MyState, None, int](working_items=[])
+    new_builder = builder.transform(transform_func)
+
+    assert len(new_builder.working_items) == 1
+    assert isinstance(new_builder.working_items[0], TransformMarker)
+
+## tests/models/test_model_function.py
+
+async def call_function_model(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:  # pragma: lax no cover
+    last = messages[-1].parts[-1]
+    if isinstance(last, UserPromptPart):
+        if isinstance(last.content, str) and last.content.startswith('{'):
+            details = json.loads(last.content)
+            return ModelResponse(parts=[ToolCallPart(details['function'], json.dumps(details['arguments']))])
+    elif isinstance(last, ToolReturnPart):
+        return ModelResponse(parts=[TextPart(pydantic_core.to_json(last).decode())])
+
+    raise ValueError(f'Unexpected message: {last}')
+
+## tests/models/test_xai.py
+
+async def test_xai_model_retries(allow_model_requests: None):
+    """Test xAI model with retries."""
+    # Create error response then success
+    success_response = create_response(content='Success after retry')
+
+    mock_client = MockXai.create_mock([success_response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+    result = await agent.run('hello')
+    assert result.output == 'Success after retry'
+
+## tests/providers/test_gateway.py
+
+def test_init_with_base_url(
+    provider_name: Literal['openai', 'openai-chat', 'openai-responses'], provider_cls: type[Provider[Any]], route: str
+):
+    provider = gateway_provider(provider_name, base_url='https://example.com/', api_key='foobar')
+    assert isinstance(provider, provider_cls)
+    assert provider.base_url == f'https://example.com/{route}/'
+    assert provider.client.api_key == 'foobar'
+
+## tests/providers/test_huggingface.py
+
+def test_huggingface_provider_init_http_client_error():
+    with pytest.raises(ValueError, match='`http_client` is ignored'):
+        HuggingFaceProvider(api_key='key', http_client=Mock())  # type: ignore[call-overload]
+
+## tests/test_direct.py
+
+async def test_model_request():
+    model_response = await model_request('test', [ModelRequest.user_text_prompt('x')])
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[TextPart(content='success (no tool calls)')],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=4),
+        )
+    )
+
+async def test_model_request_tool_call():
+    model_response = await model_request(
+        'test',
+        [ModelRequest.user_text_prompt('x')],
+        model_request_parameters=ModelRequestParameters(
+            function_tools=[ToolDefinition(name='tool_name', parameters_json_schema={'type': 'object'})],
+            allow_text_output=False,
+        ),
+    )
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[ToolCallPart(tool_name='tool_name', args={}, tool_call_id=IsStr(regex='pyd_ai_.*'))],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=2),
+        )
+    )
+
+def test_model_request_sync():
+    model_response = model_request_sync('test', [ModelRequest.user_text_prompt('x')])
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[TextPart(content='success (no tool calls)')],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=4),
+        )
+    )
+
+def test_model_request_stream_sync():
+    with model_request_stream_sync('test', [ModelRequest.user_text_prompt('x')]) as stream:
+        chunks = list(stream)
+        assert chunks == snapshot(
+            [
+                PartStartEvent(index=0, part=TextPart(content='')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='success ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='(no ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='tool ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='calls)')),
+                PartEndEvent(index=0, part=TextPart(content='success (no tool calls)')),
+            ]
+        )
+        assert stream.response == snapshot(
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=51, output_tokens=4),
+                model_name='test',
+                timestamp=IsDatetime(),
+                provider_name='test',
+            )
+        )
+
+        repr_str = repr(stream)
+        assert 'TestStreamedResponse' in repr_str
+        assert 'test' in repr_str
+
+async def test_model_request_stream():
+    async with model_request_stream('test', [ModelRequest.user_text_prompt('x')]) as stream:
+        chunks = [chunk async for chunk in stream]
+    assert chunks == snapshot(
+        [
+            PartStartEvent(index=0, part=TextPart(content='')),
+            FinalResultEvent(tool_name=None, tool_call_id=None),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='success ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='(no ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='tool ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='calls)')),
+            PartEndEvent(index=0, part=TextPart(content='success (no tool calls)')),
+        ]
+    )
+
+def test_model_request_stream_sync_without_context_manager():
+    """Test that accessing properties or iterating without context manager raises RuntimeError."""
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('x')]
+
+    expected_error_msg = re.escape(
+        'StreamedResponseSync must be used as a context manager. Use: `with model_request_stream_sync(...) as stream:`'
+    )
+
+    stream_cm = model_request_stream_sync('test', messages)
+
+    stream_repr = repr(stream_cm)
+    assert 'StreamedResponseSync' in stream_repr
+    assert 'context_entered=False' in stream_repr
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        _ = stream_cm.model_name
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        _ = stream_cm.timestamp
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        stream_cm.get()
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        stream_cm.usage()
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        list(stream_cm)
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        for _ in stream_cm:
+            break  # pragma: no cover
+
+def test_model_request_stream_sync_exception_in_stream():
+    """Test handling of exceptions raised during streaming."""
+    async_stream_mock = AsyncMock()
+    async_stream_mock.__aenter__ = AsyncMock(side_effect=ValueError('Stream error'))
+
+    stream_sync = StreamedResponseSync(_async_stream_cm=async_stream_mock)
+
+    with stream_sync:
+        with pytest.raises(ValueError, match='Stream error'):
+            list(stream_sync)
+
+def test_model_request_stream_sync_timeout():
+    """Test timeout when stream fails to initialize."""
+    async_stream_mock = AsyncMock()
+
+    async def slow_init():
+        await asyncio.sleep(0.1)
+
+    async_stream_mock.__aenter__ = AsyncMock(side_effect=slow_init)
+
+    stream_sync = StreamedResponseSync(_async_stream_cm=async_stream_mock)
+
+    with patch('pydantic_ai.direct.STREAM_INITIALIZATION_TIMEOUT', 0.01):
+        with stream_sync:
+            with pytest.raises(RuntimeError, match='Stream failed to initialize within timeout'):
+                stream_sync.get()
+
+def test_model_request_stream_sync_intermediate_get():
+    """Test getting properties of StreamedResponse before consuming all events."""
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('x')]
+
+    with model_request_stream_sync('test', messages) as stream:
+        response = stream.get()
+        assert response is not None
+
+        usage = stream.usage()
+        assert usage is not None
+
+def set_instrument_default(value: bool):
+    """Context manager to temporarily set the default instrumentation value."""
+    initial_value = Agent._instrument_default  # pyright: ignore[reportPrivateUsage]
+    try:
+        Agent._instrument_default = value  # pyright: ignore[reportPrivateUsage]
+        yield
+    finally:
+        Agent._instrument_default = initial_value  # pyright: ignore[reportPrivateUsage]
+
+def test_prepare_model():
+    with set_instrument_default(False):
+        model = _prepare_model('test', None)
+        assert isinstance(model, TestModel)
+
+        model = _prepare_model('test', True)
+        assert isinstance(model, InstrumentedModel)
+
+    with set_instrument_default(True):
+        model = _prepare_model('test', None)
+        assert isinstance(model, InstrumentedModel)
+
+        model = _prepare_model('test', False)
+        assert isinstance(model, TestModel)
+
+## tests/test_vercel_ai.py
+
+class TestSdkVersion:
+    async def test_tool_input_start_chunk_excludes_provider_metadata_for_v5(self):
+        chunk = ToolInputStartChunk(
+            tool_call_id='tc_1',
+            tool_name='my_tool',
+            provider_metadata={'pydantic_ai': {'id': 'test_id', 'provider_name': 'openai'}},
+        )
+        encoded_v5 = json.loads(chunk.encode(sdk_version=5))
+        encoded_v6 = json.loads(chunk.encode(sdk_version=6))
+
+        assert 'providerMetadata' not in encoded_v5
+        assert encoded_v5 == snapshot({'type': 'tool-input-start', 'toolCallId': 'tc_1', 'toolName': 'my_tool'})
+
+        assert 'providerMetadata' in encoded_v6
+        assert encoded_v6 == snapshot(
+            {
+                'type': 'tool-input-start',
+                'toolCallId': 'tc_1',
+                'toolName': 'my_tool',
+                'providerMetadata': {'pydantic_ai': {'id': 'test_id', 'provider_name': 'openai'}},
+            }
+        )
+
+    async def test_event_stream_uses_sdk_version(self):
+        async def event_generator():
+            part = ToolCallPart(
+                tool_name='my_tool',
+                tool_call_id='tc_ver',
+                args={'key': 'value'},
+                id='tool_call_id_ver',
+                provider_name='anthropic',
+            )
+            yield PartStartEvent(index=0, part=part)
+            yield PartEndEvent(index=0, part=part)
+
+        request = SubmitMessage(
+            id='foo',
+            messages=[UIMessage(id='bar', role='user', parts=[TextUIPart(text='Test')])],
+        )
+
+        event_stream_v5 = VercelAIEventStream(run_input=request, sdk_version=5)
+        events_v5: list[str | dict[str, Any]] = [
+            '[DONE]' if '[DONE]' in event else json.loads(event.removeprefix('data: '))
+            async for event in event_stream_v5.encode_stream(event_stream_v5.transform_stream(event_generator()))
+        ]
+        tool_input_start_v5: dict[str, Any] = next(
+            e for e in events_v5 if isinstance(e, dict) and e.get('type') == 'tool-input-start'
+        )
+        assert 'providerMetadata' not in tool_input_start_v5
+
+        event_stream_v6 = VercelAIEventStream(run_input=request, sdk_version=6)
+        events_v6: list[str | dict[str, Any]] = [
+            '[DONE]' if '[DONE]' in event else json.loads(event.removeprefix('data: '))
+            async for event in event_stream_v6.encode_stream(event_stream_v6.transform_stream(event_generator()))
+        ]
+        tool_input_start_v6: dict[str, Any] = next(
+            e for e in events_v6 if isinstance(e, dict) and e.get('type') == 'tool-input-start'
+        )
+        assert 'providerMetadata' in tool_input_start_v6

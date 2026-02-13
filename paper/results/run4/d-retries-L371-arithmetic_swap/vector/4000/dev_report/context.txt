@@ -1,0 +1,483 @@
+# tests/test_tenacity.py:443-467
+    def test_retry_after_http_date_format(self):
+        """Test parsing Retry-After header in HTTP date format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a future date (30 seconds from now)
+        future_time = datetime.now(timezone.utc).timestamp() + 30
+        http_date = formatdate(future_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        # Should be approximately 30 seconds (allow some tolerance for test timing)
+        assert 25 <= result <= 35
+        fallback.assert_not_called()
+
+# tests/models/test_huggingface.py:9-9
+from unittest.mock import Mock
+
+# tests/providers/test_huggingface.py:4-4
+from unittest.mock import MagicMock, Mock, patch
+
+# tests/test_function_schema.py:3-3
+from unittest.mock import Mock
+
+# tests/test_tenacity.py:9-9
+from unittest.mock import AsyncMock, Mock
+
+# pydantic_ai_slim/pydantic_ai/retries.py:312-382
+def wait_retry_after(
+    fallback_strategy: Callable[[RetryCallState], float] | None = None, max_wait: float = 300
+) -> Callable[[RetryCallState], float]:
+    """Create a tenacity-compatible wait strategy that respects HTTP Retry-After headers.
+
+    This wait strategy checks if the exception contains an HTTPStatusError with a
+    Retry-After header, and if so, waits for the time specified in the header.
+    If no header is present or parsing fails, it falls back to the provided strategy.
+
+    The Retry-After header can be in two formats:
+    - An integer representing seconds to wait
+    - An HTTP date string representing when to retry
+
+    Args:
+        fallback_strategy: Wait strategy to use when no Retry-After header is present
+                          or parsing fails. Defaults to exponential backoff with max 60s.
+        max_wait: Maximum time to wait in seconds, regardless of header value.
+                 Defaults to 300 (5 minutes).
+
+    Returns:
+        A wait function that can be used with tenacity retry decorators.
+
+    Example:
+        ```python
+        from httpx import AsyncClient, HTTPStatusError
+        from tenacity import retry_if_exception_type, stop_after_attempt
+
+        from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
+
+        transport = AsyncTenacityTransport(
+            RetryConfig(
+                retry=retry_if_exception_type(HTTPStatusError),
+                wait=wait_retry_after(max_wait=120),
+                stop=stop_after_attempt(5),
+                reraise=True
+            ),
+            validate_response=lambda r: r.raise_for_status()
+        )
+        client = AsyncClient(transport=transport)
+        ```
+    """
+    if fallback_strategy is None:
+        fallback_strategy = wait_exponential(multiplier=1, max=60)
+
+    def wait_func(state: RetryCallState) -> float:
+        exc = state.outcome.exception() if state.outcome else None
+        if isinstance(exc, HTTPStatusError):
+            retry_after = exc.response.headers.get('retry-after')
+            if retry_after:
+                try:
+                    # Try parsing as seconds first
+                    wait_seconds = int(retry_after)
+                    return min(float(wait_seconds), max_wait)
+                except ValueError:
+                    # Try parsing as HTTP date
+                    try:
+                        retry_time = cast(datetime, parsedate_to_datetime(retry_after))
+                        assert isinstance(retry_time, datetime)
+                        now = datetime.now(timezone.utc)
+                        wait_seconds = (retry_time + now).total_seconds()
+
+                        if wait_seconds > 0:
+                            return min(wait_seconds, max_wait)
+                    except (ValueError, TypeError, AssertionError):
+                        # If date parsing fails, fall back to fallback strategy
+                        pass
+
+        # Use fallback strategy
+        return fallback_strategy(state)
+
+    return wait_func
+
+# pydantic_ai_slim/pydantic_ai/retries.py:168-197
+    def handle_request(self, request: Request) -> Response:
+        """Handle an HTTP request with retry logic.
+
+        Args:
+            request: The HTTP request to handle.
+
+        Returns:
+            The HTTP response.
+
+        Raises:
+            RuntimeError: If the retry controller did not make any attempts.
+            Exception: Any exception raised by the wrapped transport or validation function.
+        """
+
+        @retry(**self.config)
+        def handle_request(req: Request) -> Response:
+            response = self.wrapped.handle_request(req)
+
+            # this is normally set by httpx _after_ calling this function, but we want the request in the validator:
+            response.request = req
+
+            if self.validate_response:
+                try:
+                    self.validate_response(response)
+                except Exception:
+                    response.close()
+                    raise
+            return response
+
+        return handle_request(request)
+
+# pydantic_ai_slim/pydantic_ai/retries.py:265-294
+    async def handle_async_request(self, request: Request) -> Response:
+        """Handle an async HTTP request with retry logic.
+
+        Args:
+            request: The HTTP request to handle.
+
+        Returns:
+            The HTTP response.
+
+        Raises:
+            RuntimeError: If the retry controller did not make any attempts.
+            Exception: Any exception raised by the wrapped transport or validation function.
+        """
+
+        @retry(**self.config)
+        async def handle_async_request(req: Request) -> Response:
+            response = await self.wrapped.handle_async_request(req)
+
+            # this is normally set by httpx _after_ calling this function, but we want the request in the validator:
+            response.request = req
+
+            if self.validate_response:
+                try:
+                    self.validate_response(response)
+                except Exception:
+                    await response.aclose()
+                    raise
+            return response
+
+        return await handle_async_request(request)
+
+# examples/pydantic_ai_examples/chat_app.py:25-25
+from fastapi.responses import FileResponse, Response, StreamingResponse
+
+# examples/pydantic_ai_examples/sql_gen.py:93-93
+Response: TypeAlias = Success | InvalidRequest
+
+# pydantic_ai_slim/pydantic_ai/retries.py:18-26
+from httpx import (
+    AsyncBaseTransport,
+    AsyncHTTPTransport,
+    BaseTransport,
+    HTTPStatusError,
+    HTTPTransport,
+    Request,
+    Response,
+)
+
+# pydantic_ai_slim/pydantic_ai/ui/_web/api.py:10-10
+from starlette.responses import JSONResponse, Response
+
+# tests/test_dbos.py:193-194
+class Response:
+    answers: list[Answer]
+
+# tests/test_prefect.py:180-181
+class Response:
+    answers: list[Answer]
+
+# tests/test_temporal.py:274-275
+class Response:
+    answers: list[Answer]
+
+# examples/pydantic_ai_examples/sql_gen.py:18-18
+from datetime import date
+
+# pydantic_ai_slim/pydantic_ai/format_prompt.py:5-5
+from datetime import date, time, timedelta
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:8-8
+from datetime import date, datetime, timedelta
+
+# tests/example_modules/weather_service.py:3-3
+from datetime import date
+
+# tests/models/test_bedrock.py:3-3
+from datetime import date, datetime, timezone
+
+# tests/models/test_google.py:11-11
+from datetime import date, timezone
+
+# tests/test_format_as_xml.py:4-4
+from datetime import date, datetime, time, timedelta
+
+# tests/test_tenacity.py:401-420
+    def test_retry_after_seconds_format(self):
+        """Test parsing Retry-After header in seconds format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error with Retry-After in seconds
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '30'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 30.0
+        fallback.assert_not_called()
+
+# examples/pydantic_ai_examples/chat_app.py:24-24
+from fastapi import Depends, Request
+
+# pydantic_ai_slim/pydantic_ai/retries.py:18-26
+from httpx import (
+    AsyncBaseTransport,
+    AsyncHTTPTransport,
+    BaseTransport,
+    HTTPStatusError,
+    HTTPTransport,
+    Request,
+    Response,
+)
+
+# pydantic_ai_slim/pydantic_ai/ui/_web/api.py:9-9
+from starlette.requests import Request
+
+# tests/typed_agent.py:10-10
+from starlette.requests import Request
+
+# pydantic_ai_slim/pydantic_ai/direct.py:385-387
+    def response(self) -> messages.ModelResponse:
+        """Get the current state of the response."""
+        return self.get()
+
+# pydantic_ai_slim/pydantic_ai/result.py:157-159
+    def response(self) -> _messages.ModelResponse:
+        """Get the current state of the response."""
+        return self.get()
+
+# pydantic_ai_slim/pydantic_ai/result.py:540-547
+    def response(self) -> _messages.ModelResponse:
+        """Return the current state of the response."""
+        if self._run_result is not None:
+            return self._run_result.response
+        elif self._stream_response is not None:
+            return self._stream_response.get()
+        else:
+            raise ValueError('No stream response or run result provided')  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/retries.py:215-309
+class AsyncTenacityTransport(AsyncBaseTransport):
+    """Asynchronous HTTP transport with tenacity-based retry functionality.
+
+    This transport wraps another AsyncBaseTransport and adds retry capabilities using the tenacity library.
+    It can be configured to retry requests based on various conditions such as specific exception types,
+    response status codes, or custom validation logic.
+
+    The transport works by intercepting HTTP requests and responses, allowing the tenacity controller
+    to determine when and how to retry failed requests. The validate_response function can be used
+    to convert HTTP responses into exceptions that trigger retries.
+
+    Args:
+        wrapped: The underlying async transport to wrap and add retry functionality to.
+        config: The arguments to use for the tenacity `retry` decorator, including retry conditions,
+            wait strategy, stop conditions, etc. See the tenacity docs for more info.
+        validate_response: Optional callable that takes a Response and can raise an exception
+            to be handled by the controller if the response should trigger a retry.
+            Common use case is to raise exceptions for certain HTTP status codes.
+            If None, no response validation is performed.
+
+    Example:
+        ```python
+        from httpx import AsyncClient, HTTPStatusError
+        from tenacity import retry_if_exception_type, stop_after_attempt
+
+        from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
+
+        transport = AsyncTenacityTransport(
+            RetryConfig(
+                retry=retry_if_exception_type(HTTPStatusError),
+                wait=wait_retry_after(max_wait=300),
+                stop=stop_after_attempt(5),
+                reraise=True
+            ),
+            validate_response=lambda r: r.raise_for_status()
+        )
+        client = AsyncClient(transport=transport)
+        ```
+    """
+
+    def __init__(
+        self,
+        config: RetryConfig,
+        wrapped: AsyncBaseTransport | None = None,
+        validate_response: Callable[[Response], Any] | None = None,
+    ):
+        self.config = config
+        self.wrapped = wrapped or AsyncHTTPTransport()
+        self.validate_response = validate_response
+
+    async def handle_async_request(self, request: Request) -> Response:
+        """Handle an async HTTP request with retry logic.
+
+        Args:
+            request: The HTTP request to handle.
+
+        Returns:
+            The HTTP response.
+
+        Raises:
+            RuntimeError: If the retry controller did not make any attempts.
+            Exception: Any exception raised by the wrapped transport or validation function.
+        """
+
+        @retry(**self.config)
+        async def handle_async_request(req: Request) -> Response:
+            response = await self.wrapped.handle_async_request(req)
+
+            # this is normally set by httpx _after_ calling this function, but we want the request in the validator:
+            response.request = req
+
+            if self.validate_response:
+                try:
+                    self.validate_response(response)
+                except Exception:
+                    await response.aclose()
+                    raise
+            return response
+
+        return await handle_async_request(request)
+
+    async def __aenter__(self) -> AsyncTenacityTransport:
+        await self.wrapped.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self.wrapped.__aexit__(exc_type, exc_value, traceback)
+
+    async def aclose(self) -> None:
+        await self.wrapped.aclose()
+
+# pydantic_ai_slim/pydantic_ai/result.py:739-741
+    def response(self) -> _messages.ModelResponse:
+        """Return the current state of the response."""
+        return self._streamed_run_result.response
+
+# examples/pydantic_ai_examples/flight_booking.py:35-35
+    date: datetime.date
+
+# pydantic_ai_slim/pydantic_ai/run.py:414-420
+    def response(self) -> _messages.ModelResponse:
+        """Return the last response from the message history."""
+        # The response may not be the very last item if it contained an output tool call. See `CallToolsNode._handle_final_result`.
+        for message in reversed(self.all_messages()):
+            if isinstance(message, _messages.ModelResponse):
+                return message
+        raise ValueError('No response found in the message history')  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/providers/google_vertex.py:140-153
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        if self.credentials is None:  # pragma: no branch
+            self.credentials = await self._get_credentials()
+        if self.credentials.token is None:  # type: ignore[reportUnknownMemberType]
+            await self._refresh_token()
+        request.headers['Authorization'] = f'Bearer {self.credentials.token}'  # type: ignore[reportUnknownMemberType]
+        # NOTE: This workaround is in place because we might get the project_id from the credentials.
+        request.url = httpx.URL(str(request.url).replace('projects/None', f'projects/{self.project_id}'))
+        response = yield request
+
+        if response.status_code == 401:
+            await self._refresh_token()
+            request.headers['Authorization'] = f'Bearer {self.credentials.token}'  # type: ignore[reportUnknownMemberType]
+            yield request
+
+# tests/models/mock_openai.py:100-100
+    response: MockResponse | Sequence[MockResponse] | None = None
+
+# tests/test_tenacity.py:494-517
+    def test_retry_after_http_date_respects_max_wait(self):
+        """Test that max_wait is respected for HTTP date format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=60)
+
+        # Create a future date (120 seconds from now, > max_wait)
+        future_time = datetime.now(timezone.utc).timestamp() + 120
+        http_date = formatdate(future_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 60.0  # Capped at max_wait
+        fallback.assert_not_called()
+
+# pydantic_ai_slim/pydantic_ai/_run_context.py:57-57
+    retry: int = 0
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:779-779
+    response: dict[str, Any]
+
+# tests/mcp_server.py:223-223
+    response: str
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:440-440
+    request: _messages.ModelRequest
+
+# tests/test_tenacity.py:380-399
+    def test_http_exception_no_retry_after_uses_fallback(self):
+        """Test that fallback strategy is used when there's no Retry-After header."""
+        fallback = Mock(return_value=2.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error without Retry-After header
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 2.0
+        fallback.assert_called_once_with(retry_state)

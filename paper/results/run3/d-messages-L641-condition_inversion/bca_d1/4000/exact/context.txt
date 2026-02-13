@@ -1,0 +1,419 @@
+## docs/.hooks/algolia.py
+
+from typing_extensions import TypedDict
+
+## examples/pydantic_ai_examples/chat_app.py
+
+async def get_chat(database: Database = Depends(get_db)) -> Response:
+    msgs = await database.get_messages()
+    return Response(
+        b'\n'.join(json.dumps(to_chat_message(m)).encode('utf-8') for m in msgs),
+        media_type='text/plain',
+    )
+
+class ChatMessage(TypedDict):
+    """Format of messages sent to the browser."""
+
+    role: Literal['user', 'model']
+    timestamp: str
+    content: str
+
+async def post_chat(
+    prompt: Annotated[str, fastapi.Form()], database: Database = Depends(get_db)
+) -> StreamingResponse:
+    async def stream_messages():
+        """Streams new line delimited JSON `Message`s to the client."""
+        # stream the user prompt so that can be displayed straight away
+        yield (
+            json.dumps(
+                {
+                    'role': 'user',
+                    'timestamp': datetime.now(tz=timezone.utc).isoformat(),
+                    'content': prompt,
+                }
+            ).encode('utf-8')
+            + b'\n'
+        )
+        # get the chat history so far to pass as context to the agent
+        messages = await database.get_messages()
+        # run the agent with the user prompt and the chat history
+        async with agent.run_stream(prompt, message_history=messages) as result:
+            async for text in result.stream_output(debounce_by=0.01):
+                # text here is a `str` and the frontend wants
+                # JSON encoded ModelResponse, so we create one
+                m = ModelResponse(parts=[TextPart(text)], timestamp=result.timestamp())
+                yield json.dumps(to_chat_message(m)).encode('utf-8') + b'\n'
+
+        # add new messages (e.g. the user prompt and the agent response in this case) to the database
+        await database.add_messages(result.new_messages_json())
+
+    return StreamingResponse(stream_messages(), media_type='text/plain')
+
+    async def add_messages(self, messages: bytes):
+        await self._asyncify(
+            self._execute,
+            'INSERT INTO messages (message_list) VALUES (?);',
+            messages,
+            commit=True,
+        )
+        await self._asyncify(self.con.commit)
+
+    async def get_messages(self) -> list[ModelMessage]:
+        c = await self._asyncify(
+            self._execute, 'SELECT message_list FROM messages order by id'
+        )
+        rows = await self._asyncify(c.fetchall)
+        messages: list[ModelMessage] = []
+        for row in rows:
+            messages.extend(ModelMessagesTypeAdapter.validate_json(row[0]))
+        return messages
+
+## pydantic_ai_slim/pydantic_ai/_a2a.py
+
+from typing import Any, Generic, TypeVar
+
+## pydantic_ai_slim/pydantic_ai/_otel_messages.py
+
+class OutputMessage(ChatMessage):
+    finish_reason: NotRequired[str]
+
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+from typing import Any, Protocol
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    def is_image(self) -> bool:
+        """Return `True` if the media type is an image type."""
+        return self.media_type.startswith('image/')
+
+## pydantic_ai_slim/pydantic_ai/models/instrumented.py
+
+    def messages_to_otel_messages(self, messages: list[ModelMessage]) -> list[_otel_messages.ChatMessage]:
+        result: list[_otel_messages.ChatMessage] = []
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for is_system, group in itertools.groupby(message.parts, key=lambda p: isinstance(p, SystemPromptPart)):
+                    message_parts: list[_otel_messages.MessagePart] = []
+                    for part in group:
+                        if hasattr(part, 'otel_message_parts'):
+                            message_parts.extend(part.otel_message_parts(self))
+
+                    result.append(
+                        _otel_messages.ChatMessage(role='system' if is_system else 'user', parts=message_parts)
+                    )
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                otel_message = _otel_messages.OutputMessage(role='assistant', parts=message.otel_message_parts(self))
+                if message.finish_reason is not None:
+                    otel_message['finish_reason'] = message.finish_reason
+                result.append(otel_message)
+        return result
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def all_messages(self) -> list[_messages.ModelMessage]:
+        """Return all messages for the run so far.
+
+        Messages from older runs are included.
+        """
+        return self.ctx.state.message_history
+
+    def new_messages(self) -> list[_messages.ModelMessage]:
+        """Return new messages for the run so far.
+
+        Messages from older runs are excluded.
+        """
+        return self.all_messages()[self.ctx.deps.new_message_index :]
+
+    def new_messages_json(self) -> bytes:
+        """Return new messages from [`new_messages`][pydantic_ai.agent.AgentRun.new_messages] as JSON bytes.
+
+        Returns:
+            JSON bytes representing the new messages.
+        """
+        return _messages.ModelMessagesTypeAdapter.dump_json(self.new_messages())
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+    def validate_json(
+        self,
+        input: str | bytes | bytearray,
+        *,
+        allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
+        **kwargs: Any,
+    ) -> Any: ...
+
+## pydantic_evals/pydantic_evals/dataset.py
+
+class Case(Generic[InputsT, OutputT, MetadataT]):
+    """A single row of a [`Dataset`][pydantic_evals.Dataset].
+
+    Each case represents a single test scenario with inputs to test. A case may optionally specify a name, expected
+    outputs to compare against, and arbitrary metadata.
+
+    Cases can also have their own specific evaluators which are run in addition to dataset-level evaluators.
+
+    Example:
+    ```python
+    from pydantic_evals import Case
+
+    case = Case(
+        name='Simple addition',
+        inputs={'a': 1, 'b': 2},
+        expected_output=3,
+        metadata={'description': 'Tests basic addition'},
+    )
+    ```
+    """
+
+    name: str | None
+    """Name of the case. This is used to identify the case in the report and can be used to filter cases."""
+    inputs: InputsT
+    """Inputs to the task. This is the input to the task that will be evaluated."""
+    metadata: MetadataT | None = None
+    """Metadata to be used in the evaluation.
+
+    This can be used to provide additional information about the case to the evaluators.
+    """
+    expected_output: OutputT | None = None
+    """Expected output of the task. This is the expected output of the task that will be evaluated."""
+    evaluators: list[Evaluator[InputsT, OutputT, MetadataT]] = field(
+        default_factory=list[Evaluator[InputsT, OutputT, MetadataT]]
+    )
+    """Evaluators to be used just on this case."""
+
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        inputs: InputsT,
+        metadata: MetadataT | None = None,
+        expected_output: OutputT | None = None,
+        evaluators: tuple[Evaluator[InputsT, OutputT, MetadataT], ...] = (),
+    ):
+        """Initialize a new test case.
+
+        Args:
+            name: Optional name for the case. If not provided, a generic name will be assigned when added to a dataset.
+            inputs: The inputs to the task being evaluated.
+            metadata: Optional metadata for the case, which can be used by evaluators.
+            expected_output: Optional expected output of the task, used for comparison in evaluators.
+            evaluators: Tuple of evaluators specific to this case. These are in addition to any
+                dataset-level evaluators.
+
+        """
+        # Note: `evaluators` must be a tuple instead of Sequence due to misbehavior with pyright's generic parameter
+        # inference if it has type `Sequence`
+        self.name = name
+        self.inputs = inputs
+        self.metadata = metadata
+        self.expected_output = expected_output
+        self.evaluators = list(evaluators)
+
+## pydantic_graph/pydantic_graph/beta/decision.py
+
+class Decision(Generic[StateT, DepsT, HandledT]):
+    """Decision node for conditional branching in graph execution.
+
+    A Decision node evaluates conditions and routes execution to different
+    branches based on the input data type or custom matching logic.
+    """
+
+    id: NodeID
+    """Unique identifier for this decision node."""
+
+    branches: list[DecisionBranch[Any]]
+    """List of branches that can be taken from this decision."""
+
+    note: str | None
+    """Optional documentation note for this decision."""
+
+    def branch(self, branch: DecisionBranch[T]) -> Decision[StateT, DepsT, HandledT | T]:
+        """Add a new branch to this decision.
+
+        Args:
+            branch: The branch to add to this decision.
+
+        Returns:
+            A new Decision with the additional branch.
+        """
+        return Decision(id=self.id, branches=self.branches + [branch], note=self.note)
+
+    def _force_handled_contravariant(self, inputs: HandledT) -> Never:  # pragma: no cover
+        """Forces this type to be contravariant in the HandledT type variable.
+
+        This is an implementation detail of how we can type-check that all possible input types have
+        been exhaustively covered.
+
+        Args:
+            inputs: Input data of handled types.
+
+        Raises:
+            RuntimeError: Always, as this method should never be executed.
+        """
+        raise RuntimeError('This method should never be called, it is just defined for typing purposes.')
+
+    def branch(self, branch: DecisionBranch[T]) -> Decision[StateT, DepsT, HandledT | T]:
+        """Add a new branch to this decision.
+
+        Args:
+            branch: The branch to add to this decision.
+
+        Returns:
+            A new Decision with the additional branch.
+        """
+        return Decision(id=self.id, branches=self.branches + [branch], note=self.note)
+
+    def _force_handled_contravariant(self, inputs: HandledT) -> Never:  # pragma: no cover
+        """Forces this type to be contravariant in the HandledT type variable.
+
+        This is an implementation detail of how we can type-check that all possible input types have
+        been exhaustively covered.
+
+        Args:
+            inputs: Input data of handled types.
+
+        Raises:
+            RuntimeError: Always, as this method should never be executed.
+        """
+        raise RuntimeError('This method should never be called, it is just defined for typing purposes.')
+
+class DecisionBranch(Generic[SourceT]):
+    """Represents a single branch within a decision node.
+
+    Each branch defines the conditions under which it should be taken
+    and the path to follow when those conditions are met.
+
+    Note: with the current design, it is actually _critical_ that this class is invariant in SourceT for the sake
+    of type-checking that inputs to a Decision are actually handled. See the `# type: ignore` comment in
+    `tests.graph.beta.test_graph_edge_cases.test_decision_no_matching_branch` for an example of how this works.
+    """
+
+    source: TypeOrTypeExpression[SourceT]
+    """The expected type of data for this branch.
+
+    This is necessary for exhaustiveness-checking when handling the inputs to a decision node."""
+
+    matches: Callable[[Any], bool] | None
+    """An optional predicate function used to determine whether input data matches this branch.
+
+    If `None`, default logic is used which attempts to check the value for type-compatibility with the `source` type:
+    * If `source` is `Any` or `object`, the branch will always match
+    * If `source` is a `Literal` type, this branch will match if the value is one of the parametrizing literal values
+    * If `source` is any other type, the value will be checked for matching using `isinstance`
+
+    Inputs are tested against each branch of a decision node in order, and the path of the first matching branch is
+    used to handle the input value.
+    """
+
+    path: Path
+    """The execution path to follow when an input value matches this branch of a decision node.
+
+    This can include transforming, mapping, and broadcasting the output before sending to the next node or nodes.
+
+    The path can also include position-aware labels which are used when generating mermaid diagrams."""
+
+    destinations: list[AnyDestinationNode]
+    """The destination nodes that can be referenced by DestinationMarker in the path."""
+
+## tests/models/test_anthropic.py
+
+    def messages(self) -> Any:
+        return type('Messages', (), {'create': self.messages_create, 'count_tokens': self.messages_count_tokens})
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_cache_messages_no_user_messages(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    """Test that bedrock_cache_messages handles case with no user messages."""
+    model = BedrockConverseModel('us.anthropic.claude-3-5-sonnet-20240620-v1:0', provider=bedrock_provider)
+    # Only assistant message, no user message
+    messages: list[ModelMessage] = [ModelResponse(parts=[TextPart(content='Assistant response')])]
+    _, bedrock_messages = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        messages,
+        ModelRequestParameters(),
+        BedrockModelSettings(bedrock_cache_messages=True),
+    )
+    # Should not crash, no cache point added since no user message
+    assert len(bedrock_messages) == 1
+    assert bedrock_messages[0]['role'] == 'assistant'
+
+## tests/models/test_instrumented.py
+
+def test_messages_to_otel_events_instructions():
+    messages = [
+        ModelRequest(instructions='instructions', parts=[UserPromptPart('user_prompt')], timestamp=IsDatetime()),
+        ModelResponse(parts=[TextPart('text1')]),
+    ]
+    settings = InstrumentationSettings()
+    assert [InstrumentedModel.event_to_dict(e) for e in settings.messages_to_otel_events(messages)] == snapshot(
+        [
+            {'content': 'instructions', 'role': 'system', 'event.name': 'gen_ai.system.message'},
+            {'content': 'user_prompt', 'role': 'user', 'gen_ai.message.index': 0, 'event.name': 'gen_ai.user.message'},
+            {
+                'role': 'assistant',
+                'content': 'text1',
+                'gen_ai.message.index': 1,
+                'event.name': 'gen_ai.assistant.message',
+            },
+        ]
+    )
+    assert settings.messages_to_otel_messages(messages) == snapshot(
+        [
+            {'role': 'user', 'parts': [{'type': 'text', 'content': 'user_prompt'}]},
+            {'role': 'assistant', 'parts': [{'type': 'text', 'content': 'text1'}]},
+        ]
+    )
+
+## tests/test_mcp.py
+
+def test_map_from_pai_messages_with_binary_content():
+    """Test that map_from_pai_messages correctly converts image and audio content to MCP format.
+
+    Note: `data` in this case are base64-encoded bytes (e.g., base64.b64encode(b'raw')).
+    map_from_pai_messages decodes this to get the base64 string for MCP.
+    """
+
+    message = ModelRequest(
+        parts=[
+            UserPromptPart(content='text message'),
+            UserPromptPart(content=[BinaryContent(data=b'raw_image_bytes', media_type='image/png')]),
+            # TODO uncomment when audio content is supported
+            # UserPromptPart(content=[BinaryContent(data=b'raw_audio_bytes', media_type='audio/wav'), 'text after audio']),
+        ]
+    )
+    system_prompt, sampling_msgs = map_from_pai_messages([message])
+    assert system_prompt == ''
+    assert [m.model_dump(by_alias=True) for m in sampling_msgs] == snapshot(
+        [
+            {
+                'role': 'user',
+                'content': {'type': 'text', 'text': 'text message', 'annotations': None, '_meta': None},
+                '_meta': None,
+            },
+            {
+                'role': 'user',
+                'content': {
+                    'type': 'image',
+                    'data': 'cmF3X2ltYWdlX2J5dGVz',
+                    'mimeType': 'image/png',
+                    'annotations': None,
+                    '_meta': None,
+                },
+                '_meta': None,
+            },
+        ]
+    )
+
+    # Unsupported content type raises NotImplementedError
+    message_with_video = ModelRequest(
+        parts=[UserPromptPart(content=[BinaryContent(data=b'raw_video_bytes', media_type='video/mp4')])]
+    )
+    with pytest.raises(
+        NotImplementedError, match="Unsupported content type: <class 'pydantic_ai.messages.BinaryContent'>"
+    ):
+        map_from_pai_messages([message_with_video])
+
+## tests/test_ui.py
+
+    def messages(self) -> list[ModelMessage]:
+        return self.load_messages(self.run_input.messages)

@@ -1,0 +1,473 @@
+## httpx/_auth.py
+
+    def _get_client_nonce(self, nonce_count: int, nonce: bytes) -> bytes:
+        s = str(nonce_count).encode()
+        s += nonce
+        s += time.ctime().encode()
+        s += os.urandom(8)
+
+        return hashlib.sha1(s).hexdigest()[:16].encode()
+
+    realm: bytes
+
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+USE_CLIENT_DEFAULT = UseClientDefault()
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    def build_request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Request:
+        """
+        Build and return a request instance.
+
+        * The `params`, `headers` and `cookies` arguments
+        are merged with any values set on the client.
+        * The `url` argument is merged with any `base_url` set on the client.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        url = self._merge_url(url)
+        headers = self._merge_headers(headers)
+        cookies = self._merge_cookies(cookies)
+        params = self._merge_queryparams(params)
+        extensions = {} if extensions is None else extensions
+        if "timeout" not in extensions:
+            timeout = (
+                self.timeout
+                if isinstance(timeout, UseClientDefault)
+                else Timeout(timeout)
+            )
+            extensions = dict(**extensions, timeout=timeout.as_dict())
+        return Request(
+            method,
+            url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            extensions=extensions,
+        )
+
+    def request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Build and send a request.
+
+        Equivalent to:
+
+        ```python
+        request = client.build_request(...)
+        response = client.send(request, ...)
+        ```
+
+        See `Client.build_request()`, `Client.send()` and
+        [Merging of configuration][0] for how the various parameters
+        are merged with client-level configuration.
+
+        [0]: /advanced/clients/#merging-of-configuration
+        """
+        if cookies is not None:
+            message = (
+                "Setting per-request cookies=<...> is being deprecated, because "
+                "the expected behaviour on cookie persistence is ambiguous. Set "
+                "cookies directly on the client instance instead."
+            )
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        return self.send(request, auth=auth, follow_redirects=follow_redirects)
+
+    def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `Client.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                response.read()
+
+            return response
+
+        except BaseException as exc:
+            response.close()
+            raise exc
+
+## httpx/_models.py
+
+    def is_client_error(self) -> bool:
+        """
+        A property which is `True` for 4xx status codes, `False` otherwise.
+        """
+        return codes.is_client_error(self.status_code)
+
+## httpx/_transports/mock.py
+
+class MockTransport(AsyncBaseTransport, BaseTransport):
+    def __init__(self, handler: SyncHandler | AsyncHandler) -> None:
+        self.handler = handler
+
+    def handle_request(
+        self,
+        request: Request,
+    ) -> Response:
+        request.read()
+        response = self.handler(request)
+        if not isinstance(response, Response):  # pragma: no cover
+            raise TypeError("Cannot use an async handler in a sync Client")
+        return response
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        await request.aread()
+        response = self.handler(request)
+
+        # Allow handler to *optionally* be an `async` function.
+        # If it is, then the `response` variable need to be awaited to actually
+        # return the result.
+
+        if isinstance(response, Response):
+            response = await response
+
+        return response
+
+## tests/client/test_auth.py
+
+class App:
+    """
+    A mock app to test auth credentials.
+    """
+
+    def __init__(self, auth_header: str = "", status_code: int = 200) -> None:
+        self.auth_header = auth_header
+        self.status_code = status_code
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        headers = {"www-authenticate": self.auth_header} if self.auth_header else {}
+        data = {"auth": request.headers.get("Authorization")}
+        return httpx.Response(self.status_code, headers=headers, json=data)
+
+class DigestApp:
+    def __init__(
+        self,
+        algorithm: str = "SHA-256",
+        send_response_after_attempt: int = 1,
+        qop: str = "auth",
+        regenerate_nonce: bool = True,
+    ) -> None:
+        self.algorithm = algorithm
+        self.send_response_after_attempt = send_response_after_attempt
+        self.qop = qop
+        self._regenerate_nonce = regenerate_nonce
+        self._response_count = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if self._response_count < self.send_response_after_attempt:
+            return self.challenge_send(request)
+
+        data = {"auth": request.headers.get("Authorization")}
+        return httpx.Response(200, json=data)
+
+    def challenge_send(self, request: httpx.Request) -> httpx.Response:
+        self._response_count += 1
+        nonce = (
+            hashlib.sha256(os.urandom(8)).hexdigest()
+            if self._regenerate_nonce
+            else "ee96edced2a0b43e4869e96ebe27563f369c1205a049d06419bb51d8aeddf3d3"
+        )
+        challenge_data = {
+            "nonce": nonce,
+            "qop": self.qop,
+            "opaque": (
+                "ee6378f3ee14ebfd2fff54b70a91a7c9390518047f242ab2271380db0e14bda1"
+            ),
+            "algorithm": self.algorithm,
+            "stale": "FALSE",
+        }
+        challenge_str = ", ".join(
+            '{}="{}"'.format(key, value)
+            for key, value in challenge_data.items()
+            if value
+        )
+
+        headers = {
+            "www-authenticate": f'Digest realm="httpx@example.org", {challenge_str}',
+        }
+        return httpx.Response(401, headers=headers)
+
+    requires_response_body = True
+
+class SyncOrAsyncAuth(httpx.Auth):
+    """
+    A mock authentication scheme that uses a different implementation for the
+    sync and async cases.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._async_lock = anyio.Lock()
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.AsyncGenerator[httpx.Request, httpx.Response]:
+        async with self._async_lock:
+            request.headers["Authorization"] = "async-auth"
+        yield request
+
+async def test_basic_auth_with_stream() -> None:
+    """
+    See: https://github.com/encode/httpx/pull/1312
+    """
+    url = "https://example.org/"
+    auth = ("user", "password123")
+    app = App()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(app), auth=auth
+    ) as client:
+        async with client.stream("GET", url) as response:
+            await response.aread()
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+def test_netrc_auth_credentials_exist() -> None:
+    """
+    When netrc auth is being used and a request is made to a host that is
+    in the netrc file, then the relevant credentials should be applied.
+    """
+    netrc_file = str(FIXTURES_DIR / ".netrc")
+    url = "http://netrcexample.org"
+    app = App()
+    auth = httpx.NetRCAuth(netrc_file)
+
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "auth": "Basic ZXhhbXBsZS11c2VybmFtZTpleGFtcGxlLXBhc3N3b3Jk"
+    }
+
+def test_netrc_auth_credentials_do_not_exist() -> None:
+    """
+    When netrc auth is being used and a request is made to a host that is
+    not in the netrc file, then no credentials should be applied.
+    """
+    netrc_file = str(FIXTURES_DIR / ".netrc")
+    url = "http://example.org"
+    app = App()
+    auth = httpx.NetRCAuth(netrc_file)
+
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": None}
+
+async def test_digest_auth_returns_no_auth_if_no_digest_header_in_response() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+def test_digest_auth_returns_no_auth_if_alternate_auth_scheme() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    auth_header = "Token ..."
+    app = App(auth_header=auth_header, status_code=401)
+
+    client = httpx.Client(transport=httpx.MockTransport(app))
+    response = client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+async def test_digest_auth_200_response_including_digest_auth_header() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    auth_header = 'Digest realm="realm@host.com",qop="auth",nonce="abc",opaque="xyz"'
+    app = App(auth_header=auth_header, status_code=200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+async def test_digest_auth_401_response_without_digest_auth_header() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App(auth_header="", status_code=401)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+async def test_async_auth_reads_response_body() -> None:
+    """
+    Test that we can read the response body in an auth flow if `requires_response_body`
+    is set.
+    """
+    url = "https://example.org/"
+    auth = ResponseBodyAuth("xyz")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": '{"auth":"xyz"}'}
+
+def test_sync_auth() -> None:
+    """
+    Test that we can use an auth implementation specific to the sync case.
+    """
+    url = "https://example.org/"
+    auth = SyncOrAsyncAuth()
+    app = App()
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "sync-auth"}
+
+## tests/client/test_properties.py
+
+def test_client_base_url():
+    client = httpx.Client()
+    client.base_url = "https://www.example.org/"
+    assert isinstance(client.base_url, httpx.URL)
+    assert client.base_url == "https://www.example.org/"
+
+def test_client_headers():
+    client = httpx.Client()
+    client.headers = {"a": "b"}
+    assert isinstance(client.headers, httpx.Headers)
+    assert client.headers["A"] == "b"
+
+## tests/test_timeouts.py
+
+async def test_async_client_new_request_send_timeout(server):
+    timeout = httpx.Timeout(1e-6)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with pytest.raises(httpx.TimeoutException):
+            await client.send(
+                httpx.Request("GET", server.url.copy_with(path="/slow_response"))
+            )

@@ -1,0 +1,441 @@
+# pydantic_ai_slim/pydantic_ai/models/test.py:4-4
+import string
+
+# tests/test_json_schema.py:11-52
+def test_simplify_nullable_unions():
+    """Test the simplify_nullable_unions feature (deprecated, to be removed in v2)."""
+
+    # Create a concrete subclass for testing
+    class TestTransformer(JsonSchemaTransformer):
+        def transform(self, schema: dict[str, Any]) -> dict[str, Any]:
+            return schema
+
+    # Test with simplify_nullable_unions=True
+    schema_with_null = {
+        'anyOf': [
+            {'type': 'string'},
+            {'type': 'null'},
+        ]
+    }
+    transformer = TestTransformer(schema_with_null, simplify_nullable_unions=True)
+    result = transformer.walk()
+
+    # Should collapse to a single nullable string
+    assert result == {'type': 'string', 'nullable': True}
+
+    # Test with simplify_nullable_unions=False (default)
+    transformer2 = TestTransformer(schema_with_null, simplify_nullable_unions=False)
+    result2 = transformer2.walk()
+
+    # Should keep the anyOf structure
+    assert 'anyOf' in result2
+    assert len(result2['anyOf']) == 2
+
+    # Test that non-nullable unions are unaffected
+    schema_no_null = {
+        'anyOf': [
+            {'type': 'string'},
+            {'type': 'number'},
+        ]
+    }
+    transformer3 = TestTransformer(schema_no_null, simplify_nullable_unions=True)
+    result3 = transformer3.walk()
+
+    # Should keep anyOf since it's not nullable
+    assert 'anyOf' in result3
+    assert len(result3['anyOf']) == 2
+
+# pydantic_ai_slim/pydantic_ai/providers/openrouter.py:36-79
+class _OpenRouterGoogleJsonSchemaTransformer(JsonSchemaTransformer):
+    """Legacy Google JSON schema transformer for OpenRouter compatibility.
+
+    OpenRouter's compatibility layer doesn't fully support modern JSON Schema features
+    like $defs/$ref and anyOf for nullable types. This transformer restores v1.19.0
+    behavior by inlining definitions and simplifying nullable unions.
+
+    See: https://github.com/pydantic/pydantic-ai/issues/3617
+    """
+
+    def __init__(self, schema: JsonSchema, *, strict: bool | None = None):
+        super().__init__(schema, strict=strict, prefer_inlined_defs=True, simplify_nullable_unions=True)
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        # Remove properties not supported by Gemini
+        schema.pop('$schema', None)
+        schema.pop('title', None)
+        schema.pop('discriminator', None)
+        schema.pop('examples', None)
+        schema.pop('exclusiveMaximum', None)
+        schema.pop('exclusiveMinimum', None)
+
+        if (const := schema.pop('const', None)) is not None:
+            schema['enum'] = [const]
+
+        # Convert enums to string type (legacy Gemini requirement)
+        if enum := schema.get('enum'):
+            schema['type'] = 'string'
+            schema['enum'] = [str(val) for val in enum]
+
+        # Convert oneOf to anyOf for discriminated unions
+        if 'oneOf' in schema and 'type' not in schema:
+            schema['anyOf'] = schema.pop('oneOf')
+
+        # Handle string format -> description
+        type_ = schema.get('type')
+        if type_ == 'string' and (fmt := schema.pop('format', None)):
+            description = schema.get('description')
+            if description:
+                schema['description'] = f'{description} (format: {fmt})'
+            else:
+                schema['description'] = f'Format: {fmt}'
+
+        return schema
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:442-455
+    def _str_gen(self, schema: dict[str, Any]) -> str:
+        """Generate a string from a JSON Schema string."""
+        min_len = schema.get('minLength')
+        if min_len is not None:
+            return self._char() * min_len
+
+        if schema.get('maxLength') == 0:
+            return ''
+
+        if fmt := schema.get('format'):
+            if fmt == 'date':
+                return (date(2024, 1, 1) + timedelta(days=self.seed)).isoformat()
+
+        return self._char()
+
+# pydantic_ai_slim/pydantic_ai/models/xai.py:1085-1099
+def _get_tool_result_content(content: str) -> dict[str, Any] | str | None:
+    """Extract tool result content from a content string.
+
+    Args:
+        content: The content string (may be JSON or plain text)
+
+    Returns:
+        Tool result content as dict (if JSON), string, or None if no content
+    """
+    if content:
+        try:
+            return json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return content
+    return None
+
+# tests/test_json_body_serializer.py:10-40
+def cassette_dict_base():
+    """
+    A fixture providing a base cassette dictionary with:
+    - A request containing a multi-line JSON string in `body`.
+    - A response containing a multi-line JSON string in `body['string']`.
+    - Various headers to test filtering & lowercasing.
+    """
+    return {
+        'interactions': [
+            {
+                'request': {
+                    'headers': {
+                        'Content-Type': ['application/json'],
+                        'Authorization': ['some-token'],  # Should be filtered out
+                        'X-Test': ['some-token'],  # Should be filtered out
+                        'Other-Header': ['test-value'],  # Should remain, but become lowercase (other-header)
+                    },
+                    'body': '{"message": "line1\\nline2"}',  # multi-line JSON
+                },
+            },
+            {
+                'response': {
+                    'headers': {
+                        'Content-Type': ['application/json'],
+                        'Date': ['some-date-string'],  # Should be filtered out
+                    },
+                    'body': {'string': '{"response": "line3\\nline4"}'},
+                },
+            },
+        ]
+    }
+
+# tests/models/test_google.py:4099-4120
+async def test_google_optional_fields_native_output(allow_model_requests: None, google_provider: GoogleProvider):
+    """Test optional/nullable fields with type: 'null' using gemini-2.5-flash."""
+    m = GoogleModel('gemini-2.5-flash', provider=google_provider)
+
+    class CityLocation(BaseModel):
+        """A city and its country."""
+
+        city: str
+        country: str | None = None
+        population: int | None = None
+
+    agent = Agent(m, output_type=NativeOutput(CityLocation))
+
+    # Test with all fields provided
+    result = await agent.run('Tell me about London, UK with population 9 million')
+    assert result.output.city == snapshot('London')
+    assert result.output.country == snapshot('UK')
+    assert result.output.population is not None
+
+    # Test with optional fields as None
+    result2 = await agent.run('Just tell me a city: Paris')
+    assert result2.output.city == snapshot('Paris')
+
+# tests/models/test_google.py:4123-4146
+async def test_google_optional_fields_native_output_gemini_2_0(
+    allow_model_requests: None, google_provider: GoogleProvider
+):
+    """Test optional/nullable fields with type: 'null' using gemini-2.0-flash."""
+    m = GoogleModel('gemini-2.0-flash', provider=google_provider)
+
+    class CityLocation(BaseModel):
+        """A city and its country."""
+
+        city: str
+        country: str | None = None
+        population: int | None = None
+
+    agent = Agent(m, output_type=NativeOutput(CityLocation))
+
+    # Test with all fields provided
+    result = await agent.run('Tell me about London, UK with population 9 million')
+    assert result.output.city == snapshot('London')
+    assert result.output.country == snapshot('UK')
+    assert result.output.population is not None
+
+    # Test with optional fields as None
+    result2 = await agent.run('Just tell me a city: Paris')
+    assert result2.output.city == snapshot('Paris')
+
+# pydantic_ai_slim/pydantic_ai/models/mistral.py:438-488
+    def _get_python_type(cls, value: dict[str, Any]) -> str:
+        """Return a string representation of the Python type for a single JSON schema property.
+
+        This function handles recursion for nested arrays/objects and `anyOf`.
+        """
+        # 1) Handle anyOf first, because it's a different schema structure
+        if any_of := value.get('anyOf'):
+            # Simplistic approach: pick the first option in anyOf
+            # (In reality, you'd possibly want to merge or union types)
+            return f'Optional[{cls._get_python_type(any_of[0])}]'
+
+        # 2) If we have a top-level "type" field
+        value_type = value.get('type')
+        if not value_type:
+            # No explicit type; fallback
+            return 'Any'
+
+        # 3) Direct simple type mapping (string, integer, float, bool, None)
+        if value_type in SIMPLE_JSON_TYPE_MAPPING and value_type != 'array' and value_type != 'object':
+            return SIMPLE_JSON_TYPE_MAPPING[value_type]
+
+        # 4) Array: Recursively get the item type
+        if value_type == 'array':
+            items = value.get('items', {})
+            return f'list[{cls._get_python_type(items)}]'
+
+        # 5) Object: Check for additionalProperties
+        if value_type == 'object':
+            additional_properties = value.get('additionalProperties', {})
+            if isinstance(additional_properties, bool):
+                return 'bool'  # pragma: lax no cover
+            additional_properties_type = additional_properties.get('type')
+            if (
+                additional_properties_type in SIMPLE_JSON_TYPE_MAPPING
+                and additional_properties_type != 'array'
+                and additional_properties_type != 'object'
+            ):
+                # dict[str, bool/int/float/etc...]
+                return f'dict[str, {SIMPLE_JSON_TYPE_MAPPING[additional_properties_type]}]'
+            elif additional_properties_type == 'array':
+                array_items = additional_properties.get('items', {})
+                return f'dict[str, list[{cls._get_python_type(array_items)}]]'
+            elif additional_properties_type == 'object':
+                # nested dictionary of unknown shape
+                return 'dict[str, dict[str, Any]]'
+            else:
+                # If no additionalProperties type or something else, default to a generic dict
+                return 'dict[str, Any]'
+
+        # 6) Fallback
+        return 'Any'
+
+# tests/models/mock_xai.py:31-33
+def _serialize_content(content: ToolCallOutputType) -> str:
+    """Serialize content to JSON string if not already a string."""
+    return content if isinstance(content, str) else json.dumps(content)
+
+# pydantic_ai_slim/pydantic_ai/output.py:296-360
+def StructuredDict(
+    json_schema: JsonSchemaValue, name: str | None = None, description: str | None = None
+) -> type[JsonSchemaValue]:
+    """Returns a `dict[str, Any]` subclass with a JSON schema attached that will be used for structured output.
+
+    Args:
+        json_schema: A JSON schema of type `object` defining the structure of the dictionary content.
+        name: Optional name of the structured output. If not provided, the `title` field of the JSON schema will be used if it's present.
+        description: Optional description of the structured output. If not provided, the `description` field of the JSON schema will be used if it's present.
+
+    Example:
+    ```python {title="structured_dict.py"}
+    from pydantic_ai import Agent, StructuredDict
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'name': {'type': 'string'},
+            'age': {'type': 'integer'}
+        },
+        'required': ['name', 'age']
+    }
+
+    agent = Agent('openai:gpt-5.2', output_type=StructuredDict(schema))
+    result = agent.run_sync('Create a person')
+    print(result.output)
+    #> {'name': 'John Doe', 'age': 30}
+    ```
+    """
+    json_schema = _utils.check_object_json_schema(json_schema)
+
+    # Pydantic `TypeAdapter` fails when `object.__get_pydantic_json_schema__` has `$defs`, so we inline them
+    # See https://github.com/pydantic/pydantic/issues/12145
+    if '$defs' in json_schema:
+        json_schema = InlineDefsJsonSchemaTransformer(json_schema).walk()
+        if '$defs' in json_schema:
+            raise exceptions.UserError(
+                '`StructuredDict` does not currently support recursive `$ref`s and `$defs`. See https://github.com/pydantic/pydantic/issues/12145 for more information.'
+            )
+
+    if name:
+        json_schema['title'] = name
+
+    if description:
+        json_schema['description'] = description
+
+    class _StructuredDict(JsonSchemaValue):
+        __is_model_like__ = True
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls, source_type: Any, handler: GetCoreSchemaHandler
+        ) -> core_schema.CoreSchema:
+            return core_schema.dict_schema(
+                keys_schema=core_schema.str_schema(),
+                values_schema=core_schema.any_schema(),
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, core_schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler
+        ) -> JsonSchemaValue:
+            return json_schema
+
+    return _StructuredDict
+
+# pydantic_ai_slim/pydantic_ai/models/xai.py:1102-1114
+def _parse_tool_args(arguments: str) -> dict[str, Any]:
+    """Parse tool call arguments from JSON string to dict.
+
+    Args:
+        arguments: JSON string of tool arguments
+
+    Returns:
+        Parsed arguments as dict, or empty dict if parsing fails
+    """
+    try:
+        return json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+# pydantic_ai_slim/pydantic_ai/_json_schema.py:53-55
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        """Make changes to the schema."""
+        return schema
+
+# pydantic_evals/pydantic_evals/dataset.py:728-775
+    def to_file(
+        self,
+        path: Path | str,
+        fmt: Literal['yaml', 'json'] | None = None,
+        schema_path: Path | str | None = DEFAULT_SCHEMA_PATH_TEMPLATE,
+        custom_evaluator_types: Sequence[type[Evaluator[InputsT, OutputT, MetadataT]]] = (),
+        custom_report_evaluator_types: Sequence[type[ReportEvaluator[InputsT, OutputT, MetadataT]]] = (),
+    ):
+        """Save the dataset to a file.
+
+        Args:
+            path: Path to save the dataset to.
+            fmt: Format to use. If None, the format will be inferred from the file extension.
+                Must be either 'yaml' or 'json'.
+            schema_path: Path to save the JSON schema to. If None, no schema will be saved.
+                Can be a string template with {stem} which will be replaced with the dataset filename stem.
+            custom_evaluator_types: Custom evaluator classes to include in the schema.
+            custom_report_evaluator_types: Custom report evaluator classes to include in the schema.
+        """
+        path = Path(path)
+        fmt = self._infer_fmt(path, fmt)
+
+        schema_ref: str | None = None
+        if schema_path is not None:  # pragma: no branch
+            if isinstance(schema_path, str):  # pragma: no branch
+                schema_path = Path(schema_path.format(stem=path.stem))
+
+            if not schema_path.is_absolute():
+                schema_ref = str(schema_path)
+                schema_path = path.parent / schema_path
+            elif schema_path.is_relative_to(path):  # pragma: no cover
+                schema_ref = str(_get_relative_path_reference(schema_path, path))
+            else:  # pragma: no cover
+                schema_ref = str(schema_path)
+            self._save_schema(schema_path, custom_evaluator_types, custom_report_evaluator_types)
+
+        context: dict[str, Any] = {'use_short_form': True}
+        if fmt == 'yaml':
+            dumped_data = self.model_dump(mode='json', by_alias=True, context=context)
+            content = yaml.dump(dumped_data, sort_keys=False)
+            if schema_ref:  # pragma: no branch
+                yaml_language_server_line = f'{_YAML_SCHEMA_LINE_PREFIX}{schema_ref}'
+                content = f'{yaml_language_server_line}\n{content}'
+            path.write_text(content, encoding='utf-8')
+        else:
+            context['$schema'] = schema_ref
+            json_data = self.model_dump_json(indent=2, by_alias=True, context=context)
+            path.write_text(json_data + '\n', encoding='utf-8')
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:20-20
+    type: Literal['tool_call']
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:15-15
+    type: Literal['text']
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:47-47
+    type: Literal['thinking']
+
+# pydantic_ai_slim/pydantic_ai/models/__init__.py:1344-1355
+def _customize_tool_def(transformer: type[JsonSchemaTransformer], tool_def: ToolDefinition):
+    """Customize the tool definition using the given transformer.
+
+    If the tool definition has `strict` set to None, the strictness will be inferred from the transformer.
+    """
+    schema_transformer = transformer(tool_def.parameters_json_schema, strict=tool_def.strict)
+    parameters_json_schema = schema_transformer.walk()
+    return replace(
+        tool_def,
+        parameters_json_schema=parameters_json_schema,
+        strict=schema_transformer.is_strict_compatible if tool_def.strict is None else tool_def.strict,
+    )
+
+# tests/profiles/test_google.py:23-29
+def test_const_string_infers_type():
+    """When converting const to enum, type should be inferred for string values."""
+    schema = {'const': 'hello'}
+    transformer = GoogleJsonSchemaTransformer(schema)
+    transformed = transformer.walk()
+
+    assert transformed == snapshot({'enum': ['hello'], 'type': 'string'})
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:152-152
+    type: Annotated[str, Field(pattern=r'^tool-')]
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:139-139
+    type: Annotated[str, Field(pattern=r'^tool-')]

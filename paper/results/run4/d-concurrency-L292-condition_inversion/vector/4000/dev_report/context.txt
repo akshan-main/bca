@@ -1,0 +1,439 @@
+# pydantic_ai_slim/pydantic_ai/models/openrouter.py:357-357
+    file: dict[str, Any] | None = None
+
+# pydantic_graph/pydantic_graph/persistence/file.py:30-166
+class FileStatePersistence(BaseStatePersistence[StateT, RunEndT]):
+    """File based state persistence that hold graph run state in a JSON file."""
+
+    json_file: Path
+    """Path to the JSON file where the snapshots are stored.
+
+    You should use a different file for each graph run, but a single file should be reused for multiple
+    steps of the same run.
+
+    For example if you have a run ID of the form `run_123abc`, you might create a `FileStatePersistence` thus:
+
+    ```py
+    from pathlib import Path
+
+    from pydantic_graph import FullStatePersistence
+
+    run_id = 'run_123abc'
+    persistence = FullStatePersistence(Path('runs') / f'{run_id}.json')
+    ```
+    """
+    _snapshots_type_adapter: pydantic.TypeAdapter[list[Snapshot[StateT, RunEndT]]] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    async def snapshot_node(self, state: StateT, next_node: BaseNode[StateT, Any, RunEndT]) -> None:
+        await self._append_save(NodeSnapshot(state=state, node=next_node))
+
+    async def snapshot_node_if_new(
+        self, snapshot_id: str, state: StateT, next_node: BaseNode[StateT, Any, RunEndT]
+    ) -> None:
+        async with self._lock():
+            snapshots = await self.load_all()
+            if not any(s.id == snapshot_id for s in snapshots):  # pragma: no branch
+                await self._append_save(NodeSnapshot(state=state, node=next_node), lock=False)
+
+    async def snapshot_end(self, state: StateT, end: End[RunEndT]) -> None:
+        await self._append_save(EndSnapshot(state=state, result=end))
+
+    @asynccontextmanager
+    async def record_run(self, snapshot_id: str) -> AsyncIterator[None]:
+        async with self._lock():
+            snapshots = await self.load_all()
+            try:
+                snapshot = next(s for s in snapshots if s.id == snapshot_id)
+            except StopIteration as e:
+                raise LookupError(f'No snapshot found with id={snapshot_id!r}') from e
+
+            assert isinstance(snapshot, NodeSnapshot), 'Only NodeSnapshot can be recorded'
+            exceptions.GraphNodeStatusError.check(snapshot.status)
+            snapshot.status = 'running'
+            snapshot.start_ts = _utils.now_utc()
+            await self._save(snapshots)
+
+        start = perf_counter()
+        try:
+            yield
+        except Exception:
+            duration = perf_counter() - start
+            async with self._lock():
+                await _graph_utils.run_in_executor(self._after_run_sync, snapshot_id, duration, 'error')
+            raise
+        else:
+            snapshot.duration = perf_counter() - start
+            async with self._lock():
+                await _graph_utils.run_in_executor(self._after_run_sync, snapshot_id, snapshot.duration, 'success')
+
+    async def load_next(self) -> NodeSnapshot[StateT, RunEndT] | None:
+        async with self._lock():
+            snapshots = await self.load_all()
+            if snapshot := next((s for s in snapshots if isinstance(s, NodeSnapshot) and s.status == 'created'), None):
+                snapshot.status = 'pending'
+                await self._save(snapshots)
+                return snapshot
+
+    def should_set_types(self) -> bool:
+        """Whether types need to be set."""
+        return self._snapshots_type_adapter is None
+
+    def set_types(self, state_type: type[StateT], run_end_type: type[RunEndT]) -> None:
+        self._snapshots_type_adapter = build_snapshot_list_type_adapter(state_type, run_end_type)
+
+    async def load_all(self) -> list[Snapshot[StateT, RunEndT]]:
+        return await _graph_utils.run_in_executor(self._load_sync)
+
+    def _load_sync(self) -> list[Snapshot[StateT, RunEndT]]:
+        assert self._snapshots_type_adapter is not None, 'snapshots type adapter must be set'
+        try:
+            content = self.json_file.read_bytes()
+        except FileNotFoundError:
+            return []
+        else:
+            return self._snapshots_type_adapter.validate_json(content)
+
+    def _after_run_sync(self, snapshot_id: str, duration: float, status: SnapshotStatus) -> None:
+        snapshots = self._load_sync()
+        snapshot = next(s for s in snapshots if s.id == snapshot_id)
+        assert isinstance(snapshot, NodeSnapshot), 'Only NodeSnapshot can be recorded'
+        snapshot.duration = duration
+        snapshot.status = status
+        self._save_sync(snapshots)
+
+    async def _save(self, snapshots: list[Snapshot[StateT, RunEndT]]) -> None:
+        await _graph_utils.run_in_executor(self._save_sync, snapshots)
+
+    def _save_sync(self, snapshots: list[Snapshot[StateT, RunEndT]]) -> None:
+        assert self._snapshots_type_adapter is not None, 'snapshots type adapter must be set'
+        self.json_file.write_bytes(self._snapshots_type_adapter.dump_json(snapshots, indent=2))
+
+    async def _append_save(self, snapshot: Snapshot[StateT, RunEndT], *, lock: bool = True) -> None:
+        assert self._snapshots_type_adapter is not None, 'snapshots type adapter must be set'
+        async with AsyncExitStack() as stack:
+            if lock:
+                await stack.enter_async_context(self._lock())
+            snapshots = await self.load_all()
+            snapshots.append(snapshot)
+            await self._save(snapshots)
+
+    @asynccontextmanager
+    async def _lock(self, *, timeout: float = 1.0) -> AsyncIterator[None]:
+        """Lock a file by checking and writing a `.pydantic-graph-persistence-lock` to it.
+
+        Args:
+            timeout: how long to wait for the lock
+
+        Returns: an async context manager that holds the lock
+        """
+        lock_file = self.json_file.parent / f'{self.json_file.name}.pydantic-graph-persistence-lock'
+        lock_id = secrets.token_urlsafe().encode()
+
+        with anyio.fail_after(timeout):
+            while not await _file_append_check(lock_file, lock_id):
+                await anyio.sleep(0.01)
+
+        try:
+            yield
+        finally:
+            await _graph_utils.run_in_executor(lock_file.unlink, missing_ok=True)
+
+# pydantic_ai_slim/pydantic_ai/models/xai.py:409-420
+    async def _upload_file_to_xai(self, data: bytes, filename: str) -> str:
+        """Upload a file to xAI files API and return the file ID.
+
+        Args:
+            data: The file content as bytes
+            filename: The filename to use for the upload
+
+        Returns:
+            The file ID from xAI
+        """
+        uploaded_file = await self._provider.client.files.upload(data, filename=filename)
+        return uploaded_file.id
+
+# pydantic_ai_slim/pydantic_ai/messages.py:358-360
+    def format(self) -> AudioFormat:
+        """The file format of the audio file."""
+        return _audio_format_lookup[self.media_type]
+
+# pydantic_evals/pydantic_evals/dataset.py:539-577
+    def from_file(
+        cls,
+        path: Path | str,
+        fmt: Literal['yaml', 'json'] | None = None,
+        custom_evaluator_types: Sequence[type[Evaluator[InputsT, OutputT, MetadataT]]] = (),
+        custom_report_evaluator_types: Sequence[type[ReportEvaluator[InputsT, OutputT, MetadataT]]] = (),
+    ) -> Self:
+        """Load a dataset from a file.
+
+        Args:
+            path: Path to the file to load.
+            fmt: Format of the file. If None, the format will be inferred from the file extension.
+                Must be either 'yaml' or 'json'.
+            custom_evaluator_types: Custom evaluator classes to use when deserializing the dataset.
+                These are additional evaluators beyond the default ones.
+            custom_report_evaluator_types: Custom report evaluator classes to use when deserializing the dataset.
+                These are additional report evaluators beyond the default ones.
+
+        Returns:
+            A new Dataset instance loaded from the file.
+
+        Raises:
+            ValidationError: If the file cannot be parsed as a valid dataset.
+            ValueError: If the format cannot be inferred from the file extension.
+        """
+        path = Path(path)
+        fmt = cls._infer_fmt(path, fmt)
+
+        raw = Path(path).read_text(encoding='utf-8')
+        try:
+            return cls.from_text(
+                raw,
+                fmt=fmt,
+                custom_evaluator_types=custom_evaluator_types,
+                custom_report_evaluator_types=custom_report_evaluator_types,
+                default_name=path.stem,
+            )
+        except ValidationError as e:  # pragma: no cover
+            raise ValueError(f'{path} contains data that does not match the schema for {cls.__name__}:\n{e}.') from e
+
+# tests/test_concurrency.py:225-254
+    async def test_agent_concurrency_limit(self):
+        """Test that agent respects max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=2)
+        running = 0
+        max_running = 0
+        lock = anyio.Lock()
+
+        @agent.tool_plain
+        async def slow_tool() -> str:
+            nonlocal running, max_running
+            async with lock:
+                running += 1
+                max_running = max(max_running, running)
+            await anyio.sleep(0.1)
+            async with lock:
+                running -= 1
+            return 'done'
+
+        results: list[Any] = []
+
+        async def run_agent():
+            result = await agent.run('call slow_tool', model=TestModel(call_tools=['slow_tool']))
+            results.append(result)
+
+        async with anyio.create_task_group() as tg:
+            for _ in range(5):
+                tg.start_soon(run_agent)
+
+        assert max_running <= 2
+        assert len(results) == 5
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:1387-1420
+def load_mcp_servers(config_path: str | Path) -> list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE]:
+    """Load MCP servers from a configuration file.
+
+    Environment variables can be referenced in the configuration file using:
+    - `${VAR_NAME}` syntax - expands to the value of VAR_NAME, raises error if not defined
+    - `${VAR_NAME:-default}` syntax - expands to VAR_NAME if set, otherwise uses the default value
+
+    Args:
+        config_path: The path to the configuration file.
+
+    Returns:
+        A list of MCP servers.
+
+    Raises:
+        FileNotFoundError: If the configuration file does not exist.
+        ValidationError: If the configuration file does not match the schema.
+        ValueError: If an environment variable referenced in the configuration is not defined and no default value is provided.
+    """
+    config_path = Path(config_path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f'Config file {config_path} not found')
+
+    config_data = pydantic_core.from_json(config_path.read_bytes())
+    expanded_config_data = _expand_env_vars(config_data)
+    config = MCPServerConfig.model_validate(expanded_config_data)
+
+    servers: list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE] = []
+    for name, server in config.mcp_servers.items():
+        server.id = name
+        server.tool_prefix = name
+        servers.append(server)
+
+    return servers
+
+# pydantic_ai_slim/pydantic_ai/models/google.py:913-934
+    def _handle_file_search_grounding_metadata_streaming(
+        self, grounding_metadata: GroundingMetadata | None
+    ) -> BuiltinToolReturnPart | None:
+        """Handle file search grounding metadata for streaming responses.
+
+        Returns a BuiltinToolReturnPart if file search results are available in the grounding metadata.
+        """
+        if not self._file_search_tool_call_id or not grounding_metadata:
+            return None
+
+        grounding_chunks = grounding_metadata.grounding_chunks
+        retrieved_contexts = _extract_file_search_retrieved_contexts(grounding_chunks)
+        if retrieved_contexts:  # pragma: no branch
+            part = BuiltinToolReturnPart(
+                provider_name=self.provider_name,
+                tool_name=FileSearchTool.kind,
+                tool_call_id=self._file_search_tool_call_id,
+                content=retrieved_contexts,
+            )
+            self._file_search_tool_call_id = None
+            return part
+        return None  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/messages.py:228-241
+    def identifier(self) -> str:
+        """The identifier of the file, such as a unique ID.
+
+        This identifier can be provided to the model in a message to allow it to refer to this file in a tool call argument,
+        and the tool can look up the file in question by iterating over the message history and finding the matching `FileUrl`.
+
+        This identifier is only automatically passed to the model when the `FileUrl` is returned by a tool.
+        If you're passing the `FileUrl` as a user message, it's up to you to include a separate text part with the identifier,
+        e.g. "This is file <identifier>:" preceding the `FileUrl`.
+
+        It's also included in inline-text delimiters for providers that require inlining text documents, so the model can
+        distinguish multiple files.
+        """
+        return self._identifier or _multi_modal_content_identifier(self.url)
+
+# pydantic_ai_slim/pydantic_ai/models/openrouter.py:349-357
+class _OpenRouterFileAnnotation(BaseModel, frozen=True):
+    """File annotation from OpenRouter.
+
+    OpenRouter can return file annotations when processing uploaded files like PDFs.
+    The schema is flexible since OpenRouter doesn't document the exact fields.
+    """
+
+    type: Literal['file']
+    file: dict[str, Any] | None = None
+
+# pydantic_evals/pydantic_evals/dataset.py:16-16
+import traceback
+
+# pydantic_evals/pydantic_evals/evaluators/_run_evaluator.py:3-3
+import traceback
+
+# pydantic_ai_slim/pydantic_ai/messages.py:553-566
+    def identifier(self) -> str:
+        """Identifier for the binary content, such as a unique ID.
+
+        This identifier can be provided to the model in a message to allow it to refer to this file in a tool call argument,
+        and the tool can look up the file in question by iterating over the message history and finding the matching `BinaryContent`.
+
+        This identifier is only automatically passed to the model when the `BinaryContent` is returned by a tool.
+        If you're passing the `BinaryContent` as a user message, it's up to you to include a separate text part with the identifier,
+        e.g. "This is file <identifier>:" preceding the `BinaryContent`.
+
+        It's also included in inline-text delimiters for providers that require inlining text documents, so the model can
+        distinguish multiple files.
+        """
+        return self._identifier or _multi_modal_content_identifier(self.data)
+
+# pydantic_ai_slim/pydantic_ai/messages.py:163-167
+def _multi_modal_content_identifier(identifier: str | bytes) -> str:
+    """Generate stable identifier for multi-modal content to help LLM in finding a specific file in tool call responses."""
+    if isinstance(identifier, str):
+        identifier = identifier.encode('utf-8')
+    return hashlib.sha1(identifier).hexdigest()[:6]
+
+# tests/conftest.py:204-245
+def create_module(tmp_path: Path, request: pytest.FixtureRequest) -> Callable[[str], Any]:
+    """Taken from `pydantic/tests/conftest.py`, create module object, execute and return it."""
+
+    def run(
+        source_code: str,
+        rewrite_assertions: bool = True,
+        module_name_prefix: str | None = None,
+    ) -> ModuleType:
+        """Create module object, execute and return it.
+
+        Can be used as a decorator of the function from the source code of which the module will be constructed.
+
+        Args:
+            source_code: Python source code of the module
+            rewrite_assertions: whether to rewrite assertions in module or not
+            module_name_prefix: string prefix to use in the name of the module, does not affect the name of the file.
+
+        """
+
+        # Max path length in Windows is 260. Leaving some buffer here
+        max_name_len = 240 - len(str(tmp_path))
+        sanitized_name = sanitize_filename(request.node.name, max_name_len)
+        module_name = f'{sanitized_name}_{secrets.token_hex(5)}'
+        path = tmp_path / f'{module_name}.py'
+        path.write_text(source_code, encoding='utf-8')
+        filename = str(path)
+
+        if module_name_prefix:  # pragma: no cover
+            module_name = module_name_prefix + module_name
+
+        if rewrite_assertions:
+            loader = AssertionRewritingHook(config=request.config)
+            loader.mark_rewrite(module_name)
+        else:  # pragma: no cover
+            loader = None
+
+        spec = importlib.util.spec_from_file_location(module_name, filename, loader=loader)
+        sys.modules[module_name] = module = importlib.util.module_from_spec(spec)  # pyright: ignore[reportArgumentType]
+        spec.loader.exec_module(module)  # pyright: ignore[reportOptionalMemberAccess]
+        return module
+
+    return run
+
+# pydantic_evals/pydantic_evals/dataset.py:897-924
+def _get_relative_path_reference(target: Path, source: Path, _prefix: str = '') -> Path:  # pragma: no cover
+    """Get a relative path reference from source to target.
+
+    Recursively resolve a relative path to target from source, adding '..' as needed.
+    This is useful for creating a relative path reference from a source file to a target file.
+
+    Args:
+        target: The target path to reference.
+        source: The source path to reference from.
+        _prefix: Internal prefix used during recursion.
+
+    Returns:
+        A Path object representing the relative path from source to target.
+
+    Example:
+        If source is '/a/b/c.py' and target is '/a/d/e.py', the relative path reference
+        would be '../../d/e.py'.
+    """
+    # Recursively resolve a relative path to target from source, adding '..' as needed.
+    # This is useful for creating a relative path reference from a source file to a target file.
+    # For example, if source is '/a/b/c.py' and target is '/a/d/e.py', the relative path reference
+    # would be '../../d/e.py'.
+    if not target.is_absolute():
+        target = target.resolve()
+    try:
+        return Path(f'{_prefix}{Path(target).relative_to(source)}')
+    except ValueError:
+        return _get_relative_path_reference(target, source.parent, _prefix=f'{_prefix}../')
+
+# pydantic_ai_slim/pydantic_ai/retries.py:101-101
+    reraise: bool
+
+# pydantic_ai_slim/pydantic_ai/messages.py:1181-1183
+    def has_content(self) -> bool:
+        """Return `True` if the file content is non-empty."""
+        return bool(self.content.data)
+
+# pydantic_ai_slim/pydantic_ai/messages.py:250-252
+    def format(self) -> str:
+        """The file format."""
+        raise NotImplementedError
+
+# pydantic_ai_slim/pydantic_ai/_output.py:14-14
+from typing_extensions import Self, TypedDict, TypeVar

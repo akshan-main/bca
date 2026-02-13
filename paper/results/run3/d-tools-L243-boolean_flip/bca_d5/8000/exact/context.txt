@@ -1,0 +1,760 @@
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+class MCPServerConfig(BaseModel):
+    """Configuration for MCP servers."""
+
+    mcp_servers: Annotated[
+        dict[
+            str,
+            Annotated[
+                Annotated[MCPServerStdio, Tag('stdio')]
+                | Annotated[MCPServerStreamableHTTP, Tag('streamable-http')]
+                | Annotated[MCPServerSSE, Tag('sse')],
+                Discriminator(_mcp_server_discriminator),
+            ],
+        ],
+        Field(alias='mcpServers'),
+    ]
+
+## pydantic_ai_slim/pydantic_ai/models/bedrock.py
+
+    def _map_tool_config(
+        self,
+        model_request_parameters: ModelRequestParameters,
+        model_settings: BedrockModelSettings | None,
+    ) -> ToolConfigurationTypeDef | None:
+        tools = self._get_tools(model_request_parameters)
+        for tool in model_request_parameters.builtin_tools:
+            if tool.kind == CodeExecutionTool.kind:
+                tools.append({'systemTool': {'name': 'nova_code_interpreter'}})
+            else:
+                raise NotImplementedError(
+                    f"Builtin tool '{tool.kind}' is not supported yet. If it should be, please file an issue."
+                )
+
+        if not tools:
+            return None
+
+        profile = BedrockModelProfile.from_profile(self.profile)
+        if (
+            model_settings
+            and model_settings.get('bedrock_cache_tool_definitions')
+            and profile.bedrock_supports_tool_caching
+        ):
+            tools.append({'cachePoint': {'type': 'default'}})
+
+        tool_choice: ToolChoiceTypeDef
+        if not model_request_parameters.allow_text_output:
+            tool_choice = {'any': {}}
+        else:
+            tool_choice = {'auto': {}}
+
+        tool_config: ToolConfigurationTypeDef = {'tools': tools}
+        if tool_choice and BedrockModelProfile.from_profile(self.profile).bedrock_supports_tool_choice:
+            tool_config['toolChoice'] = tool_choice
+
+        return tool_config
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+    def _get_tool_config(
+        self, model_request_parameters: ModelRequestParameters, tools: _GeminiTools | None
+    ) -> _GeminiToolConfig | None:
+        if not model_request_parameters.allow_text_output and tools:
+            return _tool_config([t['name'] for t in tools['function_declarations']])
+        else:
+            return None
+
+def _settings_to_generation_config(model_settings: GeminiModelSettings) -> _GeminiGenerationConfig:
+    config: _GeminiGenerationConfig = {}
+    if (max_tokens := model_settings.get('max_tokens')) is not None:
+        config['max_output_tokens'] = max_tokens
+    if (stop_sequences := model_settings.get('stop_sequences')) is not None:
+        config['stop_sequences'] = stop_sequences  # pragma: no cover
+    if (temperature := model_settings.get('temperature')) is not None:
+        config['temperature'] = temperature
+    if (top_p := model_settings.get('top_p')) is not None:
+        config['top_p'] = top_p
+    if (presence_penalty := model_settings.get('presence_penalty')) is not None:
+        config['presence_penalty'] = presence_penalty
+    if (frequency_penalty := model_settings.get('frequency_penalty')) is not None:
+        config['frequency_penalty'] = frequency_penalty
+    if (thinkingConfig := model_settings.get('gemini_thinking_config')) is not None:
+        config['thinking_config'] = thinkingConfig
+    return config
+
+class ThinkingConfig(TypedDict, total=False):
+    """The thinking features configuration."""
+
+    include_thoughts: Annotated[bool, pydantic.Field(alias='includeThoughts')]
+    """Indicates whether to include thoughts in the response. If true, thoughts are returned only if the model supports thought and thoughts are available."""
+
+    thinking_budget: Annotated[int, pydantic.Field(alias='thinkingBudget')]
+    """Indicates the thinking budget in tokens."""
+
+class _GeminiToolConfig(TypedDict):
+    function_calling_config: _GeminiFunctionCallingConfig
+
+def _tool_config(function_names: list[str]) -> _GeminiToolConfig:
+    return _GeminiToolConfig(
+        function_calling_config=_GeminiFunctionCallingConfig(mode='ANY', allowed_function_names=function_names)
+    )
+
+class _GeminiFunctionCallingConfig(TypedDict):
+    mode: Literal['ANY', 'AUTO']
+    allowed_function_names: list[str]
+
+## pydantic_ai_slim/pydantic_ai/models/google.py
+
+    async def _build_content_and_config(
+        self,
+        messages: list[ModelMessage],
+        model_settings: GoogleModelSettings,
+        model_request_parameters: ModelRequestParameters,
+    ) -> tuple[list[ContentUnionDict], GenerateContentConfigDict]:
+        tools, image_config = self._get_tools(model_request_parameters)
+        if model_request_parameters.function_tools and not self.profile.supports_tools:
+            raise UserError('Tools are not supported by this model.')
+
+        response_mime_type = None
+        response_schema = None
+        if model_request_parameters.output_mode == 'native':
+            if model_request_parameters.function_tools:
+                raise UserError(
+                    'Google does not support `NativeOutput` and function tools at the same time. Use `output_type=ToolOutput(...)` instead.'
+                )
+            response_mime_type = 'application/json'
+            output_object = model_request_parameters.output_object
+            assert output_object is not None
+            response_schema = self._map_response_schema(output_object)
+        elif model_request_parameters.output_mode == 'prompted' and not tools:
+            if not self.profile.supports_json_object_output:
+                raise UserError('JSON output is not supported by this model.')
+            response_mime_type = 'application/json'
+
+        tool_config = self._get_tool_config(model_request_parameters, tools)
+        system_instruction, contents = await self._map_messages(messages, model_request_parameters)
+
+        modalities = [Modality.TEXT.value]
+        if self.profile.supports_image_output:
+            modalities.append(Modality.IMAGE.value)
+
+        http_options: HttpOptionsDict = {
+            'headers': {'Content-Type': 'application/json', 'User-Agent': get_user_agent()}
+        }
+        if timeout := model_settings.get('timeout'):
+            if isinstance(timeout, int | float):
+                http_options['timeout'] = int(1000 * timeout)
+            else:
+                raise UserError('Google does not support setting ModelSettings.timeout to a httpx.Timeout')
+
+        config = GenerateContentConfigDict(
+            http_options=http_options,
+            system_instruction=system_instruction,
+            temperature=model_settings.get('temperature'),
+            top_p=model_settings.get('top_p'),
+            max_output_tokens=model_settings.get('max_tokens'),
+            stop_sequences=model_settings.get('stop_sequences'),
+            presence_penalty=model_settings.get('presence_penalty'),
+            frequency_penalty=model_settings.get('frequency_penalty'),
+            seed=model_settings.get('seed'),
+            safety_settings=model_settings.get('google_safety_settings'),
+            thinking_config=model_settings.get('google_thinking_config'),
+            labels=model_settings.get('google_labels'),
+            media_resolution=model_settings.get('google_video_resolution'),
+            cached_content=model_settings.get('google_cached_content'),
+            tools=cast(ToolListUnionDict, tools),
+            tool_config=tool_config,
+            response_mime_type=response_mime_type,
+            response_json_schema=response_schema,
+            response_modalities=modalities,
+            image_config=image_config,
+        )
+
+        return contents, config
+
+## pydantic_ai_slim/pydantic_ai/models/openrouter.py
+
+class OpenRouterUsageConfig(TypedDict, total=False):
+    """Configuration for OpenRouter usage."""
+
+    include: bool
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+class RetryConfig(TypedDict, total=False):
+    """The configuration for tenacity-based retrying.
+
+    These are precisely the arguments to the tenacity `retry` decorator, and they are generally
+    used internally by passing them to that decorator via `@retry(**config)` or similar.
+
+    All fields are optional, and if not provided, the default values from the `tenacity.retry` decorator will be used.
+    """
+
+    sleep: Callable[[int | float], None | Awaitable[None]]
+    """A sleep strategy to use for sleeping between retries.
+
+    Tenacity's default for this argument is `tenacity.nap.sleep`."""
+
+    stop: StopBaseT
+    """
+    A stop strategy to determine when to stop retrying.
+
+    Tenacity's default for this argument is `tenacity.stop.stop_never`."""
+
+    wait: WaitBaseT
+    """
+    A wait strategy to determine how long to wait between retries.
+
+    Tenacity's default for this argument is `tenacity.wait.wait_none`."""
+
+    retry: SyncRetryBaseT | RetryBaseT
+    """A retry strategy to determine which exceptions should trigger a retry.
+
+    Tenacity's default for this argument is `tenacity.retry.retry_if_exception_type()`."""
+
+    before: Callable[[RetryCallState], None | Awaitable[None]]
+    """
+    A callable that is called before each retry attempt.
+
+    Tenacity's default for this argument is `tenacity.before.before_nothing`."""
+
+    after: Callable[[RetryCallState], None | Awaitable[None]]
+    """
+    A callable that is called after each retry attempt.
+
+    Tenacity's default for this argument is `tenacity.after.after_nothing`."""
+
+    before_sleep: Callable[[RetryCallState], None | Awaitable[None]] | None
+    """
+    An optional callable that is called before sleeping between retries.
+
+    Tenacity's default for this argument is `None`."""
+
+    reraise: bool
+    """Whether to reraise the last exception if the retry attempts are exhausted, or raise a RetryError instead.
+
+    Tenacity's default for this argument is `False`."""
+
+    retry_error_cls: type[RetryError]
+    """The exception class to raise when the retry attempts are exhausted and `reraise` is False.
+
+    Tenacity's default for this argument is `tenacity.RetryError`."""
+
+    retry_error_callback: Callable[[RetryCallState], Any | Awaitable[Any]] | None
+    """An optional callable that is called when the retry attempts are exhausted and `reraise` is False.
+
+    Tenacity's default for this argument is `None`."""
+
+## pydantic_ai_slim/pydantic_ai/ui/_web/api.py
+
+class ConfigureFrontend(BaseModel, alias_generator=to_camel, populate_by_name=True):
+    """Response model for frontend configuration."""
+
+    models: list[ModelInfo]
+    builtin_tools: list[BuiltinToolInfo]
+
+## pydantic_evals/pydantic_evals/reporting/__init__.py
+
+class RenderValueConfig(TypedDict, total=False):
+    """A configuration for rendering a values in an Evaluation report."""
+
+    value_formatter: str | Callable[[Any], str]
+    diff_checker: Callable[[Any, Any], bool] | None
+    diff_formatter: Callable[[Any, Any], str | None] | None
+    diff_style: str
+
+class RenderNumberConfig(TypedDict, total=False):
+    """A configuration for rendering a particular score or metric in an Evaluation report.
+
+    See the implementation of `_RenderNumber` for more clarity on how these parameters affect the rendering.
+    """
+
+    value_formatter: str | Callable[[float | int], str]
+    """The logic to use for formatting values.
+
+    * If not provided, format as ints if all values are ints, otherwise at least one decimal place and at least four significant figures.
+    * You can also use a custom string format spec, e.g. '{:.3f}'
+    * You can also use a custom function, e.g. lambda x: f'{x:.3f}'
+    """
+    diff_formatter: str | Callable[[float | int, float | int], str | None] | None
+    """The logic to use for formatting details about the diff.
+
+    The strings produced by the value_formatter will always be included in the reports, but the diff_formatter is
+    used to produce additional text about the difference between the old and new values, such as the absolute or
+    relative difference.
+
+    * If not provided, format as ints if all values are ints, otherwise at least one decimal place and at least four
+        significant figures, and will include the percentage change.
+    * You can also use a custom string format spec, e.g. '{:+.3f}'
+    * You can also use a custom function, e.g. lambda x: f'{x:+.3f}'.
+        If this function returns None, no extra diff text will be added.
+    * You can also use None to never generate extra diff text.
+    """
+    diff_atol: float
+    """The absolute tolerance for considering a difference "significant".
+
+    A difference is "significant" if `abs(new - old) < self.diff_atol + self.diff_rtol * abs(old)`.
+
+    If a difference is not significant, it will not have the diff styles applied. Note that we still show
+    both the rendered before and after values in the diff any time they differ, even if the difference is not
+    significant. (If the rendered values are exactly the same, we only show the value once.)
+
+    If not provided, use 1e-6.
+    """
+    diff_rtol: float
+    """The relative tolerance for considering a difference "significant".
+
+    See the description of `diff_atol` for more details about what makes a difference "significant".
+
+    If not provided, use 0.001 if all values are ints, otherwise 0.05.
+    """
+    diff_increase_style: str
+    """The style to apply to diffed values that have a significant increase.
+
+    See the description of `diff_atol` for more details about what makes a difference "significant".
+
+    If not provided, use green for scores and red for metrics. You can also use arbitrary `rich` styles, such as "bold red".
+    """
+    diff_decrease_style: str
+    """The style to apply to diffed values that have significant decrease.
+
+    See the description of `diff_atol` for more details about what makes a difference "significant".
+
+    If not provided, use red for scores and green for metrics. You can also use arbitrary `rich` styles, such as "bold red".
+    """
+
+    def infer_from_config(
+        config: RenderNumberConfig, kind: Literal['score', 'metric', 'duration'], values: list[float | int]
+    ) -> _NumberRenderer:
+        value_formatter = config.get('value_formatter', UNSET)
+        if isinstance(value_formatter, Unset):
+            value_formatter = default_render_number
+
+        diff_formatter = config.get('diff_formatter', UNSET)
+        if isinstance(diff_formatter, Unset):
+            diff_formatter = default_render_number_diff
+
+        diff_atol = config.get('diff_atol', UNSET)
+        if isinstance(diff_atol, Unset):
+            diff_atol = 1e-6
+
+        diff_rtol = config.get('diff_rtol', UNSET)
+        if isinstance(diff_rtol, Unset):
+            values_are_ints = all(isinstance(v, int) for v in values)
+            diff_rtol = 0.001 if values_are_ints else 0.05
+
+        diff_increase_style = config.get('diff_increase_style', UNSET)
+        if isinstance(diff_increase_style, Unset):
+            diff_increase_style = 'green' if kind == 'score' else 'red'
+
+        diff_decrease_style = config.get('diff_decrease_style', UNSET)
+        if isinstance(diff_decrease_style, Unset):
+            diff_decrease_style = 'red' if kind == 'score' else 'green'
+
+        return _NumberRenderer(
+            value_formatter=value_formatter,
+            diff_formatter=diff_formatter,
+            diff_rtol=diff_rtol,
+            diff_atol=diff_atol,
+            diff_increase_style=diff_increase_style,
+            diff_decrease_style=diff_decrease_style,
+        )
+
+## tests/evals/test_otel.py
+
+async def test_context_subtree_not_configured(mocker: MockerFixture):
+    """Test that context_subtree correctly records spans in independent async contexts."""
+    from opentelemetry.trace import ProxyTracerProvider
+
+    mocker.patch(
+        'pydantic_evals.otel._context_in_memory_span_exporter.get_tracer_provider', return_value=ProxyTracerProvider()
+    )
+    with context_subtree() as span_tree:
+        pass
+    assert str(span_tree) == snapshot(
+        'To make use of the `span_tree` in an evaluator, you need to call '
+        '`logfire.configure(...)` before running an evaluation. For more information, '
+        'refer to the documentation at '
+        'https://ai.pydantic.dev/evals/#opentelemetry-integration.'
+    )
+
+## tests/evals/test_reporting.py
+
+async def test_evaluation_renderer_with_custom_configs(sample_report: EvaluationReport):
+    """Test EvaluationRenderer with custom render configurations."""
+    renderer = EvaluationRenderer(
+        include_input=True,
+        include_metadata=True,
+        include_expected_output=True,
+        include_output=True,
+        include_durations=True,
+        include_total_duration=True,
+        include_removed_cases=False,
+        include_averages=True,
+        input_config={'value_formatter': lambda x: str(x)},
+        metadata_config={'value_formatter': lambda x: str(x)},
+        output_config={'value_formatter': lambda x: str(x)},
+        score_configs={
+            'score1': {
+                'value_formatter': '{:.2f}',
+                'diff_formatter': '{:+.2f}',
+                'diff_atol': 0.01,
+                'diff_rtol': 0.05,
+                'diff_increase_style': 'bold green',
+                'diff_decrease_style': 'bold red',
+            }
+        },
+        label_configs={'label1': {'value_formatter': lambda x: str(x)}},
+        metric_configs={
+            'accuracy': {
+                'value_formatter': '{:.1%}',
+                'diff_formatter': '{:+.1%}',
+                'diff_atol': 0.01,
+                'diff_rtol': 0.05,
+                'diff_increase_style': 'bold green',
+                'diff_decrease_style': 'bold red',
+            }
+        },
+        duration_config={
+            'value_formatter': '{:.3f}s',
+            'diff_formatter': '{:+.3f}s',
+            'diff_atol': 0.001,
+            'diff_rtol': 0.05,
+            'diff_increase_style': 'bold red',
+            'diff_decrease_style': 'bold green',
+        },
+        include_reasons=False,
+        include_error_message=False,
+        include_error_stacktrace=False,
+        include_evaluator_failures=True,
+    )
+
+    table = renderer.build_table(sample_report)
+    assert render_table(table) == snapshot("""\
+                                                                               Evaluation Summary: test_report
+┏━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┓
+┃ Case ID   ┃ Inputs                    ┃ Metadata               ┃ Expected Output ┃ Outputs         ┃ Scores       ┃ Labels                 ┃ Metrics         ┃ Assertions ┃     Durations ┃
+┡━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━━━━━┩
+│ test_case │ {'query': 'What is 2+2?'} │ {'difficulty': 'easy'} │ {'answer': '4'} │ {'answer': '4'} │ score1: 2.50 │ label1: hello          │ accuracy: 95.0% │ ✔          │  task: 0.100s │
+│           │                           │                        │                 │                 │              │                        │                 │            │ total: 0.200s │
+├───────────┼───────────────────────────┼────────────────────────┼─────────────────┼─────────────────┼──────────────┼────────────────────────┼─────────────────┼────────────┼───────────────┤
+│ Averages  │                           │                        │                 │                 │ score1: 2.50 │ label1: {'hello': 1.0} │ accuracy: 95.0% │ 100.0% ✔   │  task: 0.100s │
+│           │                           │                        │                 │                 │              │                        │                 │            │ total: 0.200s │
+└───────────┴───────────────────────────┴────────────────────────┴─────────────────┴─────────────────┴──────────────┴────────────────────────┴─────────────────┴────────────┴───────────────┘
+""")
+
+## tests/graph/test_mermaid.py
+
+def test_pdf_config(httpx_with_handler: HttpxWithHandler):
+    def get_pdf(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params) == snapshot({'fit': '', 'landscape': '', 'paper': 'letter'})
+        assert request.url.path.startswith('/pdf/')
+        return httpx.Response(200, content=b'fake pdf')
+
+    pdf = graph1.mermaid_image(
+        start_node=Foo(),
+        image_type='pdf',
+        pdf_fit=True,
+        pdf_landscape=True,
+        pdf_paper='letter',
+        httpx_client=httpx_with_handler(get_pdf),
+    )
+    assert pdf == b'fake pdf'
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_model_performance_config(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    model = BedrockConverseModel('us.amazon.nova-pro-v1:0', provider=bedrock_provider)
+    model_settings = BedrockModelSettings(bedrock_performance_configuration={'latency': 'optimized'})
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings=model_settings)
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot(
+        'The capital of France is Paris. It is one of the most visited cities in the world and is known for its rich history, culture, and iconic landmarks such as the Eiffel Tower, the Louvre Museum, and Notre-Dame Cathedral. Paris is also a major center for finance, diplomacy, commerce, fashion, science, and arts.'
+    )
+
+async def test_bedrock_model_guardrail_config(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    model = BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+    model_settings = BedrockModelSettings(
+        bedrock_guardrail_config={
+            'guardrailIdentifier': 'xbgw7g293v7o',
+            'guardrailVersion': 'DRAFT',
+            'trace': 'enabled',
+        }
+    )
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings=model_settings)
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot(
+        "The capital of France is Paris. Paris is not only the capital city but also the most populous city in France, serving as the center of French government, culture, and commerce. It's known for its historical and cultural landmarks such as the Eiffel Tower, the Louvre Museum, Notre-Dame Cathedral, and many charming neighborhoods like Montmartre."
+    )
+
+## tests/models/test_gemini.py
+
+async def test_gemini_tool_config_any_with_tool_without_args(allow_model_requests: None, gemini_api_key: str):
+    class Foo(BaseModel):
+        bar: str
+
+    m = GeminiModel('gemini-2.0-flash', provider=GoogleGLAProvider(api_key=gemini_api_key))
+    agent = Agent(m, output_type=Foo)
+
+    @agent.tool_plain
+    async def bar() -> str:
+        return 'hello'
+
+    result = await agent.run('run bar for me please')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='run bar for me please',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='bar', args={}, tool_call_id=IsStr())],
+                usage=RequestUsage(
+                    input_tokens=21, output_tokens=1, details={'text_prompt_tokens': 21, 'text_candidates_tokens': 1}
+                ),
+                model_name='gemini-2.0-flash',
+                timestamp=IsDatetime(),
+                provider_name='google-gla',
+                provider_url='https://generativelanguage.googleapis.com/v1beta/models/',
+                provider_details={'finish_reason': 'STOP'},
+                provider_response_id=IsStr(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='bar',
+                        content='hello',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args={'bar': 'hello'},
+                        tool_call_id=IsStr(),
+                    )
+                ],
+                usage=RequestUsage(
+                    input_tokens=27, output_tokens=5, details={'text_prompt_tokens': 27, 'text_candidates_tokens': 5}
+                ),
+                model_name='gemini-2.0-flash',
+                timestamp=IsDatetime(),
+                provider_name='google-gla',
+                provider_url='https://generativelanguage.googleapis.com/v1beta/models/',
+                provider_details={'finish_reason': 'STOP'},
+                provider_response_id=IsStr(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_google.py
+
+async def test_google_model_thinking_config(allow_model_requests: None, google_provider: GoogleProvider):
+    model = GoogleModel('gemini-2.5-pro-preview-03-25', provider=google_provider)
+    settings = GoogleModelSettings(google_thinking_config={'include_thoughts': False})
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings=settings)
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is **Paris**.')
+
+async def test_google_tool_config_any_with_tool_without_args(
+    allow_model_requests: None, google_provider: GoogleProvider
+):
+    class Foo(TypedDict):
+        bar: str
+
+    m = GoogleModel('gemini-2.0-flash', provider=google_provider)
+    agent = Agent(m, output_type=Foo)
+
+    @agent.tool_plain
+    async def bar() -> str:
+        return 'hello'
+
+    result = await agent.run('run bar for me please')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='run bar for me please',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='bar', args={}, tool_call_id=IsStr())],
+                usage=RequestUsage(
+                    input_tokens=21, output_tokens=1, details={'text_candidates_tokens': 1, 'text_prompt_tokens': 21}
+                ),
+                model_name='gemini-2.0-flash',
+                timestamp=IsDatetime(),
+                provider_name='google-gla',
+                provider_url='https://generativelanguage.googleapis.com/',
+                provider_details={'finish_reason': 'STOP'},
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='bar',
+                        content='hello',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='final_result', args={'bar': 'hello'}, tool_call_id=IsStr())],
+                usage=RequestUsage(
+                    input_tokens=27, output_tokens=5, details={'text_candidates_tokens': 5, 'text_prompt_tokens': 27}
+                ),
+                model_name='gemini-2.0-flash',
+                timestamp=IsDatetime(),
+                provider_name='google-gla',
+                provider_url='https://generativelanguage.googleapis.com/',
+                provider_details={'finish_reason': 'STOP'},
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_mistral.py
+
+class MockSdkConfiguration:
+    def get_server_details(self) -> tuple[str, ...]:
+        return ('https://api.mistral.ai',)
+
+## tests/test_agent.py
+
+async def test_dynamic_builtin_tool_configured():
+    model = TestModel()
+    agent = Agent(model, builtin_tools=[prepared_web_search], deps_type=UserContext)
+
+    user_context = UserContext(location='London')
+
+    with pytest.raises(UserError, match='TestModel does not support built-in tools'):
+        await agent.run('Hello', deps=user_context)
+
+    assert model.last_model_request_parameters is not None
+    tools = model.last_model_request_parameters.builtin_tools
+    assert len(tools) == 1
+    tool = tools[0]
+    assert isinstance(tool, WebSearchTool)
+    assert tool.user_location is not None
+    assert tool.user_location.get('city') == 'London'
+    assert tool.search_context_size == 'medium'
+
+## tests/test_examples.py
+
+class ExamplesConfig(BaseExamplesConfig):
+    known_first_party: list[str] = field(default_factory=list[str])
+    known_local_folder: list[str] = field(default_factory=list[str])
+
+    def ruff_config(self) -> tuple[str, ...]:
+        config = super().ruff_config()
+        if self.known_first_party:  # pragma: no branch
+            config = (*config, '--config', f'lint.isort.known-first-party = {self.known_first_party}')
+        if self.known_local_folder:
+            config = (*config, '--config', f'lint.isort.known-local-folder = {self.known_local_folder}')
+        return config
+
+## tests/test_ui_web.py
+
+def test_chat_app_configure_endpoint():
+    """Test the /api/configure endpoint with explicit models and tools."""
+
+    agent = Agent('test')
+    app = create_web_app(
+        agent,
+        models=['test'],
+        builtin_tools=[WebSearchTool()],
+    )
+
+    with TestClient(app) as client:
+        response = client.get('/api/configure')
+        assert response.status_code == 200
+        assert response.json() == snapshot(
+            {
+                'models': [
+                    {'id': 'test:test', 'name': 'Test', 'builtinTools': ['web_search']},
+                    {'id': 'test', 'name': 'Test', 'builtinTools': ['web_search']},
+                ],
+                'builtinTools': [{'id': 'web_search', 'name': 'Web Search'}],
+            }
+        )
+
+def test_chat_app_configure_endpoint_empty():
+    """Test the /api/configure endpoint with no models or tools."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.get('/api/configure')
+        assert response.status_code == 200
+        assert response.json() == snapshot(
+            {'models': [{'id': 'test:test', 'name': 'Test', 'builtinTools': []}], 'builtinTools': []}
+        )
+
+def test_chat_app_configure_preserves_chat_vs_responses(monkeypatch: pytest.MonkeyPatch):
+    """Test that openai-chat: and openai-responses: models are kept as separate entries."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+
+    agent = Agent('test')
+    app = create_web_app(
+        agent,
+        models=['openai-chat:gpt-4o', 'openai-responses:gpt-4o'],
+    )
+
+    with TestClient(app) as client:
+        response = client.get('/api/configure')
+        assert response.status_code == 200
+        data = response.json()
+        model_ids = [m['id'] for m in data['models']]
+        assert 'openai-chat:gpt-4o' in model_ids
+        assert 'openai-responses:gpt-4o' in model_ids
+        assert len([m for m in model_ids if 'gpt-4o' in m]) == 2

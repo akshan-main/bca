@@ -1,0 +1,465 @@
+# tests/test_exceptions.py:77-87
+def test_tool_retry_error_str_with_error_details():
+    """Test that ToolRetryError formats ErrorDetails automatically."""
+    validation_error = ValidationError.from_exception_data(
+        'Test', [{'type': 'string_type', 'loc': ('name',), 'input': 123}]
+    )
+    part = RetryPromptPart(content=validation_error.errors(include_url=False), tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nname\n  Input should be a valid string [type=string_type, input_value=123]"
+    )
+
+# pydantic_ai_slim/pydantic_ai/models/openrouter.py:461-461
+    error: _OpenRouterError | None = None
+
+# pydantic_ai_slim/pydantic_ai/models/groq.py:683-683
+    error: _GroqToolUseFailedInnerError
+
+# pydantic_ai_slim/pydantic_ai/models/openai.py:203-203
+    error: _AzureError
+
+# tests/test_vercel_ai.py:2731-2816
+async def test_adapter_dump_messages_with_retry_no_tool_name():
+    """Test dumping messages with retry prompts without tool_name (e.g., output validation errors)."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Give me a number')]),
+        ModelResponse(parts=[TextPart(content='Not a valid number')]),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content='Output validation failed: expected integer',
+                    # No tool_name - this is an output validation error, not a tool error
+                )
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Give me a number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Not a valid number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'text',
+                        'text': """\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                        'state': 'done',
+                        'provider_metadata': None,
+                    }
+                ],
+            },
+        ]
+    )
+
+    # Verify roundtrip
+    # Note: This is a lossy conversion - RetryPromptPart without tool_call_id becomes a user text message.
+    # When loaded back, it creates a UserPromptPart instead of RetryPromptPart.
+    # So we check it's value and then replace it with the original RetryPromptPart to assert equality
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    assert reloaded_messages[2] == snapshot(
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content="""\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                    timestamp=IsDatetime(),
+                )
+            ]
+        )
+    )
+    # Get original tool_call_id and replace with original RetryPromptPart
+    original_retry = messages[2].parts[0]
+    assert isinstance(original_retry, RetryPromptPart)
+    reloaded_messages[2] = ModelRequest(
+        parts=[
+            RetryPromptPart(
+                content='Output validation failed: expected integer', tool_call_id=original_retry.tool_call_id
+            )
+        ]
+    )
+    _sync_timestamps(messages, reloaded_messages)
+    assert reloaded_messages == messages
+
+# tests/test_exceptions.py:90-110
+def test_tool_retry_error_str_with_value_error_type():
+    """Test that ToolRetryError handles value_error type without ctx.error.
+
+    When ErrorDetails are serialized, the exception object in ctx is stripped.
+    This test ensures we handle error types that normally require ctx.error.
+    """
+    # Simulate serialized ErrorDetails where ctx.error has been stripped
+    error_details: list[ErrorDetails] = [
+        {
+            'type': 'value_error',
+            'loc': ('field',),
+            'msg': 'Value error, must not be foo',
+            'input': 'foo',
+        }
+    ]
+    part = RetryPromptPart(content=error_details, tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nfield\n  Value error, must not be foo [type=value_error, input_value='foo']"
+    )
+
+# pydantic_ai_slim/pydantic_ai/models/openai.py:236-263
+def _check_azure_content_filter(e: APIStatusError, system: str, model_name: str) -> ModelResponse | None:
+    """Check if the error is an Azure content filter error."""
+    # Assign to Any to avoid 'dict[Unknown, Unknown]' inference in strict mode
+    body_any: Any = e.body
+
+    if system == 'azure' and e.status_code == 400 and isinstance(body_any, dict):
+        try:
+            error_data = _AzureErrorResponse.model_validate(body_any)
+
+            if error_data.error.code == 'content_filter':
+                provider_details: dict[str, Any] = {'finish_reason': 'content_filter'}
+
+                if error_data.error.innererror:
+                    provider_details['content_filter_result'] = (
+                        error_data.error.innererror.content_filter_result.model_dump(exclude_none=True)
+                    )
+
+                return ModelResponse(
+                    parts=[],  # Empty parts to trigger content filter error in agent graph
+                    model_name=model_name,
+                    timestamp=_utils.now_utc(),
+                    provider_name=system,
+                    finish_reason='content_filter',
+                    provider_details=provider_details,
+                )
+        except ValidationError:
+            pass
+    return None
+
+# tests/models/test_openrouter.py:574-596
+async def test_openrouter_file_annotation(
+    allow_model_requests: None, openrouter_api_key: str, document_content: BinaryContent
+) -> None:
+    """Test that file annotations from OpenRouter are handled correctly.
+
+    When sending files (e.g., PDFs) to OpenRouter, the response can include
+    annotations with type="file". This test ensures those annotations are
+    parsed without validation errors.
+    """
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('openai/gpt-5.1-codex-mini', provider=provider)
+    agent = Agent(model)
+
+    result = await agent.run(
+        user_prompt=[
+            'What does this PDF contain? Answer in one short sentence.',
+            document_content,
+        ]
+    )
+
+    # The response should contain text (model may or may not include file annotations)
+    assert isinstance(result.output, str)
+    assert len(result.output) > 0
+
+# pydantic_ai_slim/pydantic_ai/models/__init__.py:1368-1380
+def _get_final_result_event(e: ModelResponseStreamEvent, params: ModelRequestParameters) -> FinalResultEvent | None:
+    """Return an appropriate FinalResultEvent if `e` corresponds to a part that will produce a final result."""
+    if isinstance(e, PartStartEvent):
+        new_part = e.part
+        if (isinstance(new_part, TextPart) and params.allow_text_output) or (
+            isinstance(new_part, FilePart) and params.allow_image_output and isinstance(new_part.content, BinaryImage)
+        ):
+            return FinalResultEvent(tool_name=None, tool_call_id=None)
+        elif isinstance(new_part, ToolCallPart) and (tool_def := params.tool_defs.get(new_part.tool_name)):
+            if tool_def.kind == 'output':
+                return FinalResultEvent(tool_name=new_part.tool_name, tool_call_id=new_part.tool_call_id)
+            elif tool_def.defer:
+                return FinalResultEvent(tool_name=None, tool_call_id=None)
+
+# pydantic_ai_slim/pydantic_ai/messages.py:931-1017
+class RetryPromptPart:
+    """A message back to a model asking it to try again.
+
+    This can be sent for a number of reasons:
+
+    * Pydantic validation of tool arguments failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * a tool raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    * no tool was found for the tool name
+    * the model returned plain text when a structured response was expected
+    * Pydantic validation of a structured response failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * an output validator raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    """
+
+    content: list[pydantic_core.ErrorDetails] | str
+    """Details of why and how the model should retry.
+
+    If the retry was triggered by a [`ValidationError`][pydantic_core.ValidationError], this will be a list of
+    error details.
+    """
+
+    _: KW_ONLY
+
+    tool_name: str | None = None
+    """The name of the tool that was called, if any."""
+
+    tool_call_id: str = field(default_factory=_generate_tool_call_id)
+    """The tool call identifier, this is used by some models including OpenAI.
+
+    In case the tool call id is not provided by the model, Pydantic AI will generate a random one.
+    """
+
+    timestamp: datetime = field(default_factory=_now_utc)
+    """The timestamp, when the retry was triggered."""
+
+    part_kind: Literal['retry-prompt'] = 'retry-prompt'
+    """Part type identifier, this is available on all parts as a discriminator."""
+
+    def model_response(self) -> str:
+        """Return a string message describing why the retry is requested."""
+        if isinstance(self.content, str):
+            if self.tool_name is None:
+                description = f'Validation feedback:\n{self.content}'
+            else:
+                description = self.content
+        else:
+            json_errors = error_details_ta.dump_json(self.content, exclude={'__all__': {'ctx'}}, indent=2)
+            plural = isinstance(self.content, list) and len(self.content) != 1
+            description = (
+                f'{len(self.content)} validation error{"s" if plural else ""}:\n```json\n{json_errors.decode()}\n```'
+            )
+        return f'{description}\n\nFix the errors and try again.'
+
+    def otel_event(self, settings: InstrumentationSettings) -> LogRecord:
+        if self.tool_name is None:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.user.message'},
+                body={'content': self.model_response(), 'role': 'user'},
+            )
+        else:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.tool.message'},
+                body={
+                    **({'content': self.model_response()} if settings.include_content else {}),
+                    'role': 'tool',
+                    'id': self.tool_call_id,
+                    'name': self.tool_name,
+                },
+            )
+
+    def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
+        if self.tool_name is None:
+            return [_otel_messages.TextPart(type='text', content=self.model_response())]
+        else:
+            part = _otel_messages.ToolCallResponsePart(
+                type='tool_call_response',
+                id=self.tool_call_id,
+                name=self.tool_name,
+            )
+
+            if settings.include_content:
+                part['result'] = self.model_response()
+
+            return [part]
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_output.py:20-20
+from .exceptions import ModelRetry, ToolRetryError, UserError
+
+# pydantic_ai_slim/pydantic_ai/_tool_manager.py:17-17
+from .exceptions import ModelRetry, ToolRetryError, UnexpectedModelBehavior
+
+# tests/test_exceptions.py:11-22
+from pydantic_ai.exceptions import (
+    AgentRunError,
+    ApprovalRequired,
+    CallDeferred,
+    IncompleteToolCall,
+    ModelAPIError,
+    ModelHTTPError,
+    ToolRetryError,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+    UserError,
+)
+
+# tests/test_toolsets.py:26-26
+from pydantic_ai.exceptions import ModelRetry, ToolRetryError, UnexpectedModelBehavior, UserError
+
+# pydantic_graph/pydantic_graph/exceptions.py:29-37
+class GraphValidationError(ValueError):
+    """An error raised during graph validation."""
+
+    message: str
+    """The error message."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+# pydantic_ai_slim/pydantic_ai/ui/_event_stream.py:393-400
+    async def on_error(self, error: Exception) -> AsyncIterator[EventT]:
+        """Handle errors that occur during streaming.
+
+        Args:
+            error: The error that occurred during streaming.
+        """
+        return  # pragma: no cover
+        yield  # Make this an async generator
+
+# pydantic_ai_slim/pydantic_ai/exceptions.py:211-227
+    def _format_error_details(errors: list[pydantic_core.ErrorDetails], tool_name: str | None) -> str:
+        """Format ErrorDetails as a human-readable message.
+
+        We format manually rather than using ValidationError.from_exception_data because
+        some error types (value_error, assertion_error, etc.) require an 'error' key in ctx,
+        but when ErrorDetails are serialized, exception objects are stripped from ctx.
+        The 'msg' field already contains the human-readable message, so we use that directly.
+        """
+        error_count = len(errors)
+        lines = [
+            f'{error_count} validation error{"s" if error_count == 1 else ""}{f" for {tool_name!r}" if tool_name else ""}'
+        ]
+        for e in errors:
+            loc = '.'.join(str(x) for x in e['loc']) if e['loc'] else '__root__'
+            lines.append(loc)
+            lines.append(f'  {e["msg"]} [type={e["type"]}, input_value={e["input"]!r}]')
+        return '\n'.join(lines)
+
+# pydantic_ai_slim/pydantic_ai/exceptions.py:198-227
+class ToolRetryError(Exception):
+    """Exception used to signal a `ToolRetry` message should be returned to the LLM."""
+
+    def __init__(self, tool_retry: RetryPromptPart):
+        self.tool_retry = tool_retry
+        message = (
+            tool_retry.content
+            if isinstance(tool_retry.content, str)
+            else self._format_error_details(tool_retry.content, tool_retry.tool_name)
+        )
+        super().__init__(message)
+
+    @staticmethod
+    def _format_error_details(errors: list[pydantic_core.ErrorDetails], tool_name: str | None) -> str:
+        """Format ErrorDetails as a human-readable message.
+
+        We format manually rather than using ValidationError.from_exception_data because
+        some error types (value_error, assertion_error, etc.) require an 'error' key in ctx,
+        but when ErrorDetails are serialized, exception objects are stripped from ctx.
+        The 'msg' field already contains the human-readable message, so we use that directly.
+        """
+        error_count = len(errors)
+        lines = [
+            f'{error_count} validation error{"s" if error_count == 1 else ""}{f" for {tool_name!r}" if tool_name else ""}'
+        ]
+        for e in errors:
+            loc = '.'.join(str(x) for x in e['loc']) if e['loc'] else '__root__'
+            lines.append(loc)
+            lines.append(f'  {e["msg"]} [type={e["type"]}, input_value={e["input"]!r}]')
+        return '\n'.join(lines)
+
+# tests/test_streaming.py:1082-1105
+    async def test_output_function_structured_double_get_output(self):
+        """Test that calling `get_output()` twice works correctly.
+
+        The first `get_output()` should do validation and cache the result.
+        The second `get_output()` should return cached results without re-validation.
+        """
+        call_log: list[tuple[Foo, bool]] = []
+
+        def process_foo(ctx: RunContext[None], foo: Foo) -> Foo:
+            call_log.append((foo, ctx.partial_output))
+            return Foo(a=foo.a * 2, b=foo.b.upper())
+
+        async def sf(_: list[ModelMessage], info: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+            assert info.output_tools is not None
+            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args='{"a": 21, "b": "foo"}')}
+
+        agent = Agent(FunctionModel(stream_function=sf), output_type=ToolOutput(process_foo, name='my_output'))
+
+        async with agent.run_stream('test') as result:
+            output1 = await result.get_output()
+            output2 = await result.get_output()
+
+        assert output1 == output2 == Foo(a=42, b='FOO')
+        assert call_log == snapshot([(Foo(a=21, b='foo'), False)])
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:155-155
+    input: Any | None = None
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:142-142
+    input: Any | None = None
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:196-196
+    input: Any
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:131-131
+    input: Any | None = None
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:209-209
+    input: Any
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:127-127
+    input: Any
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:139-139
+    input: Any
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:120-120
+    input: Any | None = None
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:174-174
+    input: Any | None = None
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:185-185
+    input: Any
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:20-20
+    type: Literal['tool_call']
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_dynamic_toolset.py:149-160
+    def _tool_for_tool_info(self, tool_info: _ToolInfo) -> ToolsetTool[AgentDepsT]:
+        """Create a ToolsetTool from a _ToolInfo for use outside activities.
+
+        We use `TOOL_SCHEMA_VALIDATOR` here which just parses JSON without additional validation,
+        because the actual args validation happens inside `call_tool_activity`.
+        """
+        return ToolsetTool(
+            toolset=self,
+            tool_def=tool_info.tool_def,
+            max_retries=tool_info.max_retries,
+            args_validator=TOOL_SCHEMA_VALIDATOR,
+        )
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:15-15
+    type: Literal['text']

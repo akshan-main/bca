@@ -1,0 +1,230 @@
+# tests/test_ssrf.py:432-459
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+# tests/test_agent.py:5553-5624
+def test_empty_final_response():
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[TextPart('foo'), ToolCallPart('my_tool', {'x': 1})])
+        elif len(messages) == 3:
+            return ModelResponse(parts=[TextPart('bar'), ToolCallPart('my_tool', {'x': 2})])
+        else:
+            return ModelResponse(parts=[])
+
+    agent = Agent(FunctionModel(llm))
+
+    @agent.tool_plain
+    def my_tool(x: int) -> int:
+        return x * 2
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'bar'
+
+    assert result.new_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(content='foo'),
+                    ToolCallPart(tool_name='my_tool', args={'x': 1}, tool_call_id=IsStr()),
+                ],
+                usage=RequestUsage(input_tokens=51, output_tokens=5),
+                model_name='function:llm:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='my_tool', content=2, tool_call_id=IsStr(), timestamp=IsNow(tz=timezone.utc)
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(content='bar'),
+                    ToolCallPart(tool_name='my_tool', args={'x': 2}, tool_call_id=IsStr()),
+                ],
+                usage=RequestUsage(input_tokens=52, output_tokens=10),
+                model_name='function:llm:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='my_tool', content=4, tool_call_id=IsStr(), timestamp=IsNow(tz=timezone.utc)
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[],
+                usage=RequestUsage(input_tokens=53, output_tokens=10),
+                model_name='function:llm:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+# tests/test_ssrf.py:484-501
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/models/test_openai.py:2864-2882
+async def test_compatible_api_with_tool_calls_without_id(allow_model_requests: None, gemini_api_key: str):
+    provider = OpenAIProvider(
+        openai_client=AsyncOpenAI(
+            base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
+            api_key=gemini_api_key,
+        )
+    )
+
+    model = OpenAIChatModel('gemini-2.5-pro-preview-05-06', provider=provider)
+
+    agent = Agent(model)
+
+    @agent.tool_plain
+    def get_current_time() -> str:
+        """Get the current time."""
+        return 'Noon'
+
+    response = await agent.run('What is the current time?')
+    assert response.output == snapshot('The current time is Noon.')
+
+# tests/test_ssrf.py:531-548
+    async def test_missing_location_header(self) -> None:
+        """Test that redirect without Location header raises error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Redirect response missing Location header'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/test_fastmcp.py:360-382
+    async def test_call_tool_with_text_content(
+        self,
+        fastmcp_toolset: FastMCPToolset[None],
+        run_context: RunContext[None],
+    ):
+        """Test tool call that returns text content."""
+        async with fastmcp_toolset:
+            tools = await fastmcp_toolset.get_tools(run_context)
+            text_tool = tools['text_tool']
+
+            result = await fastmcp_toolset.call_tool(
+                name='text_tool', tool_args={'message': 'Hello World'}, ctx=run_context, tool=text_tool
+            )
+
+            assert result == snapshot({'result': 'Echo: Hello World'})
+
+            text_list_tool = tools['text_list_tool']
+
+            result = await fastmcp_toolset.call_tool(
+                name='text_list_tool', tool_args={'message': 'Hello World'}, ctx=run_context, tool=text_list_tool
+            )
+
+            assert result == snapshot(['Echo: Hello World', 'Echo: Hello World again'])
+
+# tests/test_fastmcp.py:403-418
+    async def test_call_tool_with_json_content(
+        self,
+        fastmcp_toolset: FastMCPToolset[None],
+        run_context: RunContext[None],
+    ):
+        """Test tool call that returns JSON content."""
+        async with fastmcp_toolset:
+            tools = await fastmcp_toolset.get_tools(run_context)
+            json_tool = tools['json_tool']
+
+            result = await fastmcp_toolset.call_tool(
+                name='json_tool', tool_args={'data': {'key': 'value'}}, ctx=run_context, tool=json_tool
+            )
+
+            # Should parse the JSON string into a dict
+            assert result == snapshot({'result': '{"received": {"key": "value"}, "processed": true}'})
+
+# pydantic_ai_slim/pydantic_ai/toolsets/combined.py:18-22
+class _CombinedToolsetTool(ToolsetTool[AgentDepsT]):
+    """A tool definition for a combined toolset tools that keeps track of the source toolset and tool."""
+
+    source_toolset: AbstractToolset[AgentDepsT]
+    source_tool: ToolsetTool[AgentDepsT]
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:115-128
+from .toolsets import (
+    AbstractToolset,
+    ApprovalRequiredToolset,
+    CombinedToolset,
+    ExternalToolset,
+    FilteredToolset,
+    FunctionToolset,
+    PrefixedToolset,
+    PreparedToolset,
+    RenamedToolset,
+    ToolsetFunc,
+    ToolsetTool,
+    WrapperToolset,
+)

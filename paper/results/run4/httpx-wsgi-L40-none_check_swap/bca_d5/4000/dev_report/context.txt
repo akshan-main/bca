@@ -1,0 +1,425 @@
+## httpx/_client.py
+
+class BoundSyncStream(SyncByteStream):
+    """
+    A byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: SyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        for chunk in self._stream:
+            yield chunk
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+class BoundAsyncStream(AsyncByteStream):
+    """
+    An async byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: AsyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    def build_request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Request:
+        """
+        Build and return a request instance.
+
+        * The `params`, `headers` and `cookies` arguments
+        are merged with any values set on the client.
+        * The `url` argument is merged with any `base_url` set on the client.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        url = self._merge_url(url)
+        headers = self._merge_headers(headers)
+        cookies = self._merge_cookies(cookies)
+        params = self._merge_queryparams(params)
+        extensions = {} if extensions is None else extensions
+        if "timeout" not in extensions:
+            timeout = (
+                self.timeout
+                if isinstance(timeout, UseClientDefault)
+                else Timeout(timeout)
+            )
+            extensions = dict(**extensions, timeout=timeout.as_dict())
+        return Request(
+            method,
+            url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            extensions=extensions,
+        )
+
+    def _redirect_headers(self, request: Request, url: URL, method: str) -> Headers:
+        """
+        Return the headers that should be used for the redirect request.
+        """
+        headers = Headers(request.headers)
+
+        if not _same_origin(url, request.url):
+            if not _is_https_redirect(request.url, url):
+                # Strip Authorization headers when responses are redirected
+                # away from the origin. (Except for direct HTTP to HTTPS redirects.)
+                headers.pop("Authorization", None)
+
+            # Update the Host header.
+            headers["Host"] = url.netloc.decode("ascii")
+
+        if method != request.method and method == "GET":
+            # If we've switch to a 'GET' request, then strip any headers which
+            # are only relevant to the request body.
+            headers.pop("Content-Length", None)
+            headers.pop("Transfer-Encoding", None)
+
+        # We should use the client cookie store to determine any cookie header,
+        # rather than whatever was on the original outgoing request.
+        headers.pop("Cookie", None)
+
+        return headers
+
+    def request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Build and send a request.
+
+        Equivalent to:
+
+        ```python
+        request = client.build_request(...)
+        response = client.send(request, ...)
+        ```
+
+        See `Client.build_request()`, `Client.send()` and
+        [Merging of configuration][0] for how the various parameters
+        are merged with client-level configuration.
+
+        [0]: /advanced/clients/#merging-of-configuration
+        """
+        if cookies is not None:
+            message = (
+                "Setting per-request cookies=<...> is being deprecated, because "
+                "the expected behaviour on cookie persistence is ambiguous. Set "
+                "cookies directly on the client instance instead."
+            )
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        return self.send(request, auth=auth, follow_redirects=follow_redirects)
+
+    def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `Client.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                response.read()
+
+            return response
+
+        except BaseException as exc:
+            response.close()
+            raise exc
+
+## httpx/_models.py
+
+    def values(self) -> typing.ValuesView[str]:
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.values()
+
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return `(key, value)` items of headers. Concatenate headers
+        into a single comma separated value when a key occurs multiple times.
+        """
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.items()
+
+    def update(self, headers: HeaderTypes | None = None) -> None:  # type: ignore
+        headers = Headers(headers)
+        for key in headers.keys():
+            if key in self:
+                self.pop(key)
+        self._list.extend(headers._list)
+
+    def read(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.Iterable)
+            self._content = b"".join(self.stream)
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.AsyncIterable)
+            self._content = b"".join([part async for part in self.stream])
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    async def aiter_bytes(
+        self, chunk_size: int | None = None
+    ) -> typing.AsyncIterator[bytes]:
+        """
+        A byte-iterator over the decoded response content.
+        This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+        """
+        if hasattr(self, "_content"):
+            chunk_size = len(self._content) if chunk_size is None else chunk_size
+            for i in range(0, len(self._content), max(chunk_size, 1)):
+                yield self._content[i : i + chunk_size]
+        else:
+            decoder = self._get_content_decoder()
+            chunker = ByteChunker(chunk_size=chunk_size)
+            with request_context(request=self._request):
+                async for raw_bytes in self.aiter_raw():
+                    decoded = decoder.decode(raw_bytes)
+                    for chunk in chunker.decode(decoded):
+                        yield chunk
+                decoded = decoder.flush()
+                for chunk in chunker.decode(decoded):
+                    yield chunk  # pragma: no cover
+                for chunk in chunker.flush():
+                    yield chunk
+
+    async def aiter_raw(
+        self, chunk_size: int | None = None
+    ) -> typing.AsyncIterator[bytes]:
+        """
+        A byte-iterator over the raw response content.
+        """
+        if self.is_stream_consumed:
+            raise StreamConsumed()
+        if self.is_closed:
+            raise StreamClosed()
+        if not isinstance(self.stream, AsyncByteStream):
+            raise RuntimeError("Attempted to call an async iterator on a sync stream.")
+
+        self.is_stream_consumed = True
+        self._num_bytes_downloaded = 0
+        chunker = ByteChunker(chunk_size=chunk_size)
+
+        with request_context(request=self._request):
+            async for raw_stream_bytes in self.stream:
+                self._num_bytes_downloaded += len(raw_stream_bytes)
+                for chunk in chunker.decode(raw_stream_bytes):
+                    yield chunk
+
+        for chunk in chunker.flush():
+            yield chunk
+
+        await self.aclose()
+
+    def set(self, name: str, value: str, domain: str = "", path: str = "/") -> None:
+        """
+        Set a cookie value by name. May optionally include domain and path.
+        """
+        kwargs = {
+            "version": 0,
+            "name": name,
+            "value": value,
+            "port": None,
+            "port_specified": False,
+            "domain": domain,
+            "domain_specified": bool(domain),
+            "domain_initial_dot": domain.startswith("."),
+            "path": path,
+            "path_specified": bool(path),
+            "secure": False,
+            "expires": None,
+            "discard": True,
+            "comment": None,
+            "comment_url": None,
+            "rest": {"HttpOnly": None},
+            "rfc2109": False,
+        }
+        cookie = Cookie(**kwargs)  # type: ignore
+        self.jar.set_cookie(cookie)
+
+    class _CookieCompatRequest(urllib.request.Request):
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
+
+        def __init__(self, request: Request) -> None:
+            super().__init__(
+                url=str(request.url),
+                headers=dict(request.headers),
+                method=request.method,
+            )
+            self.request = request
+
+        def add_unredirected_header(self, key: str, value: str) -> None:
+            super().add_unredirected_header(key, value)
+            self.request.headers[key] = value
+
+## tests/test_wsgi.py
+
+def test_wsgi_http_error():
+    transport = httpx.WSGITransport(app=partial(raise_exc, exc=RuntimeError))
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")
+
+def test_wsgi_generator():
+    output = [b"", b"", b"Some content", b" and more content"]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "Some content and more content"
+
+def test_logging():
+    buffer = StringIO()
+    transport = httpx.WSGITransport(app=log_to_wsgi_log_buffer, wsgi_errors=buffer)
+    client = httpx.Client(transport=transport)
+    response = client.post("http://www.example.org/", content=b"example")
+    assert response.status_code == 200  # no errors
+    buffer.seek(0)
+    assert buffer.read() == "test1\ntest2"

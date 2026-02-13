@@ -1,0 +1,838 @@
+# tests/typed_agent.py:79-80
+def wrong_tool_prepare(ctx: RunContext[MyDeps], x: int, y: str) -> str:
+    return f'{ctx.deps.foo} {x} {y}'
+
+# tests/test_streaming.py:758-792
+async def test_call_tool_wrong_name():
+    async def stream_structured_function(_messages: list[ModelMessage], _: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+        yield {0: DeltaToolCall(name='foobar', json_args='{}')}
+
+    agent = Agent(
+        FunctionModel(stream_function=stream_structured_function),
+        output_type=tuple[str, int],
+        retries=0,
+    )
+
+    @agent.tool_plain
+    async def ret_a(x: str) -> str:  # pragma: no cover
+        return x
+
+    with capture_run_messages() as messages:
+        with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(0\) for output validation'):
+            async with agent.run_stream('hello'):
+                pass
+
+    assert messages == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=50, output_tokens=1),
+                model_name='function::stream_structured_function',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+# pydantic_ai_slim/pydantic_ai/usage.py:262-262
+    tool_calls_limit: int | None = None
+
+# tests/test_usage_limits.py:329-360
+async def test_output_tool_allowed_at_limit() -> None:
+    """Test that output tools can be called even when at the tool_calls_limit."""
+
+    class MyOutput(BaseModel):
+        result: str
+
+    def call_output_after_regular(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('regular_tool', {'x': 'test'}, 'call_1'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+        else:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('final_result', {'result': 'success'}, 'call_2'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+
+    test_agent = Agent(FunctionModel(call_output_after_regular), output_type=ToolOutput(MyOutput))
+
+    @test_agent.tool_plain
+    async def regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    result = await test_agent.run('test', usage_limits=UsageLimits(tool_calls_limit=1))
+
+    assert result.output.result == 'success'
+    assert result.usage() == snapshot(RunUsage(requests=2, input_tokens=20, output_tokens=10, tool_calls=1))
+
+# tests/test_tools.py:2495-2529
+async def test_tool_timeout_triggers_retry():
+    """Test that a slow tool triggers RetryPromptPart when timeout is exceeded."""
+    import asyncio
+
+    call_count = 0
+
+    async def model_logic(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal call_count
+        call_count += 1
+        # First call: try the slow tool
+        if call_count == 1:
+            return ModelResponse(parts=[ToolCallPart(tool_name='slow_tool', args={}, tool_call_id='call-1')])
+        # After receiving retry, return text
+        return ModelResponse(parts=[TextPart(content='Tool timed out, giving up')])
+
+    agent = Agent(FunctionModel(model_logic))
+
+    @agent.tool_plain(timeout=0.1)
+    async def slow_tool() -> str:
+        await asyncio.sleep(1.0)  # 1 second, but timeout is 0.1s
+        return 'done'  # pragma: no cover
+
+    result = await agent.run('call slow_tool')
+
+    # Check that retry prompt was sent to the model
+    retry_parts = [
+        part
+        for msg in result.all_messages()
+        if isinstance(msg, ModelRequest)
+        for part in msg.parts
+        if isinstance(part, RetryPromptPart) and 'Timed out' in str(part.content)
+    ]
+    assert len(retry_parts) == 1
+    assert 'Timed out after 0.1 seconds' in retry_parts[0].content
+    assert retry_parts[0].tool_name == 'slow_tool'
+
+# tests/test_usage_limits.py:287-301
+async def test_tool_call_limit() -> None:
+    test_agent = Agent(TestModel())
+
+    @test_agent.tool_plain
+    async def ret_a(x: str) -> str:
+        return f'{x}-apple'
+
+    with pytest.raises(
+        UsageLimitExceeded,
+        match=re.escape('The next tool call(s) would exceed the tool_calls_limit of 0 (tool_calls=1).'),
+    ):
+        await test_agent.run('Hello', usage_limits=UsageLimits(tool_calls_limit=0))
+
+    result = await test_agent.run('Hello', usage_limits=UsageLimits(tool_calls_limit=1))
+    assert result.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=14, tool_calls=1))
+
+# tests/test_usage_limits.py:394-455
+async def test_parallel_tool_calls_limit_enforced():
+    """Parallel tool calls must not exceed the limit and should raise immediately."""
+    executed_tools: list[str] = []
+
+    model_call_count = 0
+
+    def test_model_function(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal model_call_count
+        model_call_count += 1
+
+        if model_call_count == 1:
+            # First response: 5 parallel tool calls (within limit)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('tool_a', {}, 'call_1'),
+                    ToolCallPart('tool_b', {}, 'call_2'),
+                    ToolCallPart('tool_c', {}, 'call_3'),
+                    ToolCallPart('tool_a', {}, 'call_4'),
+                    ToolCallPart('tool_b', {}, 'call_5'),
+                ]
+            )
+        else:
+            assert model_call_count == 2
+            # Second response: 3 parallel tool calls (would exceed limit of 6)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('tool_c', {}, 'call_6'),
+                    ToolCallPart('tool_a', {}, 'call_7'),
+                    ToolCallPart('tool_b', {}, 'call_8'),
+                ]
+            )
+
+    test_model = FunctionModel(test_model_function)
+    agent = Agent(test_model)
+
+    @agent.tool_plain
+    async def tool_a() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('a')
+        return 'result a'
+
+    @agent.tool_plain
+    async def tool_b() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('b')
+        return 'result b'
+
+    @agent.tool_plain
+    async def tool_c() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('c')
+        return 'result c'
+
+    # Run with tool call limit of 6; expecting an error when trying to execute 3 more tools
+    with pytest.raises(
+        UsageLimitExceeded,
+        match=re.escape('The next tool call(s) would exceed the tool_calls_limit of 6 (tool_calls=8).'),
+    ):
+        await agent.run('Use tools', usage_limits=UsageLimits(tool_calls_limit=6))
+
+    # Only the first batch of 5 tools should have executed
+    assert len(executed_tools) == 5
+
+# pydantic_ai_slim/pydantic_ai/usage.py:400-407
+    def check_before_tool_call(self, projected_usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next tool call(s) would exceed the tool call limit."""
+        tool_calls_limit = self.tool_calls_limit
+        tool_calls = projected_usage.tool_calls
+        if tool_calls_limit is not None and tool_calls > tool_calls_limit:
+            raise UsageLimitExceeded(
+                f'The next tool call(s) would exceed the tool_calls_limit of {tool_calls_limit} ({tool_calls=}).'
+            )
+
+# tests/test_toolsets.py:548-627
+async def test_tool_manager_retry_logic():
+    """Test the retry logic with failed_tools and for_run_step method."""
+
+    @dataclass
+    class TestDeps:
+        pass
+
+    # Create a toolset with tools that can fail
+    toolset = FunctionToolset[TestDeps](max_retries=2)
+    call_count: defaultdict[str, int] = defaultdict(int)
+
+    @toolset.tool
+    def failing_tool(x: int) -> int:
+        """A tool that always fails"""
+        call_count['failing_tool'] += 1
+        raise ModelRetry('This tool always fails')
+
+    @toolset.tool
+    def other_tool(x: int) -> int:
+        """A tool that works"""
+        call_count['other_tool'] += 1
+        return x * 2
+
+    # Create initial context and tool manager
+    initial_context = build_run_context(TestDeps())
+    tool_manager = await ToolManager[TestDeps](toolset).for_run_step(initial_context)
+
+    # Initially no failed tools
+    assert tool_manager.failed_tools == set()
+    assert initial_context.retries == {}
+
+    # Call the failing tool - should add to failed_tools
+    with pytest.raises(ToolRetryError):
+        await tool_manager.handle_call(ToolCallPart(tool_name='failing_tool', args={'x': 1}))
+
+    assert tool_manager.failed_tools == {'failing_tool'}
+    assert call_count['failing_tool'] == 1
+
+    # Call the working tool - should not add to failed_tools
+    result = await tool_manager.handle_call(ToolCallPart(tool_name='other_tool', args={'x': 3}))
+    assert result == 6
+    assert tool_manager.failed_tools == {'failing_tool'}  # unchanged
+    assert call_count['other_tool'] == 1
+
+    # Test for_run_step - should create new tool manager with updated retry counts
+    new_context = build_run_context(TestDeps(), run_step=1)
+    new_tool_manager = await tool_manager.for_run_step(new_context)
+
+    # The new tool manager should have retry count for the failed tool
+    assert new_tool_manager.ctx is not None
+    assert new_tool_manager.ctx.retries == {'failing_tool': 1}
+    assert new_tool_manager.failed_tools == set()  # reset for new run step
+
+    # Call the failing tool again in the new manager - should have retry=1
+    with pytest.raises(ToolRetryError):
+        await new_tool_manager.handle_call(ToolCallPart(tool_name='failing_tool', args={'x': 1}))
+
+    # Call the failing tool another time in the new manager
+    with pytest.raises(ToolRetryError):
+        await new_tool_manager.handle_call(ToolCallPart(tool_name='failing_tool', args={'x': 1}))
+
+    # Call the failing tool a third time in the new manager
+    with pytest.raises(ToolRetryError):
+        await new_tool_manager.handle_call(ToolCallPart(tool_name='failing_tool', args={'x': 1}))
+
+    assert new_tool_manager.failed_tools == {'failing_tool'}
+    assert call_count['failing_tool'] == 4
+
+    # Create another run step
+    another_context = build_run_context(TestDeps(), run_step=2)
+    another_tool_manager = await new_tool_manager.for_run_step(another_context)
+
+    # Should now have retry count of 2 for failing_tool
+    assert another_tool_manager.ctx is not None
+    assert another_tool_manager.ctx.retries == {'failing_tool': 2}
+    assert another_tool_manager.failed_tools == set()
+
+    # Call the failing tool _again_, now we should finally hit the limit
+    with pytest.raises(UnexpectedModelBehavior, match="Tool 'failing_tool' exceeded max retries count of 2"):
+        await another_tool_manager.handle_call(ToolCallPart(tool_name='failing_tool', args={'x': 1}))
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:114-114
+from .tools import DeferredToolRequests, DeferredToolResults, RunContext, Tool, ToolApproved, ToolDefinition, ToolDenied
+
+# tests/test_agent.py:3769-3845
+    def test_early_strategy_with_deferred_tool_call(self):
+        """Test that early strategy handles deferred tool calls correctly."""
+        tool_called: list[str] = []
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            assert info.output_tools is not None
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('deferred_tool'),
+                    ToolCallPart('regular_tool', {'x': 1}),
+                ],
+            )
+
+        agent = Agent(
+            FunctionModel(return_model),
+            output_type=[str, DeferredToolRequests],
+            end_strategy='early',
+        )
+
+        @agent.tool_plain
+        def deferred_tool() -> int:
+            raise CallDeferred
+
+        @agent.tool_plain
+        def regular_tool(x: int) -> int:
+            tool_called.append('regular_tool')
+            return x
+
+        result = agent.run_sync('test early strategy with deferred tool call')
+        assert result.output == snapshot(
+            DeferredToolRequests(calls=[ToolCallPart(tool_name='deferred_tool', tool_call_id=IsStr())])
+        )
+        messages = result.all_messages()
+
+        # Verify regular tool was called
+        assert tool_called == ['regular_tool']
+
+        # Verify we got appropriate tool returns
+        assert messages == snapshot(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content='test early strategy with deferred tool call', timestamp=IsNow(tz=timezone.utc)
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(tool_name='deferred_tool', tool_call_id=IsStr()),
+                        ToolCallPart(
+                            tool_name='regular_tool',
+                            args={'x': 1},
+                            tool_call_id=IsStr(),
+                        ),
+                    ],
+                    usage=RequestUsage(input_tokens=57, output_tokens=6),
+                    model_name='function:return_model:',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='regular_tool',
+                            content=1,
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+# tests/test_agent.py:3769-3845
+    def test_early_strategy_with_deferred_tool_call(self):
+        """Test that early strategy handles deferred tool calls correctly."""
+        tool_called: list[str] = []
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            assert info.output_tools is not None
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('deferred_tool'),
+                    ToolCallPart('regular_tool', {'x': 1}),
+                ],
+            )
+
+        agent = Agent(
+            FunctionModel(return_model),
+            output_type=[str, DeferredToolRequests],
+            end_strategy='early',
+        )
+
+        @agent.tool_plain
+        def deferred_tool() -> int:
+            raise CallDeferred
+
+        @agent.tool_plain
+        def regular_tool(x: int) -> int:
+            tool_called.append('regular_tool')
+            return x
+
+        result = agent.run_sync('test early strategy with deferred tool call')
+        assert result.output == snapshot(
+            DeferredToolRequests(calls=[ToolCallPart(tool_name='deferred_tool', tool_call_id=IsStr())])
+        )
+        messages = result.all_messages()
+
+        # Verify regular tool was called
+        assert tool_called == ['regular_tool']
+
+        # Verify we got appropriate tool returns
+        assert messages == snapshot(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content='test early strategy with deferred tool call', timestamp=IsNow(tz=timezone.utc)
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(tool_name='deferred_tool', tool_call_id=IsStr()),
+                        ToolCallPart(
+                            tool_name='regular_tool',
+                            args={'x': 1},
+                            tool_call_id=IsStr(),
+                        ),
+                    ],
+                    usage=RequestUsage(input_tokens=57, output_tokens=6),
+                    model_name='function:return_model:',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='regular_tool',
+                            content=1,
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+# tests/test_agent.py:3847-3927
+    def test_early_strategy_does_not_apply_to_tool_calls_without_final_tool(self):
+        """Test that 'early' strategy does not apply to tool calls when no output tool is called."""
+        tool_called: list[str] = []
+        agent = Agent(TestModel(), output_type=OutputType, end_strategy='early')
+
+        @agent.tool_plain
+        def regular_tool(x: int) -> int:
+            """A regular tool that should be called."""
+            tool_called.append('regular_tool')
+            return x
+
+        result = agent.run_sync('test early strategy with regular tool calls')
+
+        # Verify the regular tool was executed
+        assert tool_called == ['regular_tool']
+
+        # Verify we got appropriate tool returns
+        assert result.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content='test early strategy with regular tool calls',
+                            timestamp=IsNow(tz=timezone.utc),
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name='regular_tool',
+                            args={'x': 0},
+                            tool_call_id=IsStr(),
+                        )
+                    ],
+                    usage=RequestUsage(input_tokens=57, output_tokens=4),
+                    model_name='test',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='regular_tool',
+                            content=0,
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name='final_result',
+                            args={'value': 'a'},
+                            tool_call_id=IsStr(),
+                        )
+                    ],
+                    usage=RequestUsage(input_tokens=58, output_tokens=9),
+                    model_name='test',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='final_result',
+                            content='Final result processed.',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+# tests/test_agent.py:3847-3927
+    def test_early_strategy_does_not_apply_to_tool_calls_without_final_tool(self):
+        """Test that 'early' strategy does not apply to tool calls when no output tool is called."""
+        tool_called: list[str] = []
+        agent = Agent(TestModel(), output_type=OutputType, end_strategy='early')
+
+        @agent.tool_plain
+        def regular_tool(x: int) -> int:
+            """A regular tool that should be called."""
+            tool_called.append('regular_tool')
+            return x
+
+        result = agent.run_sync('test early strategy with regular tool calls')
+
+        # Verify the regular tool was executed
+        assert tool_called == ['regular_tool']
+
+        # Verify we got appropriate tool returns
+        assert result.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content='test early strategy with regular tool calls',
+                            timestamp=IsNow(tz=timezone.utc),
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name='regular_tool',
+                            args={'x': 0},
+                            tool_call_id=IsStr(),
+                        )
+                    ],
+                    usage=RequestUsage(input_tokens=57, output_tokens=4),
+                    model_name='test',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='regular_tool',
+                            content=0,
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name='final_result',
+                            args={'value': 'a'},
+                            tool_call_id=IsStr(),
+                        )
+                    ],
+                    usage=RequestUsage(input_tokens=58, output_tokens=9),
+                    model_name='test',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='final_result',
+                            content='Final result processed.',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+# tests/test_agent.py:3147-3165
+def test_tool_exceeds_token_limit_error():
+    def return_incomplete_tool(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        resp = ModelResponse(parts=[ToolCallPart('dummy_tool', args='{"foo": "bar",')])
+        resp.finish_reason = 'length'
+        return resp
+
+    agent = Agent(FunctionModel(return_incomplete_tool), output_type=str)
+
+    with pytest.raises(
+        IncompleteToolCall,
+        match=r'Model token limit \(10\) exceeded while generating a tool call, resulting in incomplete arguments.',
+    ):
+        agent.run_sync('Hello', model_settings=ModelSettings(max_tokens=10))
+
+    with pytest.raises(
+        IncompleteToolCall,
+        match=r'Model token limit \(provider default\) exceeded while generating a tool call, resulting in incomplete arguments.',
+    ):
+        agent.run_sync('Hello')
+
+# pydantic_ai_slim/pydantic_ai/toolsets/abstract.py:113-115
+    async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
+        """The tools that are available in this toolset."""
+        raise NotImplementedError()
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:114-114
+from .tools import DeferredToolRequests, DeferredToolResults, RunContext, Tool, ToolApproved, ToolDefinition, ToolDenied
+
+# pydantic_ai_slim/pydantic_ai/toolsets/combined.py:18-22
+class _CombinedToolsetTool(ToolsetTool[AgentDepsT]):
+    """A tool definition for a combined toolset tools that keeps track of the source toolset and tool."""
+
+    source_toolset: AbstractToolset[AgentDepsT]
+    source_tool: ToolsetTool[AgentDepsT]
+
+# tests/test_toolsets.py:630-679
+async def test_tool_manager_multiple_failed_tools():
+    """Test retry logic when multiple tools fail in the same run step."""
+
+    @dataclass
+    class TestDeps:
+        pass
+
+    toolset = FunctionToolset[TestDeps]()
+
+    @toolset.tool
+    def tool_a(x: int) -> int:
+        """Tool A that fails"""
+        raise ModelRetry('Tool A fails')
+
+    @toolset.tool
+    def tool_b(x: int) -> int:
+        """Tool B that fails"""
+        raise ModelRetry('Tool B fails')
+
+    @toolset.tool
+    def tool_c(x: int) -> int:
+        """Tool C that works"""
+        return x * 3
+
+    # Create tool manager
+    context = build_run_context(TestDeps())
+    tool_manager = await ToolManager[TestDeps](toolset).for_run_step(context)
+
+    # Call tool_a - should fail and be added to failed_tools
+    with pytest.raises(ToolRetryError):
+        await tool_manager.handle_call(ToolCallPart(tool_name='tool_a', args={'x': 1}))
+    assert tool_manager.failed_tools == {'tool_a'}
+
+    # Call tool_b - should also fail and be added to failed_tools
+    with pytest.raises(ToolRetryError):
+        await tool_manager.handle_call(ToolCallPart(tool_name='tool_b', args={'x': 1}))
+    assert tool_manager.failed_tools == {'tool_a', 'tool_b'}
+
+    # Call tool_c - should succeed and not be added to failed_tools
+    result = await tool_manager.handle_call(ToolCallPart(tool_name='tool_c', args={'x': 2}))
+    assert result == 6
+    assert tool_manager.failed_tools == {'tool_a', 'tool_b'}  # unchanged
+
+    # Create next run step - should have retry counts for both failed tools
+    new_context = build_run_context(TestDeps(), run_step=1)
+    new_tool_manager = await tool_manager.for_run_step(new_context)
+
+    assert new_tool_manager.ctx is not None
+    assert new_tool_manager.ctx.retries == {'tool_a': 1, 'tool_b': 1}
+    assert new_tool_manager.failed_tools == set()  # reset for new run step
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_function_toolset.py:12-12
+from pydantic_ai.toolsets.function import FunctionToolsetTool
+
+# pydantic_ai_slim/pydantic_ai/_tool_manager.py:90-95
+    def tool_defs(self) -> list[ToolDefinition]:
+        """The tool definitions for the tools in this tool manager."""
+        if self.tools is None:
+            raise ValueError('ToolManager has not been prepared for a run step yet')  # pragma: no cover
+
+        return [tool.tool_def for tool in self.tools.values()]
+
+# tests/test_agent.py:3413-3491
+    def test_early_strategy_does_not_call_additional_output_tools(self):
+        """Test that 'early' strategy does not execute additional output tool functions."""
+        output_tools_called: list[str] = []
+
+        def process_first(output: OutputType) -> OutputType:
+            """Process first output."""
+            output_tools_called.append('first')
+            return output
+
+        def process_second(output: OutputType) -> OutputType:  # pragma: no cover
+            """Process second output."""
+            output_tools_called.append('second')
+            return output
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            assert info.output_tools is not None
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('first_output', {'value': 'first'}),
+                    ToolCallPart('second_output', {'value': 'second'}),
+                ],
+            )
+
+        agent = Agent(
+            FunctionModel(return_model),
+            output_type=[
+                ToolOutput(process_first, name='first_output'),
+                ToolOutput(process_second, name='second_output'),
+            ],
+            end_strategy='early',
+        )
+
+        result = agent.run_sync('test early output tools')
+
+        # Verify the result came from the first output tool
+        assert isinstance(result.output, OutputType)
+        assert result.output.value == 'first'
+
+        # Verify only the first output tool was called
+        assert output_tools_called == ['first']
+
+        # Verify we got tool returns in the correct order
+        assert result.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content='test early output tools', timestamp=IsNow(tz=timezone.utc))],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(tool_name='first_output', args={'value': 'first'}, tool_call_id=IsStr()),
+                        ToolCallPart(tool_name='second_output', args={'value': 'second'}, tool_call_id=IsStr()),
+                    ],
+                    usage=RequestUsage(input_tokens=54, output_tokens=10),
+                    model_name='function:return_model:',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='first_output',
+                            content='Final result processed.',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        ),
+                        ToolReturnPart(
+                            tool_name='second_output',
+                            content='Output tool not used - a final result was already processed.',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        ),
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+# pydantic_ai_slim/pydantic_ai/toolsets/function.py:323-335
+    def add_tool(self, tool: Tool[AgentDepsT]) -> None:
+        """Add a tool to the toolset.
+
+        Args:
+            tool: The tool to add.
+        """
+        if tool.name in self.tools:
+            raise UserError(f'Tool name conflicts with existing tool: {tool.name!r}')
+        if tool.max_retries is None:
+            tool.max_retries = self.max_retries
+        if self.metadata is not None:
+            tool.metadata = self.metadata | (tool.metadata or {})
+        self.tools[tool.name] = tool
+
+# pydantic_ai_slim/pydantic_ai/ext/aci.py:70-76
+class ACIToolset(FunctionToolset):
+    """A toolset that wraps ACI.dev tools."""
+
+    def __init__(self, aci_functions: Sequence[str], linked_account_owner_id: str, *, id: str | None = None):
+        super().__init__(
+            [tool_from_aci(aci_function, linked_account_owner_id) for aci_function in aci_functions], id=id
+        )
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:47-61
+from ..tools import (
+    AgentDepsT,
+    BuiltinToolFunc,
+    DeferredToolResults,
+    DocstringFormat,
+    GenerateToolJsonSchema,
+    RunContext,
+    Tool,
+    ToolFuncContext,
+    ToolFuncEither,
+    ToolFuncPlain,
+    ToolParams,
+    ToolPrepareFunc,
+    ToolsPrepareFunc,
+)
+
+# tests/test_dbos.py:971-971
+weather_toolset = FunctionToolset(tools=[temperature_celsius, temperature_fahrenheit])

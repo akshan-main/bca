@@ -1,0 +1,417 @@
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:82-97
+def is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address is in a private/internal range.
+
+    Handles both IPv4 and IPv6 addresses, including IPv4-mapped IPv6 addresses.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:192.168.1.1)
+        if isinstance(ip, ipaddress.IPv6Address) and not ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        return any(ip in network for network in _PRIVATE_NETWORKS)
+    except ValueError:
+        # Invalid IP address, treat as potentially dangerous
+        return True
+
+# tests/test_ssrf.py:9-22
+from pydantic_ai._ssrf import (
+    _DEFAULT_TIMEOUT,  # pyright: ignore[reportPrivateUsage]
+    _MAX_REDIRECTS,  # pyright: ignore[reportPrivateUsage]
+    ResolvedUrl,
+    build_url_with_ip,
+    extract_host_and_port,
+    is_cloud_metadata_ip,
+    is_private_ip,
+    resolve_hostname,
+    resolve_redirect_url,
+    safe_download,
+    validate_and_resolve_url,
+    validate_url_protocol,
+)
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:182-204
+def build_url_with_ip(resolved: ResolvedUrl) -> str:
+    """Build a URL using a resolved IP address instead of the hostname.
+
+    For IPv6 addresses, wraps them in brackets as required by URL syntax.
+    """
+    scheme = 'https' if resolved.is_https else 'http'
+    default_port = 443 if resolved.is_https else 80
+
+    # IPv6 addresses need brackets in URLs
+    try:
+        ip_obj = ipaddress.ip_address(resolved.resolved_ip)
+        if isinstance(ip_obj, ipaddress.IPv6Address):
+            host_part = f'[{resolved.resolved_ip}]'
+        else:
+            host_part = resolved.resolved_ip
+    except ValueError:
+        host_part = resolved.resolved_ip
+
+    # Only include port if non-default
+    if resolved.port != default_port:
+        host_part = f'{host_part}:{resolved.port}'
+
+    return urlunparse((scheme, host_part, resolved.path, '', '', ''))
+
+# tests/test_ssrf.py:388-392
+    async def test_6to4_address_blocked(self) -> None:
+        """Test that 6to4 addresses (which can embed private IPv4) are blocked."""
+        # 2002:c0a8:0101::1 embeds 192.168.1.1
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://[2002:c0a8:0101::1]/path', allow_local=False)
+
+# tests/models/test_xai.py:3890-3997
+async def test_xai_builtin_tool_call_in_history(allow_model_requests: None):
+    """Test that BuiltinToolCallPart and BuiltinToolReturnPart in history are mapped."""
+    # First response with code execution
+    response1 = create_code_execution_response(code='print(2+2)', assistant_text='Tool completed successfully.')
+    # Second response
+    response2 = create_response(content='The result was 4')
+
+    mock_client = MockXai.create_mock([response1, response2])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m, builtin_tools=[CodeExecutionTool()])
+
+    # Run once, then continue with history
+    result1 = await agent.run('Calculate 2+2')
+    result2 = await agent.run('What was the result?', message_history=result1.new_messages())
+
+    # Verify kwargs - second call should have builtin tool call in history
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [{'content': [{'text': 'Calculate 2+2'}], 'role': 'ROLE_USER'}],
+                'tools': [{'code_execution': {}}],
+                'tool_choice': 'auto',
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'Calculate 2+2'}], 'role': 'ROLE_USER'},
+                    {
+                        'content': [{'text': ''}],
+                        'role': 'ROLE_ASSISTANT',
+                        'tool_calls': [
+                            {
+                                'id': 'code_exec_001',
+                                'type': 'TOOL_CALL_TYPE_CODE_EXECUTION_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'code_execution', 'arguments': '{"code":"print(2+2)"}'},
+                            }
+                        ],
+                    },
+                    {
+                        'content': [{'text': 'Tool completed successfully.'}],
+                        'role': 'ROLE_ASSISTANT',
+                    },
+                    {'content': [{'text': 'What was the result?'}], 'role': 'ROLE_USER'},
+                ],
+                'tools': [{'code_execution': {}}],
+                'tool_choice': 'auto',
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+        ]
+    )
+
+    assert result2.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Calculate 2+2', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    BuiltinToolCallPart(
+                        tool_name='code_execution',
+                        args={'code': 'print(2+2)'},
+                        tool_call_id=IsStr(),
+                        provider_name='xai',
+                    ),
+                    BuiltinToolReturnPart(
+                        tool_name='code_execution',
+                        content={'stdout': '4\n', 'stderr': '', 'output_files': {}, 'error': '', 'ret': ''},
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                        provider_name='xai',
+                    ),
+                    TextPart(content='Tool completed successfully.'),
+                ],
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_name='xai',
+                provider_url='https://api.x.ai/v1',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='What was the result?', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='The result was 4')],
+                usage=RequestUsage(),
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_url='https://api.x.ai/v1',
+                provider_name='xai',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+# tests/models/test_xai.py:3572-3690
+async def test_xai_thinking_part_in_message_history(allow_model_requests: None):
+    """Test that ThinkingPart in message history is properly mapped."""
+    # First response with reasoning
+    response1 = create_response(
+        content='first response',
+        reasoning_content='First reasoning',
+        usage=create_usage(prompt_tokens=10, completion_tokens=5),
+    )
+    # Second response
+    response2 = create_response(
+        content='second response',
+        usage=create_usage(prompt_tokens=20, completion_tokens=5),
+    )
+
+    mock_client = MockXai.create_mock([response1, response2])
+    m = XaiModel(XAI_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    # Run twice to test message history containing ThinkingPart
+    result1 = await agent.run('First question')
+    # Add a foreign, empty thinking part to the message history, it should be ignored when mapping messages
+    # (covers the empty-thinking branch in xAI thinking mapping).
+    message_history: list[ModelMessage] = [
+        *result1.new_messages(),
+        ModelResponse(parts=[ThinkingPart(content='')], provider_name='other', model_name='other-model'),
+    ]
+    # Include user-supplied `<think>` tags to confirm they are treated as plain user text.
+    result2 = await agent.run('Second question <think>user think</think>', message_history=message_history)
+
+    # Verify kwargs - second call should have ThinkingPart mapped with reasoning_content
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_REASONING_MODEL,
+                'messages': [{'content': [{'text': 'First question'}], 'role': 'ROLE_USER'}],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+            {
+                'model': XAI_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'First question'}], 'role': 'ROLE_USER'},
+                    {
+                        'content': [
+                            {
+                                'text': """\
+<think>
+First reasoning
+</think>\
+"""
+                            }
+                        ],
+                        'role': 'ROLE_ASSISTANT',
+                    },
+                    {'content': [{'text': 'first response'}], 'role': 'ROLE_ASSISTANT'},
+                    {'content': [{'text': 'Second question <think>user think</think>'}], 'role': 'ROLE_USER'},
+                ],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+        ]
+    )
+
+    assert result2.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='First question', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ThinkingPart(content='First reasoning'), TextPart(content='first response')],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+                model_name=XAI_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_name='xai',
+                provider_url='https://api.x.ai/v1',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ThinkingPart(content='')],
+                usage=RequestUsage(),
+                model_name='other-model',
+                timestamp=IsDatetime(),
+                provider_name='other',
+                provider_response_id=None,
+                finish_reason=None,
+                run_id=None,
+            ),
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Second question <think>user think</think>', timestamp=IsNow(tz=timezone.utc)
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='second response')],
+                usage=RequestUsage(input_tokens=20, output_tokens=5),
+                model_name=XAI_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_name='xai',
+                provider_url='https://api.x.ai/v1',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+# tests/models/test_xai.py:4881-4987
+async def test_xai_web_search_tool_in_history(allow_model_requests: None):
+    """Test that WebSearchTool builtin calls in history are mapped."""
+    # First response with web search
+    response1 = create_web_search_response(
+        query='test query', content='Search results', assistant_text='Tool completed successfully.'
+    )
+    # Second response
+    response2 = create_response(content='The search found results')
+
+    mock_client = MockXai.create_mock([response1, response2])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m, builtin_tools=[WebSearchTool()])
+
+    # Run once, then continue with history
+    result1 = await agent.run('Search for test')
+    result2 = await agent.run('What did you find?', message_history=result1.new_messages())
+
+    # Verify kwargs - second call should have WebSearchTool builtin call mapped
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [{'content': [{'text': 'Search for test'}], 'role': 'ROLE_USER'}],
+                'tools': [{'web_search': {'enable_image_understanding': False}}],
+                'tool_choice': 'auto',
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'Search for test'}], 'role': 'ROLE_USER'},
+                    {
+                        'content': [{'text': ''}],
+                        'role': 'ROLE_ASSISTANT',
+                        'tool_calls': [
+                            {
+                                'id': 'web_search_001',
+                                'type': 'TOOL_CALL_TYPE_WEB_SEARCH_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'web_search', 'arguments': '{"query":"test query"}'},
+                            }
+                        ],
+                    },
+                    {'content': [{'text': 'Tool completed successfully.'}], 'role': 'ROLE_ASSISTANT'},
+                    {'content': [{'text': 'What did you find?'}], 'role': 'ROLE_USER'},
+                ],
+                'tools': [{'web_search': {'enable_image_understanding': False}}],
+                'tool_choice': 'auto',
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+        ]
+    )
+
+    assert result2.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Search for test', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    BuiltinToolCallPart(
+                        tool_name='web_search',
+                        args={'query': 'test query'},
+                        tool_call_id=IsStr(),
+                        provider_name='xai',
+                    ),
+                    BuiltinToolReturnPart(
+                        tool_name='web_search',
+                        content='Search results',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                        provider_name='xai',
+                    ),
+                    TextPart(content='Tool completed successfully.'),
+                ],
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_name='xai',
+                provider_url='https://api.x.ai/v1',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='What did you find?', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='The search found results')],
+                usage=RequestUsage(),
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_url='https://api.x.ai/v1',
+                provider_name='xai',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+# tests/test_ssrf.py:372-375
+    async def test_literal_private_ip_blocked(self) -> None:
+        """Test that literal private IPs in URLs are blocked."""
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://192.168.1.1/path', allow_local=False)
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:42-45
+class _WrappedTextOutput:
+    """A private wrapper class to tag an output that came from the custom_output_text field."""
+
+    value: str | None

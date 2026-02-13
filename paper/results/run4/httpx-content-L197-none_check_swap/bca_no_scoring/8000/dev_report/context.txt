@@ -1,0 +1,860 @@
+## httpx/_models.py
+
+SENSITIVE_HEADERS = {"authorization", "proxy-authorization"}
+
+def _is_known_encoding(encoding: str) -> bool:
+    """
+    Return `True` if `encoding` is a known codec.
+    """
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        return False
+    return True
+
+def _normalize_header_key(key: str | bytes, encoding: str | None = None) -> bytes:
+    """
+    Coerce str/bytes into a strictly byte-wise HTTP header key.
+    """
+    return key if isinstance(key, bytes) else key.encode(encoding or "ascii")
+
+def _normalize_header_value(value: str | bytes, encoding: str | None = None) -> bytes:
+    """
+    Coerce str/bytes into a strictly byte-wise HTTP header value.
+    """
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise TypeError(f"Header value must be str or bytes, not {type(value)}")
+    return value.encode(encoding or "ascii")
+
+def _parse_content_type_charset(content_type: str) -> str | None:
+    # We used to use `cgi.parse_header()` here, but `cgi` became a dead battery.
+    # See: https://peps.python.org/pep-0594/#cgi
+    msg = email.message.Message()
+    msg["content-type"] = content_type
+    return msg.get_content_charset(failobj=None)
+
+def _parse_header_links(value: str) -> list[dict[str, str]]:
+    """
+    Returns a list of parsed link headers, for more info see:
+    https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Link
+    The generic syntax of those is:
+    Link: < uri-reference >; param1=value1; param2="value2"
+    So for instance:
+    Link; '<http:/.../front.jpeg>; type="image/jpeg",<http://.../back.jpeg>;'
+    would return
+        [
+            {"url": "http:/.../front.jpeg", "type": "image/jpeg"},
+            {"url": "http://.../back.jpeg"},
+        ]
+    :param value: HTTP Link entity-header field
+    :return: list of parsed link headers
+    """
+    links: list[dict[str, str]] = []
+    replace_chars = " '\""
+    value = value.strip(replace_chars)
+    if not value:
+        return links
+    for val in re.split(", *<", value):
+        try:
+            url, params = val.split(";", 1)
+        except ValueError:
+            url, params = val, ""
+        link = {"url": url.strip("<> '\"")}
+        for param in params.split(";"):
+            try:
+                key, value = param.split("=")
+            except ValueError:
+                break
+            link[key.strip(replace_chars)] = value.strip(replace_chars)
+        links.append(link)
+    return links
+
+def _obfuscate_sensitive_headers(
+    items: typing.Iterable[tuple[typing.AnyStr, typing.AnyStr]],
+) -> typing.Iterator[tuple[typing.AnyStr, typing.AnyStr]]:
+    for k, v in items:
+        if to_str(k.lower()) in SENSITIVE_HEADERS:
+            v = to_bytes_or_str("[secure]", match_type_of=v)
+        yield k, v
+
+    def raw(self) -> list[tuple[bytes, bytes]]:
+        """
+        Returns a list of the raw header items, as byte pairs.
+        """
+        return [(raw_key, value) for raw_key, _, value in self._list]
+
+    def keys(self) -> typing.KeysView[str]:
+        return {key.decode(self.encoding): None for _, key, value in self._list}.keys()
+
+    def values(self) -> typing.ValuesView[str]:
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.values()
+
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return `(key, value)` items of headers. Concatenate headers
+        into a single comma separated value when a key occurs multiple times.
+        """
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.items()
+
+    def multi_items(self) -> list[tuple[str, str]]:
+        """
+        Return a list of `(key, value)` pairs of headers. Allow multiple
+        occurrences of the same key without concatenating into a single
+        comma separated value.
+        """
+        return [
+            (key.decode(self.encoding), value.decode(self.encoding))
+            for _, key, value in self._list
+        ]
+
+    def get(self, key: str, default: typing.Any = None) -> typing.Any:
+        """
+        Return a header value. If multiple occurrences of the header occur
+        then concatenate them together with commas.
+        """
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def get_list(self, key: str, split_commas: bool = False) -> list[str]:
+        """
+        Return a list of all header values for a given key.
+        If `split_commas=True` is passed, then any comma separated header
+        values are split into multiple return strings.
+        """
+        get_header_key = key.lower().encode(self.encoding)
+
+        values = [
+            item_value.decode(self.encoding)
+            for _, item_key, item_value in self._list
+            if item_key.lower() == get_header_key
+        ]
+
+        if not split_commas:
+            return values
+
+        split_values = []
+        for value in values:
+            split_values.extend([item.strip() for item in value.split(",")])
+        return split_values
+
+    def update(self, headers: HeaderTypes | None = None) -> None:  # type: ignore
+        headers = Headers(headers)
+        for key in headers.keys():
+            if key in self:
+                self.pop(key)
+        self._list.extend(headers._list)
+
+    def copy(self) -> Headers:
+        return Headers(self, encoding=self.encoding)
+
+    def __getitem__(self, key: str) -> str:
+        """
+        Return a single header value.
+
+        If there are multiple headers with the same key, then we concatenate
+        them with commas. See: https://tools.ietf.org/html/rfc7230#section-3.2.2
+        """
+        normalized_key = key.lower().encode(self.encoding)
+
+        items = [
+            header_value.decode(self.encoding)
+            for _, header_key, header_value in self._list
+            if header_key == normalized_key
+        ]
+
+        if items:
+            return ", ".join(items)
+
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value: str) -> None:
+        """
+        Set the header `key` to `value`, removing any duplicate entries.
+        Retains insertion order.
+        """
+        set_key = key.encode(self._encoding or "utf-8")
+        set_value = value.encode(self._encoding or "utf-8")
+        lookup_key = set_key.lower()
+
+        found_indexes = [
+            idx
+            for idx, (_, item_key, _) in enumerate(self._list)
+            if item_key == lookup_key
+        ]
+
+        for idx in reversed(found_indexes[1:]):
+            del self._list[idx]
+
+        if found_indexes:
+            idx = found_indexes[0]
+            self._list[idx] = (set_key, lookup_key, set_value)
+        else:
+            self._list.append((set_key, lookup_key, set_value))
+
+    def __delitem__(self, key: str) -> None:
+        """
+        Remove the header `key`.
+        """
+        del_key = key.lower().encode(self.encoding)
+
+        pop_indexes = [
+            idx
+            for idx, (_, item_key, _) in enumerate(self._list)
+            if item_key.lower() == del_key
+        ]
+
+        if not pop_indexes:
+            raise KeyError(key)
+
+        for idx in reversed(pop_indexes):
+            del self._list[idx]
+
+    def __contains__(self, key: typing.Any) -> bool:
+        header_key = key.lower().encode(self.encoding)
+        return header_key in [key for _, key, _ in self._list]
+
+    def __iter__(self) -> typing.Iterator[typing.Any]:
+        return iter(self.keys())
+
+    def __len__(self) -> int:
+        return len(self._list)
+
+    def __eq__(self, other: typing.Any) -> bool:
+        try:
+            other_headers = Headers(other)
+        except ValueError:
+            return False
+
+        self_list = [(key, value) for _, key, value in self._list]
+        other_list = [(key, value) for _, key, value in other_headers._list]
+        return sorted(self_list) == sorted(other_list)
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+
+        encoding_str = ""
+        if self.encoding != "ascii":
+            encoding_str = f", encoding={self.encoding!r}"
+
+        as_list = list(_obfuscate_sensitive_headers(self.multi_items()))
+        as_dict = dict(as_list)
+
+        no_duplicate_keys = len(as_dict) == len(as_list)
+        if no_duplicate_keys:
+            return f"{class_name}({as_dict!r}{encoding_str})"
+        return f"{class_name}({as_list!r}{encoding_str})"
+
+    def __init__(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        stream: SyncByteStream | AsyncByteStream | None = None,
+        extensions: RequestExtensions | None = None,
+    ) -> None:
+        self.method = method.upper()
+        self.url = URL(url) if params is None else URL(url, params=params)
+        self.headers = Headers(headers)
+        self.extensions = {} if extensions is None else dict(extensions)
+
+        if cookies:
+            Cookies(cookies).set_cookie_header(self)
+
+        if stream is None:
+            content_type: str | None = self.headers.get("content-type")
+            headers, stream = encode_request(
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                boundary=get_multipart_boundary_from_content_type(
+                    content_type=content_type.encode(self.headers.encoding)
+                    if content_type
+                    else None
+                ),
+            )
+            self._prepare(headers)
+            self.stream = stream
+            # Load the request body, except for streaming content.
+            if isinstance(stream, ByteStream):
+                self.read()
+        else:
+            # There's an important distinction between `Request(content=...)`,
+            # and `Request(stream=...)`.
+            #
+            # Using `content=...` implies automatically populated `Host` and content
+            # headers, of either `Content-Length: ...` or `Transfer-Encoding: chunked`.
+            #
+            # Using `stream=...` will not automatically include *any*
+            # auto-populated headers.
+            #
+            # As an end-user you don't really need `stream=...`. It's only
+            # useful when:
+            #
+            # * Preserving the request stream when copying requests, eg for redirects.
+            # * Creating request instances on the *server-side* of the transport API.
+            self.stream = stream
+
+    def elapsed(self, elapsed: datetime.timedelta) -> None:
+        self._elapsed = elapsed
+
+    def read(self) -> bytes:
+        """
+        Read and return the response content.
+        """
+        if not hasattr(self, "_content"):
+            self._content = b"".join(self.iter_bytes())
+        return self._content
+
+    class _CookieCompatRequest(urllib.request.Request):
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
+
+        def __init__(self, request: Request) -> None:
+            super().__init__(
+                url=str(request.url),
+                headers=dict(request.headers),
+                method=request.method,
+            )
+            self.request = request
+
+        def add_unredirected_header(self, key: str, value: str) -> None:
+            super().add_unredirected_header(key, value)
+            self.request.headers[key] = value
+
+    class _CookieCompatResponse:
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
+
+        def __init__(self, response: Response) -> None:
+            self.response = response
+
+        def info(self) -> email.message.Message:
+            info = email.message.Message()
+            for key, value in self.response.headers.multi_items():
+                # Note that setting `info[key]` here is an "append" operation,
+                # not a "replace" operation.
+                # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
+                info[key] = value
+            return info
+
+        def info(self) -> email.message.Message:
+            info = email.message.Message()
+            for key, value in self.response.headers.multi_items():
+                # Note that setting `info[key]` here is an "append" operation,
+                # not a "replace" operation.
+                # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
+                info[key] = value
+            return info
+
+## httpx/_types.py
+
+class SyncByteStream:
+    def __iter__(self) -> Iterator[bytes]:
+        raise NotImplementedError(
+            "The '__iter__' method must be implemented."
+        )  # pragma: no cover
+        yield b""  # pragma: no cover
+
+    def close(self) -> None:
+        """
+        Subclasses can override this method to release any network resources
+        after a request/response cycle is complete.
+        """
+
+class AsyncByteStream:
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        raise NotImplementedError(
+            "The '__aiter__' method must be implemented."
+        )  # pragma: no cover
+        yield b""  # pragma: no cover
+
+    async def aclose(self) -> None:
+        pass
+
+## tests/test_content.py
+
+async def test_bytes_content():
+    request = httpx.Request(method, url, content=b"Hello, world!")
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+    assert sync_content == b"Hello, world!"
+    assert async_content == b"Hello, world!"
+
+    # Support 'data' for compat with requests.
+    with pytest.warns(DeprecationWarning):
+        request = httpx.Request(method, url, data=b"Hello, world!")  # type: ignore
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+    assert sync_content == b"Hello, world!"
+    assert async_content == b"Hello, world!"
+
+async def test_bytesio_content():
+    request = httpx.Request(method, url, content=io.BytesIO(b"Hello, world!"))
+    assert isinstance(request.stream, typing.Iterable)
+    assert not isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+    assert content == b"Hello, world!"
+
+async def test_async_bytesio_content():
+    class AsyncBytesIO:
+        def __init__(self, content: bytes) -> None:
+            self._idx = 0
+            self._content = content
+
+        async def aread(self, chunk_size: int) -> bytes:
+            chunk = self._content[self._idx : self._idx + chunk_size]
+            self._idx = self._idx + chunk_size
+            return chunk
+
+        async def __aiter__(self):
+            yield self._content  # pragma: no cover
+
+    request = httpx.Request(method, url, content=AsyncBytesIO(b"Hello, world!"))
+    assert not isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+async def test_iterator_content():
+    def hello_world() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    request = httpx.Request(method, url, content=hello_world())
+    assert isinstance(request.stream, typing.Iterable)
+    assert not isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        list(request.stream)
+
+    # Support 'data' for compat with requests.
+    with pytest.warns(DeprecationWarning):
+        request = httpx.Request(method, url, data=hello_world())  # type: ignore
+    assert isinstance(request.stream, typing.Iterable)
+    assert not isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+async def test_aiterator_content():
+    async def hello_world() -> typing.AsyncIterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    request = httpx.Request(method, url, content=hello_world())
+    assert not isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        [part async for part in request.stream]
+
+    # Support 'data' for compat with requests.
+    with pytest.warns(DeprecationWarning):
+        request = httpx.Request(method, url, data=hello_world())  # type: ignore
+    assert not isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+async def test_json_content():
+    request = httpx.Request(method, url, json={"Hello": "world!"})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "18",
+        "Content-Type": "application/json",
+    }
+    assert sync_content == b'{"Hello":"world!"}'
+    assert async_content == b'{"Hello":"world!"}'
+
+async def test_urlencoded_content():
+    request = httpx.Request(method, url, data={"Hello": "world!"})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "14",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"Hello=world%21"
+    assert async_content == b"Hello=world%21"
+
+async def test_urlencoded_boolean():
+    request = httpx.Request(method, url, data={"example": True})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "12",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"example=true"
+    assert async_content == b"example=true"
+
+async def test_urlencoded_none():
+    request = httpx.Request(method, url, data={"example": None})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "8",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"example="
+    assert async_content == b"example="
+
+async def test_urlencoded_list():
+    request = httpx.Request(method, url, data={"example": ["a", 1, True]})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "32",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"example=a&example=1&example=true"
+    assert async_content == b"example=a&example=1&example=true"
+
+async def test_multipart_files_content():
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"Content-Type": "multipart/form-data; boundary=+++"}
+    request = httpx.Request(
+        method,
+        url,
+        files=files,
+        headers=headers,
+    )
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "138",
+        "Content-Type": "multipart/form-data; boundary=+++",
+    }
+    assert sync_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+    assert async_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+
+async def test_multipart_data_and_files_content():
+    data = {"message": "Hello, world!"}
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"Content-Type": "multipart/form-data; boundary=+++"}
+    request = httpx.Request(method, url, data=data, files=files, headers=headers)
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "210",
+        "Content-Type": "multipart/form-data; boundary=+++",
+    }
+    assert sync_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="message"\r\n',
+            b"\r\n",
+            b"Hello, world!\r\n",
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+    assert async_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="message"\r\n',
+            b"\r\n",
+            b"Hello, world!\r\n",
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+
+async def test_empty_request():
+    request = httpx.Request(method, url, data={}, files={})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "0"}
+    assert sync_content == b""
+    assert async_content == b""
+
+def test_invalid_argument():
+    with pytest.raises(TypeError):
+        httpx.Request(method, url, content=123)  # type: ignore
+
+    with pytest.raises(TypeError):
+        httpx.Request(method, url, content={"a": "b"})  # type: ignore
+
+async def test_multipart_multiple_files_single_input_content():
+    files = [
+        ("file", io.BytesIO(b"<file content 1>")),
+        ("file", io.BytesIO(b"<file content 2>")),
+    ]
+    headers = {"Content-Type": "multipart/form-data; boundary=+++"}
+    request = httpx.Request(method, url, files=files, headers=headers)
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "271",
+        "Content-Type": "multipart/form-data; boundary=+++",
+    }
+    assert sync_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content 1>\r\n",
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content 2>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+    assert async_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content 1>\r\n",
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content 2>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+
+async def test_response_empty_content():
+    response = httpx.Response(200)
+    assert isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(response.stream))
+    async_content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {}
+    assert sync_content == b""
+    assert async_content == b""
+
+async def test_response_bytes_content():
+    response = httpx.Response(200, content=b"Hello, world!")
+    assert isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(response.stream))
+    async_content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {"Content-Length": "13"}
+    assert sync_content == b"Hello, world!"
+    assert async_content == b"Hello, world!"
+
+async def test_response_iterator_content():
+    def hello_world() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    response = httpx.Response(200, content=hello_world())
+    assert isinstance(response.stream, typing.Iterable)
+    assert not isinstance(response.stream, typing.AsyncIterable)
+
+    content = b"".join(list(response.stream))
+
+    assert response.headers == {"Transfer-Encoding": "chunked"}
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        list(response.stream)
+
+async def test_response_aiterator_content():
+    async def hello_world() -> typing.AsyncIterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    response = httpx.Response(200, content=hello_world())
+    assert not isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {"Transfer-Encoding": "chunked"}
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        [part async for part in response.stream]
+
+def test_response_invalid_argument():
+    with pytest.raises(TypeError):
+        httpx.Response(200, content=123)  # type: ignore
+
+def test_ensure_ascii_false_with_french_characters():
+    data = {"greeting": "Bonjour, ça va ?"}
+    response = httpx.Response(200, json=data)
+    assert "ça va" in response.text, (
+        "ensure_ascii=False should preserve French accented characters"
+    )
+    assert response.headers["Content-Type"] == "application/json"
+
+def test_separators_for_compact_json():
+    data = {"clé": "valeur", "liste": [1, 2, 3]}
+    response = httpx.Response(200, json=data)
+    assert response.text == '{"clé":"valeur","liste":[1,2,3]}', (
+        "separators=(',', ':') should produce a compact representation"
+    )
+    assert response.headers["Content-Type"] == "application/json"
+
+def test_allow_nan_false():
+    data_with_nan = {"nombre": float("nan")}
+    data_with_inf = {"nombre": float("inf")}
+
+    with pytest.raises(
+        ValueError, match="Out of range float values are not JSON compliant"
+    ):
+        httpx.Response(200, json=data_with_nan)
+    with pytest.raises(
+        ValueError, match="Out of range float values are not JSON compliant"
+    ):
+        httpx.Response(200, json=data_with_inf)

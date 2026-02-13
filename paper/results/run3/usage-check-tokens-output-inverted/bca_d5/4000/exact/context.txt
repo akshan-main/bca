@@ -1,0 +1,421 @@
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    request: _messages.ModelRequest
+
+async def _call_tools(  # noqa: C901
+    tool_manager: ToolManager[DepsT],
+    tool_calls: list[_messages.ToolCallPart],
+    tool_call_results: dict[str, DeferredToolResult],
+    tool_call_metadata: dict[str, dict[str, Any]] | None,
+    tracer: Tracer,
+    usage: _usage.RunUsage,
+    usage_limits: _usage.UsageLimits,
+    output_parts: list[_messages.ModelRequestPart],
+    output_deferred_calls: dict[Literal['external', 'unapproved'], list[_messages.ToolCallPart]],
+    output_deferred_metadata: dict[str, dict[str, Any]],
+) -> AsyncIterator[_messages.HandleResponseEvent]:
+    tool_parts_by_index: dict[int, _messages.ModelRequestPart] = {}
+    user_parts_by_index: dict[int, _messages.UserPromptPart] = {}
+    deferred_calls_by_index: dict[int, Literal['external', 'unapproved']] = {}
+    deferred_metadata_by_index: dict[int, dict[str, Any] | None] = {}
+
+    if usage_limits.tool_calls_limit is not None:
+        projected_usage = deepcopy(usage)
+        projected_usage.tool_calls += len(tool_calls)
+        usage_limits.check_before_tool_call(projected_usage)
+
+    for call in tool_calls:
+        yield _messages.FunctionToolCallEvent(call)
+
+    with tracer.start_as_current_span(
+        'running tools',
+        attributes={
+            'tools': [call.tool_name for call in tool_calls],
+            'logfire.msg': f'running {len(tool_calls)} tool{"" if len(tool_calls) == 1 else "s"}',
+        },
+    ):
+
+        async def handle_call_or_result(
+            coro_or_task: Awaitable[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ]
+            | Task[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ],
+            index: int,
+        ) -> _messages.HandleResponseEvent | None:
+            try:
+                tool_part, tool_user_content = (
+                    (await coro_or_task) if inspect.isawaitable(coro_or_task) else coro_or_task.result()
+                )
+            except exceptions.CallDeferred as e:
+                deferred_calls_by_index[index] = 'external'
+                deferred_metadata_by_index[index] = e.metadata
+            except exceptions.ApprovalRequired as e:
+                deferred_calls_by_index[index] = 'unapproved'
+                deferred_metadata_by_index[index] = e.metadata
+            else:
+                tool_parts_by_index[index] = tool_part
+                if tool_user_content:
+                    user_parts_by_index[index] = _messages.UserPromptPart(content=tool_user_content)
+
+                return _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
+
+        parallel_execution_mode = tool_manager.get_parallel_execution_mode(tool_calls)
+        if parallel_execution_mode == 'sequential':
+            for index, call in enumerate(tool_calls):
+                if event := await handle_call_or_result(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    index,
+                ):
+                    yield event
+
+        else:
+            tasks = [
+                asyncio.create_task(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    name=call.tool_name,
+                )
+                for call in tool_calls
+            ]
+            try:
+                if parallel_execution_mode == 'parallel_ordered_events':
+                    # Wait for all tasks to complete before yielding any events
+                    await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+                    for index, task in enumerate(tasks):
+                        if event := await handle_call_or_result(coro_or_task=task, index=index):
+                            yield event
+                else:
+                    pending: set[
+                        asyncio.Task[
+                            tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, _messages.UserPromptPart | None]
+                        ]
+                    ] = set(tasks)  # pyright: ignore[reportAssignmentType]
+                    while pending:
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            index = tasks.index(task)  # pyright: ignore[reportArgumentType]
+                            if event := await handle_call_or_result(coro_or_task=task, index=index):  # pyright: ignore[reportArgumentType]
+                                yield event
+
+            except asyncio.CancelledError as e:
+                for task in tasks:
+                    task.cancel(msg=e.args[0] if len(e.args) != 0 else None)
+
+                raise
+
+    # We append the results at the end, rather than as they are received, to retain a consistent ordering
+    # This is mostly just to simplify testing
+    output_parts.extend([tool_parts_by_index[k] for k in sorted(tool_parts_by_index)])
+    output_parts.extend([user_parts_by_index[k] for k in sorted(user_parts_by_index)])
+
+    _populate_deferred_calls(
+        tool_calls, deferred_calls_by_index, deferred_metadata_by_index, output_deferred_calls, output_deferred_metadata
+    )
+
+## pydantic_ai_slim/pydantic_ai/_otel_messages.py
+
+    type: Literal['text']
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    async def to_cli(
+        self: Self,
+        deps: AgentDepsT = None,
+        prog_name: str = 'pydantic-ai',
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+    ) -> None:
+        """Run the agent in a CLI chat interface.
+
+        Args:
+            deps: The dependencies to pass to the agent.
+            prog_name: The name of the program to use for the CLI. Defaults to 'pydantic-ai'.
+            message_history: History of the conversation so far.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+
+        Example:
+        ```python {title="agent_to_cli.py" test="skip"}
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2', instructions='You always respond in Italian.')
+
+        async def main():
+            await agent.to_cli()
+        ```
+        """
+        from rich.console import Console
+
+        from pydantic_ai._cli import run_chat
+
+        await run_chat(
+            stream=True,
+            agent=self,
+            deps=deps,
+            console=Console(),
+            code_theme='monokai',
+            prog_name=prog_name,
+            message_history=message_history,
+            model_settings=model_settings,
+            usage_limits=usage_limits,
+        )
+
+## pydantic_ai_slim/pydantic_ai/concurrency.py
+
+def get_concurrency_context(
+    limiter: AbstractConcurrencyLimiter | None,
+    source: str = 'unnamed',
+) -> AbstractAsyncContextManager[None]:
+    """Get an async context manager for the concurrency limiter.
+
+    If limiter is None, returns a no-op context manager.
+
+    Args:
+        limiter: The AbstractConcurrencyLimiter or None.
+        source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+
+    Returns:
+        An async context manager.
+    """
+    if limiter is None:
+        return _null_context()
+    return _limiter_context(limiter, source)
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+def _get_usage_checking_stream_response(
+    stream_response: models.StreamedResponse,
+    limits: UsageLimits | None,
+    get_usage: Callable[[], RunUsage],
+) -> AsyncIterator[ModelResponseStreamEvent]:
+    if limits is not None and limits.has_token_limits():
+
+        async def _usage_checking_iterator():
+            async for item in stream_response:
+                limits.check_tokens(get_usage())
+                yield item
+
+        return _usage_checking_iterator()
+    else:
+        return aiter(stream_response)
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    sleep: Callable[[int | float], None | Awaitable[None]]
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    output_tokens_limit: int | None = None
+
+    def check_tokens(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the usage exceeds any of the token limits."""
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})')
+
+        output_tokens = usage.output_tokens
+        if self.output_tokens_limit is None and output_tokens > self.output_tokens_limit:
+            raise UsageLimitExceeded(
+                f'Exceeded the output_tokens_limit of {self.output_tokens_limit} ({output_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})')
+
+## pydantic_graph/pydantic_graph/beta/graph_builder.py
+
+    def decision(self, *, note: str | None = None, node_id: str | None = None) -> Decision[StateT, DepsT, Never]:
+        """Create a new decision node.
+
+        Args:
+            note: Optional note to describe the decision logic
+            node_id: Optional ID for the node produced for this decision logic
+
+        Returns:
+            A new Decision node with no branches
+        """
+        return Decision(id=NodeID(node_id or generate_placeholder_node_id('decision')), branches=[], note=note)
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+    items: list[PathItem]
+
+## pydantic_graph/pydantic_graph/graph.py
+
+    def mermaid_code(
+        self,
+        *,
+        start_node: Sequence[mermaid.NodeIdent] | mermaid.NodeIdent | None = None,
+        title: str | None | typing_extensions.Literal[False] = None,
+        edge_labels: bool = True,
+        notes: bool = True,
+        highlighted_nodes: Sequence[mermaid.NodeIdent] | mermaid.NodeIdent | None = None,
+        highlight_css: str = mermaid.DEFAULT_HIGHLIGHT_CSS,
+        infer_name: bool = True,
+        direction: mermaid.StateDiagramDirection | None = None,
+    ) -> str:
+        """Generate a diagram representing the graph as [mermaid](https://mermaid.js.org/) diagram.
+
+        This method calls [`pydantic_graph.mermaid.generate_code`][pydantic_graph.mermaid.generate_code].
+
+        Args:
+            start_node: The node or nodes which can start the graph.
+            title: The title of the diagram, use `False` to not include a title.
+            edge_labels: Whether to include edge labels.
+            notes: Whether to include notes on each node.
+            highlighted_nodes: Optional node or nodes to highlight.
+            highlight_css: The CSS to use for highlighting nodes.
+            infer_name: Whether to infer the graph name from the calling frame.
+            direction: The direction of flow.
+
+        Returns:
+            The mermaid code for the graph, which can then be rendered as a diagram.
+
+        Here's an example of generating a diagram for the graph from [above][pydantic_graph.graph.Graph]:
+
+        ```py {title="mermaid_never_42.py" requires="never_42.py"}
+        from never_42 import Increment, never_42_graph
+
+        print(never_42_graph.mermaid_code(start_node=Increment))
+        '''
+        ---
+        title: never_42_graph
+        ---
+        stateDiagram-v2
+          [*] --> Increment
+          Increment --> Check42
+          Check42 --> Increment
+          Check42 --> [*]
+        '''
+        ```
+
+        The rendered diagram will look like this:
+
+        ```mermaid
+        ---
+        title: never_42_graph
+        ---
+        stateDiagram-v2
+          [*] --> Increment
+          Increment --> Check42
+          Check42 --> Increment
+          Check42 --> [*]
+        ```
+        """
+        if infer_name and self.name is None:
+            self._infer_name(inspect.currentframe())
+        if title is None and self.name:
+            title = self.name
+        return mermaid.generate_code(
+            self,
+            start_node=start_node,
+            highlighted_nodes=highlighted_nodes,
+            highlight_css=highlight_css,
+            title=title or None,
+            edge_labels=edge_labels,
+            notes=notes,
+            direction=direction,
+        )
+
+## tests/models/xai_proto_cassettes.py
+
+def _normalize_record_mode(mode: str | None) -> ProtoCassetteRecordMode | None:
+    """Normalize pytest-recording/VCR-ish record modes to a small supported set.
+
+    Notes:
+    - VCR uses: `none`, `once`, `new_episodes`, `all`
+    - This repo frequently uses `rewrite` as a synonym for "overwrite cassette".
+    """
+    if mode is None:
+        return None
+    m = mode.strip().lower()
+    if m in {'none', 'once', 'new_episodes', 'rewrite', 'all'}:
+        return cast(ProtoCassetteRecordMode, m)
+    raise ValueError(f'Unknown record mode: {mode!r}')
+
+## tests/test_concurrency.py
+
+class TestAgentConcurrency:
+    """Tests for agent-level concurrency limiting."""
+
+    async def test_agent_concurrency_limit(self):
+        """Test that agent respects max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=2)
+        running = 0
+        max_running = 0
+        lock = anyio.Lock()
+
+        @agent.tool_plain
+        async def slow_tool() -> str:
+            nonlocal running, max_running
+            async with lock:
+                running += 1
+                max_running = max(max_running, running)
+            await anyio.sleep(0.1)
+            async with lock:
+                running -= 1
+            return 'done'
+
+        results: list[Any] = []
+
+        async def run_agent():
+            result = await agent.run('call slow_tool', model=TestModel(call_tools=['slow_tool']))
+            results.append(result)
+
+        async with anyio.create_task_group() as tg:
+            for _ in range(5):
+                tg.start_soon(run_agent)
+
+        assert max_running <= 2
+        assert len(results) == 5
+
+    async def test_agent_concurrency_backpressure(self):
+        """Test that agent raises when queue exceeds max_queued."""
+        agent = Agent(TestModel(), max_concurrency=ConcurrencyLimit(max_running=1, max_queued=1))
+        hold = anyio.Event()
+
+        @agent.tool_plain
+        async def hold_tool() -> str:
+            await hold.wait()
+            return 'done'
+
+        async def run_agent():
+            await agent.run('x', model=TestModel(call_tools=['hold_tool']))
+
+        async with anyio.create_task_group() as tg:
+            # Start 2 runs (1 running + 1 queued = at limit)
+            tg.start_soon(run_agent)
+            tg.start_soon(run_agent)
+            await anyio.sleep(0.05)
+
+            # Third should raise
+            with pytest.raises(ConcurrencyLimitExceeded):
+                await agent.run('x', model=TestModel(call_tools=['hold_tool']))
+
+            hold.set()
+
+    async def test_agent_no_limit_by_default(self):
+        """Test that agents have no concurrency limit by default."""
+        agent = Agent(TestModel())
+        assert agent._concurrency_limiter is None
+
+    async def test_agent_with_int_concurrency(self):
+        """Test that agent accepts int for max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=5)
+        assert agent._concurrency_limiter is not None
+        assert agent._concurrency_limiter.max_running == 5
+        assert agent._concurrency_limiter._max_queued is None
+
+    async def test_agent_with_limiter_concurrency(self):
+        """Test that agent accepts ConcurrencyLimit for max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=ConcurrencyLimit(max_running=5, max_queued=10))
+        assert agent._concurrency_limiter is not None
+        assert agent._concurrency_limiter.max_running == 5
+        assert agent._concurrency_limiter._max_queued == 10

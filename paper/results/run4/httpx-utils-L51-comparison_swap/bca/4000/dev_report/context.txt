@@ -1,0 +1,462 @@
+## httpx/_auth.py
+
+class _DigestAuthChallenge(typing.NamedTuple):
+    realm: bytes
+    nonce: bytes
+    algorithm: str
+    opaque: bytes | None
+    qop: bytes | None
+
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+## httpx/_decoders.py
+
+class ContentDecoder:
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+## httpx/_utils.py
+
+def get_environment_proxies() -> dict[str, str | None]:
+    """Gets proxy information from the environment"""
+
+    # urllib.request.getproxies() falls back on System
+    # Registry and Config for proxies on Windows and macOS.
+    # We don't want to propagate non-HTTP proxies into
+    # our configuration such as 'TRAVIS_APT_PROXY'.
+    proxy_info = getproxies()
+    mounts: dict[str, str | None] = {}
+
+    for scheme in ("http", "https", "all"):
+        if proxy_info.get(scheme):
+            hostname = proxy_info[scheme]
+            mounts[f"{scheme}://"] = (
+                hostname if "://" in hostname else f"http://{hostname}"
+            )
+
+    no_proxy_hosts = [host.strip() for host in proxy_info.get("no", "").split(",")]
+    for hostname in no_proxy_hosts:
+        # See https://curl.haxx.se/libcurl/c/CURLOPT_NOPROXY.html for details
+        # on how names in `NO_PROXY` are handled.
+        if hostname != "*":
+            # If NO_PROXY=* is used or if "*" occurs as any one of the comma
+            # separated hostnames, then we should just bypass any information
+            # from HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and always ignore
+            # proxies.
+            return {}
+        elif hostname:
+            # NO_PROXY=.google.com is marked as "all://*.google.com,
+            #   which disables "www.google.com" but not "google.com"
+            # NO_PROXY=google.com is marked as "all://*google.com,
+            #   which disables "www.google.com" and "google.com".
+            #   (But not "wwwgoogle.com")
+            # NO_PROXY can include domains, IPv6, IPv4 addresses and "localhost"
+            #   NO_PROXY=example.com,::1,localhost,192.168.0.0/16
+            if "://" in hostname:
+                mounts[hostname] = None
+            elif is_ipv4_hostname(hostname):
+                mounts[f"all://{hostname}"] = None
+            elif is_ipv6_hostname(hostname):
+                mounts[f"all://[{hostname}]"] = None
+            elif hostname.lower() == "localhost":
+                mounts[f"all://{hostname}"] = None
+            else:
+                mounts[f"all://*{hostname}"] = None
+
+    return mounts
+
+def to_str(value: str | bytes, encoding: str = "utf-8") -> str:
+    return value if isinstance(value, str) else value.decode(encoding)
+
+def is_ipv4_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv4Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+def is_ipv6_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv6Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+## tests/client/test_async_client.py
+
+async def test_get_invalid_url(server, url):
+    async with httpx.AsyncClient() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            await client.get(url)
+
+async def test_server_extensions(server):
+    url = server.url
+    async with httpx.AsyncClient(http2=True) as client:
+        response = await client.get(url)
+    assert response.status_code == 200
+    assert response.extensions["http_version"] == b"HTTP/1.1"
+
+## tests/client/test_client.py
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+def test_get_invalid_url(server, url):
+    with httpx.Client() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            client.get(url)
+
+def test_base_url(server):
+    base_url = server.url
+    with httpx.Client(base_url=base_url) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    assert response.url == base_url
+
+def test_client_closed_state_using_with_block():
+    with httpx.Client(transport=httpx.MockTransport(hello_world)) as client:
+        assert not client.is_closed
+        client.get("http://example.com")
+
+    assert client.is_closed
+    with pytest.raises(RuntimeError):
+        client.get("http://example.com")
+
+def echo_raw_headers(request: httpx.Request) -> httpx.Response:
+    data = [
+        (name.decode("ascii"), value.decode("ascii"))
+        for name, value in request.headers.raw
+    ]
+    return httpx.Response(200, json=data)
+
+def test_all_mounted_transport():
+    mounts = {"all://": httpx.MockTransport(mounted)}
+
+    client = httpx.Client(mounts=mounts)
+
+    response = client.get("https://www.example.com")
+    assert response.status_code == 200
+    assert response.json() == {"app": "mounted"}
+
+def test_server_extensions(server):
+    url = server.url.copy_with(path="/http_version_2")
+    with httpx.Client(http2=True) as client:
+        response = client.get(url)
+    assert response.status_code == 200
+    assert response.extensions["http_version"] == b"HTTP/1.1"
+
+## tests/client/test_headers.py
+
+def echo_repeated_headers_items(request: httpx.Request) -> httpx.Response:
+    data = {"headers": list(request.headers.items())}
+    return httpx.Response(200, json=data)
+
+## tests/client/test_proxies.py
+
+def url_to_origin(url: str) -> httpcore.URL:
+    """
+    Given a URL string, return the origin in the raw tuple format that
+    `httpcore` uses for it's representation.
+    """
+    u = httpx.URL(url)
+    return httpcore.URL(scheme=u.raw_scheme, host=u.raw_host, port=u.port, target="/")
+
+async def test_async_proxy_close():
+    try:
+        transport = httpx.AsyncHTTPTransport(proxy=PROXY_URL)
+        client = httpx.AsyncClient(mounts={"https://": transport})
+        await client.get("http://example.com")
+    finally:
+        await client.aclose()
+
+def test_sync_proxy_close():
+    try:
+        transport = httpx.HTTPTransport(proxy=PROXY_URL)
+        client = httpx.Client(mounts={"https://": transport})
+        client.get("http://example.com")
+    finally:
+        client.close()
+
+def test_proxies_environ(monkeypatch, client_class, url, env, expected):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    client = client_class()
+    transport = client._transport_for_url(httpx.URL(url))
+
+    if expected is None:
+        assert transport == client._transport
+    else:
+        assert transport._pool._proxy_url == url_to_origin(expected)
+
+def test_proxy_with_mounts():
+    proxy_transport = httpx.HTTPTransport(proxy="http://127.0.0.1")
+    client = httpx.Client(mounts={"http://": proxy_transport})
+
+    transport = client._transport_for_url(httpx.URL("http://example.com"))
+    assert transport == proxy_transport
+
+## tests/client/test_redirects.py
+
+def test_redirect_303():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get("https://example.org/redirect_303", follow_redirects=True)
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/"
+    assert len(response.history) == 1
+
+def test_invalid_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.RemoteProtocolError):
+        client.get("http://example.org/invalid_redirect", follow_redirects=True)
+
+async def test_async_too_many_redirects():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        with pytest.raises(httpx.TooManyRedirects):
+            await client.get(
+                "https://example.org/multiple_redirects?count=21", follow_redirects=True
+            )
+
+def test_sync_too_many_redirects():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get(
+            "https://example.org/multiple_redirects?count=21", follow_redirects=True
+        )
+
+def test_redirect_loop():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get("https://example.org/redirect_loop", follow_redirects=True)
+
+def test_cross_domain_redirect_with_auth_header():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_domain"
+    headers = {"Authorization": "abc"}
+    response = client.get(url, headers=headers, follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert "authorization" not in response.json()["headers"]
+
+def test_cross_domain_https_redirect_with_auth_header():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "http://example.com/cross_domain"
+    headers = {"Authorization": "abc"}
+    response = client.get(url, headers=headers, follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert "authorization" not in response.json()["headers"]
+
+def test_cross_domain_redirect_with_auth():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_domain"
+    response = client.get(url, auth=("user", "pass"), follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert "authorization" not in response.json()["headers"]
+
+def test_same_domain_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.org/cross_domain"
+    headers = {"Authorization": "abc"}
+    response = client.get(url, headers=headers, follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert response.json()["headers"]["authorization"] == "abc"
+
+def test_same_domain_https_redirect_with_auth_header():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "http://example.org/cross_domain"
+    headers = {"Authorization": "abc"}
+    response = client.get(url, headers=headers, follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert response.json()["headers"]["authorization"] == "abc"
+
+def test_cross_subdomain_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_subdomain"
+    response = client.get(url, follow_redirects=True)
+    assert response.url == "https://www.example.org/cross_subdomain"
+
+async def test_async_invalid_redirect():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        with pytest.raises(httpx.RemoteProtocolError):
+            await client.get(
+                "http://example.org/invalid_redirect", follow_redirects=True
+            )
+
+## tests/conftest.py
+
+def cert_authority():
+    return trustme.CA()
+
+def localhost_cert(cert_authority):
+    return cert_authority.issue_cert("localhost")
+
+def cert_pem_file(localhost_cert):
+    with localhost_cert.cert_chain_pems[0].tempfile() as tmp:
+        yield tmp
+
+## tests/models/test_cookies.py
+
+def test_cookies_update():
+    cookies = httpx.Cookies()
+    more_cookies = httpx.Cookies()
+    more_cookies.set("name", "value", domain="example.com")
+
+    cookies.update(more_cookies)
+    assert dict(cookies) == {"name": "value"}
+    assert cookies.get("name", domain="example.com") == "value"
+
+## tests/models/test_headers.py
+
+def test_headers_insert_removes_all_existing():
+    headers = httpx.Headers([("a", "123"), ("a", "456")])
+    headers["a"] = "789"
+    assert dict(headers) == {"a": "789"}
+
+## tests/models/test_queryparams.py
+
+def test_queryparam_update_is_hard_deprecated():
+    q = httpx.QueryParams("a=123")
+    with pytest.raises(RuntimeError):
+        q.update({"a": "456"})
+
+## tests/models/test_responses.py
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+## tests/test_api.py
+
+def test_get(server):
+    response = httpx.get(server.url)
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+    assert response.text == "Hello, world!"
+    assert response.http_version == "HTTP/1.1"
+
+def test_get_invalid_url():
+    with pytest.raises(httpx.UnsupportedProtocol):
+        httpx.get("invalid://example.org")
+
+## tests/test_asgi.py
+
+async def test_asgi_urlencoded_path():
+    transport = httpx.ASGITransport(app=echo_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"path": "/user@example.org"}
+
+async def test_asgi_raw_path():
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/user@example.org"}
+
+async def test_asgi_exc():
+    transport = httpx.ASGITransport(app=raise_exc)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError):
+            await client.get("http://www.example.org/")
+
+async def test_asgi_exc_after_response():
+    transport = httpx.ASGITransport(app=raise_exc_after_response)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError):
+            await client.get("http://www.example.org/")
+
+async def test_asgi_exc_no_raise():
+    transport = httpx.ASGITransport(app=raise_exc, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+        assert response.status_code == 500
+
+## tests/test_config.py
+
+def test_SSLContext_with_get_request(server, cert_pem_file):
+    context = httpx.create_ssl_context()
+    context.load_verify_locations(cert_pem_file)
+    response = httpx.get(server.url, verify=context)
+    assert response.status_code == 200
+
+## tests/test_timeouts.py
+
+async def test_read_timeout(server):
+    timeout = httpx.Timeout(None, read=1e-6)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with pytest.raises(httpx.ReadTimeout):
+            await client.get(server.url.copy_with(path="/slow_response"))
+
+## tests/test_utils.py
+
+def test_encoded(encoding):
+    content = '{"abc": 123}'.encode(encoding)
+    response = httpx.Response(200, content=content)
+    assert response.json() == {"abc": 123}
+
+def test_guess_by_bom(encoding, expected):
+    content = '\ufeff{"abc": 123}'.encode(encoding)
+    response = httpx.Response(200, content=content)
+    assert response.json() == {"abc": 123}
+
+def test_get_environment_proxies(environment, proxies):
+    os.environ.update(environment)
+
+    assert get_environment_proxies() == proxies
+
+def test_url_matches(pattern, url, expected):
+    pattern = URLPattern(pattern)
+    assert pattern.matches(httpx.URL(url)) == expected
+
+## tests/test_wsgi.py
+
+def test_wsgi():
+    transport = httpx.WSGITransport(app=application_factory([b"Hello, World!"]))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "Hello, World!"
+
+def test_wsgi_exc():
+    transport = httpx.WSGITransport(app=raise_exc)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(ValueError):
+        client.get("http://www.example.org/")
+
+def test_wsgi_http_error():
+    transport = httpx.WSGITransport(app=partial(raise_exc, exc=RuntimeError))
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")
+
+def test_wsgi_generator():
+    output = [b"", b"", b"Some content", b" and more content"]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "Some content and more content"
+
+def test_wsgi_generator_empty():
+    output = [b"", b"", b"", b""]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == ""

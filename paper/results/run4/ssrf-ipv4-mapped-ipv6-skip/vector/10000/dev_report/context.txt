@@ -1,0 +1,1069 @@
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:136-384
+class Embedder:
+    """High-level interface for generating text embeddings.
+
+    The `Embedder` class provides a convenient way to generate vector embeddings from text
+    using various embedding model providers. It handles model inference, settings management,
+    and optional OpenTelemetry instrumentation.
+
+    Example:
+    ```python
+    from pydantic_ai import Embedder
+
+    embedder = Embedder('openai:text-embedding-3-small')
+
+
+    async def main():
+        result = await embedder.embed_query('What is machine learning?')
+        print(result.embeddings[0][:5])  # First 5 dimensions
+        #> [1.0, 1.0, 1.0, 1.0, 1.0]
+    ```
+    """
+
+    instrument: InstrumentationSettings | bool | None
+    """Options to automatically instrument with OpenTelemetry.
+
+    Set to `True` to use default instrumentation settings, which will use Logfire if it's configured.
+    Set to an instance of [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings] to customize.
+    If this isn't set, then the last value set by
+    [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all]
+    will be used, which defaults to False.
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    _instrument_default: ClassVar[InstrumentationSettings | bool] = False
+
+    def __init__(
+        self,
+        model: EmbeddingModel | KnownEmbeddingModelName | str,
+        *,
+        settings: EmbeddingSettings | None = None,
+        defer_model_check: bool = True,
+        instrument: InstrumentationSettings | bool | None = None,
+    ) -> None:
+        """Initialize an Embedder.
+
+        Args:
+            model: The embedding model to use. Can be specified as:
+
+                - A model name string in the format `'provider:model-name'`
+                  (e.g., `'openai:text-embedding-3-small'`)
+                - An [`EmbeddingModel`][pydantic_ai.embeddings.EmbeddingModel] instance
+            settings: Optional [`EmbeddingSettings`][pydantic_ai.embeddings.EmbeddingSettings]
+                to use as defaults for all embed calls.
+            defer_model_check: Whether to defer model validation until first use.
+                Set to `False` to validate the model immediately on construction.
+            instrument: OpenTelemetry instrumentation settings. Set to `True` to enable with defaults,
+                or pass an [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize. If `None`, uses the value from
+                [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all].
+        """
+        self._model = model if defer_model_check else infer_embedding_model(model)
+        self._settings = settings
+        self.instrument = instrument
+
+        self._override_model: ContextVar[EmbeddingModel | None] = ContextVar('_override_model', default=None)
+
+    @staticmethod
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the default instrumentation options for all embedders where `instrument` is not explicitly set.
+
+        This is useful for enabling instrumentation globally without modifying each embedder individually.
+
+        Args:
+            instrument: Instrumentation settings to use as the default. Set to `True` for default settings,
+                `False` to disable, or pass an
+                [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize.
+        """
+        Embedder._instrument_default = instrument
+
+    @property
+    def model(self) -> EmbeddingModel | KnownEmbeddingModelName | str:
+        """The embedding model used by this embedder."""
+        return self._model
+
+    @contextmanager
+    def override(
+        self,
+        *,
+        model: EmbeddingModel | KnownEmbeddingModelName | str | _utils.Unset = _utils.UNSET,
+    ) -> Iterator[None]:
+        """Context manager to temporarily override the embedding model.
+
+        Useful for testing or dynamically switching models.
+
+        Args:
+            model: The embedding model to use within this context.
+
+        Example:
+        ```python
+        from pydantic_ai import Embedder
+
+        embedder = Embedder('openai:text-embedding-3-small')
+
+
+        async def main():
+            # Temporarily use a different model
+            with embedder.override(model='openai:text-embedding-3-large'):
+                result = await embedder.embed_query('test')
+                print(len(result.embeddings[0]))  # 3072 dimensions for large model
+                #> 3072
+        ```
+        """
+        if _utils.is_set(model):
+            model_token = self._override_model.set(infer_embedding_model(model))
+        else:
+            model_token = None
+
+        try:
+            yield
+        finally:
+            if model_token is not None:
+                self._override_model.reset(model_token)
+
+    async def embed_query(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more query texts.
+
+        Use this method when embedding search queries that will be compared against document embeddings.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            query: A single query string or sequence of query strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(query, input_type='query', settings=settings)
+
+    async def embed_documents(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more document texts.
+
+        Use this method when embedding documents that will be stored and later searched against.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            documents: A single document string or sequence of document strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(documents, input_type='document', settings=settings)
+
+    async def embed(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed text inputs with explicit input type specification.
+
+        This is the low-level embedding method. For most use cases, prefer
+        [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query] or
+        [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents].
+
+        Args:
+            inputs: A single string or sequence of strings to embed.
+            input_type: The type of input, either `'query'` or `'document'`.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        model = self._get_model()
+        settings = merge_embedding_settings(self._settings, settings)
+        return await model.embed(inputs, input_type=input_type, settings=settings)
+
+    async def max_input_tokens(self) -> int | None:
+        """Get the maximum number of tokens the model can accept as input.
+
+        Returns:
+            The maximum token count, or `None` if the limit is unknown for this model.
+        """
+        model = self._get_model()
+        return await model.max_input_tokens()
+
+    async def count_tokens(self, text: str) -> int:
+        """Count the number of tokens in the given text.
+
+        Args:
+            text: The text to tokenize and count.
+
+        Returns:
+            The number of tokens in the text.
+
+        Raises:
+            NotImplementedError: If the model doesn't support token counting.
+            UserError: If the model or tokenizer is not supported.
+        """
+        model = self._get_model()
+        return await model.count_tokens(text)
+
+    def embed_query_sync(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_query(query, settings=settings))
+
+    def embed_documents_sync(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_documents(documents, settings=settings))
+
+    def embed_sync(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed()`][pydantic_ai.embeddings.Embedder.embed]."""
+        return _utils.get_event_loop().run_until_complete(self.embed(inputs, input_type=input_type, settings=settings))
+
+    def max_input_tokens_sync(self) -> int | None:
+        """Synchronous version of [`max_input_tokens()`][pydantic_ai.embeddings.Embedder.max_input_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.max_input_tokens())
+
+    def count_tokens_sync(self, text: str) -> int:
+        """Synchronous version of [`count_tokens()`][pydantic_ai.embeddings.Embedder.count_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.count_tokens(text))
+
+    def _get_model(self) -> EmbeddingModel:
+        """Create a model configured for this embedder.
+
+        Returns:
+            The embedding model to use, with instrumentation applied if configured.
+        """
+        model_: EmbeddingModel
+        if some_model := self._override_model.get():
+            model_ = some_model
+        else:
+            model_ = self._model = infer_embedding_model(self.model)
+
+        instrument = self.instrument
+        if instrument is None:
+            instrument = self._instrument_default
+
+        return instrument_embedding_model(model_, instrument)
+
+# tests/test_ssrf.py:99-100
+    def test_ipv4_mapped_ipv6_private(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:1354-1408
+    def to_a2a(
+        self,
+        *,
+        storage: Storage | None = None,
+        broker: Broker | None = None,
+        # Agent card
+        name: str | None = None,
+        url: str = 'http://localhost:8000',
+        version: str = '1.0.0',
+        description: str | None = None,
+        provider: AgentProvider | None = None,
+        skills: list[Skill] | None = None,
+        # Starlette
+        debug: bool = False,
+        routes: Sequence[Route] | None = None,
+        middleware: Sequence[Middleware] | None = None,
+        exception_handlers: dict[Any, ExceptionHandler] | None = None,
+        lifespan: Lifespan[FastA2A] | None = None,
+    ) -> FastA2A:
+        """Convert the agent to a FastA2A application.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+        app = agent.to_a2a()
+        ```
+
+        The `app` is an ASGI application that can be used with any ASGI server.
+
+        To run the application, you can use the following command:
+
+        ```bash
+        uvicorn app:app --host 0.0.0.0 --port 8000
+        ```
+        """
+        from .._a2a import agent_to_a2a
+
+        return agent_to_a2a(
+            self,
+            storage=storage,
+            broker=broker,
+            name=name,
+            url=url,
+            version=version,
+            description=description,
+            provider=provider,
+            skills=skills,
+            debug=debug,
+            routes=routes,
+            middleware=middleware,
+            exception_handlers=exception_handlers,
+            lifespan=lifespan,
+        )
+
+# tests/models/mock_xai.py:723-737
+def create_usage(
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    cached_prompt_text_tokens: int = 0,
+    server_side_tools_used: list[usage_pb2.ServerSideTool] | None = None,
+) -> usage_pb2.SamplingUsage:
+    """Helper to create xAI SamplingUsage protobuf objects for tests with all required fields."""
+    return usage_pb2.SamplingUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cached_prompt_text_tokens=cached_prompt_text_tokens,
+        server_side_tools_used=server_side_tools_used or [],
+    )
+
+# pydantic_ai_slim/pydantic_ai/result.py:434-436
+    async def stream(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[OutputDataT]:
+        async for output in self.stream_output(debounce_by=debounce_by):
+            yield output
+
+# pydantic_evals/pydantic_evals/reporting/render_numbers.py:62-94
+def default_render_number_diff(old: float | int, new: float | int) -> str | None:
+    """Return a string representing the difference between old and new values.
+
+    Rules:
+      - If the two values are equal, return None.
+      - For integers, return the raw difference (with a leading sign), e.g.:
+            _default_format_number_diff(3, 4) -> '+1'
+      - For floats (or a mix of float and int):
+          * Compute the raw delta = new - old and format it with ABS_SIG_FIGS significant figures.
+          * If `old` is nonzero, compute a relative change:
+              - If |delta|/|old| ≤ 1, render the relative change as a percentage with
+                PERC_DECIMALS decimal places, e.g. '+0.7 / +70.0%'.
+              - If |delta|/|old| > 1, render a multiplier (new/old). Use one decimal place
+                if the absolute multiplier is less than MULTIPLIER_ONE_DECIMAL_THRESHOLD,
+                otherwise no decimals.
+          * However, if the percentage rounds to 0.0% (e.g. '+0.0%'), return only the absolute diff.
+          * Also, if |old| is below BASE_THRESHOLD and |delta| exceeds MULTIPLIER_DROP_FACTOR×|old|,
+            drop the relative change indicator.
+    """
+    if old == new:
+        return None
+
+    if isinstance(old, int) and isinstance(new, int):
+        diff_int = new - old
+        return f'{diff_int:+d}'
+
+    delta = new - old
+    abs_diff_str = _render_signed(delta, ABS_SIG_FIGS)
+    rel_diff_str = _render_relative(new, old, BASE_THRESHOLD)
+    if rel_diff_str is None:
+        return abs_diff_str
+    else:
+        return f'{abs_diff_str} / {rel_diff_str}'
+
+# tests/test_ssrf.py:27-116
+class TestIsPrivateIp:
+    """Tests for is_private_ip function."""
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # IPv4 loopback
+            '127.0.0.1',
+            '127.0.0.2',
+            '127.255.255.255',
+            # IPv4 private class A
+            '10.0.0.1',
+            '10.255.255.255',
+            # IPv4 private class B
+            '172.16.0.1',
+            '172.31.255.255',
+            # IPv4 private class C
+            '192.168.0.1',
+            '192.168.255.255',
+            # IPv4 link-local
+            '169.254.0.1',
+            '169.254.255.255',
+            # IPv4 "this" network
+            '0.0.0.0',
+            '0.255.255.255',
+            # IPv4 CGNAT (RFC 6598)
+            '100.64.0.1',
+            '100.127.255.255',
+            '100.100.100.200',  # Alibaba Cloud metadata
+            # IPv6 loopback
+            '::1',
+            # IPv6 link-local
+            'fe80::1',
+            'fe80::ffff:ffff:ffff:ffff',
+            # IPv6 unique local
+            'fc00::1',
+            'fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+            # IPv6 6to4 (can embed private IPv4)
+            '2002::1',
+            '2002:c0a8:0101::1',  # Embeds 192.168.1.1
+            '2002:0a00:0001::1',  # Embeds 10.0.0.1
+        ],
+    )
+    def test_private_ips_detected(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # Public IPv4
+            '8.8.8.8',
+            '1.1.1.1',
+            '203.0.113.50',
+            '198.51.100.1',
+            # Public IPv6
+            '2001:4860:4860::8888',
+            '2606:4700:4700::1111',
+        ],
+    )
+    def test_public_ips_allowed(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # IPv4-mapped IPv6 private addresses
+            '::ffff:127.0.0.1',
+            '::ffff:10.0.0.1',
+            '::ffff:192.168.1.1',
+            '::ffff:172.16.0.1',
+        ],
+    )
+    def test_ipv4_mapped_ipv6_private(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # IPv4-mapped IPv6 public addresses
+            '::ffff:8.8.8.8',
+            '::ffff:1.1.1.1',
+        ],
+    )
+    def test_ipv4_mapped_ipv6_public(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+    def test_invalid_ip_treated_as_private(self) -> None:
+        """Invalid IP addresses should be treated as potentially dangerous."""
+        assert is_private_ip('not-an-ip') is True
+        assert is_private_ip('') is True
+
+# tests/test_ssrf.py:394-399
+    async def test_cgnat_range_blocked(self) -> None:
+        """Test that CGNAT range (100.64.0.0/10) is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.64.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://cgnat-host.internal/path', allow_local=False)
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:75-115
+def agent_to_a2a(
+    agent: AbstractAgent[AgentDepsT, OutputDataT],
+    *,
+    storage: Storage | None = None,
+    broker: Broker | None = None,
+    # Agent card
+    name: str | None = None,
+    url: str = 'http://localhost:8000',
+    version: str = '1.0.0',
+    description: str | None = None,
+    provider: AgentProvider | None = None,
+    skills: list[Skill] | None = None,
+    # Starlette
+    debug: bool = False,
+    routes: Sequence[Route] | None = None,
+    middleware: Sequence[Middleware] | None = None,
+    exception_handlers: dict[Any, ExceptionHandler] | None = None,
+    lifespan: Lifespan[FastA2A] | None = None,
+) -> FastA2A:
+    """Create a FastA2A server from an agent."""
+    storage = storage or InMemoryStorage()
+    broker = broker or InMemoryBroker()
+    worker = AgentWorker(agent=agent, broker=broker, storage=storage)
+
+    lifespan = lifespan or partial(worker_lifespan, worker=worker, agent=agent)
+
+    return FastA2A(
+        storage=storage,
+        broker=broker,
+        name=name or agent.name,
+        url=url,
+        version=version,
+        description=description,
+        provider=provider,
+        skills=skills,
+        debug=debug,
+        routes=routes,
+        middleware=middleware,
+        exception_handlers=exception_handlers,
+        lifespan=lifespan,
+    )
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:82-97
+def is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address is in a private/internal range.
+
+    Handles both IPv4 and IPv6 addresses, including IPv4-mapped IPv6 addresses.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:192.168.1.1)
+        if isinstance(ip, ipaddress.IPv6Address) and not ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        return any(ip in network for network in _PRIVATE_NETWORKS)
+    except ValueError:
+        # Invalid IP address, treat as potentially dangerous
+        return True
+
+# pydantic_ai_slim/pydantic_ai/result.py:244-301
+    async def _stream_response_text(
+        self, *, delta: bool = False, debounce_by: float | None = 0.1
+    ) -> AsyncIterator[str]:
+        """Stream the response as an async iterable of text."""
+
+        # Define a "merged" version of the iterator that will yield items that have already been retrieved
+        # and items that we receive while streaming. We define a dedicated async iterator for this so we can
+        # pass the combined stream to the group_by_temporal function within `_stream_text_deltas` below.
+        async def _stream_text_deltas_ungrouped() -> AsyncIterator[tuple[str, int]]:
+            # yields tuples of (text_content, part_index)
+            # we don't currently make use of the part_index, but in principle this may be useful
+            # so we retain it here for now to make possible future refactors simpler
+            msg = self.response
+            for i, part in enumerate(msg.parts):
+                if isinstance(part, _messages.TextPart) and part.content:
+                    yield part.content, i
+
+            last_text_index: int | None = None
+            async for event in self._raw_stream_response:
+                if (
+                    isinstance(event, _messages.PartStartEvent)
+                    and isinstance(event.part, _messages.TextPart)
+                    and event.part.content
+                ):
+                    last_text_index = event.index
+                    yield event.part.content, event.index
+                elif (
+                    isinstance(event, _messages.PartDeltaEvent)
+                    and isinstance(event.delta, _messages.TextPartDelta)
+                    and event.delta.content_delta
+                ):
+                    last_text_index = event.index
+                    yield event.delta.content_delta, event.index
+                elif (
+                    isinstance(event, _messages.PartStartEvent)
+                    and isinstance(event.part, _messages.BuiltinToolCallPart)
+                    and last_text_index is not None
+                ):
+                    # Text parts that are interrupted by a built-in tool call should not be joined together directly
+                    yield '\n\n', event.index
+                    last_text_index = None
+
+        async def _stream_text_deltas() -> AsyncIterator[str]:
+            async with _utils.group_by_temporal(_stream_text_deltas_ungrouped(), debounce_by) as group_iter:
+                async for items in group_iter:
+                    # Note: we are currently just dropping the part index on the group here
+                    yield ''.join([content for content, _ in items])
+
+        if delta:
+            async for text in _stream_text_deltas():
+                yield text
+        else:
+            # a quick benchmark shows it's faster to build up a string with concat when we're
+            # yielding at each step
+            deltas: list[str] = []
+            async for text in _stream_text_deltas():
+                deltas.append(text)
+                yield ''.join(deltas)
+
+# pydantic_ai_slim/pydantic_ai/result.py:64-91
+    async def stream_output(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[OutputDataT]:
+        """Asynchronously stream the (validated) agent outputs."""
+        if self._cached_output is not None:
+            yield deepcopy(self._cached_output)
+            return
+
+        last_response: _messages.ModelResponse | None = None
+        async for response in self.stream_responses(debounce_by=debounce_by):
+            if self._raw_stream_response.final_result_event is None or (
+                last_response and response.parts == last_response.parts
+            ):
+                continue
+            last_response = response
+
+            try:
+                yield await self.validate_response_output(response, allow_partial=True)
+            except ValidationError:
+                pass
+
+        if self._raw_stream_response.final_result_event is not None:  # pragma: no branch
+            response = self.response
+            # Final validation with allow_partial=False (the default).
+            # We always yield the final result even if the content matches the last partial yield, because:
+            # 1. Output validators/functions receive partial_output=False only on this final call,
+            #    and may behave differently based on that flag
+            # 2. Users can rely on the last yielded item being the fully validated output
+            self._cached_output = await self.validate_response_output(response)
+            yield deepcopy(self._cached_output)
+
+# pydantic_ai_slim/pydantic_ai/result.py:492-496
+    async def stream_structured(
+        self, *, debounce_by: float | None = 0.1
+    ) -> AsyncIterator[tuple[_messages.ModelResponse, bool]]:
+        async for msg, last in self.stream_responses(debounce_by=debounce_by):
+            yield msg, last
+
+# pydantic_ai_slim/pydantic_ai/result.py:93-104
+    async def stream_responses(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[_messages.ModelResponse]:
+        """Asynchronously stream the (unvalidated) model responses for the agent."""
+        # if the message currently has any parts with content, yield before streaming
+        msg = self.response
+        for part in msg.parts:
+            if part.has_content():
+                yield msg
+                break
+
+        async with _utils.group_by_temporal(self, debounce_by) as group_iter:
+            async for _items in group_iter:
+                yield self.response  # current state of the response
+
+# pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py:205-217
+def _extract_version(model_name: str) -> int | None:
+    """Extract the version number from a model name.
+
+    Examples:
+        - 'amazon.titan-embed-text-v1' -> 1
+        - 'amazon.titan-embed-text-v2:0' -> 2
+        - 'cohere.embed-english-v3' -> 3
+        - 'cohere.embed-v4:0' -> 4
+    """
+    if match := re.search(r'v(\d+)', model_name):
+        return int(match.group(1))
+    else:  # pragma: no cover
+        return None
+
+# pydantic_ai_slim/pydantic_ai/providers/bedrock.py:75-88
+def remove_bedrock_geo_prefix(model_name: str) -> str:
+    """Remove inference geographic prefix from model ID if present.
+
+    Bedrock supports cross-region inference using geographic prefixes like
+    'us.', 'eu.', 'apac.', etc. This function strips those prefixes.
+
+    Example:
+        'us.amazon.titan-embed-text-v2:0' -> 'amazon.titan-embed-text-v2:0'
+        'amazon.titan-embed-text-v2:0' -> 'amazon.titan-embed-text-v2:0'
+    """
+    for prefix in BEDROCK_GEO_PREFIXES:
+        if model_name.startswith(f'{prefix}.'):
+            return model_name.removeprefix(f'{prefix}.')
+    return model_name
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:376-379
+    def __init__(self, schema: _utils.ObjectJsonSchema, seed: int = 0):
+        self.schema = schema
+        self.defs = schema.get('$defs', {})
+        self.seed = seed
+
+# pydantic_ai_slim/pydantic_ai/direct.py:144-203
+def model_request_stream(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> AbstractAsyncContextManager[models.StreamedResponse]:
+    """Make a streamed async request to a model.
+
+    ```py {title="model_request_stream_example.py"}
+
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_stream
+
+
+    async def main():
+        messages = [ModelRequest.user_text_prompt('Who was Albert Einstein?')]  # (1)!
+        async with model_request_stream('openai:gpt-5-mini', messages) as stream:
+            chunks = []
+            async for chunk in stream:
+                chunks.append(chunk)
+            print(chunks)
+            '''
+            [
+                PartStartEvent(index=0, part=TextPart(content='Albert Einstein was ')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(
+                    index=0, delta=TextPartDelta(content_delta='a German-born theoretical ')
+                ),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='physicist.')),
+                PartEndEvent(
+                    index=0,
+                    part=TextPart(
+                        content='Albert Einstein was a German-born theoretical physicist.'
+                    ),
+                ),
+            ]
+            '''
+    ```
+
+    1. See [`ModelRequest.user_text_prompt`][pydantic_ai.messages.ModelRequest.user_text_prompt] for details.
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        A [stream response][pydantic_ai.models.StreamedResponse] async context manager.
+    """
+    model_instance = _prepare_model(model, instrument)
+    return model_instance.request_stream(
+        list(messages),
+        model_settings,
+        model_request_parameters or models.ModelRequestParameters(),
+    )
+
+# tests/models/test_anthropic.py:8219-8257
+async def test_anthropic_cache_messages_real_api(allow_model_requests: None, anthropic_api_key: str):
+    """Test that anthropic_cache_messages setting adds cache_control and produces cache usage metrics.
+
+    This test uses a cassette to verify the cache behavior without making real API calls in CI.
+    When run with real API credentials, it demonstrates that:
+    1. The first call with a long context creates a cache (cache_write_tokens > 0)
+    2. Follow-up messages in the same conversation can read from that cache (cache_read_tokens > 0)
+    """
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+    agent = Agent(
+        m,
+        system_prompt='You are a helpful assistant.',
+        model_settings=AnthropicModelSettings(
+            anthropic_cache_messages=True,
+        ),
+    )
+
+    # First call with a longer message - this will cache the message content
+    result1 = await agent.run('Please explain what Python is and its main use cases. ' * 100)
+    usage1 = result1.usage()
+
+    # With anthropic_cache_messages, the first call should write cache for the last message
+    # (cache_write_tokens > 0 indicates that caching occurred)
+    assert usage1.requests == 1
+    assert usage1.cache_write_tokens > 0
+    assert usage1.output_tokens > 0
+
+    # Continue the conversation - this message appends to history
+    # The previous cached message should still be in the request
+    result2 = await agent.run('Can you summarize that in one sentence?', message_history=result1.all_messages())
+    usage2 = result2.usage()
+
+    # The second call should potentially read from cache if the previous message is still cached
+    # (cache_read_tokens > 0 when cache hit occurs)
+    # (cache_write_tokens > 0 as new message is added to cache)
+    assert usage2.requests == 1
+    assert usage2.cache_read_tokens > 0
+    assert usage2.cache_write_tokens > 0
+    assert usage2.output_tokens > 0
+
+# pydantic_ai_slim/pydantic_ai/_cli/web.py:12-91
+def run_web_command(
+    agent_path: str | None = None,
+    host: str = '127.0.0.1',
+    port: int = 7932,
+    models: list[str] = [],
+    tools: list[str] = [],
+    instructions: str | None = None,
+    default_model: str = 'openai:gpt-5',
+    html_source: str | None = None,
+) -> int:
+    """Run the web command to serve an agent via web UI.
+
+    If an agent is provided, its model and builtin tools are used as defaults.
+    CLI-specified models and tools are added on top. Duplicates are removed.
+
+    Args:
+        agent_path: Agent path in 'module:variable' format. If None, creates generic agent.
+        host: Host to bind the server to.
+        port: Port to bind the server to.
+        models: List of model strings (e.g., ['openai:gpt-5', 'anthropic:claude-sonnet-4-5']).
+        tools: List of builtin tool IDs (e.g., ['web_search', 'code_execution']).
+        instructions: System instructions passed as extra instructions to each agent run.
+        default_model: Default model to use when no agent or models are specified.
+        html_source: URL or file path for the chat UI HTML.
+    """
+    console = Console()
+
+    if agent_path:
+        agent = load_agent(agent_path)
+        if agent is None:
+            console.print(f'[red]Error: Could not load agent from {agent_path}[/red]')
+            return 1
+    else:
+        agent = Agent()
+
+    # Use default model if neither agent nor CLI specifies one
+    if agent.model is None and not models:
+        models = [default_model]
+
+    tool_instances: list[AbstractBuiltinTool] = []
+    for tool_id in tools:
+        tool_cls = BUILTIN_TOOL_TYPES.get(tool_id)
+        if tool_cls is None:
+            console.print(f'[yellow]Warning: Unknown tool "{tool_id}", skipping[/yellow]')
+            continue
+        if tool_id not in SUPPORTED_CLI_TOOL_IDS:
+            console.print(
+                f'[yellow]Warning: "{tool_id}" requires configuration and cannot be enabled via CLI, skipping[/yellow]'
+            )
+            continue
+        tool_instances.append(tool_cls())
+
+    app = create_web_app(
+        agent,
+        models=models or None,
+        builtin_tools=tool_instances,
+        instructions=instructions,
+        html_source=html_source,
+    )
+
+    agent_desc = agent_path or 'generic agent'
+    console.print(f'\n[green]Starting chat UI for {agent_desc}...[/green]')
+    console.print(f'Open your browser at: [link=http://{host}:{port}]http://{host}:{port}[/link]')
+    console.print('[dim]Press Ctrl+C to stop the server[/dim]\n')
+
+    try:
+        import uvicorn
+
+        uvicorn.run(app, host=host, port=port)
+        return 0
+    except KeyboardInterrupt:  # pragma: no cover
+        console.print('\n[dim]Server stopped.[/dim]')
+        return 0
+    except ImportError:  # pragma: no cover
+        console.print('[red]Error: uvicorn is required to run the chat UI[/red]')
+        console.print('[dim]Install it with: pip install uvicorn[/dim]')
+        return 1
+    except Exception as e:  # pragma: no cover
+        console.print(f'[red]Error starting server: {e}[/red]')
+        return 1
+
+# pydantic_ai_slim/pydantic_ai/result.py:706-719
+    def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> Iterator[str]:
+        """Stream the text result as an iterable.
+
+        !!! note
+            Result validators will NOT be called on the text result if `delta=True`.
+
+        Args:
+            delta: if `True`, yield each chunk of text as it is received, if `False` (default), yield the full text
+                up to the current point.
+            debounce_by: by how much (if at all) to debounce/group the response chunks by. `None` means no debouncing.
+                Debouncing is particularly important for long structured responses to reduce the overhead of
+                performing validation as each token is received.
+        """
+        return _utils.sync_async_iterator(self._streamed_run_result.stream_text(delta=delta, debounce_by=debounce_by))
+
+# pydantic_ai_slim/pydantic_ai/result.py:463-489
+    async def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> AsyncIterator[str]:
+        """Stream the text result as an async iterable.
+
+        !!! note
+            Result validators will NOT be called on the text result if `delta=True`.
+
+        Args:
+            delta: if `True`, yield each chunk of text as it is received, if `False` (default), yield the full text
+                up to the current point.
+            debounce_by: by how much (if at all) to debounce/group the response chunks by. `None` means no debouncing.
+                Debouncing is particularly important for long structured responses to reduce the overhead of
+                performing validation as each token is received.
+        """
+        if self._run_result is not None:  # pragma: no cover
+            # We can't really get here, as `_run_result` is only set in `run_stream` when `CallToolsNode` produces `DeferredToolRequests` output
+            # as a result of a tool function raising `CallDeferred` or `ApprovalRequired`.
+            # That'll change if we ever support something like `raise EndRun(output: OutputT)` where `OutputT` could be `str`.
+            if not isinstance(self._run_result.output, str):
+                raise exceptions.UserError('stream_text() can only be used with text responses')
+            yield self._run_result.output
+            await self._marked_completed()
+        elif self._stream_response is not None:
+            async for text in self._stream_response.stream_text(delta=delta, debounce_by=debounce_by):
+                yield text
+            await self._marked_completed(self.response)
+        else:
+            raise ValueError('No stream response or run result provided')  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/result.py:106-136
+    async def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> AsyncIterator[str]:
+        """Stream the text result as an async iterable.
+
+        !!! note
+            Result validators will NOT be called on the text result if `delta=True`.
+
+        Args:
+            delta: if `True`, yield each chunk of text as it is received, if `False` (default), yield the full text
+                up to the current point.
+            debounce_by: by how much (if at all) to debounce/group the response chunks by. `None` means no debouncing.
+                Debouncing is particularly important for long structured responses to reduce the overhead of
+                performing validation as each token is received.
+        """
+        if not isinstance(self._output_schema, TextOutputSchema):
+            raise exceptions.UserError('stream_text() can only be used with text responses')
+
+        # Yield cached output for both delta and non-delta modes
+        # This is expected that the subsequent calls to `stream_text()`
+        # yield full not delta output even for `delta=True`
+        if isinstance(self._cached_output, str):
+            yield self._cached_output
+            return
+
+        if delta:
+            async for text in self._stream_response_text(delta=True, debounce_by=debounce_by):
+                yield text
+        else:
+            async for text in self._stream_response_text(delta=False, debounce_by=debounce_by):
+                for validator in self._output_validators:
+                    text = await validator.validate(text, replace(self._run_ctx, partial_output=True))
+                yield text
+
+# pydantic_evals/pydantic_evals/dataset.py:943-957
+    def increment_metric(self, name: str, amount: int | float) -> None:
+        """Increment a metric value.
+
+        Args:
+            name: The name of the metric.
+            amount: The amount to increment by.
+
+        Note:
+            If the current value is 0 and the increment amount is 0, no metric will be recorded.
+        """
+        current_value = self.metrics.get(name, 0)
+        incremented_value = current_value + amount
+        if current_value == 0 and incremented_value == 0:
+            return  # Avoid recording a metric that is always zero
+        self.record_metric(name, incremented_value)
+
+# tests/test_ssrf.py:9-22
+from pydantic_ai._ssrf import (
+    _DEFAULT_TIMEOUT,  # pyright: ignore[reportPrivateUsage]
+    _MAX_REDIRECTS,  # pyright: ignore[reportPrivateUsage]
+    ResolvedUrl,
+    build_url_with_ip,
+    extract_host_and_port,
+    is_cloud_metadata_ip,
+    is_private_ip,
+    resolve_hostname,
+    resolve_redirect_url,
+    safe_download,
+    validate_and_resolve_url,
+    validate_url_protocol,
+)
+
+# pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py:225-231
+    def __init__(self, model_name: str):
+        """Initialize the handler with the model name.
+
+        Args:
+            model_name: The normalized model name (e.g., 'amazon.titan-embed-text-v2:0').
+        """
+        self.model_name = model_name
+
+# tests/test_embeddings.py:1046-1055
+    async def test_regional_prefix_model_name(self, bedrock_provider: BedrockProvider):
+        """Test model with regional prefix (e.g., us.amazon.titan-embed-text-v2:0) is handled correctly."""
+        model = BedrockEmbeddingModel('us.amazon.titan-embed-text-v2:0', provider=bedrock_provider)
+        # Model name preserves the regional prefix
+        assert model.model_name == 'us.amazon.titan-embed-text-v2:0'
+        # But handler uses normalized name (without prefix)
+        assert model._handler.model_name == 'amazon.titan-embed-text-v2:0'  # pyright: ignore[reportPrivateUsage]
+        # max_input_tokens() works correctly with regional prefix
+        max_tokens = await model.max_input_tokens()
+        assert max_tokens == snapshot(8192)
+
+# tests/test_toolsets.py:37-45
+def build_run_context(deps: T, run_step: int = 0) -> RunContext[T]:
+    return RunContext(
+        deps=deps,
+        model=TestModel(),
+        usage=RunUsage(),
+        prompt=None,
+        messages=[],
+        run_step=run_step,
+    )
+
+# pydantic_ai_slim/pydantic_ai/result.py:721-732
+    def stream_responses(self, *, debounce_by: float | None = 0.1) -> Iterator[tuple[_messages.ModelResponse, bool]]:
+        """Stream the response as an iterable of Structured LLM Messages.
+
+        Args:
+            debounce_by: by how much (if at all) to debounce/group the response chunks by. `None` means no debouncing.
+                Debouncing is particularly important for long structured responses to reduce the overhead of
+                performing validation as each token is received.
+
+        Returns:
+            An iterable of the structured response message and whether that is the last message.
+        """
+        return _utils.sync_async_iterator(self._streamed_run_result.stream_responses(debounce_by=debounce_by))
+
+# pydantic_ai_slim/pydantic_ai/result.py:498-524
+    async def stream_responses(
+        self, *, debounce_by: float | None = 0.1
+    ) -> AsyncIterator[tuple[_messages.ModelResponse, bool]]:
+        """Stream the response as an async iterable of Structured LLM Messages.
+
+        Args:
+            debounce_by: by how much (if at all) to debounce/group the response chunks by. `None` means no debouncing.
+                Debouncing is particularly important for long structured responses to reduce the overhead of
+                performing validation as each token is received.
+
+        Returns:
+            An async iterable of the structured response message and whether that is the last message.
+        """
+        if self._run_result is not None:
+            yield self.response, True
+            await self._marked_completed()
+        elif self._stream_response is not None:
+            # if the message currently has any parts with content, yield before streaming
+            async for msg in self._stream_response.stream_responses(debounce_by=debounce_by):
+                yield msg, False
+
+            msg = self.response
+            yield msg, True
+
+            await self._marked_completed(msg)
+        else:
+            raise ValueError('No stream response or run result provided')  # pragma: no cover
+
+# tests/test_ssrf.py:70-71
+    def test_private_ips_detected(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+# tests/test_ssrf.py:86-87
+    def test_public_ips_allowed(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+# tests/test_ssrf.py:110-111
+    def test_ipv4_mapped_ipv6_public(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+# tests/test_ssrf.py:113-116
+    def test_invalid_ip_treated_as_private(self) -> None:
+        """Invalid IP addresses should be treated as potentially dangerous."""
+        assert is_private_ip('not-an-ip') is True
+        assert is_private_ip('') is True
+
+# tests/models/test_gemini_vertex.py:6-6
+from inline_snapshot import Is, snapshot

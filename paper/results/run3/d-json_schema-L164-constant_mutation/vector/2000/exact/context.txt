@@ -1,0 +1,229 @@
+# pydantic_ai_slim/pydantic_ai/tools.py:235-235
+A = TypeVar('A')
+
+# pydantic_evals/pydantic_evals/dataset.py:778-825
+    def model_json_schema_with_evaluators(
+        cls,
+        custom_evaluator_types: Sequence[type[Evaluator[InputsT, OutputT, MetadataT]]] = (),
+        custom_report_evaluator_types: Sequence[type[ReportEvaluator[InputsT, OutputT, MetadataT]]] = (),
+    ) -> dict[str, Any]:
+        """Generate a JSON schema for this dataset type, including evaluator details.
+
+        This is useful for generating a schema that can be used to validate YAML-format dataset files.
+
+        Args:
+            custom_evaluator_types: Custom evaluator classes to include in the schema.
+            custom_report_evaluator_types: Custom report evaluator classes to include in the schema.
+
+        Returns:
+            A dictionary representing the JSON schema.
+        """
+        evaluator_schema_types = _build_evaluator_schema_types(
+            _get_evaluator_registry(custom_evaluator_types, Evaluator, DEFAULT_EVALUATORS, 'evaluator')
+        )
+        report_evaluator_schema_types = _build_evaluator_schema_types(
+            _get_evaluator_registry(
+                custom_report_evaluator_types, ReportEvaluator, DEFAULT_REPORT_EVALUATORS, 'report evaluator'
+            )
+        )
+
+        in_type, out_type, meta_type = cls._params()
+
+        # Note: we shadow the `Case` and `Dataset` class names here to generate a clean JSON schema
+        class Case(BaseModel, extra='forbid'):  # pyright: ignore[reportUnusedClass]  # this _is_ used below, but pyright doesn't seem to notice..
+            name: str | None = None
+            inputs: in_type  # pyright: ignore[reportInvalidTypeForm]
+            metadata: meta_type | None = None  # pyright: ignore[reportInvalidTypeForm]
+            expected_output: out_type | None = None  # pyright: ignore[reportInvalidTypeForm]
+            if evaluator_schema_types:  # pragma: no branch
+                evaluators: list[Union[tuple(evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
+
+        class Dataset(BaseModel, extra='forbid'):
+            name: str | None = None
+            cases: list[Case]
+            if evaluator_schema_types:  # pragma: no branch
+                evaluators: list[Union[tuple(evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
+            if report_evaluator_schema_types:  # pragma: no branch
+                report_evaluators: list[Union[tuple(report_evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
+
+        json_schema = Dataset.model_json_schema()
+        # See `_add_json_schema` below, since `$schema` is added to the JSON, it has to be supported in the JSON
+        json_schema['properties']['$schema'] = {'type': 'string'}
+        return json_schema
+
+# tests/typed_graph.py:90-94
+class A(BaseNode[MyState, MyDeps]):
+    async def run(self, ctx: GraphRunContext[MyState, MyDeps]) -> B:
+        assert ctx.state.x == 1
+        assert ctx.deps.y == 'y'
+        return B()
+
+# pydantic_ai_slim/pydantic_ai/messages.py:681-703
+class ToolReturn:
+    """A structured return value for tools that need to provide both a return value and custom content to the model.
+
+    This class allows tools to return complex responses that include:
+    - A return value for actual tool return
+    - Custom content (including multi-modal content) to be sent to the model as a UserPromptPart
+    - Optional metadata for application use
+    """
+
+    return_value: ToolReturnContent
+    """The return value to be used in the tool response."""
+
+    _: KW_ONLY
+
+    content: str | Sequence[UserContent] | None = None
+    """The content to be sent to the model as a UserPromptPart."""
+
+    metadata: Any = None
+    """Additional data that can be accessed programmatically by the application but is not sent to the LLM."""
+
+    kind: Literal['tool-return'] = 'tool-return'
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+# pydantic_evals/pydantic_evals/dataset.py:1388-1436
+def _build_evaluator_schema_types(registry: Mapping[str, type[Any]]) -> list[Any]:
+    """Build a list of schema types for evaluators from a registry.
+
+    This is used to generate the JSON schema for both case-level and report-level evaluators.
+
+    Args:
+        registry: Mapping from evaluator names to evaluator classes.
+
+    Returns:
+        A list of types suitable for use in a Union for JSON schema generation.
+    """
+    schema_types: list[Any] = []
+    for name, evaluator_class in registry.items():
+        type_hints = _typing_extra.get_function_type_hints(evaluator_class)
+        type_hints.pop('return', None)
+        required_type_hints: dict[str, Any] = {}
+
+        for p in inspect.signature(evaluator_class).parameters.values():
+            type_hints.setdefault(p.name, Any)
+            if p.default is not p.empty:
+                type_hints[p.name] = NotRequired[type_hints[p.name]]
+            else:
+                required_type_hints[p.name] = type_hints[p.name]
+
+        def _make_typed_dict(cls_name_prefix: str, fields: dict[str, Any]) -> Any:
+            td = TypedDict(f'{cls_name_prefix}_{name}', fields)  # pyright: ignore[reportArgumentType]
+            config = ConfigDict(extra='forbid', arbitrary_types_allowed=True)
+            # TODO: Replace with pydantic.with_config once pydantic 2.11 is the min supported version
+            td.__pydantic_config__ = config  # pyright: ignore[reportAttributeAccessIssue]
+            return td
+
+        # Shortest form: just the call name
+        if len(type_hints) == 0 or not required_type_hints:
+            schema_types.append(Literal[name])
+
+        # Short form: can be called with only one parameter
+        if len(type_hints) == 1:
+            [type_hint_type] = type_hints.values()
+            schema_types.append(_make_typed_dict('short_evaluator', {name: type_hint_type}))
+        elif len(required_type_hints) == 1:  # pragma: no branch
+            [type_hint_type] = required_type_hints.values()
+            schema_types.append(_make_typed_dict('short_evaluator', {name: type_hint_type}))
+
+        # Long form: multiple parameters, possibly required
+        if len(type_hints) > 1:
+            params_td = _make_typed_dict('evaluator_params', type_hints)
+            schema_types.append(_make_typed_dict('evaluator', {name: params_td}))
+
+    return schema_types
+
+# pydantic_evals/pydantic_evals/reporting/render_numbers.py:62-94
+def default_render_number_diff(old: float | int, new: float | int) -> str | None:
+    """Return a string representing the difference between old and new values.
+
+    Rules:
+      - If the two values are equal, return None.
+      - For integers, return the raw difference (with a leading sign), e.g.:
+            _default_format_number_diff(3, 4) -> '+1'
+      - For floats (or a mix of float and int):
+          * Compute the raw delta = new - old and format it with ABS_SIG_FIGS significant figures.
+          * If `old` is nonzero, compute a relative change:
+              - If |delta|/|old| ≤ 1, render the relative change as a percentage with
+                PERC_DECIMALS decimal places, e.g. '+0.7 / +70.0%'.
+              - If |delta|/|old| > 1, render a multiplier (new/old). Use one decimal place
+                if the absolute multiplier is less than MULTIPLIER_ONE_DECIMAL_THRESHOLD,
+                otherwise no decimals.
+          * However, if the percentage rounds to 0.0% (e.g. '+0.0%'), return only the absolute diff.
+          * Also, if |old| is below BASE_THRESHOLD and |delta| exceeds MULTIPLIER_DROP_FACTOR×|old|,
+            drop the relative change indicator.
+    """
+    if old == new:
+        return None
+
+    if isinstance(old, int) and isinstance(new, int):
+        diff_int = new - old
+        return f'{diff_int:+d}'
+
+    delta = new - old
+    abs_diff_str = _render_signed(delta, ABS_SIG_FIGS)
+    rel_diff_str = _render_relative(new, old, BASE_THRESHOLD)
+    if rel_diff_str is None:
+        return abs_diff_str
+    else:
+        return f'{abs_diff_str} / {rel_diff_str}'
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:442-455
+    def _str_gen(self, schema: dict[str, Any]) -> str:
+        """Generate a string from a JSON Schema string."""
+        min_len = schema.get('minLength')
+        if min_len is not None:
+            return self._char() * min_len
+
+        if schema.get('maxLength') == 0:
+            return ''
+
+        if fmt := schema.get('format'):
+            if fmt == 'date':
+                return (date(2024, 1, 1) + timedelta(days=self.seed)).isoformat()
+
+        return self._char()
+
+# pydantic_evals/pydantic_evals/dataset.py:828-845
+    def _save_schema(
+        cls,
+        path: Path | str,
+        custom_evaluator_types: Sequence[type[Evaluator[InputsT, OutputT, MetadataT]]] = (),
+        custom_report_evaluator_types: Sequence[type[ReportEvaluator[InputsT, OutputT, MetadataT]]] = (),
+    ):
+        """Save the JSON schema for this dataset type to a file.
+
+        Args:
+            path: Path to save the schema to.
+            custom_evaluator_types: Custom evaluator classes to include in the schema.
+            custom_report_evaluator_types: Custom report evaluator classes to include in the schema.
+        """
+        path = Path(path)
+        json_schema = cls.model_json_schema_with_evaluators(custom_evaluator_types, custom_report_evaluator_types)
+        schema_content = to_json(json_schema, indent=2).decode() + '\n'
+        if not path.exists() or path.read_text(encoding='utf-8') != schema_content:  # pragma: no branch
+            path.write_text(schema_content, encoding='utf-8')
+
+# tests/test_agent.py:150-150
+    a: int
+
+# tests/test_agent_output_schemas.py:24-24
+    a: list[Bar]
+
+# tests/test_streaming.py:65-65
+    a: int
+
+# tests/typed_agent.py:154-154
+    a: int
+
+# pydantic_ai_slim/pydantic_ai/_json_schema.py:53-55
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        """Make changes to the schema."""
+        return schema
+
+# tests/models/test_openai.py:1668-1668
+    a = 'a'
+
+# tests/typed_deps.py:11-11
+    a: int

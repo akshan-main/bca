@@ -1,0 +1,805 @@
+## pydantic_ai_slim/pydantic_ai/exceptions.py
+
+class UsageLimitExceeded(AgentRunError):
+    """Error raised when a Model's usage exceeds the specified limits."""
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class TestModel(Model):
+    """A model specifically for testing purposes.
+
+    This will (by default) call all tools in the agent, then return a tool response if possible,
+    otherwise a plain response.
+
+    How useful this model is will vary significantly.
+
+    Apart from `__init__` derived by the `dataclass` decorator, all methods are private or match those
+    of the base class.
+    """
+
+    # NOTE: Avoid test discovery by pytest.
+    __test__ = False
+
+    call_tools: list[str] | Literal['all'] = 'all'
+    """List of tools to call. If `'all'`, all tools will be called."""
+    custom_output_text: str | None = None
+    """If set, this text is returned as the final output."""
+    custom_output_args: Any | None = None
+    """If set, these args will be passed to the output tool."""
+    seed: int = 0
+    """Seed for generating random data."""
+    last_model_request_parameters: ModelRequestParameters | None = field(default=None, init=False)
+    """The last ModelRequestParameters passed to the model in a request.
+
+    The ModelRequestParameters contains information about the function and output tools available during request handling.
+
+    This is set when a request is made, so will reflect the function tools from the last step of the last run.
+    """
+    _model_name: str = field(default='test', repr=False)
+    _system: str = field(default='test', repr=False)
+
+    def __init__(
+        self,
+        *,
+        call_tools: list[str] | Literal['all'] = 'all',
+        custom_output_text: str | None = None,
+        custom_output_args: Any | None = None,
+        seed: int = 0,
+        model_name: str = 'test',
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize TestModel with optional settings and profile."""
+        self.call_tools = call_tools
+        self.custom_output_text = custom_output_text
+        self.custom_output_args = custom_output_args
+        self.seed = seed
+        self.last_model_request_parameters = None
+        self._model_name = model_name
+        self._system = 'test'
+        super().__init__(settings=settings, profile=profile)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        model_response.usage = _estimate_usage([*messages, model_response])
+        return model_response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        yield TestStreamedResponse(
+            model_request_parameters=model_request_parameters,
+            _model_name=self._model_name,
+            _structured_response=model_response,
+            _messages=messages,
+            _provider_name=self._system,
+        )
+
+    @property
+    def model_name(self) -> str:
+        """The model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The model provider."""
+        return self._system
+
+    @classmethod
+    def supported_builtin_tools(cls) -> frozenset[type[AbstractBuiltinTool]]:
+        """TestModel supports all builtin tools for testing flexibility."""
+        return SUPPORTED_BUILTIN_TOOLS
+
+    def gen_tool_args(self, tool_def: ToolDefinition) -> Any:
+        return _JsonSchemaTestData(tool_def.parameters_json_schema, self.seed).generate()
+
+    def _get_tool_calls(self, model_request_parameters: ModelRequestParameters) -> list[tuple[str, ToolDefinition]]:
+        if self.call_tools == 'all':
+            return [(r.name, r) for r in model_request_parameters.function_tools]
+        else:
+            function_tools_lookup = {t.name: t for t in model_request_parameters.function_tools}
+            tools_to_call = (function_tools_lookup[name] for name in self.call_tools)
+            return [(r.name, r) for r in tools_to_call]
+
+    def _get_output(self, model_request_parameters: ModelRequestParameters) -> _WrappedTextOutput | _WrappedToolOutput:
+        if self.custom_output_text is not None:
+            assert model_request_parameters.output_mode != 'tool', (
+                'Plain response not allowed, but `custom_output_text` is set.'
+            )
+            assert self.custom_output_args is None, 'Cannot set both `custom_output_text` and `custom_output_args`.'
+            return _WrappedTextOutput(self.custom_output_text)
+        elif self.custom_output_args is not None:
+            assert model_request_parameters.output_tools is not None, (
+                'No output tools provided, but `custom_output_args` is set.'
+            )
+            output_tool = model_request_parameters.output_tools[0]
+
+            if k := output_tool.outer_typed_dict_key:
+                return _WrappedToolOutput({k: self.custom_output_args})
+            else:
+                return _WrappedToolOutput(self.custom_output_args)
+        elif model_request_parameters.allow_text_output:
+            return _WrappedTextOutput(None)
+        elif model_request_parameters.output_tools:
+            return _WrappedToolOutput(None)
+        else:
+            return _WrappedTextOutput(None)
+
+    def _request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        if model_request_parameters.builtin_tools:
+            raise UserError('TestModel does not support built-in tools')
+
+        tool_calls = self._get_tool_calls(model_request_parameters)
+        output_wrapper = self._get_output(model_request_parameters)
+        output_tools = model_request_parameters.output_tools
+
+        # if there are tools, the first thing we want to do is call all of them
+        if tool_calls and not any(isinstance(m, ModelResponse) for m in messages):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(name, self.gen_tool_args(args), tool_call_id=f'pyd_ai_tool_call_id__{name}')
+                    for name, args in tool_calls
+                ],
+                model_name=self._model_name,
+            )
+
+        if messages:  # pragma: no branch
+            last_message = messages[-1]
+            assert isinstance(last_message, ModelRequest), 'Expected last message to be a `ModelRequest`.'
+
+            # check if there are any retry prompts, if so retry them
+            new_retry_names = {p.tool_name for p in last_message.parts if isinstance(p, RetryPromptPart)}
+            if new_retry_names:
+                # Handle retries for both function tools and output tools
+                # Check function tools first
+                retry_parts: list[ModelResponsePart] = [
+                    ToolCallPart(name, self.gen_tool_args(args)) for name, args in tool_calls if name in new_retry_names
+                ]
+                # Check output tools
+                if output_tools:
+                    retry_parts.extend(
+                        [
+                            ToolCallPart(
+                                tool.name,
+                                output_wrapper.value
+                                if isinstance(output_wrapper, _WrappedToolOutput) and output_wrapper.value is not None
+                                else self.gen_tool_args(tool),
+                                tool_call_id=f'pyd_ai_tool_call_id__{tool.name}',
+                            )
+                            for tool in output_tools
+                            if tool.name in new_retry_names
+                        ]
+                    )
+                return ModelResponse(parts=retry_parts, model_name=self._model_name)
+
+        if isinstance(output_wrapper, _WrappedTextOutput):
+            if (response_text := output_wrapper.value) is None:
+                # build up details of tool responses
+                output: dict[str, Any] = {}
+                for message in messages:
+                    if isinstance(message, ModelRequest):
+                        for part in message.parts:
+                            if isinstance(part, ToolReturnPart):
+                                output[part.tool_name] = part.content
+                if output:
+                    return ModelResponse(
+                        parts=[TextPart(pydantic_core.to_json(output).decode())], model_name=self._model_name
+                    )
+                else:
+                    return ModelResponse(parts=[TextPart('success (no tool calls)')], model_name=self._model_name)
+            else:
+                return ModelResponse(parts=[TextPart(response_text)], model_name=self._model_name)
+        else:
+            assert output_tools, 'No output tools provided'
+            custom_output_args = output_wrapper.value
+            output_tool = output_tools[self.seed % len(output_tools)]
+            if custom_output_args is not None:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            custom_output_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+            else:
+                response_args = self.gen_tool_args(output_tool)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            response_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+
+## tests/test_mcp.py
+
+async def test_agent_with_stdio_server(allow_model_requests: None, agent: Agent):
+    async with agent:
+        result = await agent.run('What is 0 degrees Celsius in Fahrenheit?')
+        assert result.output == snapshot('0 degrees Celsius is equal to 32 degrees Fahrenheit.')
+        assert result.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content='What is 0 degrees Celsius in Fahrenheit?',
+                            timestamp=IsDatetime(),
+                        )
+                    ],
+                    timestamp=IsDatetime(),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            tool_name='celsius_to_fahrenheit',
+                            args='{"celsius":0}',
+                            tool_call_id='call_QssdxTGkPblTYHmyVES1tKBj',
+                        )
+                    ],
+                    usage=RequestUsage(
+                        input_tokens=195,
+                        output_tokens=19,
+                        details={
+                            'accepted_prediction_tokens': 0,
+                            'audio_tokens': 0,
+                            'reasoning_tokens': 0,
+                            'rejected_prediction_tokens': 0,
+                        },
+                    ),
+                    model_name='gpt-4o-2024-08-06',
+                    timestamp=IsDatetime(),
+                    provider_name='openai',
+                    provider_url='https://api.openai.com/v1/',
+                    provider_details={
+                        'finish_reason': 'tool_calls',
+                        'timestamp': IsDatetime(),
+                    },
+                    provider_response_id='chatcmpl-BRlnvvqIPFofAtKqtQKMWZkgXhzlT',
+                    finish_reason='tool_call',
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='celsius_to_fahrenheit',
+                            content=32.0,
+                            tool_call_id='call_QssdxTGkPblTYHmyVES1tKBj',
+                            timestamp=IsDatetime(),
+                        )
+                    ],
+                    timestamp=IsDatetime(),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[TextPart(content='0 degrees Celsius is equal to 32 degrees Fahrenheit.')],
+                    usage=RequestUsage(
+                        input_tokens=227,
+                        output_tokens=13,
+                        details={
+                            'accepted_prediction_tokens': 0,
+                            'audio_tokens': 0,
+                            'reasoning_tokens': 0,
+                            'rejected_prediction_tokens': 0,
+                        },
+                    ),
+                    model_name='gpt-4o-2024-08-06',
+                    timestamp=IsDatetime(),
+                    provider_name='openai',
+                    provider_url='https://api.openai.com/v1/',
+                    provider_details={
+                        'finish_reason': 'stop',
+                        'timestamp': IsDatetime(),
+                    },
+                    provider_response_id='chatcmpl-BRlnyjUo5wlyqvdNdM5I8vIWjo1qF',
+                    finish_reason='stop',
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+## tests/test_streaming.py
+
+def test_agent_stream_metadata_falls_back_to_run_context() -> None:
+    response_message = ModelResponse(parts=[TextPart('fallback metadata')], model_name='test')
+    stream_response = ModelTestStreamedResponse(
+        model_request_parameters=models.ModelRequestParameters(),
+        _model_name='test',
+        _structured_response=response_message,
+        _messages=[],
+        _provider_name='test',
+    )
+    run_ctx = RunContext(
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        metadata={'source': 'run-context'},
+    )
+    output_schema = TextOutputSchema[str](
+        text_processor=TextOutputProcessor(),
+        allows_deferred_tools=False,
+        allows_image=False,
+    )
+    stream = AgentStream(
+        _raw_stream_response=stream_response,
+        _output_schema=output_schema,
+        _model_request_parameters=models.ModelRequestParameters(),
+        _output_validators=[],
+        _run_ctx=run_ctx,
+        _usage_limits=None,
+        _tool_manager=ToolManager(toolset=MagicMock()),
+    )
+
+    assert stream.metadata == {'source': 'run-context'}
+
+## tests/test_ui_web.py
+
+def test_agent_to_web_with_instructions():
+    """Test to_web() accepts instructions parameter."""
+    agent = Agent(TestModel())
+    app = agent.to_web(instructions='Always respond in Spanish')
+    assert isinstance(app, Starlette)
+
+## tests/test_usage_limits.py
+
+def test_genai_prices():
+    usage = GenaiPricesUsage(input_tokens=100, output_tokens=50)
+    assert calc_price(usage, model_ref='gpt-4o').total_price == snapshot(Decimal('0.00075'))
+
+def test_request_token_limit() -> None:
+    test_agent = Agent(TestModel())
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('Exceeded the input_tokens_limit of 5 (input_tokens=59)')):
+        test_agent.run_sync(
+            'Hello, this prompt exceeds the request tokens limit.', usage_limits=UsageLimits(input_tokens_limit=5)
+        )
+
+def test_response_token_limit() -> None:
+    test_agent = Agent(
+        TestModel(custom_output_text='Unfortunately, this response exceeds the response tokens limit by a few!')
+    )
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('Exceeded the output_tokens_limit of 5 (output_tokens=11)')):
+        test_agent.run_sync('Hello', usage_limits=UsageLimits(output_tokens_limit=5))
+
+def test_total_token_limit() -> None:
+    test_agent = Agent(TestModel(custom_output_text='This utilizes 4 tokens!'))
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('Exceeded the total_tokens_limit of 50 (total_tokens=55)')):
+        test_agent.run_sync('Hello', usage_limits=UsageLimits(total_tokens_limit=50))
+
+def test_retry_limit() -> None:
+    test_agent = Agent(TestModel())
+
+    @test_agent.tool_plain
+    async def foo(x: str) -> str:
+        return x
+
+    @test_agent.tool_plain
+    async def bar(y: str) -> str:
+        return y
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('The next request would exceed the request_limit of 1')):
+        test_agent.run_sync('Hello', usage_limits=UsageLimits(request_limit=1))
+
+async def test_streamed_text_limits() -> None:
+    m = TestModel()
+
+    test_agent = Agent(m)
+    assert test_agent.name is None
+
+    @test_agent.tool_plain
+    async def ret_a(x: str) -> str:
+        return f'{x}-apple'
+
+    succeeded = False
+
+    with pytest.raises(
+        UsageLimitExceeded, match=re.escape('Exceeded the output_tokens_limit of 10 (output_tokens=11)')
+    ):
+        async with test_agent.run_stream('Hello', usage_limits=UsageLimits(output_tokens_limit=10)) as result:
+            assert test_agent.name == 'test_agent'
+            assert not result.is_complete
+            assert result.all_messages() == snapshot(
+                [
+                    ModelRequest(
+                        parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                        timestamp=IsNow(tz=timezone.utc),
+                        run_id=IsStr(),
+                    ),
+                    ModelResponse(
+                        parts=[
+                            ToolCallPart(
+                                tool_name='ret_a',
+                                args={'x': 'a'},
+                                tool_call_id=IsStr(),
+                            )
+                        ],
+                        usage=RequestUsage(input_tokens=51),
+                        model_name='test',
+                        timestamp=IsNow(tz=timezone.utc),
+                        provider_name='test',
+                        run_id=IsStr(),
+                    ),
+                    ModelRequest(
+                        parts=[
+                            ToolReturnPart(
+                                tool_name='ret_a',
+                                content='a-apple',
+                                timestamp=IsNow(tz=timezone.utc),
+                                tool_call_id=IsStr(),
+                            )
+                        ],
+                        timestamp=IsNow(tz=timezone.utc),
+                        run_id=IsStr(),
+                    ),
+                ]
+            )
+            assert result.usage() == snapshot(
+                RunUsage(
+                    requests=2,
+                    input_tokens=103,
+                    output_tokens=5,
+                    tool_calls=1,
+                )
+            )
+            succeeded = True
+
+    assert succeeded
+
+def test_usage_so_far() -> None:
+    test_agent = Agent(TestModel())
+
+    with pytest.raises(
+        UsageLimitExceeded, match=re.escape('Exceeded the total_tokens_limit of 105 (total_tokens=163)')
+    ):
+        test_agent.run_sync(
+            'Hello, this prompt exceeds the request tokens limit.',
+            usage_limits=UsageLimits(total_tokens_limit=105),
+            usage=RunUsage(input_tokens=50, output_tokens=50),
+        )
+
+async def test_multi_agent_usage_no_incr():
+    delegate_agent = Agent(TestModel(), output_type=int)
+
+    controller_agent1 = Agent(TestModel())
+    run_1_usages: list[RunUsage] = []
+
+    @controller_agent1.tool
+    async def delegate_to_other_agent1(ctx: RunContext[None], sentence: str) -> int:
+        delegate_result = await delegate_agent.run(sentence)
+        delegate_usage = delegate_result.usage()
+        run_1_usages.append(delegate_usage)
+        assert delegate_usage == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=4))
+        return delegate_result.output
+
+    result1 = await controller_agent1.run('foobar')
+    assert result1.output == snapshot('{"delegate_to_other_agent1":0}')
+    run_1_usages.append(result1.usage())
+    assert result1.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=13, tool_calls=1))
+
+    controller_agent2 = Agent(TestModel())
+
+    @controller_agent2.tool
+    async def delegate_to_other_agent2(ctx: RunContext[None], sentence: str) -> int:
+        delegate_result = await delegate_agent.run(sentence, usage=ctx.usage)
+        delegate_usage = delegate_result.usage()
+        assert delegate_usage == snapshot(RunUsage(requests=2, input_tokens=102, output_tokens=9))
+        return delegate_result.output
+
+    result2 = await controller_agent2.run('foobar')
+    assert result2.output == snapshot('{"delegate_to_other_agent2":0}')
+    assert result2.usage() == snapshot(RunUsage(requests=3, input_tokens=154, output_tokens=17, tool_calls=1))
+
+    # confirm the usage from result2 is the sum of the usage from result1
+    assert result2.usage() == functools.reduce(operator.add, run_1_usages)
+
+    result1_usage = result1.usage()
+    result1_usage.details = {'custom1': 10, 'custom2': 20, 'custom3': 0}
+    assert result1_usage.opentelemetry_attributes() == {
+        'gen_ai.usage.input_tokens': 103,
+        'gen_ai.usage.output_tokens': 13,
+        'gen_ai.usage.details.custom1': 10,
+        'gen_ai.usage.details.custom2': 20,
+    }
+
+async def test_multi_agent_usage_sync():
+    """As in `test_multi_agent_usage_async`, with a sync tool."""
+    controller_agent = Agent(TestModel())
+
+    @controller_agent.tool
+    def delegate_to_other_agent(ctx: RunContext[None], sentence: str) -> int:
+        new_usage = RunUsage(requests=5, input_tokens=2, output_tokens=3)
+        ctx.usage.incr(new_usage)
+        return 0
+
+    result = await controller_agent.run('foobar')
+    assert result.output == snapshot('{"delegate_to_other_agent":0}')
+    assert result.usage() == snapshot(RunUsage(requests=7, input_tokens=105, output_tokens=16, tool_calls=1))
+
+def test_request_usage_basics():
+    usage = RequestUsage()
+    assert usage.output_audio_tokens == 0
+    assert usage.requests == 1
+
+def test_add_usages():
+    usage = RunUsage(
+        requests=2,
+        input_tokens=10,
+        output_tokens=20,
+        cache_read_tokens=30,
+        cache_write_tokens=40,
+        input_audio_tokens=50,
+        cache_audio_read_tokens=60,
+        tool_calls=3,
+        details={
+            'custom1': 10,
+            'custom2': 20,
+        },
+    )
+    assert usage + usage == snapshot(
+        RunUsage(
+            requests=4,
+            input_tokens=20,
+            output_tokens=40,
+            cache_write_tokens=80,
+            cache_read_tokens=60,
+            input_audio_tokens=100,
+            cache_audio_read_tokens=120,
+            tool_calls=6,
+            details={'custom1': 20, 'custom2': 40},
+        )
+    )
+    assert usage + RunUsage() == usage
+    assert RunUsage() + RunUsage() == RunUsage()
+
+def test_add_usages_with_none_detail_value():
+    """Test that None values in details are skipped when incrementing usage."""
+    usage = RunUsage(
+        requests=1,
+        input_tokens=10,
+        output_tokens=20,
+        details={'reasoning_tokens': 5},
+    )
+
+    # Create a usage with None in details (simulating model response with missing detail)
+    incr_usage = RunUsage(
+        requests=1,
+        input_tokens=5,
+        output_tokens=10,
+    )
+    # Manually set a None value in details to simulate edge case from model responses
+    incr_usage.details = {'reasoning_tokens': None, 'other_tokens': 10}  # type: ignore[dict-item]
+
+    result = usage + incr_usage
+    assert result == snapshot(
+        RunUsage(
+            requests=2,
+            input_tokens=15,
+            output_tokens=30,
+            details={'reasoning_tokens': 5, 'other_tokens': 10},
+        )
+    )
+
+async def test_tool_call_limit() -> None:
+    test_agent = Agent(TestModel())
+
+    @test_agent.tool_plain
+    async def ret_a(x: str) -> str:
+        return f'{x}-apple'
+
+    with pytest.raises(
+        UsageLimitExceeded,
+        match=re.escape('The next tool call(s) would exceed the tool_calls_limit of 0 (tool_calls=1).'),
+    ):
+        await test_agent.run('Hello', usage_limits=UsageLimits(tool_calls_limit=0))
+
+    result = await test_agent.run('Hello', usage_limits=UsageLimits(tool_calls_limit=1))
+    assert result.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=14, tool_calls=1))
+
+async def test_output_tool_not_counted() -> None:
+    """Test that output tools are not counted in tool_calls usage metric."""
+    test_agent = Agent(TestModel())
+
+    @test_agent.tool_plain
+    async def regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    class MyOutput(BaseModel):
+        result: str
+
+    result_regular = await test_agent.run('test')
+    assert result_regular.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=14, tool_calls=1))
+
+    test_agent_with_output = Agent(TestModel(), output_type=ToolOutput(MyOutput))
+
+    @test_agent_with_output.tool_plain
+    async def another_regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    result_output = await test_agent_with_output.run('test')
+
+    assert result_output.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=15, tool_calls=1))
+
+async def test_output_tool_allowed_at_limit() -> None:
+    """Test that output tools can be called even when at the tool_calls_limit."""
+
+    class MyOutput(BaseModel):
+        result: str
+
+    def call_output_after_regular(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('regular_tool', {'x': 'test'}, 'call_1'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+        else:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('final_result', {'result': 'success'}, 'call_2'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+
+    test_agent = Agent(FunctionModel(call_output_after_regular), output_type=ToolOutput(MyOutput))
+
+    @test_agent.tool_plain
+    async def regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    result = await test_agent.run('test', usage_limits=UsageLimits(tool_calls_limit=1))
+
+    assert result.output.result == 'success'
+    assert result.usage() == snapshot(RunUsage(requests=2, input_tokens=20, output_tokens=10, tool_calls=1))
+
+async def test_failed_tool_calls_not_counted() -> None:
+    """Test that failed tool calls (raising ModelRetry) are not counted in usage or against limits."""
+    test_agent = Agent(TestModel())
+
+    call_count = 0
+
+    @test_agent.tool_plain
+    async def flaky_tool(x: str) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ModelRetry('Temporary failure, please retry')
+        return f'{x}-success'
+
+    result = await test_agent.run('test', usage_limits=UsageLimits(tool_calls_limit=1))
+    assert call_count == 2
+    assert result.usage() == snapshot(RunUsage(requests=3, input_tokens=176, output_tokens=29, tool_calls=1))
+
+def test_deprecated_usage_limits():
+    with warns(
+        snapshot(['DeprecationWarning: `request_tokens_limit` is deprecated, use `input_tokens_limit` instead'])
+    ):
+        assert UsageLimits(input_tokens_limit=100).request_tokens_limit == 100  # type: ignore
+
+    with warns(
+        snapshot(['DeprecationWarning: `response_tokens_limit` is deprecated, use `output_tokens_limit` instead'])
+    ):
+        assert UsageLimits(output_tokens_limit=100).response_tokens_limit == 100  # type: ignore
+
+async def test_parallel_tool_calls_limit_enforced():
+    """Parallel tool calls must not exceed the limit and should raise immediately."""
+    executed_tools: list[str] = []
+
+    model_call_count = 0
+
+    def test_model_function(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal model_call_count
+        model_call_count += 1
+
+        if model_call_count == 1:
+            # First response: 5 parallel tool calls (within limit)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('tool_a', {}, 'call_1'),
+                    ToolCallPart('tool_b', {}, 'call_2'),
+                    ToolCallPart('tool_c', {}, 'call_3'),
+                    ToolCallPart('tool_a', {}, 'call_4'),
+                    ToolCallPart('tool_b', {}, 'call_5'),
+                ]
+            )
+        else:
+            assert model_call_count == 2
+            # Second response: 3 parallel tool calls (would exceed limit of 6)
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('tool_c', {}, 'call_6'),
+                    ToolCallPart('tool_a', {}, 'call_7'),
+                    ToolCallPart('tool_b', {}, 'call_8'),
+                ]
+            )
+
+    test_model = FunctionModel(test_model_function)
+    agent = Agent(test_model)
+
+    @agent.tool_plain
+    async def tool_a() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('a')
+        return 'result a'
+
+    @agent.tool_plain
+    async def tool_b() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('b')
+        return 'result b'
+
+    @agent.tool_plain
+    async def tool_c() -> str:
+        await asyncio.sleep(0.01)
+        executed_tools.append('c')
+        return 'result c'
+
+    # Run with tool call limit of 6; expecting an error when trying to execute 3 more tools
+    with pytest.raises(
+        UsageLimitExceeded,
+        match=re.escape('The next tool call(s) would exceed the tool_calls_limit of 6 (tool_calls=8).'),
+    ):
+        await agent.run('Use tools', usage_limits=UsageLimits(tool_calls_limit=6))
+
+    # Only the first batch of 5 tools should have executed
+    assert len(executed_tools) == 5
+
+def test_usage_unknown_provider():
+    assert RequestUsage.extract({}, provider='unknown', provider_url='', provider_fallback='') == RequestUsage()
+
+## tests/test_validation_context.py
+
+def test_agent_output_with_validation_context(output_type: OutputSpec[Value]):
+    """Test that the output is validated using the validation context"""
+
+    def mock_llm(_: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        if isinstance(output_type, ToolOutput):
+            return ModelResponse(parts=[ToolCallPart(tool_name='final_result', args={'x': 0})])
+        else:
+            text = Value(x=0).model_dump_json()
+            return ModelResponse(parts=[TextPart(content=text)])
+
+    agent = Agent(
+        FunctionModel(mock_llm),
+        output_type=output_type,
+        deps_type=Deps,
+        validation_context=lambda ctx: ctx.deps.increment,
+    )
+
+    result = agent.run_sync('', deps=Deps(increment=10))
+    assert result.output.x == snapshot(10)

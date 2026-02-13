@@ -1,0 +1,1175 @@
+## httpx/_api.py
+
+def get(
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `GET` request.
+
+    **Parameters**: See `httpx.request`.
+
+    Note that the `data`, `files`, `json` and `content` parameters are not available
+    on this function, as `GET` requests should not include a request body.
+    """
+    return request(
+        "GET",
+        url,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+## httpx/_client.py
+
+from ._transports.base import AsyncBaseTransport, BaseTransport
+
+from ._transports.base import AsyncBaseTransport, BaseTransport
+
+from ._types import (
+    AsyncByteStream,
+    AuthTypes,
+    CertTypes,
+    CookieTypes,
+    HeaderTypes,
+    ProxyTypes,
+    QueryParamTypes,
+    RequestContent,
+    RequestData,
+    RequestExtensions,
+    RequestFiles,
+    SyncByteStream,
+    TimeoutTypes,
+)
+
+from ._types import (
+    AsyncByteStream,
+    AuthTypes,
+    CertTypes,
+    CookieTypes,
+    HeaderTypes,
+    ProxyTypes,
+    QueryParamTypes,
+    RequestContent,
+    RequestData,
+    RequestExtensions,
+    RequestFiles,
+    SyncByteStream,
+    TimeoutTypes,
+)
+
+## httpx/_content.py
+
+class ByteStream(AsyncByteStream, SyncByteStream):
+    def __init__(self, stream: bytes) -> None:
+        self._stream = stream
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self._stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._stream
+
+def encode_content(
+    content: str | bytes | Iterable[bytes] | AsyncIterable[bytes],
+) -> tuple[dict[str, str], SyncByteStream | AsyncByteStream]:
+    if isinstance(content, (bytes, str)):
+        body = content.encode("utf-8") if isinstance(content, str) else content
+        content_length = len(body)
+        headers = {"Content-Length": str(content_length)} if body else {}
+        return headers, ByteStream(body)
+
+    elif isinstance(content, Iterable) and not isinstance(content, dict):
+        # `not isinstance(content, dict)` is a bit oddly specific, but it
+        # catches a case that's easy for users to make in error, and would
+        # otherwise pass through here, like any other bytes-iterable,
+        # because `dict` happens to be iterable. See issue #2491.
+        content_length_or_none = peek_filelike_length(content)
+
+        if content_length_or_none is None:
+            headers = {"Transfer-Encoding": "chunked"}
+        else:
+            headers = {"Content-Length": str(content_length_or_none)}
+        return headers, IteratorByteStream(content)  # type: ignore
+
+    elif isinstance(content, AsyncIterable):
+        headers = {"Transfer-Encoding": "chunked"}
+        return headers, AsyncIteratorByteStream(content)
+
+    raise TypeError(f"Unexpected type for 'content', {type(content)!r}")
+
+def encode_urlencoded_data(
+    data: RequestData,
+) -> tuple[dict[str, str], ByteStream]:
+    plain_data = []
+    for key, value in data.items():
+        if isinstance(value, (list, tuple)):
+            plain_data.extend([(key, primitive_value_to_str(item)) for item in value])
+        else:
+            plain_data.append((key, primitive_value_to_str(value)))
+    body = urlencode(plain_data, doseq=True).encode("utf-8")
+    content_length = str(len(body))
+    content_type = "application/x-www-form-urlencoded"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+def encode_multipart_data(
+    data: RequestData, files: RequestFiles, boundary: bytes | None
+) -> tuple[dict[str, str], MultipartStream]:
+    multipart = MultipartStream(data=data, files=files, boundary=boundary)
+    headers = multipart.get_headers()
+    return headers, multipart
+
+def encode_json(json: Any) -> tuple[dict[str, str], ByteStream]:
+    body = json_dumps(
+        json, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    content_length = str(len(body))
+    content_type = "application/json"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+def encode_request(
+    content: RequestContent | None = None,
+    data: RequestData | None = None,
+    files: RequestFiles | None = None,
+    json: Any | None = None,
+    boundary: bytes | None = None,
+) -> tuple[dict[str, str], SyncByteStream | AsyncByteStream]:
+    """
+    Handles encoding the given `content`, `data`, `files`, and `json`,
+    returning a two-tuple of (<headers>, <stream>).
+    """
+    if data is not None and not isinstance(data, Mapping):
+        # We prefer to separate `content=<bytes|str|byte iterator|bytes aiterator>`
+        # for raw request content, and `data=<form data>` for url encoded or
+        # multipart form content.
+        #
+        # However for compat with requests, we *do* still support
+        # `data=<bytes...>` usages. We deal with that case here, treating it
+        # as if `content=<...>` had been supplied instead.
+        message = "Use 'content=<...>' to upload raw bytes/text content."
+        warnings.warn(message, DeprecationWarning, stacklevel=2)
+        return encode_content(data)
+
+    if content is not None:
+        return encode_content(content)
+    elif files:
+        return encode_multipart_data(data or {}, files, boundary)
+    elif data:
+        return encode_urlencoded_data(data)
+    elif json is not None:
+        return encode_json(json)
+
+    return {}, ByteStream(b"")
+
+## httpx/_decoders.py
+
+class ContentDecoder:
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def __init__(self, children: typing.Sequence[ContentDecoder]) -> None:
+        """
+        'children' should be a sequence of decoders in the order in which
+        each was applied.
+        """
+        # Note that we reverse the order for decoding.
+        self.children = list(reversed(children))
+
+## httpx/_exceptions.py
+
+class HTTPError(Exception):
+    """
+    Base class for `RequestError` and `HTTPStatusError`.
+
+    Useful for `try...except` blocks when issuing a request,
+    and then calling `.raise_for_status()`.
+
+    For example:
+
+    ```
+    try:
+        response = httpx.get("https://www.example.com")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        print(f"HTTP Exception for {exc.request.url} - {exc}")
+    ```
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._request: Request | None = None
+
+    @property
+    def request(self) -> Request:
+        if self._request is None:
+            raise RuntimeError("The .request property has not been set.")
+        return self._request
+
+    @request.setter
+    def request(self, request: Request) -> None:
+        self._request = request
+
+class RequestError(HTTPError):
+    """
+    Base class for all exceptions that may occur when issuing a `.request()`.
+    """
+
+    def __init__(self, message: str, *, request: Request | None = None) -> None:
+        super().__init__(message)
+        # At the point an exception is raised we won't typically have a request
+        # instance to associate it with.
+        #
+        # The 'request_context' context manager is used within the Client and
+        # Response methods in order to ensure that any raised exceptions
+        # have a `.request` property set on them.
+        self._request = request
+
+class TransportError(RequestError):
+    """
+    Base class for all exceptions that occur at the level of the Transport API.
+    """
+
+class ProtocolError(TransportError):
+    """
+    The protocol was violated.
+    """
+
+class LocalProtocolError(ProtocolError):
+    """
+    A protocol was violated by the client.
+
+    For example if the user instantiated a `Request` instance explicitly,
+    failed to include the mandatory `Host:` header, and then issued it directly
+    using `client.send()`.
+    """
+
+class RemoteProtocolError(ProtocolError):
+    """
+    The protocol was violated by the server.
+
+    For example, returning malformed HTTP.
+    """
+
+## httpx/_models.py
+
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+## httpx/_multipart.py
+
+def get_multipart_boundary_from_content_type(
+    content_type: bytes | None,
+) -> bytes | None:
+    if not content_type or not content_type.startswith(b"multipart/form-data"):
+        return None
+    # parse boundary according to
+    # https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
+    if b";" in content_type:
+        for section in content_type.split(b";"):
+            if section.strip().lower().startswith(b"boundary="):
+                return section.strip()[len(b"boundary=") :].strip(b'"')
+    return None
+
+class MultipartStream(SyncByteStream, AsyncByteStream):
+    """
+    Request content as streaming multipart encoded form data.
+    """
+
+    def __init__(
+        self,
+        data: RequestData,
+        files: RequestFiles,
+        boundary: bytes | None = None,
+    ) -> None:
+        if boundary is None:
+            boundary = os.urandom(16).hex().encode("ascii")
+
+        self.boundary = boundary
+        self.content_type = "multipart/form-data; boundary=%s" % boundary.decode(
+            "ascii"
+        )
+        self.fields = list(self._iter_fields(data, files))
+
+    def _iter_fields(
+        self, data: RequestData, files: RequestFiles
+    ) -> typing.Iterator[FileField | DataField]:
+        for name, value in data.items():
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    yield DataField(name=name, value=item)
+            else:
+                yield DataField(name=name, value=value)
+
+        file_items = files.items() if isinstance(files, typing.Mapping) else files
+        for name, value in file_items:
+            yield FileField(name=name, value=value)
+
+    def iter_chunks(self) -> typing.Iterator[bytes]:
+        for field in self.fields:
+            yield b"--%s\r\n" % self.boundary
+            yield from field.render()
+            yield b"\r\n"
+        yield b"--%s--\r\n" % self.boundary
+
+    def get_content_length(self) -> int | None:
+        """
+        Return the length of the multipart encoded content, or `None` if
+        any of the files have a length that cannot be determined upfront.
+        """
+        boundary_length = len(self.boundary)
+        length = 0
+
+        for field in self.fields:
+            field_length = field.get_length()
+            if field_length is None:
+                return None
+
+            length += 2 + boundary_length + 2  # b"--{boundary}\r\n"
+            length += field_length
+            length += 2  # b"\r\n"
+
+        length += 2 + boundary_length + 4  # b"--{boundary}--\r\n"
+        return length
+
+    # Content stream interface.
+
+    def get_headers(self) -> dict[str, str]:
+        content_length = self.get_content_length()
+        content_type = self.content_type
+        if content_length is None:
+            return {"Transfer-Encoding": "chunked", "Content-Type": content_type}
+        return {"Content-Length": str(content_length), "Content-Type": content_type}
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        for chunk in self.iter_chunks():
+            yield chunk
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        for chunk in self.iter_chunks():
+            yield chunk
+
+    def __init__(
+        self,
+        data: RequestData,
+        files: RequestFiles,
+        boundary: bytes | None = None,
+    ) -> None:
+        if boundary is None:
+            boundary = os.urandom(16).hex().encode("ascii")
+
+        self.boundary = boundary
+        self.content_type = "multipart/form-data; boundary=%s" % boundary.decode(
+            "ascii"
+        )
+        self.fields = list(self._iter_fields(data, files))
+
+    def _iter_fields(
+        self, data: RequestData, files: RequestFiles
+    ) -> typing.Iterator[FileField | DataField]:
+        for name, value in data.items():
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    yield DataField(name=name, value=item)
+            else:
+                yield DataField(name=name, value=value)
+
+        file_items = files.items() if isinstance(files, typing.Mapping) else files
+        for name, value in file_items:
+            yield FileField(name=name, value=value)
+
+    def get_headers(self) -> dict[str, str]:
+        content_length = self.get_content_length()
+        content_type = self.content_type
+        if content_length is None:
+            return {"Transfer-Encoding": "chunked", "Content-Type": content_type}
+        return {"Content-Length": str(content_length), "Content-Type": content_type}
+
+## httpx/_status_codes.py
+
+    PRECONDITION_FAILED = 412, "Precondition Failed"
+
+    PRECONDITION_REQUIRED = 428, "Precondition Required"
+
+## httpx/_transports/mock.py
+
+class MockTransport(AsyncBaseTransport, BaseTransport):
+    def __init__(self, handler: SyncHandler | AsyncHandler) -> None:
+        self.handler = handler
+
+    def handle_request(
+        self,
+        request: Request,
+    ) -> Response:
+        request.read()
+        response = self.handler(request)
+        if not isinstance(response, Response):  # pragma: no cover
+            raise TypeError("Cannot use an async handler in a sync Client")
+        return response
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        await request.aread()
+        response = self.handler(request)
+
+        # Allow handler to *optionally* be an `async` function.
+        # If it is, then the `response` variable need to be awaited to actually
+        # return the result.
+
+        if not isinstance(response, Response):
+            response = await response
+
+        return response
+
+## httpx/_urlparse.py
+
+IPv4_STYLE_HOSTNAME = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")
+
+IPv6_STYLE_HOSTNAME = re.compile(r"^\[.*\]$")
+
+## httpx/_urls.py
+
+from __future__ import annotations
+
+import typing
+from urllib.parse import parse_qs, unquote, urlencode
+
+import idna
+
+from ._types import QueryParamTypes
+from ._urlparse import urlparse
+from ._utils import primitive_value_to_str
+
+__all__ = ["URL", "QueryParams"]
+
+
+class URL:
+    """
+    url = httpx.URL("HTTPS://jo%40email.com:a%20secret@müller.de:1234/pa%20th?search=ab#anchorlink")
+
+    assert url.scheme == "https"
+    assert url.username == "jo@email.com"
+    assert url.password == "a secret"
+    assert url.userinfo == b"jo%40email.com:a%20secret"
+    assert url.host == "müller.de"
+    assert url.raw_host == b"xn--mller-kva.de"
+    assert url.port == 1234
+    assert url.netloc == b"xn--mller-kva.de:1234"
+    assert url.path == "/pa th"
+    assert url.query == b"?search=ab"
+    assert url.raw_path == b"/pa%20th?search=ab"
+    assert url.fragment == "anchorlink"
+
+    The components of a URL are broken down like this:
+
+       https://jo%40email.com:a%20secret@müller.de:1234/pa%20th?search=ab#anchorlink
+    [scheme]   [  username  ] [password] [ host ][port][ path ] [ query ] [fragment]
+               [       userinfo        ] [   netloc   ][    raw_path    ]
+
+    Note that:
+
+    * `url.scheme` is normalized to always be lowercased.
+
+    * `url.host` is normalized to always be lowercased. Internationalized domain
+      names are represented in unicode, without IDNA encoding applied. For instance:
+
+      url = httpx.URL("http://中国.icom.museum")
+      assert url.host == "中国.icom.museum"
+      url = httpx.URL("http://xn--fiqs8s.icom.museum")
+      assert url.host == "中国.icom.museum"
+
+    * `url.raw_host` is normalized to always be lowercased, and is IDNA encoded.
+
+      url = httpx.URL("http://中国.icom.museum")
+      assert url.raw_host == b"xn--fiqs8s.icom.museum"
+      url = httpx.URL("http://xn--fiqs8s.icom.museum")
+      assert url.raw_host == b"xn--fiqs8s.icom.museum"
+
+    * `url.port` is either None or an integer. URLs that include the default port for
+      "http", "https", "ws", "wss", and "ftp" schemes have their port
+      normalized to `None`.
+
+      assert httpx.URL("http://example.com") == httpx.URL("http://example.com:80")
+      assert httpx.URL("http://example.com").port is None
+      assert httpx.URL("http://example.com:80").port is None
+
+    * `url.userinfo` is raw bytes, without URL escaping. Usually you'll want to work
+      with `url.username` and `url.password` instead, which handle the URL escaping.
+
+    * `url.raw_path` is raw bytes of both the path and query, without URL escaping.
+      This portion is used as the target when constructing HTTP requests. Usually you'll
+      want to work with `url.path` instead.
+
+    * `url.query` is raw bytes, without URL escaping. A URL query string portion can
+      only be properly URL escaped when decoding the parameter names and values
+      themselves.
+    """
+
+    def __init__(self, url: URL | str = "", **kwargs: typing.Any) -> None:
+        if kwargs:
+            allowed = {
+                "scheme": str,
+                "username": str,
+                "password": str,
+                "userinfo": bytes,
+                "host": str,
+                "port": int,
+                "netloc": bytes,
+                "path": str,
+                "query": bytes,
+                "raw_path": bytes,
+                "fragment": str,
+                "params": object,
+            }
+
+            # Perform type checking for all supported keyword arguments.
+            for key, value in kwargs.items():
+                if key not in allowed:
+                    message = f"{key!r} is an invalid keyword argument for URL()"
+                    raise TypeError(message)
+                if value is not None and not isinstance(value, allowed[key]):
+                    expected = allowed[key].__name__
+                    seen = type(value).__name__
+                    message = f"Argument {key!r} must be {expected} but got {seen}"
+                    raise TypeError(message)
+                if isinstance(value, bytes):
+                    kwargs[key] = value.decode("ascii")
+
+            if "params" in kwargs:
+                # Replace any "params" keyword with the raw "query" instead.
+                #
+                # Ensure that empty params use `kwargs["query"] = None` rather
+                # than `kwargs["query"] = ""`, so that generated URLs do not
+                # include an empty trailing "?".
+                params = kwargs.pop("params")
+                kwargs["query"] = None if not params else str(QueryParams(params))
+
+        if isinstance(url, str):
+            self._uri_reference = urlparse(url, **kwargs)
+        elif isinstance(url, URL):
+            self._uri_reference = url._uri_reference.copy_with(**kwargs)
+        else:
+            raise TypeError(
+                "Invalid type for url.  Expected str or httpx.URL,"
+                f" got {type(url)}: {url!r}"
+            )
+
+    @property
+    def scheme(self) -> str:
+        """
+        The URL scheme, such as "http", "https".
+        Always normalised to lowercase.
+        """
+        return self._uri_reference.scheme
+
+    @property
+    def raw_scheme(self) -> bytes:
+        """
+        The raw bytes representation of the URL scheme, such as b"http", b"https".
+        Always normalised to lowercase.
+        """
+        return self._uri_reference.scheme.encode("ascii")
+
+    @property
+    def userinfo(self) -> bytes:
+        """
+        The URL userinfo as a raw bytestring.
+        For example: b"jo%40email.com:a%20secret".
+        """
+        return self._uri_reference.userinfo.encode("ascii")
+
+    @property
+    def username(self) -> str:
+        """
+        The URL username as a string, with URL decoding applied.
+        For example: "jo@email.com"
+        """
+        userinfo = self._uri_reference.userinfo
+        return unquote(userinfo.partition(":")[0])
+
+    @property
+    def password(self) -> str:
+        """
+        The URL password as a string, with URL decoding applied.
+        For example: "a secret"
+        """
+        userinfo = self._uri_reference.userinfo
+        return unquote(userinfo.partition(":")[2])
+
+    @property
+    def host(self) -> str:
+        """
+        The URL host as a string.
+        Always normalized to lowercase, with IDNA hosts decoded into unicode.
+
+        Examples:
+
+        url = httpx.URL("http://www.EXAMPLE.org")
+        assert url.host == "www.example.org"
+
+        url = httpx.URL("http://中国.icom.museum")
+        assert url.host == "中国.icom.museum"
+
+        url = httpx.URL("http://xn--fiqs8s.icom.museum")
+        assert url.host == "中国.icom.museum"
+
+        url = httpx.URL("https://[::ffff:192.168.0.1]")
+        assert url.host == "::ffff:192.168.0.1"
+        """
+        host: str = self._uri_reference.host
+
+        if host.startswith("xn--"):
+            host = idna.decode(host)
+
+        return host
+
+    @property
+    def raw_host(self) -> bytes:
+        """
+        The raw bytes representation of the URL host.
+        Always normalized to lowercase, and IDNA encoded.
+
+        Examples:
+
+        url = httpx.URL("http://www.EXAMPLE.org")
+        assert url.raw_host == b"www.example.org"
+
+        url = httpx.URL("http://中国.icom.museum")
+        assert url.raw_host == b"xn--fiqs8s.icom.museum"
+
+        url = httpx.URL("http://xn--fiqs8s.icom.museum")
+        assert url.raw_host == b"xn--fiqs8s.icom.museum"
+
+        url = httpx.URL("https://[::ffff:192.168.0.1]")
+        assert url.raw_host == b"::ffff:192.168.0.1"
+        """
+        return self._uri_reference.host.encode("ascii")
+
+    @property
+    def port(self) -> int | None:
+        """
+        The URL port as an integer.
+
+        Note that the URL class performs port normalization as per the WHATWG spec.
+        Default ports for "http", "https", "ws", "wss", and "ftp" schemes are always
+        treated as `None`.
+
+        For example:
+
+        assert httpx.URL("http://www.example.com") == httpx.URL("http://www.example.com:80")
+        assert httpx.URL("http://www.example.com:80").port is None
+        """
+        return self._uri_reference.port
+
+    @property
+    def netloc(self) -> bytes:
+        """
+        Either `<host>` or `<host>:<port>` as bytes.
+        Always normalized to lowercase, and IDNA encoded.
+
+        This property may be used for generating the value of a request
+        "Host" header.
+        """
+        return self._uri_reference.netloc.encode("ascii")
+
+    @property
+    def path(self) -> str:
+        """
+        The URL path as a string. Excluding the query string, and URL decoded.
+
+        For example:
+
+        url = httpx.URL("https://example.com/pa%20th")
+        assert url.path == "/pa th"
+        """
+        path = self._uri_reference.path or "/"
+        return unquote(path)
+
+    @property
+    def query(self) -> bytes:
+        """
+        The URL query string, as raw bytes, excluding the leading b"?".
+
+        This is necessarily a bytewise interface, because we cannot
+        perform URL decoding of this representation until we've parsed
+        the keys and values into a QueryParams instance.
+
+        For example:
+
+        url = httpx.URL("https://example.com/?filter=some%20search%20terms")
+        assert url.query == b"filter=some%20search%20terms"
+        """
+        query = self._uri_reference.query or ""
+        return query.encode("ascii")
+
+    @property
+    def params(self) -> QueryParams:
+        """
+        The URL query parameters, neatly parsed and packaged into an immutable
+        multidict representation.
+        """
+        return QueryParams(self._uri_reference.query)
+
+    @property
+    def raw_path(self) -> bytes:
+        """
+        The complete URL path and query string as raw bytes.
+        Used as the target when constructing HTTP requests.
+
+        For example:
+
+        GET /users?search=some%20text HTTP/1.1
+        Host: www.example.org
+        Connection: close
+        """
+        path = self._uri_reference.path or "/"
+        if self._uri_reference.query is not None:
+            path += "?" + self._uri_reference.query
+        return path.encode("ascii")
+
+    @property
+    def fragment(self) -> str:
+        """
+        The URL fragments, as used in HTML anchors.
+        As a string, without the leading '#'.
+        """
+        return unquote(self._uri_reference.fragment or "")
+
+    @property
+    def is_absolute_url(self) -> bool:
+        """
+        Return `True` for absolute URLs such as 'http://example.com/path',
+        and `False` for relative URLs such as '/path'.
+        """
+        # We don't use `.is_absolute` from `rfc3986` because it treats
+        # URLs with a fragment portion as not absolute.
+        # What we actually care about is if the URL provides
+        # a scheme and hostname to which connections should be made.
+        return bool(self._uri_reference.scheme and self._uri_reference.host)
+
+    @property
+    def is_relative_url(self) -> bool:
+        """
+        Return `False` for absolute URLs such as 'http://example.com/path',
+        and `True` for relative URLs such as '/path'.
+        """
+        return not self.is_absolute_url
+
+    def copy_with(self, **kwargs: typing.Any) -> URL:
+        """
+        Copy this URL, returning a new URL with some components altered.
+        Accepts the same set of parameters as the components that are made
+        available via properties on the `URL` class.
+
+        For example:
+
+        url = httpx.URL("https://www.example.com").copy_with(
+            username="jo@gmail.com", password="a secret"
+        )
+        assert url == "https://jo%40email.com:a%20secret@www.example.com"
+        """
+        return URL(self, **kwargs)
+
+    def copy_set_param(self, key: str, value: typing.Any = None) -> URL:
+        return self.copy_with(params=self.params.set(key, value))
+
+    def copy_add_param(self, key: str, value: typing.Any = None) -> URL:
+        return self.copy_with(params=self.params.add(key, value))
+
+    def copy_remove_param(self, key: str) -> URL:
+        return self.copy_with(params=self.params.remove(key))
+
+    def copy_merge_params(self, params: QueryParamTypes) -> URL:
+        return self.copy_with(params=self.params.merge(params))
+
+    def join(self, url: URL | str) -> URL:
+        """
+        Return an absolute URL, using this URL as the base.
+
+        Eg.
+
+        url = httpx.URL("https://www.example.com/test")
+        url = url.join("/new/path")
+        assert url == "https://www.example.com/new/path"
+        """
+        from urllib.parse import urljoin
+
+        return URL(urljoin(str(self), str(URL(url))))
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return isinstance(other, (URL, str)) and str(self) == str(URL(other))
+
+    def __str__(self) -> str:
+        return str(self._uri_reference)
+
+    def __repr__(self) -> str:
+        scheme, userinfo, host, port, path, query, fragment = self._uri_reference
+
+        if ":" in userinfo:
+            # Mask any password component.
+            userinfo = f"{userinfo.split(':')[0]}:[secure]"
+
+        authority = "".join(
+            [
+                f"{userinfo}@" if userinfo else "",
+                f"[{host}]" if ":" in host else host,
+                f":{port}" if port is not None else "",
+            ]
+        )
+        url = "".join(
+            [
+                f"{self.scheme}:" if scheme else "",
+                f"//{authority}" if authority else "",
+                path,
+                f"?{query}" if query is not None else "",
+                f"#{fragment}" if fragment is not None else "",
+            ]
+        )
+
+        return f"{self.__class__.__name__}({url!r})"
+
+    @property
+    def raw(self) -> tuple[bytes, bytes, int, bytes]:  # pragma: nocover
+        import collections
+        import warnings
+
+        warnings.warn("URL.raw is deprecated.")
+        RawURL = collections.namedtuple(
+            "RawURL", ["raw_scheme", "raw_host", "port", "raw_path"]
+        )
+        return RawURL(
+            raw_scheme=self.raw_scheme,
+            raw_host=self.raw_host,
+            port=self.port,
+            raw_path=self.raw_path,
+        )
+
+
+class QueryParams(typing.Mapping[str, str]):
+    """
+    URL query parameters, as a multi-dict.
+    """
+
+    def __init__(self, *args: QueryParamTypes | None, **kwargs: typing.Any) -> None:
+        assert len(args) < 2, "Too many arguments."
+        assert not (args and kwargs), "Cannot mix named and unnamed arguments."
+
+        value = args[0] if args else kwargs
+
+        if value is None or isinstance(value, (str, bytes)):
+            value = value.decode("ascii") if isinstance(value, bytes) else value
+            self._dict = parse_qs(value, keep_blank_values=True)
+        elif isinstance(value, QueryParams):
+            self._dict = {k: list(v) for k, v in value._dict.items()}
+        else:
+            dict_value: dict[typing.Any, list[typing.Any]] = {}
+            if isinstance(value, (list, tuple)):
+                # Convert list inputs like:
+                #     [("a", "123"), ("a", "456"), ("b", "789")]
+                # To a dict representation, like:
+                #     {"a": ["123", "456"], "b": ["789"]}
+                for item in value:
+                    dict_value.setdefault(item[0], []).append(item[1])
+            else:
+                # Convert dict inputs like:
+                #    {"a": "123", "b": ["456", "789"]}
+                # To dict inputs where values are always lists, like:
+                #    {"a": ["123"], "b": ["456", "789"]}
+                dict_value = {
+                    k: list(v) if isinstance(v, (list, tuple)) else [v]
+                    for k, v in value.items()
+                }
+
+            # Ensure that keys and values are neatly coerced to strings.
+            # We coerce values `True` and `False` to JSON-like "true" and "false"
+            # representations, and coerce `None` values to the empty string.
+            self._dict = {
+                str(k): [primitive_value_to_str(item) for item in v]
+                for k, v in dict_value.items()
+            }
+
+    def keys(self) -> typing.KeysView[str]:
+        """
+        Return all the keys in the query params.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.keys()) == ["a", "b"]
+        """
+        return self._dict.keys()
+
+    def values(self) -> typing.ValuesView[str]:
+        """
+        Return all the values in the query params. If a key occurs more than once
+        only the first item for that key is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.values()) == ["123", "789"]
+        """
+        return {k: v[0] for k, v in self._dict.items()}.values()
+
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return all items in the query params. If a key occurs more than once
+        only the first item for that key is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.items()) == [("a", "123"), ("b", "789")]
+        """
+        return {k: v[0] for k, v in self._dict.items()}.items()
+
+    def multi_items(self) -> list[tuple[str, str]]:
+        """
+        Return all items in the query params. Allow duplicate keys to occur.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.multi_items()) == [("a", "123"), ("a", "456"), ("b", "789")]
+        """
+        multi_items: list[tuple[str, str]] = []
+        for k, v in self._dict.items():
+            multi_items.extend([(k, i) for i in v])
+        return multi_items
+
+    def get(self, key: typing.Any, default: typing.Any = None) -> typing.Any:
+        """
+        Get a value from the query param for a given key. If the key occurs
+        more than once, then only the first value is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get("a") == "123"
+        """
+        if key in self._dict:
+            return self._dict[str(key)][0]
+        return default
+
+    def get_list(self, key: str) -> list[str]:
+        """
+        Get all values from the query param for a given key.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get_list("a") == ["123", "456"]
+        """
+        return list(self._dict.get(str(key), []))
+
+    def set(self, key: str, value: typing.Any = None) -> QueryParams:
+        """
+        Return a new QueryParams instance, setting the value of a key.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123")
+        q = q.set("a", "456")
+        assert q == httpx.QueryParams("a=456")
+        """
+        q = QueryParams()
+        q._dict = dict(self._dict)
+        q._dict[str(key)] = [primitive_value_to_str(value)]
+        return q
+
+    def add(self, key: str, value: typing.Any = None) -> QueryParams:
+        """
+        Return a new QueryParams instance, setting or appending the value of a key.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123")
+        q = q.add("a", "456")
+        assert q == httpx.QueryParams("a=123&a=456")
+        """
+        q = QueryParams()
+        q._dict = dict(self._dict)
+        q._dict[str(key)] = q.get_list(key) + [primitive_value_to_str(value)]
+        return q
+
+    def remove(self, key: str) -> QueryParams:
+        """
+        Return a new QueryParams instance, removing the value of a key.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123")
+        q = q.remove("a")
+        assert q == httpx.QueryParams("")
+        """
+        q = QueryParams()
+        q._dict = dict(self._dict)
+        q._dict.pop(str(key), None)
+        return q
+
+    def merge(self, params: QueryParamTypes | None = None) -> QueryParams:
+        """
+        Return a new QueryParams instance, updated with.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123")
+        q = q.merge({"b": "456"})
+        assert q == httpx.QueryParams("a=123&b=456")
+
+        q = httpx.QueryParams("a=123")
+        q = q.merge({"a": "456", "b": "789"})
+        assert q == httpx.QueryParams("a=456&b=789")
+        """
+        q = QueryParams(params)
+        q._dict = {**self._dict, **q._dict}
+        return q
+
+    def __getitem__(self, key: typing.Any) -> str:
+        return self._dict[key][0]
+
+    def __contains__(self, key: typing.Any) -> bool:
+        return key in self._dict
+
+    def __iter__(self) -> typing.Iterator[typing.Any]:
+        return iter(self.keys())
+
+    def __len__(self) -> int:
+        return len(self._dict)
+
+    def __bool__(self) -> bool:
+        return bool(self._dict)
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+    def __eq__(self, other: typing.Any) -> bool:
+        if not isinstance(other, self.__class__):
+            return False
+        return sorted(self.multi_items()) == sorted(other.multi_items())
+
+    def __str__(self) -> str:
+        return urlencode(self.multi_items())
+
+    def __repr__(self) -> str:
+
+## httpx/_utils.py
+
+def is_ipv4_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv4Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+def is_ipv6_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv6Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+## tests/client/test_headers.py
+
+def test_host_with_auth_and_port_in_url():
+    """
+    The Host header should only include the hostname, or hostname:port
+    (for non-default ports only). Any userinfo or default port should not
+    be present.
+    """
+    url = "http://username:password@example.org:80/echo_headers"
+
+    client = httpx.Client(transport=httpx.MockTransport(echo_headers))
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org",
+            "user-agent": f"python-httpx/{httpx.__version__}",
+            "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+        }
+    }
+
+## tests/models/test_url.py
+
+def test_url_invalid_hostname():
+    """
+    Ensure that invalid URLs raise an `httpx.InvalidURL` exception.
+    """
+    with pytest.raises(httpx.InvalidURL):
+        httpx.URL("https://😇/")
+
+def test_url_eq_str():
+    """
+    Ensure that `httpx.URL` supports the equality operator.
+    """
+    url = httpx.URL("https://example.org:123/path/to/somewhere?abc=123#anchor")
+    assert url == "https://example.org:123/path/to/somewhere?abc=123#anchor"
+    assert str(url) == url
+
+## tests/test_multipart.py
+
+def test_multipart_explicit_boundary(header: str) -> None:
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"content-type": header}
+    response = client.post("http://127.0.0.1:8000/", files=files, headers=headers)
+    boundary_bytes = b"+++"
+
+    assert response.status_code == 200
+    assert response.request.headers["Content-Type"] == header
+    assert response.content == b"".join(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+
+def test_multipart_header_without_boundary(header: str) -> None:
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"content-type": header}
+    response = client.post("http://127.0.0.1:8000/", files=files, headers=headers)
+
+    assert response.status_code == 200
+    assert response.request.headers["Content-Type"] == header

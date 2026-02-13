@@ -1,0 +1,254 @@
+## httpx/_content.py
+
+    CHUNK_SIZE = 65_536
+
+## httpx/_decoders.py
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def decode(self, data: bytes) -> bytes:
+        assert zstandard is not None
+        self.seen_data = True
+        output = io.BytesIO()
+        try:
+            output.write(self.decompressor.decompress(data))
+            while self.decompressor.eof and self.decompressor.unused_data:
+                unused_data = self.decompressor.unused_data
+                self.decompressor = zstandard.ZstdDecompressor().decompressobj()
+                output.write(self.decompressor.decompress(unused_data))
+        except zstandard.ZstdError as exc:
+            raise DecodingError(str(exc)) from exc
+        return output.getvalue()
+
+    def flush(self) -> bytes:
+        if self.seen_data:
+            return b""
+        ret = self.decompressor.flush()  # note: this is a no-op
+        if not self.decompressor.eof:
+            raise DecodingError("Zstandard data is incomplete")  # pragma: no cover
+        return bytes(ret)
+
+## httpx/_models.py
+
+    def keys(self) -> typing.KeysView[str]:
+        return {key.decode(self.encoding): None for _, key, value in self._list}.keys()
+
+## tests/test_decoders.py
+
+def test_deflate():
+    """
+    Deflate encoding may use either 'zlib' or 'deflate' in the wild.
+
+    https://stackoverflow.com/questions/1838699/how-can-i-decompress-a-gzip-stream-with-zlib#answer-22311297
+    """
+    body = b"test 123"
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    compressed_body = compressor.compress(body) + compressor.flush()
+
+    headers = [(b"Content-Encoding", b"deflate")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_zlib():
+    """
+    Deflate encoding may use either 'zlib' or 'deflate' in the wild.
+
+    https://stackoverflow.com/questions/1838699/how-can-i-decompress-a-gzip-stream-with-zlib#answer-22311297
+    """
+    body = b"test 123"
+    compressed_body = zlib.compress(body)
+
+    headers = [(b"Content-Encoding", b"deflate")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_gzip():
+    body = b"test 123"
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    compressed_body = compressor.compress(body) + compressor.flush()
+
+    headers = [(b"Content-Encoding", b"gzip")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_brotli():
+    body = b"test 123"
+    compressed_body = b"\x8b\x03\x80test 123\x03"
+
+    headers = [(b"Content-Encoding", b"br")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_zstd():
+    body = b"test 123"
+    compressed_body = zstd.compress(body)
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_zstd_decoding_error():
+    compressed_body = "this_is_not_zstd_compressed_data"
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(
+            200,
+            headers=headers,
+            content=compressed_body,
+        )
+
+def test_zstd_truncated():
+    body = b"test 123"
+    compressed_body = zstd.compress(body)
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(
+            200,
+            headers=headers,
+            content=compressed_body[1:3],
+        )
+
+def test_zstd_multiframe():
+    # test inspired by urllib3 test suite
+    data = (
+        # Zstandard frame
+        zstd.compress(b"foo")
+        # skippable frame (must be ignored)
+        + bytes.fromhex(
+            "50 2A 4D 18"  # Magic_Number (little-endian)
+            "07 00 00 00"  # Frame_Size (little-endian)
+            "00 00 00 00 00 00 00"  # User_Data
+        )
+        # Zstandard frame
+        + zstd.compress(b"bar")
+    )
+    compressed_body = io.BytesIO(data)
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(200, headers=headers, content=compressed_body)
+    response.read()
+    assert response.content == b"foobar"
+
+def test_multi():
+    body = b"test 123"
+
+    deflate_compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    compressed_body = deflate_compressor.compress(body) + deflate_compressor.flush()
+
+    gzip_compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    compressed_body = (
+        gzip_compressor.compress(compressed_body) + gzip_compressor.flush()
+    )
+
+    headers = [(b"Content-Encoding", b"deflate, gzip")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_multi_with_identity():
+    body = b"test 123"
+    compressed_body = b"\x8b\x03\x80test 123\x03"
+
+    headers = [(b"Content-Encoding", b"br, identity")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+    headers = [(b"Content-Encoding", b"identity, br")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+async def test_streaming():
+    body = b"test 123"
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+
+    async def compress(body: bytes) -> typing.AsyncIterator[bytes]:
+        yield compressor.compress(body)
+        yield compressor.flush()
+
+    headers = [(b"Content-Encoding", b"gzip")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compress(body),
+    )
+    assert not hasattr(response, "body")
+    assert await response.aread() == body
+
+def test_empty_content(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=b"",
+    )
+    assert response.content == b""
+
+def test_decoding_errors(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    compressed_body = b"invalid"
+    with pytest.raises(httpx.DecodingError):
+        request = httpx.Request("GET", "https://example.org")
+        httpx.Response(200, headers=headers, content=compressed_body, request=request)
+
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(200, headers=headers, content=compressed_body)
+
+async def test_text_decoder_with_autodetect(data, encoding):
+    async def iterator() -> typing.AsyncIterator[bytes]:
+        nonlocal data
+        for chunk in data:
+            yield chunk
+
+    def autodetect(content):
+        return chardet.detect(content).get("encoding")
+
+    # Accessing `.text` on a read response.
+    response = httpx.Response(200, content=iterator(), default_encoding=autodetect)
+    await response.aread()
+    assert response.text == (b"".join(data)).decode(encoding)
+
+    # Streaming `.aiter_text` iteratively.
+    # Note that if we streamed the text *without* having read it first, then
+    # we won't get a `charset_normalizer` guess, and will instead always rely
+    # on utf-8 if no charset is specified.
+    text = "".join([part async for part in response.aiter_text()])
+    assert text == (b"".join(data)).decode(encoding)
+
+## tests/test_multipart.py
+
+def echo_request_content(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, content=request.content)

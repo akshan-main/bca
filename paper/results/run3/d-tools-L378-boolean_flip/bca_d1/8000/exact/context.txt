@@ -1,0 +1,860 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/store.py
+
+class AnalysisStore:
+    @classmethod
+    @logfire.instrument('Add analysis to store')
+    async def add(cls, analysis: Analysis):
+        await cls._get_store().put.aio(analysis.profile.email, analysis.model_dump())
+
+    @classmethod
+    @logfire.instrument('List analyses from store')
+    async def list(cls) -> list[Analysis]:
+        return [
+            Analysis.model_validate(analysis)
+            async for analysis in cls._get_store().values.aio()
+        ]
+
+    @classmethod
+    @logfire.instrument('Clear analyses from store')
+    async def clear(cls):
+        await cls._get_store().clear.aio()
+
+    @classmethod
+    def _get_store(cls) -> modal.Dict:
+        return modal.Dict.from_name('analyses', create_if_missing=True)  # type: ignore ### [/analysis_store]
+
+    async def add(cls, analysis: Analysis):
+        await cls._get_store().put.aio(analysis.profile.email, analysis.model_dump())
+
+## pydantic_ai_slim/pydantic_ai/__init__.py
+
+from .profiles import (
+    DEFAULT_PROFILE,
+    InlineDefsJsonSchemaTransformer,
+    JsonSchemaTransformer,
+    ModelProfile,
+    ModelProfileSpec,
+)
+
+## pydantic_ai_slim/pydantic_ai/_a2a.py
+
+from typing import Any, Generic, TypeVar
+
+## pydantic_ai_slim/pydantic_ai/_function_schema.py
+
+class FunctionSchema:
+    """Internal information about a function schema."""
+
+    function: Callable[..., Any]
+    description: str | None
+    validator: SchemaValidator
+    json_schema: ObjectJsonSchema
+    # if not None, the function takes a single by that name (besides potentially `info`)
+    takes_ctx: bool
+    is_async: bool
+    single_arg_name: str | None = None
+    positional_fields: list[str] = field(default_factory=list[str])
+    var_positional_field: str | None = None
+
+    async def call(self, args_dict: dict[str, Any], ctx: RunContext[Any]) -> Any:
+        args, kwargs = self._call_args(args_dict, ctx)
+        if self.is_async:
+            function = cast(Callable[[Any], Awaitable[str]], self.function)
+            return await function(*args, **kwargs)
+        else:
+            function = cast(Callable[[Any], str], self.function)
+            return await run_in_executor(function, *args, **kwargs)
+
+    def _call_args(
+        self,
+        args_dict: dict[str, Any],
+        ctx: RunContext[Any],
+    ) -> tuple[list[Any], dict[str, Any]]:
+        if self.single_arg_name:
+            args_dict = {self.single_arg_name: args_dict}
+
+        args = [ctx] if self.takes_ctx else []
+        for positional_field in self.positional_fields:
+            args.append(args_dict.pop(positional_field))  # pragma: no cover
+        if self.var_positional_field:
+            args.extend(args_dict.pop(self.var_positional_field))
+
+        return args, args_dict
+
+def function_schema(  # noqa: C901
+    function: Callable[..., Any],
+    schema_generator: type[GenerateJsonSchema],
+    takes_ctx: bool | None = None,
+    docstring_format: DocstringFormat = 'auto',
+    require_parameter_descriptions: bool = False,
+) -> FunctionSchema:
+    """Build a Pydantic validator and JSON schema from a tool function.
+
+    Args:
+        function: The function to build a validator and JSON schema for.
+        takes_ctx: Whether the function takes a `RunContext` first argument.
+        docstring_format: The docstring format to use.
+        require_parameter_descriptions: Whether to require descriptions for all tool function parameters.
+        schema_generator: The JSON schema generator class to use.
+
+    Returns:
+        A `FunctionSchema` instance.
+    """
+    config = ConfigDict(title=function.__name__, use_attribute_docstrings=True)
+    config_wrapper = ConfigWrapper(config)
+    gen_schema = _generate_schema.GenerateSchema(config_wrapper)
+    errors: list[str] = []
+
+    try:
+        sig = signature(function)
+    except ValueError as e:
+        errors.append(str(e))
+        sig = signature(lambda: None)
+    original_func = function.func if isinstance(function, partial) else function
+    function = cast(Callable[..., Any], function)  # cope with pyright changing the type from the isinstance() check.
+
+    type_hints = get_type_hints(original_func, include_extras=True)
+
+    var_kwargs_schema: core_schema.CoreSchema | None = None
+    fields: dict[str, core_schema.TypedDictField] = {}
+    positional_fields: list[str] = []
+    var_positional_field: str | None = None
+    decorators = _decorators.DecoratorInfos()
+
+    description, field_descriptions = doc_descriptions(original_func, sig, docstring_format=docstring_format)
+    missing_param_descriptions: set[str] = set()
+
+    for index, (name, p) in enumerate(sig.parameters.items()):
+        if index == 0 and takes_ctx is None:
+            takes_ctx = p.annotation is not sig.empty and _is_call_ctx(type_hints[name])
+
+        if p.annotation is sig.empty:
+            if takes_ctx and index == 0:
+                # should be the `context` argument, skip
+                continue
+            # TODO warn?
+            annotation = Any
+        else:
+            annotation = type_hints[name]
+
+            if index == 0 and takes_ctx:
+                if not _is_call_ctx(annotation):
+                    errors.append('First parameter of tools that take context must be annotated with RunContext[...]')
+                continue
+            elif not takes_ctx and _is_call_ctx(annotation):
+                errors.append('RunContext annotations can only be used with tools that take context')
+                continue
+            elif index != 0 and _is_call_ctx(annotation):
+                errors.append('RunContext annotations can only be used as the first argument')
+                continue
+
+        field_name = p.name
+
+        if require_parameter_descriptions and field_name not in field_descriptions:
+            missing_param_descriptions.add(field_name)
+
+        if p.kind == Parameter.VAR_KEYWORD:
+            var_kwargs_schema = gen_schema.generate_schema(annotation)
+        else:
+            if p.kind == Parameter.VAR_POSITIONAL:
+                annotation = list[annotation]
+
+            required = p.default is Parameter.empty
+            # FieldInfo.from_annotated_attribute expects a type, `annotation` is Any
+            annotation = cast(type[Any], annotation)
+            if required:
+                field_info = FieldInfo.from_annotation(annotation)
+            else:
+                field_info = FieldInfo.from_annotated_attribute(annotation, p.default)
+            if field_info.description is None:
+                field_info.description = field_descriptions.get(field_name)
+
+            fields[field_name] = td_schema = gen_schema._generate_td_field_schema(  # pyright: ignore[reportPrivateUsage]
+                field_name,
+                field_info,
+                decorators,
+                required=required,
+            )
+            # noinspection PyTypeChecker
+            td_schema.setdefault('metadata', {})['is_model_like'] = is_model_like(annotation)
+
+            if p.kind == Parameter.POSITIONAL_ONLY:
+                positional_fields.append(field_name)
+            elif p.kind == Parameter.VAR_POSITIONAL:
+                var_positional_field = field_name
+
+    if missing_param_descriptions:
+        errors.append(f'Missing parameter descriptions for {", ".join(missing_param_descriptions)}')
+
+    if errors:
+        from .exceptions import UserError
+
+        error_details = '\n  '.join(errors)
+        raise UserError(f'Error generating schema for {function.__qualname__}:\n  {error_details}')
+
+    core_config = config_wrapper.core_config(None)
+    # noinspection PyTypedDict
+    core_config['extra_fields_behavior'] = 'allow' if var_kwargs_schema else 'forbid'
+
+    schema, single_arg_name = _build_schema(fields, var_kwargs_schema, gen_schema, core_config)
+    schema = gen_schema.clean_schema(schema)
+    # noinspection PyUnresolvedReferences
+    schema_validator = create_schema_validator(
+        schema,
+        function,
+        function.__module__,
+        function.__qualname__,
+        'validate_call',
+        core_config,
+        config_wrapper.plugin_settings,
+    )
+    # PluggableSchemaValidator is api compatible with SchemaValidator
+    schema_validator = cast(SchemaValidator, schema_validator)
+    json_schema = schema_generator().generate(schema)
+
+    # workaround for https://github.com/pydantic/pydantic/issues/10785
+    # if we build a custom TypedDict schema (matches when `single_arg_name is None`), we manually set
+    # `additionalProperties` in the JSON Schema
+    if single_arg_name is not None and not description:
+        # if the tool description is not set, and we have a single parameter, take the description from that
+        # and set it on the tool
+        description = json_schema.pop('description', None)
+
+    return FunctionSchema(
+        description=description,
+        validator=schema_validator,
+        json_schema=check_object_json_schema(json_schema),
+        single_arg_name=single_arg_name,
+        positional_fields=positional_fields,
+        var_positional_field=var_positional_field,
+        takes_ctx=bool(takes_ctx),
+        is_async=is_async_callable(function),
+        function=function,
+    )
+
+def _build_schema(
+    fields: dict[str, core_schema.TypedDictField],
+    var_kwargs_schema: core_schema.CoreSchema | None,
+    gen_schema: _generate_schema.GenerateSchema,
+    core_config: core_schema.CoreConfig,
+) -> tuple[core_schema.CoreSchema, str | None]:
+    """Generate a typed dict schema for function parameters.
+
+    Args:
+        fields: The fields to generate a typed dict schema for.
+        var_kwargs_schema: The variable keyword arguments schema.
+        gen_schema: The `GenerateSchema` instance.
+        core_config: The core configuration.
+
+    Returns:
+        tuple of (generated core schema, single arg name).
+    """
+    if len(fields) == 1 and var_kwargs_schema is None:
+        name = next(iter(fields))
+        td_field = fields[name]
+        if td_field['metadata']['is_model_like']:  # type: ignore
+            return td_field['schema'], name
+
+    td_schema = core_schema.typed_dict_schema(
+        fields,
+        config=core_config,
+        extras_schema=gen_schema.generate_schema(var_kwargs_schema) if var_kwargs_schema else None,
+    )
+    return td_schema, None
+
+def _is_call_ctx(annotation: Any) -> bool:
+    """Return whether the annotation is the `RunContext` class, parameterized or not."""
+    return annotation is RunContext or get_origin(annotation) is RunContext
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+from abc import ABC, abstractmethod
+
+class JsonSchemaTransformer
+    """Walks a JSON schema, applying transformations to it at each level.
+
+    The transformer is called during a model's prepare_request() step to build the JSON schema
+    before it is sent to the model provider.
+
+    Note: We may eventually want to rework tools to build the JSON schema from the type directly, using a subclass of
+    pydantic.json_schema.GenerateJsonSchema, rather than making use of this machinery."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def walk(self) -> JsonSchema:
+        schema = deepcopy(self.schema)
+
+        # First, handle everything but $defs:
+        schema.pop('$defs', None)
+        handled = self._handle(schema)
+
+        if not self.prefer_inlined_defs and self.defs:
+            handled['$defs'] = {k: self._handle(v) for k, v in self.defs.items()}
+
+        elif self.recursive_refs:
+            # If we are preferring inlined defs and there are recursive refs, we _have_ to use a $defs+$ref structure
+            # We try to use whatever the original root key was, but if it is already in use,
+            # we modify it to avoid collisions.
+            defs = {key: self.defs[key] for key in self.recursive_refs}
+            root_ref = self.schema.get('$ref')
+            root_key = None if root_ref is None else re.sub(r'^#/\$defs/', '', root_ref)
+            if root_key is None:  # pragma: no cover
+                root_key = self.schema.get('title', 'root')
+                while root_key in defs:
+                    # Modify the root key until it is not already in use
+                    root_key = f'{root_key}_root'
+
+            defs[root_key] = handled
+            return {'$defs': defs, '$ref': f'#/$defs/{root_key}'}
+
+        return handled
+
+## pydantic_ai_slim/pydantic_ai/_output.py
+
+DEFAULT_OUTPUT_TOOL_DESCRIPTION = 'The final response which ends this conversation'
+
+class BaseOutputProcessor(ABC, Generic[OutputDataT]):
+    @abstractmethod
+    async def process(
+        self,
+        data: str,
+        *,
+        run_context: RunContext[AgentDepsT],
+        allow_partial: bool = False,
+        wrap_validation_errors: bool = True,
+    ) -> OutputDataT:
+        """Process an output message, performing validation and (if necessary) calling the output function."""
+        raise NotImplementedError()
+
+    _function_schema: _function_schema.FunctionSchema | None = None
+
+class TextOutputProcessor(BaseOutputProcessor[OutputDataT]):
+    async def process(
+        self,
+        data: str,
+        *,
+        run_context: RunContext[AgentDepsT],
+        validation_context: Any | None = None,
+        allow_partial: bool = False,
+        wrap_validation_errors: bool = True,
+    ) -> OutputDataT:
+        return cast(OutputDataT, data)
+
+class TextFunctionOutputProcessor(TextOutputProcessor[OutputDataT]):
+    _function_schema: _function_schema.FunctionSchema
+    _str_argument_name: str
+
+    def __init__(
+        self,
+        output_function: TextOutputFunc[OutputDataT],
+    ):
+        self._function_schema = _function_schema.function_schema(output_function, GenerateToolJsonSchema)
+
+        if (
+            not (arguments_schema := self._function_schema.json_schema.get('properties', {}))
+            or len(arguments_schema) != 1
+            or not (argument_name := next(iter(arguments_schema.keys()), None))
+            or arguments_schema.get(argument_name, {}).get('type') != 'string'
+        ):
+            raise UserError('TextOutput must take a function taking a single `str` argument')
+
+        self._str_argument_name = argument_name
+
+    async def process(
+        self,
+        data: str,
+        *,
+        run_context: RunContext[AgentDepsT],
+        validation_context: Any | None = None,
+        allow_partial: bool = False,
+        wrap_validation_errors: bool = True,
+    ) -> OutputDataT:
+        args = {self._str_argument_name: data}
+        data = await execute_traced_output_function(self._function_schema, run_context, args, wrap_validation_errors)
+
+        return await super().process(
+            data,
+            run_context=run_context,
+            validation_context=validation_context,
+            allow_partial=allow_partial,
+            wrap_validation_errors=wrap_validation_errors,
+        )
+
+    _function_schema: _function_schema.FunctionSchema
+
+    def __init__(
+        self,
+        output_function: TextOutputFunc[OutputDataT],
+    ):
+        self._function_schema = _function_schema.function_schema(output_function, GenerateToolJsonSchema)
+
+        if (
+            not (arguments_schema := self._function_schema.json_schema.get('properties', {}))
+            or len(arguments_schema) != 1
+            or not (argument_name := next(iter(arguments_schema.keys()), None))
+            or arguments_schema.get(argument_name, {}).get('type') != 'string'
+        ):
+            raise UserError('TextOutput must take a function taking a single `str` argument')
+
+        self._str_argument_name = argument_name
+
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+    def description(self) -> str: ...
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class _JsonSchemaTestData:
+    """Generate data that matches a JSON schema.
+
+    This tries to generate the minimal viable data for the schema.
+    """
+
+    def __init__(self, schema: _utils.ObjectJsonSchema, seed: int = 0):
+        self.schema = schema
+        self.defs = schema.get('$defs', {})
+        self.seed = seed
+
+    def generate(self) -> dict[str, Any]:
+        """Generate data for the JSON schema."""
+        return self._gen_any(self.schema)
+
+    def _gen_any(self, schema: dict[str, Any]) -> Any:
+        """Generate data for any JSON Schema."""
+        if const := schema.get('const'):
+            return const
+        elif enum := schema.get('enum'):
+            return enum[self.seed % len(enum)]
+        elif examples := schema.get('examples'):
+            return examples[self.seed % len(examples)]
+        elif ref := schema.get('$ref'):
+            key = re.sub(r'^#/\$defs/', '', ref)
+            js_def = self.defs[key]
+            return self._gen_any(js_def)
+        elif any_of := schema.get('anyOf'):
+            return self._gen_any(any_of[self.seed % len(any_of)])
+
+        type_ = schema.get('type')
+        if type_ is None:
+            # if there's no type or ref, we can't generate anything
+            return self._char()
+        elif type_ == 'object':
+            return self._object_gen(schema)
+        elif type_ == 'string':
+            return self._str_gen(schema)
+        elif type_ == 'integer':
+            return self._int_gen(schema)
+        elif type_ == 'number':
+            return float(self._int_gen(schema))
+        elif type_ == 'boolean':
+            return self._bool_gen()
+        elif type_ == 'array':
+            return self._array_gen(schema)
+        elif type_ == 'null':
+            return None
+        else:
+            raise NotImplementedError(f'Unknown type: {type_}, please submit a PR to extend JsonSchemaTestData!')
+
+    def _object_gen(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """Generate data for a JSON Schema object."""
+        required = set(schema.get('required', []))
+
+        data: dict[str, Any] = {}
+        if properties := schema.get('properties'):
+            for key, value in properties.items():
+                if key in required:
+                    data[key] = self._gen_any(value)
+
+        if addition_props := schema.get('additionalProperties'):
+            add_prop_key = 'additionalProperty'
+            while add_prop_key in data:
+                add_prop_key += '_'
+            if addition_props is True:
+                data[add_prop_key] = self._char()
+            else:
+                data[add_prop_key] = self._gen_any(addition_props)
+
+        return data
+
+    def _str_gen(self, schema: dict[str, Any]) -> str:
+        """Generate a string from a JSON Schema string."""
+        min_len = schema.get('minLength')
+        if min_len is not None:
+            return self._char() * min_len
+
+        if schema.get('maxLength') == 0:
+            return ''
+
+        if fmt := schema.get('format'):
+            if fmt == 'date':
+                return (date(2024, 1, 1) + timedelta(days=self.seed)).isoformat()
+
+        return self._char()
+
+    def _int_gen(self, schema: dict[str, Any]) -> int:
+        """Generate an integer from a JSON Schema integer."""
+        maximum = schema.get('maximum')
+        if maximum is None:
+            exc_max = schema.get('exclusiveMaximum')
+            if exc_max is not None:
+                maximum = exc_max - 1
+
+        minimum = schema.get('minimum')
+        if minimum is None:
+            exc_min = schema.get('exclusiveMinimum')
+            if exc_min is not None:
+                minimum = exc_min + 1
+
+        if minimum is not None and maximum is not None:
+            return minimum + self.seed % (maximum - minimum)
+        elif minimum is not None:
+            return minimum + self.seed
+        elif maximum is not None:
+            return maximum - self.seed
+        else:
+            return self.seed
+
+    def _bool_gen(self) -> bool:
+        """Generate a boolean from a JSON Schema boolean."""
+        return bool(self.seed % 2)
+
+    def _array_gen(self, schema: dict[str, Any]) -> list[Any]:
+        """Generate an array from a JSON Schema array."""
+        data: list[Any] = []
+        unique_items = schema.get('uniqueItems')
+        if prefix_items := schema.get('prefixItems'):
+            for item in prefix_items:
+                data.append(self._gen_any(item))
+                if unique_items:
+                    self.seed += 1
+
+        items_schema = schema.get('items', {})
+        min_items = schema.get('minItems', 0)
+        if min_items > len(data):
+            for _ in range(min_items - len(data)):
+                data.append(self._gen_any(items_schema))
+                if unique_items:
+                    self.seed += 1
+        elif items_schema:
+            # if there is an `items` schema, add an item unless it would break `maxItems` rule
+            max_items = schema.get('maxItems')
+            if max_items is None or max_items > len(data):
+                data.append(self._gen_any(items_schema))
+                if unique_items:
+                    self.seed += 1
+
+        return data
+
+    def _char(self) -> str:
+        """Generate a character on the same principle as Excel columns, e.g. a-z, aa-az..."""
+        chars = len(_chars)
+        s = ''
+        rem = self.seed // chars
+        while rem > 0:
+            s += _chars[(rem - 1) % chars]
+            rem //= chars
+        s += _chars[self.seed % chars]
+        return s
+
+    def generate(self) -> dict[str, Any]:
+        """Generate data for the JSON schema."""
+        return self._gen_any(self.schema)
+
+## pydantic_ai_slim/pydantic_ai/profiles/google.py
+
+class GoogleJsonSchemaTransformer(JsonSchemaTransformer):
+    """Transforms the JSON Schema from Pydantic to be suitable for Gemini.
+
+    Gemini supports [a subset of OpenAPI v3.0.3](https://ai.google.dev/gemini-api/docs/function-calling#function_declarations).
+    """
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        # Remove properties not supported by Gemini
+        schema.pop('$schema', None)
+        if (const := schema.pop('const', None)) is not None:
+            # Gemini doesn't support const, but it does support enum with a single value
+            schema['enum'] = [const]
+            # If type is not present, infer it from the const value for Gemini API compatibility
+            if 'type' not in schema:
+                if isinstance(const, str):
+                    schema['type'] = 'string'
+                elif isinstance(const, bool):
+                    # bool must be checked before int since bool is a subclass of int in Python
+                    schema['type'] = 'boolean'
+                elif isinstance(const, int):
+                    schema['type'] = 'integer'
+                elif isinstance(const, float):
+                    schema['type'] = 'number'
+        schema.pop('discriminator', None)
+        schema.pop('examples', None)
+
+        # Remove 'title' due to https://github.com/googleapis/python-genai/issues/1732
+        schema.pop('title', None)
+
+        type_ = schema.get('type')
+        if type_ == 'string' and (fmt := schema.pop('format', None)):
+            description = schema.get('description')
+            if description:
+                schema['description'] = f'{description} (format: {fmt})'
+            else:
+                schema['description'] = f'Format: {fmt}'
+
+        # Note: exclusiveMinimum/exclusiveMaximum are NOT yet supported
+        schema.pop('exclusiveMinimum', None)
+        schema.pop('exclusiveMaximum', None)
+
+        return schema
+
+## pydantic_ai_slim/pydantic_ai/tools.py
+
+    require_parameter_descriptions: bool
+
+    function_schema: _function_schema.FunctionSchema
+
+## pydantic_ai_slim/pydantic_ai/toolsets/function.py
+
+    require_parameter_descriptions: bool
+
+## pydantic_graph/pydantic_graph/beta/graph_builder.py
+
+    def join(
+        self,
+        reducer: ReducerFunction[StateT, DepsT, InputT, OutputT],
+        *,
+        initial: OutputT | Unset = UNSET,
+        initial_factory: Callable[[], OutputT] | Unset = UNSET,
+        node_id: str | None = None,
+        parent_fork_id: str | None = None,
+        preferred_parent_fork: Literal['farthest', 'closest'] = 'farthest',
+    ) -> Join[StateT, DepsT, InputT, OutputT]:
+        if initial_factory is UNSET:
+            initial_factory = lambda: initial  # pyright: ignore[reportAssignmentType]  # noqa: E731
+
+        return Join[StateT, DepsT, InputT, OutputT](
+            id=JoinID(NodeID(node_id or generate_placeholder_node_id(get_callable_name(reducer)))),
+            reducer=reducer,
+            initial_factory=cast(Callable[[], OutputT], initial_factory),
+            parent_fork_id=ForkID(parent_fork_id) if parent_fork_id is not None else None,
+            preferred_parent_fork=preferred_parent_fork,
+        )
+
+## pydantic_graph/pydantic_graph/beta/mermaid.py
+
+def _topological_sort(
+    nodes: list[MermaidNode], edges: list[MermaidEdge]
+) -> tuple[list[MermaidNode], list[MermaidEdge]]:
+    """Sort nodes and edges in a logical topological order.
+
+    Uses BFS from the start node to assign depths, then sorts:
+    - Nodes by their distance from start
+    - Edges by the distance of their source and target nodes
+    """
+    # Build adjacency list for BFS
+    adjacency: dict[str, list[str]] = defaultdict(list)
+    for edge in edges:
+        adjacency[edge.start_id].append(edge.end_id)
+
+    # BFS to assign depth to each node (distance from start)
+    depths: dict[str, int] = {}
+    queue: list[tuple[str, int]] = [(StartNode.id, 0)]
+    depths[StartNode.id] = 0
+
+    while queue:
+        node_id, depth = queue.pop(0)
+        for next_id in adjacency[node_id]:
+            if next_id not in depths:  # pragma: no branch
+                depths[next_id] = depth + 1
+                queue.append((next_id, depth + 1))
+
+    # Sort nodes by depth (distance from start), then by id for stability
+    # Nodes not reachable from start get infinity depth (sorted to end)
+    sorted_nodes = sorted(nodes, key=lambda n: (depths.get(n.id, float('inf')), n.id))
+
+    # Sort edges by source depth, then target depth
+    # This ensures edges closer to start come first, edges closer to end come last
+    sorted_edges = sorted(
+        edges,
+        key=lambda e: (
+            depths.get(e.start_id, float('inf')),
+            depths.get(e.end_id, float('inf')),
+            e.start_id,
+            e.end_id,
+        ),
+    )
+
+    return sorted_nodes, sorted_edges
+
+## tests/conftest.py
+
+class TestEnv:
+    __test__ = False
+
+    def __init__(self):
+        self.envars: dict[str, str | None] = {}
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+    def reset(self) -> None:
+        for name, value in self.envars.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value  # pragma: lax no cover
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+## tests/evals/test_otel.py
+
+async def test_span_query_logical_combinations():
+    """Test logical combinations (AND/OR) in SpanQuery."""
+
+    with context_subtree() as tree:
+        with logfire.span('root1', level='0'):
+            with logfire.span('child1', level='1', category='important'):
+                pass
+            with logfire.span('child2', level='1', category='normal'):
+                pass
+            with logfire.span('special', level='1', category='important', priority='high'):
+                pass
+    assert isinstance(tree, SpanTree)
+
+    # Test AND logic
+    and_query: SpanQuery = {'and_': [{'name_contains': '1'}, {'has_attributes': {'level': '1'}}]}
+    matched_nodes = list(tree.find(and_query))
+    assert len(matched_nodes) == 1, matched_nodes
+    assert all(node.name in ['child1'] for node in matched_nodes)
+
+    # Test OR logic
+    or_query: SpanQuery = {'or_': [{'name_contains': '2'}, {'has_attributes': {'level': '0'}}]}
+    matched_nodes = list(tree.find(or_query))
+    assert len(matched_nodes) == 2
+    assert any(node.name == 'child2' for node in matched_nodes)
+    assert any(node.attributes.get('level') == '0' for node in matched_nodes)
+
+    # Test complex combination (AND + OR)
+    complex_query: SpanQuery = {
+        'and_': [
+            {'has_attributes': {'level': '1'}},
+            {'or_': [{'has_attributes': {'category': 'important'}}, {'name_equals': 'child2'}]},
+        ]
+    }
+    matched_nodes = list(tree.find(complex_query))
+    assert len(matched_nodes) == 3  # child1, child2, special
+    matched_names = [node.name for node in matched_nodes]
+    assert set(matched_names) == {'child1', 'child2', 'special'}
+
+## tests/profiles/test_google.py
+
+def test_format_moved_to_description():
+    """format should be moved to description for string types."""
+    schema = {'type': 'string', 'format': 'date-time'}
+    transformer = GoogleJsonSchemaTransformer(schema)
+    transformed = transformer.walk()
+
+    assert 'format' not in transformed
+    assert transformed == snapshot({'type': 'string', 'description': 'Format: date-time'})
+
+def test_format_appended_to_existing_description():
+    """format should be appended to existing description."""
+    schema = {'type': 'string', 'format': 'email', 'description': 'User email address'}
+    transformer = GoogleJsonSchemaTransformer(schema)
+    transformed = transformer.walk()
+
+    assert 'format' not in transformed
+    assert transformed == snapshot({'type': 'string', 'description': 'User email address (format: email)'})
+
+## tests/test_agent.py
+
+def test_output_type_with_two_descriptions():
+    class MyOutput(BaseModel):
+        """Description from docstring"""
+
+        valid: bool
+
+    m = TestModel()
+    agent = Agent(m, output_type=ToolOutput(MyOutput, description='Description from ToolOutput'))
+    result = agent.run_sync('Hello')
+    assert result.output == snapshot(MyOutput(valid=False))
+    assert m.last_model_request_parameters is not None
+    assert m.last_model_request_parameters.output_tools == snapshot(
+        [
+            ToolDefinition(
+                name='final_result',
+                description='Description from ToolOutput. Description from docstring',
+                parameters_json_schema={
+                    'properties': {'valid': {'type': 'boolean'}},
+                    'required': ['valid'],
+                    'title': 'MyOutput',
+                    'type': 'object',
+                },
+                kind='output',
+            )
+        ]
+    )
+
+## tests/test_prefect.py
+
+def conditions(city: str) -> str:
+    # Simplified version without RunContext
+    return "It's raining"
+
+## tests/test_tools.py
+
+def test_enforce_parameter_descriptions() -> None:
+    agent = Agent(FunctionModel(get_json_schema))
+
+    with pytest.raises(UserError) as exc_info:
+        agent.tool_plain(require_parameter_descriptions=True)(missing_parameter_descriptions_docstring)
+
+    error_reason = exc_info.value.args[0]
+    error_parts = [
+        'Error generating schema for missing_parameter_descriptions_docstring',
+        'Missing parameter descriptions for ',
+        'foo',
+        'bar',
+    ]
+    assert all(err_part in error_reason for err_part in error_parts)
+
+def test_enforce_parameter_descriptions_noraise() -> None:
+    async def complete_parameter_descriptions_docstring(ctx: RunContext, foo: int) -> str:  # pragma: no cover
+        """Describes function ops, but missing ctx description and contains non-existent parameter description.
+
+        :param foo: The foo thing.
+        :param bar: The bar thing.
+        """
+        return f'{foo}'
+
+    agent = Agent(FunctionModel(get_json_schema))
+
+    agent.tool(require_parameter_descriptions=True)(complete_parameter_descriptions_docstring)

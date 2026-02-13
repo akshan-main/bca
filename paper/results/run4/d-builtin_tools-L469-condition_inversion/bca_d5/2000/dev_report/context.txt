@@ -1,0 +1,222 @@
+## pydantic_ai_slim/pydantic_ai/builtin_tools.py
+
+class AbstractBuiltinTool(ABC):
+    """A builtin tool that can be used by an agent.
+
+    This class is abstract and cannot be instantiated directly.
+
+    The builtin tools are passed to the model as part of the `ModelRequestParameters`.
+    """
+
+    kind: str = 'unknown_builtin_tool'
+    """Built-in tool identifier, this should be available on all built-in tools as a discriminator."""
+
+    @property
+    def unique_id(self) -> str:
+        """A unique identifier for the builtin tool.
+
+        If multiple instances of the same builtin tool can be passed to the model, subclasses should override this property to allow them to be distinguished.
+        """
+        return self.kind
+
+    @property
+    def label(self) -> str:
+        """Human-readable label for UI display.
+
+        Subclasses should override this to provide a meaningful label.
+        """
+        return self.kind.replace('_', ' ').title()
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        BUILTIN_TOOL_TYPES[cls.kind] = cls
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls, _source_type: Any, handler: pydantic.GetCoreSchemaHandler
+    ) -> core_schema.CoreSchema:
+        if cls is not AbstractBuiltinTool:
+            return handler(cls)
+
+        tools = BUILTIN_TOOL_TYPES.values()
+        if len(tools) == 1:  # pragma: no cover
+            tools_type = next(iter(tools))
+        else:
+            tools_annotated = [Annotated[tool, pydantic.Tag(tool.kind)] for tool in tools]
+            tools_type = Annotated[Union[tuple(tools_annotated)], pydantic.Discriminator(_tool_discriminator)]  # noqa: UP007
+
+        return handler(tools_type)
+
+class WebFetchTool(AbstractBuiltinTool):
+    """Allows your agent to access contents from URLs.
+
+    The parameters that PydanticAI passes depend on the model, as some parameters may not be supported by certain models.
+
+    Supported by:
+
+    * Anthropic
+    * Google
+    """
+
+    max_uses: int | None = None
+    """If provided, the tool will stop fetching URLs after the given number of uses.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    allowed_domains: list[str] | None = None
+    """If provided, only these domains will be fetched.
+
+    With Anthropic, you can only use one of `blocked_domains` or `allowed_domains`, not both.
+
+    Supported by:
+
+    * Anthropic, see <https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-fetch-tool#domain-filtering>
+    """
+
+    blocked_domains: list[str] | None = None
+    """If provided, these domains will never be fetched.
+
+    With Anthropic, you can only use one of `blocked_domains` or `allowed_domains`, not both.
+
+    Supported by:
+
+    * Anthropic, see <https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/web-fetch-tool#domain-filtering>
+    """
+
+    enable_citations: bool = False
+    """If True, enables citations for fetched content.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    max_content_tokens: int | None = None
+    """Maximum content length in tokens for fetched content.
+
+    Supported by:
+
+    * Anthropic
+    """
+
+    kind: str = 'web_fetch'
+    """The kind of tool."""
+
+class UrlContextTool(WebFetchTool):
+    """Deprecated alias for WebFetchTool. Use WebFetchTool instead.
+
+    Overrides kind to 'url_context' so old serialized payloads with {"kind": "url_context", ...}
+    can be deserialized to UrlContextTool for backward compatibility.
+    """
+
+    kind: str = 'url_context'
+    """The kind of tool (deprecated value for backward compatibility)."""
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    def args_as_dict(self) -> dict[str, Any]:
+        """Return the arguments as a Python dictionary.
+
+        This is just for convenience with models that require dicts as input.
+        """
+        if not self.args:
+            return {}
+        if isinstance(self.args, dict):
+            return self.args
+        args = pydantic_core.from_json(self.args)
+        assert isinstance(args, dict), 'args should be a dict'
+        return cast(dict[str, Any], args)
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+    def validate_python(
+        self, input: Any, *, allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False, **kwargs: Any
+    ) -> Any: ...
+
+## tests/graph/beta/test_joins_and_reducers.py
+
+async def test_reduce_dict_update_with_overlapping_keys():
+    """Test that reduce_dict_update properly handles overlapping keys (later values win)."""
+    g = GraphBuilder(state_type=SimpleState, output_type=dict[str, int])
+
+    @g.step
+    async def generate(ctx: StepContext[SimpleState, None, None]) -> list[int]:
+        return [1, 2, 3]
+
+    @g.step
+    async def create_dict(ctx: StepContext[SimpleState, None, int]) -> dict[str, int]:
+        # All create the same key
+        return {'key': ctx.inputs}
+
+    dict_join = g.join(reduce_dict_update, initial_factory=dict[str, int])
+
+    g.add(
+        g.edge_from(g.start_node).to(generate),
+        g.edge_from(generate).map().to(create_dict),
+        g.edge_from(create_dict).to(dict_join),
+        g.edge_from(dict_join).to(g.end_node),
+    )
+
+    graph = g.build()
+    result = await graph.run(state=SimpleState())
+    # One of the values should win (1, 2, or 3)
+    assert 'key' in result
+    assert result['key'] in [1, 2, 3]
+
+## tests/models/test_openai.py
+
+def test_azure_400_non_dict_body(allow_model_requests: None) -> None:
+    """Test a 400 error from Azure where the body is not a dictionary."""
+    mock_client = MockOpenAI.create_mock(
+        APIStatusError(
+            'Bad Request',
+            response=httpx.Response(status_code=400, request=httpx.Request('POST', 'https://example.com/v1')),
+            body='Raw string body',
+        )
+    )
+    m = OpenAIChatModel('gpt-5-mini', provider=AzureProvider(openai_client=cast(AsyncAzureOpenAI, mock_client)))
+    agent = Agent(m)
+
+    with pytest.raises(ModelHTTPError) as exc_info:
+        agent.run_sync('hello')
+
+    assert exc_info.value.status_code == 400
+
+## tests/test_builtin_tools.py
+
+def test_url_context_tool_backward_compatibility():
+    """Test that old payloads with 'url_context' kind can be deserialized."""
+    adapter = TypeAdapter(AbstractBuiltinTool)
+
+    # Test 1: Old payload with url_context should deserialize to UrlContextTool (which is deprecated)
+    old_payload = {'kind': 'url_context', 'max_uses': 5, 'enable_citations': True}
+    with pytest.warns(DeprecationWarning, match='Use `WebFetchTool` instead.'):
+        result = adapter.validate_python(old_payload)
+    assert isinstance(result, UrlContextTool)  # pyright: ignore[reportDeprecated]
+    assert isinstance(result, WebFetchTool)  # UrlContextTool is a subclass of WebFetchTool
+    assert result.kind == 'url_context'  # Preserves the original kind from payload
+    assert result.max_uses == 5
+    assert result.enable_citations is True
+
+    # Test 2: Re-serialization should preserve the kind
+    serialized = adapter.dump_python(result)
+    assert serialized['kind'] == 'url_context'
+    assert serialized['max_uses'] == 5
+    assert serialized['enable_citations'] is True
+
+    # Test 3: New payload with web_fetch should work normally
+    new_payload = {'kind': 'web_fetch', 'max_uses': 10}
+    result2 = adapter.validate_python(new_payload)
+    assert isinstance(result2, WebFetchTool)
+    assert result2.kind == 'web_fetch'
+    assert result2.max_uses == 10
+
+## tests/test_tools.py
+
+def test_tool_call_part_args_as_dict(args: str | dict[str, Any], expected: dict[str, Any]):
+    part = ToolCallPart(tool_name='foo', args=args)
+    result = part.args_as_dict()
+    assert result == expected

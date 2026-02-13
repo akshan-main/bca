@@ -1,0 +1,196 @@
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+## pydantic_ai_slim/pydantic_ai/direct.py
+
+    _context_entered: bool = field(default=False, init=False)
+
+## pydantic_graph/pydantic_graph/beta/graph.py
+
+    def value(self) -> OutputT:
+        return self._value
+
+    def render(self, *, title: str | None = None, direction: StateDiagramDirection | None = None) -> str:
+        """Render the graph as a Mermaid diagram string.
+
+        Args:
+            title: Optional title for the diagram
+            direction: Optional direction for the diagram layout
+
+        Returns:
+            A string containing the Mermaid diagram representation
+        """
+        from pydantic_graph.beta.mermaid import build_mermaid_graph
+
+        return build_mermaid_graph(self.nodes, self.edges_by_source).render(title=title, direction=direction)
+
+## pydantic_graph/pydantic_graph/beta/mermaid.py
+
+    def render(
+        self,
+        direction: StateDiagramDirection | None = None,
+        title: str | None = None,
+        edge_labels: bool = True,
+    ):
+        lines: list[str] = []
+        if title:
+            lines = ['---', f'title: {title}', '---']
+        lines.append('stateDiagram-v2')
+        if direction is not None:
+            lines.append(f'  direction {direction}')
+
+        nodes, edges = _topological_sort(self.nodes, self.edges)
+        for node in nodes:
+            # List all nodes in order they were created
+            node_lines: list[str] = []
+            if node.kind == 'start' or node.kind == 'end':
+                pass  # Start and end nodes use special [*] syntax in edges
+            elif node.kind == 'step':
+                line = f'  {node.id}'
+                if node.label:
+                    line += f': {node.label}'
+                node_lines.append(line)
+            elif node.kind == 'join':
+                node_lines = [f'  state {node.id} <<join>>']
+            elif node.kind == 'broadcast' or node.kind == 'map':
+                node_lines = [f'  state {node.id} <<fork>>']
+            elif node.kind == 'decision':
+                node_lines = [f'  state {node.id} <<choice>>']
+                if node.note:
+                    node_lines.append(f'  note right of {node.id}\n    {node.note}\n  end note')
+            else:  # pragma: no cover
+                assert_never(node.kind)
+            lines.extend(node_lines)
+
+        lines.append('')
+
+        for edge in edges:
+            # Use special [*] syntax for start/end nodes
+            render_start_id = '[*]' if edge.start_id == StartNode.id else edge.start_id
+            render_end_id = '[*]' if edge.end_id == EndNode.id else edge.end_id
+            edge_line = f'  {render_start_id} --> {render_end_id}'
+            if edge.label and edge_labels:
+                edge_line += f': {edge.label}'
+            lines.append(edge_line)
+
+        return '\n'.join(lines)
+
+## tests/graph/beta/test_edge_cases.py
+
+async def test_graph_with_no_steps():
+    """Test a graph with no intermediate steps (direct start to end)."""
+    g = GraphBuilder(input_type=int, output_type=int)
+
+    g.add(g.edge_from(g.start_node).to(g.end_node))
+
+    graph = g.build()
+    result = await graph.run(inputs=42)
+    assert result == 42
+
+## tests/models/test_openrouter.py
+
+async def test_openrouter_document_url_no_force_download(
+    allow_model_requests: None, openrouter_api_key: str, vcr: Cassette
+) -> None:
+    """Test that OpenRouter passes DocumentUrl directly without downloading when force_download=False.
+
+    OpenRouter supports file URLs directly in the Chat API, unlike native OpenAI which only
+    supports base64-encoded data. This test verifies that when using OpenRouter, the URL
+    is passed directly without being downloaded first.
+    """
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('openai/gpt-4.1-mini', provider=provider)
+    agent = Agent(model)
+
+    pdf_url = 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf'
+    document_url = DocumentUrl(url=pdf_url, force_download=False)
+
+    result = await agent.run(['What is the main content of this document?', document_url])
+    assert 'dummy' in result.output.lower() or 'pdf' in result.output.lower()
+
+    # Verify URL was passed directly (not downloaded and base64-encoded)
+    assert vcr is not None
+    assert len(vcr.requests) == 1, 'Should only have one request (to OpenRouter, not a download)'  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+    request_body = json.loads(vcr.requests[0].body)  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+    file_content = request_body['messages'][0]['content'][1]
+    assert file_content == snapshot(
+        {
+            'file': {
+                'file_data': 'https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf',
+                'filename': 'filename.pdf',
+            },
+            'type': 'file',
+        }
+    )

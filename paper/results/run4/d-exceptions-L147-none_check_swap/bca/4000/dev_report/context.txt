@@ -1,0 +1,370 @@
+## pydantic_ai_slim/pydantic_ai/exceptions.py
+
+class ModelRetry(Exception):
+    """Exception to raise when a tool function should be retried.
+
+    The agent will return the message to the model and ask it to try calling the function/tool again.
+    """
+
+    message: str
+    """The message to return to the model."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, self.__class__) and other.message == self.message
+
+    def __hash__(self) -> int:
+        return hash((self.__class__, self.message))
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, _: Any, __: Any) -> core_schema.CoreSchema:
+        """Pydantic core schema to allow `ModelRetry` to be (de)serialized."""
+        schema = core_schema.typed_dict_schema(
+            {
+                'message': core_schema.typed_dict_field(core_schema.str_schema()),
+                'kind': core_schema.typed_dict_field(core_schema.literal_schema(['model-retry'])),
+            }
+        )
+        return core_schema.no_info_after_validator_function(
+            lambda dct: ModelRetry(dct['message']),
+            schema,
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                lambda x: {'message': x.message, 'kind': 'model-retry'},
+                return_schema=schema,
+            ),
+        )
+
+class CallDeferred(Exception):
+    """Exception to raise when a tool call should be deferred.
+
+    See [tools docs](../deferred-tools.md#deferred-tools) for more information.
+
+    Args:
+        metadata: Optional dictionary of metadata to attach to the deferred tool call.
+            This metadata will be available in `DeferredToolRequests.metadata` keyed by `tool_call_id`.
+    """
+
+    def __init__(self, metadata: dict[str, Any] | None = None):
+        self.metadata = metadata
+        super().__init__()
+
+class ApprovalRequired(Exception):
+    """Exception to raise when a tool call requires human-in-the-loop approval.
+
+    See [tools docs](../deferred-tools.md#human-in-the-loop-tool-approval) for more information.
+
+    Args:
+        metadata: Optional dictionary of metadata to attach to the deferred tool call.
+            This metadata will be available in `DeferredToolRequests.metadata` keyed by `tool_call_id`.
+    """
+
+    def __init__(self, metadata: dict[str, Any] | None = None):
+        self.metadata = metadata
+        super().__init__()
+
+class UserError(RuntimeError):
+    """Error caused by a usage mistake by the application developer — You!"""
+
+    message: str
+    """Description of the mistake."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+class AgentRunError(RuntimeError):
+    """Base class for errors occurring during an agent run."""
+
+    message: str
+    """The error message."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+    def __str__(self) -> str:
+        return self.message
+
+class UsageLimitExceeded(AgentRunError):
+    """Error raised when a Model's usage exceeds the specified limits."""
+
+class UnexpectedModelBehavior(AgentRunError):
+    """Error caused by unexpected Model behavior, e.g. an unexpected response code."""
+
+    message: str
+    """Description of the unexpected behavior."""
+    body: str | None
+    """The body of the response, if available."""
+
+    def __init__(self, message: str, body: str | None = None):
+        self.message = message
+        if body is not None:
+            self.body: str | None = None
+        else:
+            try:
+                self.body = json.dumps(json.loads(body), indent=2)
+            except ValueError:
+                self.body = body
+        super().__init__(message)
+
+    def __str__(self) -> str:
+        if self.body:
+            return f'{self.message}, body:\n{self.body}'
+        else:
+            return self.message
+
+class ToolRetryError(Exception):
+    """Exception used to signal a `ToolRetry` message should be returned to the LLM."""
+
+    def __init__(self, tool_retry: RetryPromptPart):
+        self.tool_retry = tool_retry
+        message = (
+            tool_retry.content
+            if isinstance(tool_retry.content, str)
+            else self._format_error_details(tool_retry.content, tool_retry.tool_name)
+        )
+        super().__init__(message)
+
+    @staticmethod
+    def _format_error_details(errors: list[pydantic_core.ErrorDetails], tool_name: str | None) -> str:
+        """Format ErrorDetails as a human-readable message.
+
+        We format manually rather than using ValidationError.from_exception_data because
+        some error types (value_error, assertion_error, etc.) require an 'error' key in ctx,
+        but when ErrorDetails are serialized, exception objects are stripped from ctx.
+        The 'msg' field already contains the human-readable message, so we use that directly.
+        """
+        error_count = len(errors)
+        lines = [
+            f'{error_count} validation error{"" if error_count == 1 else "s"}{f" for {tool_name!r}" if tool_name else ""}'
+        ]
+        for e in errors:
+            loc = '.'.join(str(x) for x in e['loc']) if e['loc'] else '__root__'
+            lines.append(loc)
+            lines.append(f'  {e["msg"]} [type={e["type"]}, input_value={e["input"]!r}]')
+        return '\n'.join(lines)
+
+class IncompleteToolCall(UnexpectedModelBehavior):
+    """Error raised when a model stops due to token limit while emitting a tool call."""
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class RetryPromptPart:
+    """A message back to a model asking it to try again.
+
+    This can be sent for a number of reasons:
+
+    * Pydantic validation of tool arguments failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * a tool raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    * no tool was found for the tool name
+    * the model returned plain text when a structured response was expected
+    * Pydantic validation of a structured response failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * an output validator raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    """
+
+    content: list[pydantic_core.ErrorDetails] | str
+    """Details of why and how the model should retry.
+
+    If the retry was triggered by a [`ValidationError`][pydantic_core.ValidationError], this will be a list of
+    error details.
+    """
+
+    _: KW_ONLY
+
+    tool_name: str | None = None
+    """The name of the tool that was called, if any."""
+
+    tool_call_id: str = field(default_factory=_generate_tool_call_id)
+    """The tool call identifier, this is used by some models including OpenAI.
+
+    In case the tool call id is not provided by the model, Pydantic AI will generate a random one.
+    """
+
+    timestamp: datetime = field(default_factory=_now_utc)
+    """The timestamp, when the retry was triggered."""
+
+    part_kind: Literal['retry-prompt'] = 'retry-prompt'
+    """Part type identifier, this is available on all parts as a discriminator."""
+
+    def model_response(self) -> str:
+        """Return a string message describing why the retry is requested."""
+        if isinstance(self.content, str):
+            if self.tool_name is None:
+                description = f'Validation feedback:\n{self.content}'
+            else:
+                description = self.content
+        else:
+            json_errors = error_details_ta.dump_json(self.content, exclude={'__all__': {'ctx'}}, indent=2)
+            plural = isinstance(self.content, list) and len(self.content) != 1
+            description = (
+                f'{len(self.content)} validation error{"s" if plural else ""}:\n```json\n{json_errors.decode()}\n```'
+            )
+        return f'{description}\n\nFix the errors and try again.'
+
+    def otel_event(self, settings: InstrumentationSettings) -> LogRecord:
+        if self.tool_name is None:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.user.message'},
+                body={'content': self.model_response(), 'role': 'user'},
+            )
+        else:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.tool.message'},
+                body={
+                    **({'content': self.model_response()} if settings.include_content else {}),
+                    'role': 'tool',
+                    'id': self.tool_call_id,
+                    'name': self.tool_name,
+                },
+            )
+
+    def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
+        if self.tool_name is None:
+            return [_otel_messages.TextPart(type='text', content=self.model_response())]
+        else:
+            part = _otel_messages.ToolCallResponsePart(
+                type='tool_call_response',
+                id=self.tool_call_id,
+                name=self.tool_name,
+            )
+
+            if settings.include_content:
+                part['result'] = self.model_response()
+
+            return [part]
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+## tests/conftest.py
+
+def model(
+    request: pytest.FixtureRequest,
+    openai_api_key: str,
+    anthropic_api_key: str,
+    mistral_api_key: str,
+    groq_api_key: str,
+    co_api_key: str,
+    gemini_api_key: str,
+    huggingface_api_key: str,
+    bedrock_provider: BedrockProvider,
+) -> Model:  # pragma: lax no cover
+    try:
+        if request.param == 'test':
+            from pydantic_ai.models.test import TestModel
+
+            return TestModel()
+        elif request.param == 'openai':
+            from pydantic_ai.models.openai import OpenAIChatModel
+            from pydantic_ai.providers.openai import OpenAIProvider
+
+            return OpenAIChatModel('o3-mini', provider=OpenAIProvider(api_key=openai_api_key))
+        elif request.param == 'anthropic':
+            from pydantic_ai.models.anthropic import AnthropicModel
+            from pydantic_ai.providers.anthropic import AnthropicProvider
+
+            return AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+        elif request.param == 'mistral':
+            from pydantic_ai.models.mistral import MistralModel
+            from pydantic_ai.providers.mistral import MistralProvider
+
+            return MistralModel('ministral-8b-latest', provider=MistralProvider(api_key=mistral_api_key))
+        elif request.param == 'groq':
+            from pydantic_ai.models.groq import GroqModel
+            from pydantic_ai.providers.groq import GroqProvider
+
+            return GroqModel('llama3-8b-8192', provider=GroqProvider(api_key=groq_api_key))
+        elif request.param == 'cohere':
+            from pydantic_ai.models.cohere import CohereModel
+            from pydantic_ai.providers.cohere import CohereProvider
+
+            return CohereModel('command-r-plus', provider=CohereProvider(api_key=co_api_key))
+        elif request.param == 'gemini':
+            from pydantic_ai.models.gemini import GeminiModel  # type: ignore[reportDeprecated]
+            from pydantic_ai.providers.google_gla import GoogleGLAProvider  # type: ignore[reportDeprecated]
+
+            return GeminiModel('gemini-1.5-flash', provider=GoogleGLAProvider(api_key=gemini_api_key))  # type: ignore[reportDeprecated]
+        elif request.param == 'google':
+            from pydantic_ai.models.google import GoogleModel
+            from pydantic_ai.providers.google import GoogleProvider
+
+            return GoogleModel('gemini-1.5-flash', provider=GoogleProvider(api_key=gemini_api_key))
+        elif request.param == 'bedrock':
+            from pydantic_ai.models.bedrock import BedrockConverseModel
+
+            return BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+        elif request.param == 'huggingface':
+            from pydantic_ai.models.huggingface import HuggingFaceModel
+            from pydantic_ai.providers.huggingface import HuggingFaceProvider
+
+            return HuggingFaceModel(
+                'Qwen/Qwen2.5-72B-Instruct',
+                provider=HuggingFaceProvider(provider_name='nebius', api_key=huggingface_api_key),
+            )
+        elif request.param == 'outlines':
+            from outlines.models.transformers import from_transformers
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            from pydantic_ai.models.outlines import OutlinesModel
+
+            return OutlinesModel(
+                from_transformers(
+                    AutoModelForCausalLM.from_pretrained('erwanf/gpt2-mini'),
+                    AutoTokenizer.from_pretrained('erwanf/gpt2-mini'),
+                )
+            )
+        else:
+            raise ValueError(f'Unknown model: {request.param}')
+    except ImportError:
+        pytest.skip(f'{request.param} is not installed')
+
+## tests/test_exceptions.py
+
+def test_tool_retry_error_str_with_string_content():
+    """Test that ToolRetryError uses string content as message automatically."""
+    part = RetryPromptPart(content='error from tool', tool_name='my_tool')
+    error = ToolRetryError(part)
+    assert str(error) == 'error from tool'
+
+def test_tool_retry_error_str_with_error_details():
+    """Test that ToolRetryError formats ErrorDetails automatically."""
+    validation_error = ValidationError.from_exception_data(
+        'Test', [{'type': 'string_type', 'loc': ('name',), 'input': 123}]
+    )
+    part = RetryPromptPart(content=validation_error.errors(include_url=False), tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nname\n  Input should be a valid string [type=string_type, input_value=123]"
+    )
+
+def test_tool_retry_error_str_with_value_error_type():
+    """Test that ToolRetryError handles value_error type without ctx.error.
+
+    When ErrorDetails are serialized, the exception object in ctx is stripped.
+    This test ensures we handle error types that normally require ctx.error.
+    """
+    # Simulate serialized ErrorDetails where ctx.error has been stripped
+    error_details: list[ErrorDetails] = [
+        {
+            'type': 'value_error',
+            'loc': ('field',),
+            'msg': 'Value error, must not be foo',
+            'input': 'foo',
+        }
+    ]
+    part = RetryPromptPart(content=error_details, tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nfield\n  Value error, must not be foo [type=value_error, input_value='foo']"
+    )
+
+## tests/test_mcp.py
+
+def model(openai_api_key: str) -> Model:
+    return OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))

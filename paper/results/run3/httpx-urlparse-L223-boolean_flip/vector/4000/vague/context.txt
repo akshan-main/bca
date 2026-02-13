@@ -1,0 +1,431 @@
+# httpx/_auth.py:22-110
+class Auth:
+    """
+    Base class for all authentication schemes.
+
+    To implement a custom authentication scheme, subclass `Auth` and override
+    the `.auth_flow()` method.
+
+    If the authentication scheme does I/O such as disk access or network calls, or uses
+    synchronization primitives such as locks, you should override `.sync_auth_flow()`
+    and/or `.async_auth_flow()` instead of `.auth_flow()` to provide specialized
+    implementations that will be used by `Client` and `AsyncClient` respectively.
+    """
+
+    requires_request_body = False
+    requires_response_body = False
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow.
+
+        To dispatch a request, `yield` it:
+
+        ```
+        yield request
+        ```
+
+        The client will `.send()` the response back into the flow generator. You can
+        access it like so:
+
+        ```
+        response = yield request
+        ```
+
+        A `return` (or reaching the end of the generator) will result in the
+        client returning the last response obtained from the server.
+
+        You can dispatch as many requests as is necessary.
+        """
+        yield request
+
+    def sync_auth_flow(
+        self, request: Request
+    ) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow synchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            request.read()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                response.read()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+    async def async_auth_flow(
+        self, request: Request
+    ) -> typing.AsyncGenerator[Request, Response]:
+        """
+        Execute the authentication flow asynchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            await request.aread()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                await response.aread()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+# httpx/_client.py:162-182
+class BoundAsyncStream(AsyncByteStream):
+    """
+    An async byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: AsyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+# tests/client/test_headers.py:188-209
+def test_host_with_auth_and_port_in_url():
+    """
+    The Host header should only include the hostname, or hostname:port
+    (for non-default ports only). Any userinfo or default port should not
+    be present.
+    """
+    url = "http://username:password@example.org:80/echo_headers"
+
+    client = httpx.Client(transport=httpx.MockTransport(echo_headers))
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org",
+            "user-agent": f"python-httpx/{httpx.__version__}",
+            "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+        }
+    }
+
+# httpx/_client.py:760-769
+    def _transport_for_url(self, url: URL) -> BaseTransport:
+        """
+        Returns the transport instance that should be used for a given URL.
+        This will either be the standard connection pool, or a proxy.
+        """
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(url):
+                return self._transport if transport is None else transport
+
+        return self._transport
+
+# httpx/_client.py:1474-1483
+    def _transport_for_url(self, url: URL) -> AsyncBaseTransport:
+        """
+        Returns the transport instance that should be used for a given URL.
+        This will either be the standard connection pool, or a proxy.
+        """
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(url):
+                return self._transport if transport is None else transport
+
+        return self._transport
+
+# tests/client/test_auth.py:237-253
+def test_netrc_auth_credentials_exist() -> None:
+    """
+    When netrc auth is being used and a request is made to a host that is
+    in the netrc file, then the relevant credentials should be applied.
+    """
+    netrc_file = str(FIXTURES_DIR / ".netrc")
+    url = "http://netrcexample.org"
+    app = App()
+    auth = httpx.NetRCAuth(netrc_file)
+
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "auth": "Basic ZXhhbXBsZS11c2VybmFtZTpleGFtcGxlLXBhc3N3b3Jk"
+    }
+
+# tests/client/test_auth.py:256-270
+def test_netrc_auth_credentials_do_not_exist() -> None:
+    """
+    When netrc auth is being used and a request is made to a host that is
+    not in the netrc file, then no credentials should be applied.
+    """
+    netrc_file = str(FIXTURES_DIR / ".netrc")
+    url = "http://example.org"
+    app = App()
+    auth = httpx.NetRCAuth(netrc_file)
+
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": None}
+
+# httpx/_client.py:139-159
+class BoundSyncStream(SyncByteStream):
+    """
+    A byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: SyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        for chunk in self._stream:
+            yield chunk
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+# httpx/_client.py:94-111
+class UseClientDefault:
+    """
+    For some parameters such as `auth=...` and `timeout=...` we need to be able
+    to indicate the default "unset" state, in a way that is distinctly different
+    to using `None`.
+
+    The default "unset" state indicates that whatever default is set on the
+    client should be used. This is different to setting `None`, which
+    explicitly disables the parameter, possibly overriding a client default.
+
+    For example we use `timeout=USE_CLIENT_DEFAULT` in the `request()` signature.
+    Omitting the `timeout` parameter will send a request using whatever default
+    timeout has been configured on the client. Including `timeout=None` will
+    ensure no timeout is used.
+
+    Note that user code shouldn't need to use the `USE_CLIENT_DEFAULT` constant,
+    but it is used internally when a parameter is not included.
+    """
+
+# tests/client/test_auth.py:743-757
+async def test_async_auth() -> None:
+    """
+    Test that we can use an auth implementation specific to the async case, to
+    support cases that require performing I/O or using concurrency primitives (such
+    as checking a disk-based cache or fetching a token from a remote auth server).
+    """
+    url = "https://example.org/"
+    auth = SyncOrAsyncAuth()
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "async-auth"}
+
+# httpx/_exceptions.py:271-277
+class InvalidURL(Exception):
+    """
+    URL is improperly formed or cannot be parsed.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+# httpx/_api.py:39-120
+def request(
+    method: str,
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    content: RequestContent | None = None,
+    data: RequestData | None = None,
+    files: RequestFiles | None = None,
+    json: typing.Any | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends an HTTP request.
+
+    **Parameters:**
+
+    * **method** - HTTP method for the new `Request` object: `GET`, `OPTIONS`,
+    `HEAD`, `POST`, `PUT`, `PATCH`, or `DELETE`.
+    * **url** - URL for the new `Request` object.
+    * **params** - *(optional)* Query parameters to include in the URL, as a
+    string, dictionary, or sequence of two-tuples.
+    * **content** - *(optional)* Binary content to include in the body of the
+    request, as bytes or a byte iterator.
+    * **data** - *(optional)* Form data to include in the body of the request,
+    as a dictionary.
+    * **files** - *(optional)* A dictionary of upload files to include in the
+    body of the request.
+    * **json** - *(optional)* A JSON serializable object to include in the body
+    of the request.
+    * **headers** - *(optional)* Dictionary of HTTP headers to include in the
+    request.
+    * **cookies** - *(optional)* Dictionary of Cookie items to include in the
+    request.
+    * **auth** - *(optional)* An authentication class to use when sending the
+    request.
+    * **proxy** - *(optional)* A proxy URL where all the traffic should be routed.
+    * **timeout** - *(optional)* The timeout configuration to use when sending
+    the request.
+    * **follow_redirects** - *(optional)* Enables or disables HTTP redirects.
+    * **verify** - *(optional)* Either `True` to use an SSL context with the
+    default CA bundle, `False` to disable verification, or an instance of
+    `ssl.SSLContext` to use a custom context.
+    * **trust_env** - *(optional)* Enables or disables usage of environment
+    variables for configuration.
+
+    **Returns:** `Response`
+
+    Usage:
+
+    ```
+    >>> import httpx
+    >>> response = httpx.request('GET', 'https://httpbin.org/get')
+    >>> response
+    <Response [200 OK]>
+    ```
+    """
+    with Client(
+        cookies=cookies,
+        proxy=proxy,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    ) as client:
+        return client.request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            auth=auth,
+            follow_redirects=follow_redirects,
+        )
+
+# httpx/_exceptions.py:258-268
+class HTTPStatusError(HTTPError):
+    """
+    The response had an error HTTP status of 4xx or 5xx.
+
+    May be raised when calling `response.raise_for_status()`
+    """
+
+    def __init__(self, message: str, *, request: Request, response: Response) -> None:
+        super().__init__(message)
+        self.request = request
+        self.response = response
+
+# httpx/_client.py:494-515
+    def _redirect_method(self, request: Request, response: Response) -> str:
+        """
+        When being redirected we may want to change the method of the request
+        based on certain specs or browser behavior.
+        """
+        method = request.method
+
+        # https://tools.ietf.org/html/rfc7231#section-6.4.4
+        if response.status_code == codes.SEE_OTHER and method != "HEAD":
+            method = "GET"
+
+        # Do what the browsers do, despite standards...
+        # Turn 302s into GETs.
+        if response.status_code == codes.FOUND and method != "HEAD":
+            method = "GET"
+
+        # If a POST is responded to with a 301, turn it into a GET.
+        # This bizarre behaviour is explained in 'requests' issue 1704.
+        if response.status_code == codes.MOVED_PERMANENTLY and method == "POST":
+            method = "GET"
+
+        return method
+
+# httpx/_multipart.py:265-283
+    def get_content_length(self) -> int | None:
+        """
+        Return the length of the multipart encoded content, or `None` if
+        any of the files have a length that cannot be determined upfront.
+        """
+        boundary_length = len(self.boundary)
+        length = 0
+
+        for field in self.fields:
+            field_length = field.get_length()
+            if field_length is None:
+                return None
+
+            length += 2 + boundary_length + 2  # b"--{boundary}\r\n"
+            length += field_length
+            length += 2  # b"\r\n"
+
+        length += 2 + boundary_length + 4  # b"--{boundary}--\r\n"
+        return length
+
+# httpx/_content.py:92-104
+class UnattachedStream(AsyncByteStream, SyncByteStream):
+    """
+    If a request or response is serialized using pickle, then it is no longer
+    attached to a stream for I/O purposes. Any stream operations should result
+    in `httpx.StreamClosed`.
+    """
+
+    def __iter__(self) -> Iterator[bytes]:
+        raise StreamClosed()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        raise StreamClosed()
+        yield b""  # pragma: no cover
+
+# httpx/_urls.py:275-280
+    def params(self) -> QueryParams:
+        """
+        The URL query parameters, neatly parsed and packaged into an immutable
+        multidict representation.
+        """
+        return QueryParams(self._uri_reference.query)

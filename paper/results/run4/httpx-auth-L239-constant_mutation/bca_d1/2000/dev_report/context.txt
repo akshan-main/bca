@@ -1,0 +1,233 @@
+## httpx/_api.py
+
+def get(
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `GET` request.
+
+    **Parameters**: See `httpx.request`.
+
+    Note that the `data`, `files`, `json` and `content` parameters are not available
+    on this function, as `GET` requests should not include a request body.
+    """
+    return request(
+        "GET",
+        url,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+## httpx/_auth.py
+
+class Auth:
+    """
+    Base class for all authentication schemes.
+
+    To implement a custom authentication scheme, subclass `Auth` and override
+    the `.auth_flow()` method.
+
+    If the authentication scheme does I/O such as disk access or network calls, or uses
+    synchronization primitives such as locks, you should override `.sync_auth_flow()`
+    and/or `.async_auth_flow()` instead of `.auth_flow()` to provide specialized
+    implementations that will be used by `Client` and `AsyncClient` respectively.
+    """
+
+    requires_request_body = False
+    requires_response_body = False
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow.
+
+        To dispatch a request, `yield` it:
+
+        ```
+        yield request
+        ```
+
+        The client will `.send()` the response back into the flow generator. You can
+        access it like so:
+
+        ```
+        response = yield request
+        ```
+
+        A `return` (or reaching the end of the generator) will result in the
+        client returning the last response obtained from the server.
+
+        You can dispatch as many requests as is necessary.
+        """
+        yield request
+
+    def sync_auth_flow(
+        self, request: Request
+    ) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow synchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            request.read()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                response.read()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+    async def async_auth_flow(
+        self, request: Request
+    ) -> typing.AsyncGenerator[Request, Response]:
+        """
+        Execute the authentication flow asynchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            await request.aread()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                await response.aread()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+    def __init__(self, func: typing.Callable[[Request], Request]) -> None:
+        self._func = func
+
+class BasicAuth(Auth):
+    """
+    Allows the 'auth' argument to be passed as a (username, password) pair,
+    and uses HTTP Basic authentication.
+    """
+
+    def __init__(self, username: str | bytes, password: str | bytes) -> None:
+        self._auth_header = self._build_auth_header(username, password)
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        request.headers["Authorization"] = self._auth_header
+        yield request
+
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
+    def __init__(self, username: str | bytes, password: str | bytes) -> None:
+        self._auth_header = self._build_auth_header(username, password)
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        request.headers["Authorization"] = self._auth_header
+        yield request
+
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
+class NetRCAuth(Auth):
+    """
+    Use a 'netrc' file to lookup basic auth credentials based on the url host.
+    """
+
+    def __init__(self, file: str | None = None) -> None:
+        # Lazily import 'netrc'.
+        # There's no need for us to load this module unless 'NetRCAuth' is being used.
+        import netrc
+
+        self._netrc_info = netrc.netrc(file)
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        auth_info = self._netrc_info.authenticators(request.url.host)
+        if auth_info is None or not auth_info[2]:
+            # The netrc file did not have authentication credentials for this host.
+            yield request
+        else:
+            # Build a basic auth header with credentials from the netrc file.
+            request.headers["Authorization"] = self._build_auth_header(
+                username=auth_info[0], password=auth_info[2]
+            )
+            yield request
+
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
+## tests/client/test_auth.py
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.AsyncGenerator[httpx.Request, httpx.Response]:
+        async with self._async_lock:
+            request.headers["Authorization"] = "async-auth"
+        yield request
+
+## tests/test_auth.py
+
+def test_digest_auth_setting_cookie_in_request():
+    url = "https://www.example.com/auth"
+    client = httpx.Client(transport=httpx.MockTransport(set_cookies))
+    request = client.build_request("GET", url)
+
+    auth = httpx.DigestAuth(username="user", password="pass")
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    response = client.get(url)
+    assert len(response.cookies) > 0
+    assert response.cookies["session"] == ".session_value..."
+
+    request = flow.send(response)
+    assert request.headers["Authorization"].startswith("Digest")
+    assert request.headers["Cookie"] == "session=.session_value..."
+
+    # No other requests are made.
+    response = httpx.Response(
+        content=b"Hello, world!", status_code=200, request=request
+    )
+    with pytest.raises(StopIteration):
+        flow.send(response)

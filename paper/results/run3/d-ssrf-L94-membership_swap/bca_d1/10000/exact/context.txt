@@ -1,0 +1,952 @@
+## pydantic_ai_slim/pydantic_ai/_function_schema.py
+
+def function_schema(  # noqa: C901
+    function: Callable[..., Any],
+    schema_generator: type[GenerateJsonSchema],
+    takes_ctx: bool | None = None,
+    docstring_format: DocstringFormat = 'auto',
+    require_parameter_descriptions: bool = False,
+) -> FunctionSchema:
+    """Build a Pydantic validator and JSON schema from a tool function.
+
+    Args:
+        function: The function to build a validator and JSON schema for.
+        takes_ctx: Whether the function takes a `RunContext` first argument.
+        docstring_format: The docstring format to use.
+        require_parameter_descriptions: Whether to require descriptions for all tool function parameters.
+        schema_generator: The JSON schema generator class to use.
+
+    Returns:
+        A `FunctionSchema` instance.
+    """
+    config = ConfigDict(title=function.__name__, use_attribute_docstrings=True)
+    config_wrapper = ConfigWrapper(config)
+    gen_schema = _generate_schema.GenerateSchema(config_wrapper)
+    errors: list[str] = []
+
+    try:
+        sig = signature(function)
+    except ValueError as e:
+        errors.append(str(e))
+        sig = signature(lambda: None)
+    original_func = function.func if isinstance(function, partial) else function
+    function = cast(Callable[..., Any], function)  # cope with pyright changing the type from the isinstance() check.
+
+    type_hints = get_type_hints(original_func, include_extras=True)
+
+    var_kwargs_schema: core_schema.CoreSchema | None = None
+    fields: dict[str, core_schema.TypedDictField] = {}
+    positional_fields: list[str] = []
+    var_positional_field: str | None = None
+    decorators = _decorators.DecoratorInfos()
+
+    description, field_descriptions = doc_descriptions(original_func, sig, docstring_format=docstring_format)
+    missing_param_descriptions: set[str] = set()
+
+    for index, (name, p) in enumerate(sig.parameters.items()):
+        if index == 0 and takes_ctx is None:
+            takes_ctx = p.annotation is not sig.empty and _is_call_ctx(type_hints[name])
+
+        if p.annotation is sig.empty:
+            if takes_ctx and index == 0:
+                # should be the `context` argument, skip
+                continue
+            # TODO warn?
+            annotation = Any
+        else:
+            annotation = type_hints[name]
+
+            if index == 0 and takes_ctx:
+                if not _is_call_ctx(annotation):
+                    errors.append('First parameter of tools that take context must be annotated with RunContext[...]')
+                continue
+            elif not takes_ctx and _is_call_ctx(annotation):
+                errors.append('RunContext annotations can only be used with tools that take context')
+                continue
+            elif index != 0 and _is_call_ctx(annotation):
+                errors.append('RunContext annotations can only be used as the first argument')
+                continue
+
+        field_name = p.name
+
+        if require_parameter_descriptions and field_name not in field_descriptions:
+            missing_param_descriptions.add(field_name)
+
+        if p.kind == Parameter.VAR_KEYWORD:
+            var_kwargs_schema = gen_schema.generate_schema(annotation)
+        else:
+            if p.kind == Parameter.VAR_POSITIONAL:
+                annotation = list[annotation]
+
+            required = p.default is Parameter.empty
+            # FieldInfo.from_annotated_attribute expects a type, `annotation` is Any
+            annotation = cast(type[Any], annotation)
+            if required:
+                field_info = FieldInfo.from_annotation(annotation)
+            else:
+                field_info = FieldInfo.from_annotated_attribute(annotation, p.default)
+            if field_info.description is None:
+                field_info.description = field_descriptions.get(field_name)
+
+            fields[field_name] = td_schema = gen_schema._generate_td_field_schema(  # pyright: ignore[reportPrivateUsage]
+                field_name,
+                field_info,
+                decorators,
+                required=required,
+            )
+            # noinspection PyTypeChecker
+            td_schema.setdefault('metadata', {})['is_model_like'] = is_model_like(annotation)
+
+            if p.kind == Parameter.POSITIONAL_ONLY:
+                positional_fields.append(field_name)
+            elif p.kind == Parameter.VAR_POSITIONAL:
+                var_positional_field = field_name
+
+    if missing_param_descriptions:
+        errors.append(f'Missing parameter descriptions for {", ".join(missing_param_descriptions)}')
+
+    if errors:
+        from .exceptions import UserError
+
+        error_details = '\n  '.join(errors)
+        raise UserError(f'Error generating schema for {function.__qualname__}:\n  {error_details}')
+
+    core_config = config_wrapper.core_config(None)
+    # noinspection PyTypedDict
+    core_config['extra_fields_behavior'] = 'allow' if var_kwargs_schema else 'forbid'
+
+    schema, single_arg_name = _build_schema(fields, var_kwargs_schema, gen_schema, core_config)
+    schema = gen_schema.clean_schema(schema)
+    # noinspection PyUnresolvedReferences
+    schema_validator = create_schema_validator(
+        schema,
+        function,
+        function.__module__,
+        function.__qualname__,
+        'validate_call',
+        core_config,
+        config_wrapper.plugin_settings,
+    )
+    # PluggableSchemaValidator is api compatible with SchemaValidator
+    schema_validator = cast(SchemaValidator, schema_validator)
+    json_schema = schema_generator().generate(schema)
+
+    # workaround for https://github.com/pydantic/pydantic/issues/10785
+    # if we build a custom TypedDict schema (matches when `single_arg_name is None`), we manually set
+    # `additionalProperties` in the JSON Schema
+    if single_arg_name is not None and not description:
+        # if the tool description is not set, and we have a single parameter, take the description from that
+        # and set it on the tool
+        description = json_schema.pop('description', None)
+
+    return FunctionSchema(
+        description=description,
+        validator=schema_validator,
+        json_schema=check_object_json_schema(json_schema),
+        single_arg_name=single_arg_name,
+        positional_fields=positional_fields,
+        var_positional_field=var_positional_field,
+        takes_ctx=bool(takes_ctx),
+        is_async=is_async_callable(function),
+        function=function,
+    )
+
+def _takes_ctx(callable_obj: TargetCallable[P, R]) -> TypeIs[WithCtx[P, R]]:  # pyright: ignore[reportUnusedFunction]
+    """Check if a callable takes a `RunContext` first argument.
+
+    Args:
+        callable_obj: The callable to check.
+
+    Returns:
+        `True` if the callable takes a `RunContext` as first argument, `False` otherwise.
+    """
+    try:
+        sig = signature(callable_obj)
+    except ValueError:
+        return False
+    try:
+        first_param_name = next(iter(sig.parameters.keys()))
+    except StopIteration:
+        return False
+    else:
+        # See https://github.com/pydantic/pydantic/pull/11451 for a similar implementation in Pydantic
+        if not isinstance(callable_obj, _decorators._function_like):  # pyright: ignore[reportPrivateUsage]
+            call_func = getattr(type(callable_obj), '__call__', None)
+            if call_func is not None:
+                callable_obj = call_func
+            else:
+                return False  # pragma: no cover
+
+        type_hints = _typing_extra.get_function_type_hints(_decorators.unwrap_wrapped_function(callable_obj))
+        annotation = type_hints.get(first_param_name)
+        if annotation is None:
+            return False
+        return True is not sig.empty and _is_call_ctx(annotation)
+
+def _is_call_ctx(annotation: Any) -> bool:
+    """Return whether the annotation is the `RunContext` class, parameterized or not."""
+    return annotation is RunContext or get_origin(annotation) is RunContext
+
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+class ResolvedUrl:
+    """Result of URL validation and DNS resolution."""
+
+    resolved_ip: str
+    """The resolved IP address to connect to."""
+
+    hostname: str
+    """The original hostname (used for Host header)."""
+
+    port: int
+    """The port number."""
+
+    is_https: bool
+    """Whether to use HTTPS."""
+
+    path: str
+    """The path including query string and fragment."""
+
+def extract_host_and_port(url: str) -> tuple[str, str, int, bool]:
+    """Extract hostname, path, port, and protocol info from a URL.
+
+    Returns:
+        Tuple of (hostname, path_with_query, port, is_https)
+
+    Raises:
+        ValueError: If the URL is malformed or uses an unsupported protocol.
+    """
+    # Validate protocol first, before trying to extract hostname
+    _, is_https = validate_url_protocol(url)
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+
+    if not hostname:
+        raise ValueError(f'Invalid URL: no hostname found in "{url}"')
+
+    default_port = 443 if is_https else 80
+    port = parsed.port or default_port
+
+    # Reconstruct path with query string
+    path = parsed.path or '/'
+    if parsed.query:
+        path = f'{path}?{parsed.query}'
+    if parsed.fragment:
+        path = f'{path}#{parsed.fragment}'
+
+    return hostname, path, port, is_https
+
+## pydantic_ai_slim/pydantic_ai/ag_ui.py
+
+from .models import KnownModelName, Model
+
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+class ServerCapabilities:
+    """Capabilities that an MCP server supports."""
+
+    experimental: list[str] | None = None
+    """Experimental, non-standard capabilities that the server supports."""
+
+    logging: bool = False
+    """Whether the server supports sending log messages to the client."""
+
+    prompts: bool = False
+    """Whether the server offers any prompt templates."""
+
+    prompts_list_changed: bool = False
+    """Whether the server will emit notifications when the list of prompts changes."""
+
+    resources: bool = False
+    """Whether the server offers any resources to read."""
+
+    resources_list_changed: bool = False
+    """Whether the server will emit notifications when the list of resources changes."""
+
+    tools: bool = False
+    """Whether the server offers any tools to call."""
+
+    tools_list_changed: bool = False
+    """Whether the server will emit notifications when the list of tools changes."""
+
+    completions: bool = False
+    """Whether the server offers autocompletion suggestions for prompts and resources."""
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    @classmethod
+    def from_mcp_sdk(cls, mcp_capabilities: mcp_types.ServerCapabilities) -> ServerCapabilities:
+        """Convert from MCP SDK ServerCapabilities to PydanticAI ServerCapabilities.
+
+        Args:
+            mcp_capabilities: The MCP SDK ServerCapabilities object.
+        """
+        prompts_cap = mcp_capabilities.prompts
+        resources_cap = mcp_capabilities.resources
+        tools_cap = mcp_capabilities.tools
+        return cls(
+            experimental=list(mcp_capabilities.experimental.keys()) if mcp_capabilities.experimental else None,
+            logging=mcp_capabilities.logging is not None,
+            prompts=prompts_cap is not None,
+            prompts_list_changed=bool(prompts_cap.listChanged) if prompts_cap else False,
+            resources=resources_cap is not None,
+            resources_list_changed=bool(resources_cap.listChanged) if resources_cap else False,
+            tools=tools_cap is not None,
+            tools_list_changed=bool(tools_cap.listChanged) if tools_cap else False,
+            completions=mcp_capabilities.completions is not None,
+        )
+
+    async def list_resource_templates(self) -> list[ResourceTemplate]:
+        """Retrieve resource templates that are currently present on the server.
+
+        Raises:
+            MCPError: If the server returns an error.
+        """
+        async with self:  # Ensure server is running
+            if not self.capabilities.resources:
+                return []
+            try:
+                result = await self._client.list_resource_templates()
+            except mcp_exceptions.McpError as e:
+                raise MCPError.from_mcp_sdk(e) from e
+        return [ResourceTemplate.from_mcp_sdk(t) for t in result.resourceTemplates]
+
+def load_mcp_servers(config_path: str | Path) -> list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE]:
+    """Load MCP servers from a configuration file.
+
+    Environment variables can be referenced in the configuration file using:
+    - `${VAR_NAME}` syntax - expands to the value of VAR_NAME, raises error if not defined
+    - `${VAR_NAME:-default}` syntax - expands to VAR_NAME if set, otherwise uses the default value
+
+    Args:
+        config_path: The path to the configuration file.
+
+    Returns:
+        A list of MCP servers.
+
+    Raises:
+        FileNotFoundError: If the configuration file does not exist.
+        ValidationError: If the configuration file does not match the schema.
+        ValueError: If an environment variable referenced in the configuration is not defined and no default value is provided.
+    """
+    config_path = Path(config_path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f'Config file {config_path} not found')
+
+    config_data = pydantic_core.from_json(config_path.read_bytes())
+    expanded_config_data = _expand_env_vars(config_data)
+    config = MCPServerConfig.model_validate(expanded_config_data)
+
+    servers: list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE] = []
+    for name, server in config.mcp_servers.items():
+        server.id = name
+        server.tool_prefix = name
+        servers.append(server)
+
+    return servers
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+async def download_item(
+    item: FileUrl,
+    data_format: Literal['bytes', 'base64', 'base64_uri', 'text'] = 'bytes',
+    type_format: Literal['mime', 'extension'] = 'mime',
+) -> DownloadedItem[str] | DownloadedItem[bytes]:
+    """Download an item by URL and return the content as a bytes object or a (base64-encoded) string.
+
+    This function includes SSRF (Server-Side Request Forgery) protection:
+    - Only http:// and https:// protocols are allowed
+    - Private/internal IP addresses are blocked by default
+    - Cloud metadata endpoints (169.254.169.254) are always blocked
+    - Hostnames are resolved before requests to prevent DNS rebinding
+
+    Set `item.force_download='allow-local'` to allow private IP addresses.
+
+    Args:
+        item: The item to download.
+        data_format: The format to return the content in:
+            - `bytes`: The raw bytes of the content.
+            - `base64`: The base64-encoded content.
+            - `base64_uri`: The base64-encoded content as a data URI.
+            - `text`: The content as a string.
+        type_format: The format to return the media type in:
+            - `mime`: The media type as a MIME type.
+            - `extension`: The media type as an extension.
+
+    Raises:
+        UserError: If the URL points to a YouTube video.
+        ValueError: If the URL uses an unsupported protocol or targets a private/internal
+            IP address (unless allow-local is set).
+    """
+    if isinstance(item, VideoUrl) and item.is_youtube:
+        raise UserError('Downloading YouTube videos is not supported.')
+
+    from .._ssrf import safe_download
+
+    allow_local = item.force_download == 'allow-local'
+    response = await safe_download(item.url, allow_local=allow_local)
+
+    if content_type := response.headers.get('content-type'):
+        content_type = content_type.split(';')[0]
+        if content_type == 'application/octet-stream':
+            content_type = None
+
+    media_type = content_type or item.media_type
+
+    data_type = media_type
+    if type_format == 'extension':
+        data_type = item.format
+
+    data = response.content
+    if data_format in ('base64', 'base64_uri'):
+        data = base64.b64encode(data).decode('utf-8')
+        if data_format == 'base64_uri':
+            data = f'data:{media_type};base64,{data}'
+        return DownloadedItem[str](data=data, data_type=data_type)
+    elif data_format == 'text':
+        return DownloadedItem[str](data=data.decode('utf-8'), data_type=data_type)
+    else:
+        return DownloadedItem[bytes](data=data, data_type=data_type)
+
+## pydantic_ai_slim/pydantic_ai/models/function.py
+
+class FunctionModel(Model):
+    """A model controlled by a local function.
+
+    Apart from `__init__`, all methods are private or match those of the base class.
+    """
+
+    function: FunctionDef | None
+    stream_function: StreamFunctionDef | None
+
+    _model_name: str = field(repr=False)
+    _system: str = field(default='function', repr=False)
+
+    @overload
+    def __init__(
+        self,
+        function: FunctionDef,
+        *,
+        model_name: str | None = None,
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        *,
+        stream_function: StreamFunctionDef,
+        model_name: str | None = None,
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        function: FunctionDef,
+        *,
+        stream_function: StreamFunctionDef,
+        model_name: str | None = None,
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        function: FunctionDef | None = None,
+        *,
+        stream_function: StreamFunctionDef | None = None,
+        model_name: str | None = None,
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize a `FunctionModel`.
+
+        Either `function` or `stream_function` must be provided, providing both is allowed.
+
+        Args:
+            function: The function to call for non-streamed requests.
+            stream_function: The function to call for streamed requests.
+            model_name: The name of the model. If not provided, a name is generated from the function names.
+            profile: The model profile to use.
+            settings: Model-specific settings that will be used as defaults for this model.
+        """
+        if function is None and stream_function is None:
+            raise TypeError('Either `function` or `stream_function` must be provided')
+
+        self.function = function
+        self.stream_function = stream_function
+
+        function_name = self.function.__name__ if self.function is not None else ''
+        stream_function_name = self.stream_function.__name__ if self.stream_function is not None else ''
+        self._model_name = model_name or f'function:{function_name}:{stream_function_name}'
+
+        # Use a default profile that supports JSON schema and object output if none provided
+        if profile is None:
+            profile = ModelProfile(
+                supports_json_schema_output=True,
+                supports_json_object_output=True,
+            )
+        super().__init__(settings=settings, profile=profile)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        agent_info = AgentInfo(
+            function_tools=model_request_parameters.function_tools,
+            allow_text_output=model_request_parameters.allow_text_output,
+            output_tools=model_request_parameters.output_tools,
+            model_settings=model_settings,
+            model_request_parameters=model_request_parameters,
+            instructions=self._get_instructions(messages, model_request_parameters),
+        )
+
+        assert self.function is not None, 'FunctionModel must receive a `function` to support non-streamed requests'
+
+        if inspect.iscoroutinefunction(self.function):
+            response = await self.function(messages, agent_info)
+        else:
+            response_ = await _utils.run_in_executor(self.function, messages, agent_info)
+            assert isinstance(response_, ModelResponse), response_
+            response = response_
+        response.model_name = self._model_name
+        # Add usage data if not already present
+        if not response.usage.has_values():  # pragma: no branch
+            response.usage = _estimate_usage(chain(messages, [response]))
+        return response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        agent_info = AgentInfo(
+            function_tools=model_request_parameters.function_tools,
+            allow_text_output=model_request_parameters.allow_text_output,
+            output_tools=model_request_parameters.output_tools,
+            model_settings=model_settings,
+            model_request_parameters=model_request_parameters,
+            instructions=self._get_instructions(messages, model_request_parameters),
+        )
+
+        assert self.stream_function is not None, (
+            'FunctionModel must receive a `stream_function` to support streamed requests'
+        )
+
+        response_stream = PeekableAsyncStream(self.stream_function(messages, agent_info))
+
+        first = await response_stream.peek()
+        if isinstance(first, _utils.Unset):
+            raise ValueError('Stream function must return at least one item')
+
+        yield FunctionStreamedResponse(
+            model_request_parameters=model_request_parameters,
+            _model_name=self._model_name,
+            _iter=response_stream,
+        )
+
+    @property
+    def model_name(self) -> str:
+        """The model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The system / model provider."""
+        return self._system
+
+    @classmethod
+    def supported_builtin_tools(cls) -> frozenset[type[AbstractBuiltinTool]]:
+        """FunctionModel supports all builtin tools for testing flexibility."""
+        from ..builtin_tools import SUPPORTED_BUILTIN_TOOLS
+
+        return SUPPORTED_BUILTIN_TOOLS
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        agent_info = AgentInfo(
+            function_tools=model_request_parameters.function_tools,
+            allow_text_output=model_request_parameters.allow_text_output,
+            output_tools=model_request_parameters.output_tools,
+            model_settings=model_settings,
+            model_request_parameters=model_request_parameters,
+            instructions=self._get_instructions(messages, model_request_parameters),
+        )
+
+        assert self.function is not None, 'FunctionModel must receive a `function` to support non-streamed requests'
+
+        if inspect.iscoroutinefunction(self.function):
+            response = await self.function(messages, agent_info)
+        else:
+            response_ = await _utils.run_in_executor(self.function, messages, agent_info)
+            assert isinstance(response_, ModelResponse), response_
+            response = response_
+        response.model_name = self._model_name
+        # Add usage data if not already present
+        if not response.usage.has_values():  # pragma: no branch
+            response.usage = _estimate_usage(chain(messages, [response]))
+        return response
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+    ) -> Any:
+        """Call a tool with the given arguments.
+
+        Args:
+            name: The name of the tool to call.
+            tool_args: The arguments to pass to the tool.
+            ctx: The run context.
+            tool: The tool definition returned by [`get_tools`][pydantic_ai.toolsets.AbstractToolset.get_tools] that was called.
+        """
+        raise NotImplementedError()
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+class UsageBase:
+    input_tokens: Annotated[
+        int,
+        # `request_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('input_tokens', 'request_tokens')),
+    ] = 0
+    """Number of input/prompt tokens."""
+
+    cache_write_tokens: int = 0
+    """Number of tokens written to the cache."""
+    cache_read_tokens: int = 0
+    """Number of tokens read from the cache."""
+
+    output_tokens: Annotated[
+        int,
+        # `response_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('output_tokens', 'response_tokens')),
+    ] = 0
+    """Number of output/completion tokens."""
+
+    input_audio_tokens: int = 0
+    """Number of audio input tokens."""
+    cache_audio_read_tokens: int = 0
+    """Number of audio tokens read from the cache."""
+    output_audio_tokens: int = 0
+    """Number of audio output tokens."""
+
+    details: Annotated[
+        dict[str, int],
+        # `details` can not be `None` any longer, but we still want to support deserializing model responses stored in a DB before this was changed
+        BeforeValidator(lambda d: d or {}),
+    ] = dataclasses.field(default_factory=dict[str, int])
+    """Any extra details returned by the model."""
+
+    @property
+    @deprecated('`request_tokens` is deprecated, use `input_tokens` instead')
+    def request_tokens(self) -> int:
+        return self.input_tokens
+
+    @property
+    @deprecated('`response_tokens` is deprecated, use `output_tokens` instead')
+    def response_tokens(self) -> int:
+        return self.output_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Sum of `input_tokens + output_tokens`."""
+        return self.input_tokens + self.output_tokens
+
+    def opentelemetry_attributes(self) -> dict[str, int]:
+        """Get the token usage values as OpenTelemetry attributes."""
+        result: dict[str, int] = {}
+        if self.input_tokens:
+            result['gen_ai.usage.input_tokens'] = self.input_tokens
+        if self.output_tokens:
+            result['gen_ai.usage.output_tokens'] = self.output_tokens
+
+        details = self.details.copy()
+        if self.cache_write_tokens:
+            details['cache_write_tokens'] = self.cache_write_tokens
+        if self.cache_read_tokens:
+            details['cache_read_tokens'] = self.cache_read_tokens
+        if self.input_audio_tokens:
+            details['input_audio_tokens'] = self.input_audio_tokens
+        if self.cache_audio_read_tokens:
+            details['cache_audio_read_tokens'] = self.cache_audio_read_tokens
+        if self.output_audio_tokens:
+            details['output_audio_tokens'] = self.output_audio_tokens
+        if details:
+            prefix = 'gen_ai.usage.details.'
+            for key, value in details.items():
+                # Skipping check for value since spec implies all detail values are relevant
+                if value:
+                    result[prefix + key] = value
+        return result
+
+    def __repr__(self):
+        kv_pairs = (f'{f.name}={value!r}' for f in fields(self) if (value := getattr(self, f.name)))
+        return f'{self.__class__.__qualname__}({", ".join(kv_pairs)})'
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+## pydantic_evals/pydantic_evals/otel/span_tree.py
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+## tests/conftest.py
+
+def disable_ssrf_protection_for_vcr():
+    """Disable SSRF protection for VCR compatibility.
+
+    VCR cassettes record requests with the original hostname. Since SSRF protection
+    resolves hostnames to IPs before making requests, we need to disable the validation
+    for VCR tests to match the pre-recorded cassettes.
+
+    This fixture patches validate_and_resolve_url to return the hostname in place
+    of the resolved IP, allowing the request URL to use the original hostname.
+    """
+    from unittest.mock import patch
+
+    from pydantic_ai._ssrf import ResolvedUrl, extract_host_and_port
+
+    async def mock_validate_and_resolve(url: str, allow_local: bool) -> ResolvedUrl:
+        hostname, path, port, is_https = extract_host_and_port(url)
+        # Return hostname in place of resolved IP - this allows VCR matching
+        return ResolvedUrl(resolved_ip=hostname, hostname=hostname, port=port, is_https=is_https, path=path)
+
+    with patch('pydantic_ai._ssrf.validate_and_resolve_url', mock_validate_and_resolve):
+        yield
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_group_consecutive_tool_return_parts(bedrock_provider: BedrockProvider):
+    """
+    Test that consecutive ToolReturnPart objects are grouped into a single user message for Bedrock.
+    """
+    model = BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+    now = datetime.now()
+    # Create a ModelRequest with 3 consecutive ToolReturnParts
+    req = [
+        ModelRequest(parts=[UserPromptPart(content=['Hello'])], timestamp=IsDatetime()),
+        ModelResponse(parts=[TextPart(content='Hi')]),
+        ModelRequest(parts=[UserPromptPart(content=['How are you?'])], timestamp=IsDatetime()),
+        ModelResponse(parts=[TextPart(content='Cloudy')]),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name='tool1', content='result1', tool_call_id='id1', timestamp=now),
+                ToolReturnPart(tool_name='tool2', content='result2', tool_call_id='id2', timestamp=now),
+                ToolReturnPart(tool_name='tool3', content='result3', tool_call_id='id3', timestamp=now),
+            ],
+            timestamp=IsDatetime(),
+        ),
+    ]
+
+    # Call the mapping function directly
+    _, bedrock_messages = await model._map_messages(req, ModelRequestParameters(), BedrockModelSettings())  # type: ignore[reportPrivateUsage]
+
+    assert bedrock_messages == snapshot(
+        [
+            {'role': 'user', 'content': [{'text': 'Hello'}]},
+            {'role': 'assistant', 'content': [{'text': 'Hi'}]},
+            {'role': 'user', 'content': [{'text': 'How are you?'}]},
+            {'role': 'assistant', 'content': [{'text': 'Cloudy'}]},
+            {
+                'role': 'user',
+                'content': [
+                    {'toolResult': {'toolUseId': 'id1', 'content': [{'text': 'result1'}], 'status': 'success'}},
+                    {'toolResult': {'toolUseId': 'id2', 'content': [{'text': 'result2'}], 'status': 'success'}},
+                    {'toolResult': {'toolUseId': 'id3', 'content': [{'text': 'result3'}], 'status': 'success'}},
+                ],
+            },
+        ]
+    )
+
+## tests/models/test_download_item.py
+
+async def test_download_item_audio_mpeg(disable_ssrf_protection_for_vcr: None) -> None:
+    downloaded_item = await download_item(
+        AudioUrl(url='https://smokeshow.helpmanual.io/4l1l1s0s6q4741012x1w/common_voice_en_537507.mp3'),
+        data_format='bytes',
+    )
+    assert downloaded_item['data_type'] == 'audio/mpeg'
+    assert downloaded_item['data'] == IsInstance(bytes)
+
+## tests/models/test_model_function.py
+
+async def test_return_empty():
+    agent = Agent(FunctionModel(stream_function=stream_text_function_empty))
+    with pytest.raises(ValueError, match='Stream function must return at least one item'):
+        async with agent.run_stream(''):
+            pass
+
+## tests/test_agent.py
+
+def test_tool_return_part_binary_content_serialization():
+    """Test that ToolReturnPart can properly serialize BinaryContent."""
+    png_data = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDATx\x9cc```\x00\x00\x00\x04\x00\x01\xf6\x178\x00\x00\x00\x00IEND\xaeB`\x82'
+    binary_content = BinaryContent(png_data, media_type='image/png')
+
+    tool_return = ToolReturnPart(tool_name='test_tool', content=binary_content, tool_call_id='test_call_123')
+
+    assert tool_return.model_response_object() == snapshot(
+        {
+            'data': 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYGAAAAAEAAH2FzgAAAAASUVORK5CYII=',
+            'media_type': 'image/png',
+            'vendor_metadata': None,
+            'kind': 'binary',
+            'identifier': '14a01a',
+        }
+    )
+
+def test_many_multimodal_tool_response():
+    """Test ToolReturn with custom content and tool return."""
+
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[TextPart('Starting analysis'), ToolCallPart('analyze_data', {})])
+        else:
+            return ModelResponse(  # pragma: no cover
+                parts=[
+                    TextPart('Analysis completed'),
+                ]
+            )
+
+    agent = Agent(FunctionModel(llm))
+
+    @agent.tool_plain
+    def analyze_data() -> list[Any]:
+        return [
+            ToolReturn(
+                return_value='Data analysis completed successfully',
+                content=[
+                    'Here are the analysis results:',
+                    ImageUrl('https://example.com/chart.jpg'),
+                    'The chart shows positive trends.',
+                ],
+                metadata={'foo': 'bar'},
+            ),
+            'Something else',
+        ]
+
+    with pytest.raises(
+        UserError,
+        match="The return value of tool 'analyze_data' contains invalid nested `ToolReturn` objects. `ToolReturn` should be used directly.",
+    ):
+        agent.run_sync('Please analyze the data')
+
+## tests/test_logfire.py
+
+def get_logfire_summary(capfire: CaptureLogfire) -> Callable[[], LogfireSummary]:
+    def get_summary() -> LogfireSummary:
+        return LogfireSummary(capfire)
+
+    return get_summary
+
+def _test_logfire_metadata_values_callable_dict(ctx: RunContext[Any]) -> dict[str, str]:
+    return {'model_name': ctx.model.model_name}
+
+def test_logfire_metadata_values(
+    get_logfire_summary: Callable[[], LogfireSummary],
+    metadata: dict[str, Any] | Callable[[RunContext[Any]], dict[str, Any]],
+    expected: dict[str, Any],
+) -> None:
+    agent = Agent(model=TestModel(), instrument=InstrumentationSettings(version=2), metadata=metadata)
+    agent.run_sync('Hello')
+
+    summary = get_logfire_summary()
+    assert summary.attributes[0]['metadata'] == expected
+
+## tests/test_mcp.py
+
+def test_load_mcp_servers_with_non_string_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test that non-string primitive values (int, bool, null) in nested structures are passed through unchanged."""
+    config = tmp_path / 'mcp.json'
+
+    # Create a config with environment variables and extra fields containing primitives
+    # The extra fields will be ignored during validation but go through _expand_env_vars
+    monkeypatch.setenv('PYTHON_CMD', 'python')
+    config.write_text(
+        '{"mcpServers": {"my_server": {"command": "${PYTHON_CMD}", "args": ["-m", "tests.mcp_server"], '
+        '"metadata": {"count": 42, "enabled": true, "value": null}}}}',
+        encoding='utf-8',
+    )
+
+    # This should successfully expand env vars and ignore the metadata field
+    servers = load_mcp_servers(config)
+
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == 'python'
+
+async def test_resource_methods_without_capability(mcp_server: MCPServerStdio) -> None:
+    """Test that resource list methods return empty values when resources capability is not available."""
+    async with mcp_server:
+        # Mock the capabilities to not support resources
+        mock_capabilities = ServerCapabilities(resources=False)
+        with patch.object(mcp_server, '_server_capabilities', mock_capabilities):
+            # list_resources should return empty list
+            result = await mcp_server.list_resources()
+            assert result == []
+
+            # list_resource_templates should return empty list
+            result = await mcp_server.list_resource_templates()
+            assert result == []
+
+## tests/test_tools.py
+
+def test_only_returns_type():
+    agent = Agent(FunctionModel(get_json_schema))
+    agent.tool_plain(only_returns_type)
+
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'only_returns_type',
+            'description': """\
+<returns>
+<type>str</type>
+<description>The result as a string.</description>
+</returns>\
+""",
+            'parameters_json_schema': {'additionalProperties': False, 'properties': {}, 'type': 'object'},
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )

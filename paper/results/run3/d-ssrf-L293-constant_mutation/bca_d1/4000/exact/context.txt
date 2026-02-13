@@ -1,0 +1,393 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    def narrow_type(bc: BinaryContent) -> BinaryContent | BinaryImage:
+        """Narrow the type of the `BinaryContent` to `BinaryImage` if it's an image."""
+        if bc.is_image:
+            return BinaryImage(
+                data=bc.data,
+                media_type=bc.media_type,
+                identifier=bc.identifier,
+                vendor_metadata=bc.vendor_metadata,
+            )
+        else:
+            return bc
+
+    def from_path(cls, path: PathLike[str]) -> BinaryContent:
+        """Create a `BinaryContent` from a path.
+
+        Defaults to 'application/octet-stream' if the media type cannot be inferred.
+
+        Raises:
+            FileNotFoundError: if the file does not exist.
+            PermissionError: if the file cannot be read.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f'File not found: {path}')
+        media_type, _ = _mime_types.guess_type(path)
+        if media_type is None:
+            media_type = 'application/octet-stream'
+
+        return cls.narrow_type(cls(data=path.read_bytes(), media_type=media_type))
+
+## pydantic_ai_slim/pydantic_ai/providers/gateway.py
+
+def gateway_provider(
+    upstream_provider: UpstreamProvider | str,
+    /,
+    *,
+    # Every provider
+    route: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    # OpenAI, Groq, Anthropic & Gemini - Only Bedrock doesn't have an HTTPX client.
+    http_client: httpx.AsyncClient | None = None,
+) -> Provider[Any]:
+    """Create a new Gateway provider.
+
+    Args:
+        upstream_provider: The upstream provider to use.
+        route: The name of the provider or routing group to use to handle the request. If not provided, the default
+            routing group for the API format will be used.
+        api_key: The API key to use for authentication. If not provided, the `PYDANTIC_AI_GATEWAY_API_KEY`
+            environment variable will be used if available.
+        base_url: The base URL to use for the Gateway. If not provided, the `PYDANTIC_AI_GATEWAY_BASE_URL`
+            environment variable will be used if available. Otherwise, defaults to `https://gateway.pydantic.dev/proxy`.
+        http_client: The HTTP client to use for the Gateway.
+    """
+    api_key = api_key or os.getenv('PYDANTIC_AI_GATEWAY_API_KEY', os.getenv('PAIG_API_KEY'))
+    if not api_key:
+        raise UserError(
+            'Set the `PYDANTIC_AI_GATEWAY_API_KEY` environment variable or pass it via `gateway_provider(..., api_key=...)`'
+            ' to use the Pydantic AI Gateway provider.'
+        )
+
+    base_url = (
+        base_url or os.getenv('PYDANTIC_AI_GATEWAY_BASE_URL', os.getenv('PAIG_BASE_URL')) or _infer_base_url(api_key)
+    )
+    http_client = http_client or cached_async_http_client(provider=f'gateway/{upstream_provider}')
+    http_client.event_hooks = {'request': [_request_hook(api_key)]}
+
+    if route is None:
+        # Use the implied providerId as the default route.
+        route = normalize_gateway_provider(upstream_provider)
+
+    base_url = _merge_url_path(base_url, route)
+
+    if upstream_provider in ('openai', 'openai-chat', 'openai-responses', 'chat', 'responses'):
+        from .openai import OpenAIProvider
+
+        return OpenAIProvider(api_key=api_key, base_url=base_url, http_client=http_client)
+    elif upstream_provider == 'groq':
+        from .groq import GroqProvider
+
+        return GroqProvider(api_key=api_key, base_url=base_url, http_client=http_client)
+    elif upstream_provider == 'anthropic':
+        from anthropic import AsyncAnthropic
+
+        from .anthropic import AnthropicProvider
+
+        return AnthropicProvider(
+            anthropic_client=AsyncAnthropic(auth_token=api_key, base_url=base_url, http_client=http_client)
+        )
+    elif upstream_provider in ('bedrock', 'converse'):
+        from .bedrock import BedrockProvider
+
+        return BedrockProvider(
+            api_key=api_key,
+            base_url=base_url,
+            region_name='pydantic-ai-gateway',  # Fake region name to avoid NoRegionError
+        )
+    elif upstream_provider in ('google-vertex', 'gemini'):
+        from .google import GoogleProvider
+
+        return GoogleProvider(vertexai=True, api_key=api_key, base_url=base_url, http_client=http_client)
+    else:
+        raise UserError(f'Unknown upstream provider: {upstream_provider}')
+
+def _merge_url_path(base_url: str, path: str) -> str:
+    """Merge a base URL and a path.
+
+    Args:
+        base_url: The base URL to merge.
+        path: The path to merge.
+    """
+    return base_url.rstrip('/') + '/' + path.lstrip('/')
+
+## pydantic_graph/pydantic_graph/beta/graph_builder.py
+
+def _replace_placeholder_node_ids(nodes: dict[NodeID, AnyNode], edges_by_source: dict[NodeID, list[Path]]):
+    node_id_remapping = _build_placeholder_node_id_remapping(nodes)
+    replaced_nodes = {
+        node_id_remapping.get(name, name): _update_node_with_id_remapping(node, node_id_remapping)
+        for name, node in nodes.items()
+    }
+    replaced_edges_by_source = {
+        node_id_remapping.get(source, source): [_update_path_with_id_remapping(p, node_id_remapping) for p in paths]
+        for source, paths in edges_by_source.items()
+    }
+    return replaced_nodes, replaced_edges_by_source
+
+def _update_node_with_id_remapping(node: AnyNode, node_id_remapping: dict[NodeID, NodeID]) -> AnyNode:
+    # Note: it's a bit awkward that we mutate the provided nodes, but this is necessary to ensure that
+    # calls to `.as_node` reference the correct node_ids when relying on compatibility with the v1 API.
+    # We only mutate placeholder IDs so I _think_ this should generally be okay. I guess we can
+    # rework it more carefully if it causes issues in the future..
+    if isinstance(node, Step):
+        node.id = node_id_remapping.get(node.id, node.id)
+    elif isinstance(node, Join):
+        node.id = JoinID(node_id_remapping.get(node.id, node.id))
+    elif isinstance(node, Fork):
+        node.id = ForkID(node_id_remapping.get(node.id, node.id))
+        if node.downstream_join_id is not None:
+            node.downstream_join_id = JoinID(node_id_remapping.get(node.downstream_join_id, node.downstream_join_id))
+    elif isinstance(node, Decision):
+        node.id = node_id_remapping.get(node.id, node.id)
+        node.branches = [
+            replace(branch, path=_update_path_with_id_remapping(branch.path, node_id_remapping))
+            for branch in node.branches
+        ]
+    return node
+
+def _update_path_with_id_remapping(path: Path, node_id_remapping: dict[NodeID, NodeID]) -> Path:
+    # Note: we have already deepcopied the node provided to this function so it should be okay to make mutations,
+    # this could change if we change the code surrounding the code paths leading to this function call though.
+    for item in path.items:
+        if isinstance(item, MapMarker):
+            downstream_join_id = item.downstream_join_id
+            if downstream_join_id is not None:
+                item.downstream_join_id = JoinID(node_id_remapping.get(downstream_join_id, downstream_join_id))
+            item.fork_id = ForkID(node_id_remapping.get(item.fork_id, item.fork_id))
+        elif isinstance(item, BroadcastMarker):
+            item.fork_id = ForkID(node_id_remapping.get(item.fork_id, item.fork_id))
+            item.paths = [_update_path_with_id_remapping(p, node_id_remapping) for p in item.paths]
+        elif isinstance(item, DestinationMarker):
+            item.destination_id = node_id_remapping.get(item.destination_id, item.destination_id)
+    return path
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+PathItem = TypeAliasType('PathItem', TransformMarker | MapMarker | BroadcastMarker | LabelMarker | DestinationMarker)
+
+    def next_path(self) -> Path:
+        """Create a new path with the first item removed.
+
+        Returns:
+            A new Path with all items except the first one
+        """
+        return Path(self.items[1:])
+
+## tests/conftest.py
+
+class TestEnv:
+    __test__ = False
+
+    def __init__(self):
+        self.envars: dict[str, str | None] = {}
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+    def reset(self) -> None:
+        for name, value in self.envars.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value  # pragma: lax no cover
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+def assets_path() -> Path:
+    return Path(__file__).parent / 'assets'
+
+## tests/evals/test_reporting.py
+
+async def test_evaluation_renderer_diff_with_changed_metadata(sample_report_case: ReportCase):
+    """Test EvaluationRenderer diff table where both reports have the same metadata."""
+
+    baseline_report = EvaluationReport(
+        cases=[sample_report_case],
+        name='baseline_report',
+        experiment_metadata={
+            'updated-key': 'original value',
+            'preserved-key': 'preserved value',
+            'old-key': 'old value',
+        },
+    )
+
+    new_report = EvaluationReport(
+        cases=[sample_report_case],
+        name='new_report',
+        experiment_metadata={
+            'updated-key': 'updated value',
+            'preserved-key': 'preserved value',
+            'new-key': 'new value',
+        },
+    )
+
+    output = new_report.render(
+        include_input=False,
+        include_metadata=False,
+        include_expected_output=False,
+        include_output=False,
+        include_durations=True,
+        include_total_duration=False,
+        include_removed_cases=False,
+        include_averages=False,
+        include_error_stacktrace=False,
+        include_evaluator_failures=True,
+        input_config={},
+        metadata_config={},
+        output_config={},
+        score_configs={},
+        label_configs={},
+        metric_configs={},
+        duration_config={},
+        include_reasons=False,
+        baseline=baseline_report,
+        include_errors=False,  # Prevent failures table from being added
+    )
+    assert output == snapshot("""\
+╭─ Evaluation Diff: baseline_report → new_report ─╮
+│ + new-key: new value                            │
+│ - old-key: old value                            │
+│ preserved-key: preserved value                  │
+│ updated-key: original value → updated value     │
+╰─────────────────────────────────────────────────╯
+┏━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━┓
+┃ Case ID   ┃ Scores       ┃ Labels        ┃ Metrics         ┃ Assertions ┃ Duration ┃
+┡━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━┩
+│ test_case │ score1: 2.50 │ label1: hello │ accuracy: 0.950 │ ✔          │  100.0ms │
+└───────────┴──────────────┴───────────────┴─────────────────┴────────────┴──────────┘
+""")
+
+## tests/graph/beta/test_paths.py
+
+async def test_path_next_path():
+    """Test Path.next_path removes first item."""
+    items: list[PathItem] = [LabelMarker('first'), LabelMarker('second'), DestinationMarker(NodeID('dest'))]
+    path = Path(items=items)
+
+    next_path = path.next_path
+    assert len(next_path.items) == 2
+    assert next_path.items[0] == items[1]
+    assert next_path.items[1] == items[2]
+
+## tests/models/xai_proto_cassettes.py
+
+    def from_path(cls, path: Path) -> XaiProtoCassetteClient:
+        return cls(cassette=XaiProtoCassette.load(path))
+
+## tests/test_examples.py
+
+def tmp_path_cwd(tmp_path: Path):
+    cwd = os.getcwd()
+
+    root_dir = Path(__file__).parent.parent
+    for file in (root_dir / 'tests' / 'example_modules').glob('*.py'):
+        shutil.copy(file, tmp_path)
+    sys.path.append(str(tmp_path))
+    os.chdir(tmp_path)
+
+    try:
+        yield tmp_path
+    finally:
+        os.chdir(cwd)
+        sys.path.remove(str(tmp_path))
+
+## tests/test_mcp.py
+
+async def test_server_capabilities_list_changed_fields() -> None:
+    """Test that ServerCapabilities correctly parses listChanged fields."""
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+    async with server:
+        caps = server.capabilities
+        assert isinstance(caps.prompts_list_changed, bool)
+        assert isinstance(caps.tools_list_changed, bool)
+        assert isinstance(caps.resources_list_changed, bool)
+
+## tests/test_messages.py
+
+def test_binary_content_from_path(tmp_path: Path):
+    # test normal file
+    test_xml_file = tmp_path / 'test.xml'
+    test_xml_file.write_text('<think>about trains</think>', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_xml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'<think>about trains</think>', media_type='application/xml'))
+
+    # test non-existent file
+    non_existent_file = tmp_path / 'non-existent.txt'
+    with pytest.raises(FileNotFoundError, match='File not found:'):
+        BinaryContent.from_path(non_existent_file)
+
+    # test file with unknown media type
+    test_unknown_file = tmp_path / 'test.unknownext'
+    test_unknown_file.write_text('some content', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_unknown_file)
+    assert binary_content == snapshot(BinaryContent(data=b'some content', media_type='application/octet-stream'))
+
+    # test string path
+    test_txt_file = tmp_path / 'test.txt'
+    test_txt_file.write_text('just some text', encoding='utf-8')
+    string_path = test_txt_file.as_posix()
+    binary_content = BinaryContent.from_path(string_path)  # pyright: ignore[reportArgumentType]
+    assert binary_content == snapshot(BinaryContent(data=b'just some text', media_type='text/plain'))
+
+    # test image file
+    test_jpg_file = tmp_path / 'test.jpg'
+    test_jpg_file.write_bytes(b'\xff\xd8\xff\xe0' + b'0' * 100)  # minimal JPEG header + padding
+    binary_content = BinaryContent.from_path(test_jpg_file)
+    assert binary_content == snapshot(
+        BinaryImage(data=b'\xff\xd8\xff\xe0' + b'0' * 100, media_type='image/jpeg', _identifier='bc8d49')
+    )
+
+    # test yaml file
+    test_yaml_file = tmp_path / 'config.yaml'
+    test_yaml_file.write_text('key: value', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_yaml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'key: value', media_type='application/yaml'))
+
+    # test yml file (alternative extension)
+    test_yml_file = tmp_path / 'docker-compose.yml'
+    test_yml_file.write_text('version: "3"', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_yml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'version: "3"', media_type='application/yaml'))
+
+    # test toml file
+    test_toml_file = tmp_path / 'pyproject.toml'
+    test_toml_file.write_text('[project]\nname = "test"', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_toml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'[project]\nname = "test"', media_type='application/toml'))
+
+## tests/test_temporal.py
+
+def test_pydantic_ai_plugin_with_pydantic_payload_converter_unchanged() -> None:
+    """When converter already uses PydanticPayloadConverter, return it unchanged."""
+    plugin = PydanticAIPlugin()
+    converter = DataConverter(payload_converter_class=PydanticPayloadConverter)
+    config: dict[str, Any] = {'data_converter': converter}
+    result = plugin.configure_client(config)  # type: ignore[arg-type]
+    assert result['data_converter'] is converter
+
+def test_pydantic_ai_plugin_with_custom_pydantic_subclass_unchanged() -> None:
+    """When converter uses a subclass of PydanticPayloadConverter, return it unchanged (no warning)."""
+    plugin = PydanticAIPlugin()
+    converter = DataConverter(payload_converter_class=CustomPydanticPayloadConverter)
+    config: dict[str, Any] = {'data_converter': converter}
+    result = plugin.configure_client(config)  # type: ignore[arg-type]
+    assert result['data_converter'] is converter
+    assert result['data_converter'].payload_converter_class is CustomPydanticPayloadConverter

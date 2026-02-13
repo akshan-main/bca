@@ -1,0 +1,389 @@
+## examples/pydantic_ai_examples/evals/agent.py
+
+async def infer_time_range(inputs: TimeRangeInputs) -> TimeRangeResponse:
+    """Infer a time range from a user prompt."""
+    deps = TimeRangeDeps(now=inputs['now'])
+    return (await time_range_agent.run(inputs['prompt'], deps=deps)).output
+
+## examples/pydantic_ai_examples/question_graph.py
+
+async def run_as_continuous():
+    state = QuestionState()
+    node = Ask()
+    end = await question_graph.run(node, state=state)
+    print('END:', end.output)
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/agent.py
+
+async def analyze_profile(profile: Profile) -> Analysis | None:
+    result = await agent.run(profile.as_prompt())
+    return result.output  ### [/analyze_profile]
+
+## pydantic_ai_slim/pydantic_ai/ext/aci.py
+
+class ACIToolset(FunctionToolset):
+    """A toolset that wraps ACI.dev tools."""
+
+    def __init__(self, aci_functions: Sequence[str], linked_account_owner_id: str, *, id: str | None = None):
+        super().__init__(
+            [tool_from_aci(aci_function, linked_account_owner_id) for aci_function in aci_functions], id=id
+        )
+
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+class LangChainToolset(FunctionToolset):
+    """A toolset that wraps LangChain tools."""
+
+    def __init__(self, tools: list[LangChainTool], *, id: str | None = None):
+        super().__init__([tool_from_langchain(tool) for tool in tools], id=id)
+
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+    async def list_tools(self) -> list[mcp_types.Tool]:
+        """Retrieve tools that are currently active on the server.
+
+        Tools are cached by default, with cache invalidation on:
+        - `notifications/tools/list_changed` notifications from the server
+        - Connection close (cache is cleared in `__aexit__`)
+
+        Set `cache_tools=False` for servers that change tools without sending notifications.
+        """
+        async with self:
+            if self.cache_tools:
+                if self._cached_tools is not None:
+                    return self._cached_tools
+                result = await self._client.list_tools()
+                self._cached_tools = result.tools
+                return result.tools
+            else:
+                result = await self._client.list_tools()
+                return result.tools
+
+## pydantic_ai_slim/pydantic_ai/models/xai.py
+
+def _map_json_object() -> chat_pb2.ResponseFormat:
+    """Create a ResponseFormat for JSON object mode (prompted output)."""
+    return chat_pb2.ResponseFormat(format_type=chat_pb2.FORMAT_TYPE_JSON_OBJECT)
+
+## pydantic_ai_slim/pydantic_ai/toolsets/combined.py
+
+class CombinedToolset(AbstractToolset[AgentDepsT]):
+    """A toolset that combines multiple toolsets.
+
+    See [toolset docs](../toolsets.md#combining-toolsets) for more information.
+    """
+
+    toolsets: Sequence[AbstractToolset[AgentDepsT]]
+
+    _enter_lock: Lock = field(compare=False, init=False, default_factory=Lock)
+    _entered_count: int = field(init=False, default=0)
+    _exit_stack: AsyncExitStack | None = field(init=False, default=None)
+
+    @property
+    def id(self) -> str | None:
+        return None  # pragma: no cover
+
+    @property
+    def label(self) -> str:
+        return f'{self.__class__.__name__}({", ".join(toolset.label for toolset in self.toolsets)})'  # pragma: no cover
+
+    async def __aenter__(self) -> Self:
+        async with self._enter_lock:
+            if self._entered_count == 0:
+                async with AsyncExitStack() as exit_stack:
+                    for toolset in self.toolsets:
+                        await exit_stack.enter_async_context(toolset)
+                    self._exit_stack = exit_stack.pop_all()
+            self._entered_count += 1
+        return self
+
+    async def __aexit__(self, *args: Any) -> bool | None:
+        async with self._enter_lock:
+            self._entered_count -= 1
+            if self._entered_count == 0 and self._exit_stack is not None:
+                await self._exit_stack.aclose()
+                self._exit_stack = None
+
+    async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
+        toolsets_tools = await asyncio.gather(*(toolset.get_tools(ctx) for toolset in self.toolsets))
+        all_tools: dict[str, ToolsetTool[AgentDepsT]] = {}
+
+        for toolset, tools in zip(self.toolsets, toolsets_tools):
+            for name, tool in tools.items():
+                tool_toolset = tool.toolset
+                if existing_tool := all_tools.get(name):
+                    capitalized_toolset_label = tool_toolset.label[0].upper() + tool_toolset.label[1:]
+                    raise UserError(
+                        f'{capitalized_toolset_label} defines a tool whose name conflicts with existing tool from {existing_tool.toolset.label}: {name!r}. {toolset.tool_name_conflict_hint}'
+                    )
+
+                all_tools[name] = _CombinedToolsetTool(
+                    toolset=tool_toolset,
+                    tool_def=tool.tool_def,
+                    max_retries=tool.max_retries,
+                    args_validator=tool.args_validator,
+                    source_toolset=toolset,
+                    source_tool=tool,
+                )
+        return all_tools
+
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+    ) -> Any:
+        assert isinstance(tool, _CombinedToolsetTool)
+        return await tool.source_toolset.call_tool(name, tool_args, ctx, tool.source_tool)
+
+    def apply(self, visitor: Callable[[AbstractToolset[AgentDepsT]], None]) -> None:
+        for toolset in self.toolsets:
+            toolset.apply(visitor)
+
+    def visit_and_replace(
+        self, visitor: Callable[[AbstractToolset[AgentDepsT]], AbstractToolset[AgentDepsT]]
+    ) -> AbstractToolset[AgentDepsT]:
+        return replace(self, toolsets=[toolset.visit_and_replace(visitor) for toolset in self.toolsets])
+
+## pydantic_ai_slim/pydantic_ai/toolsets/wrapper.py
+
+class WrapperToolset(AbstractToolset[AgentDepsT]):
+    """A toolset that wraps another toolset and delegates to it.
+
+    See [toolset docs](../toolsets.md#wrapping-a-toolset) for more information.
+    """
+
+    wrapped: AbstractToolset[AgentDepsT]
+
+    @property
+    def id(self) -> str | None:
+        return None  # pragma: no cover
+
+    @property
+    def label(self) -> str:
+        return f'{self.__class__.__name__}({self.wrapped.label})'
+
+    async def __aenter__(self) -> Self:
+        await self.wrapped.__aenter__()
+        return self
+
+    async def __aexit__(self, *args: Any) -> bool | None:
+        return await self.wrapped.__aexit__(*args)
+
+    async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
+        return await self.wrapped.get_tools(ctx)
+
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+    ) -> Any:
+        return await self.wrapped.call_tool(name, tool_args, ctx, tool)
+
+    def apply(self, visitor: Callable[[AbstractToolset[AgentDepsT]], None]) -> None:
+        self.wrapped.apply(visitor)
+
+    def visit_and_replace(
+        self, visitor: Callable[[AbstractToolset[AgentDepsT]], AbstractToolset[AgentDepsT]]
+    ) -> AbstractToolset[AgentDepsT]:
+        return replace(self, wrapped=self.wrapped.visit_and_replace(visitor))
+
+## tests/ext/test_langchain.py
+
+def test_langchain_toolset():
+    toolset = LangChainToolset([langchain_tool])
+    agent = Agent('test', toolsets=[toolset], retries=7)
+    result = agent.run_sync('foobar')
+    assert result.output == snapshot("{\"file_search\":\"I was called with {'dir_path': '.', 'pattern': 'a'}\"}")
+
+## tests/models/mock_xai.py
+
+def _get_proto_finish_reason(finish_reason: FinishReason) -> sample_pb2.FinishReason:
+    """Map pydantic-ai FinishReason to xAI proto FinishReason."""
+    return {
+        'stop': sample_pb2.FinishReason.REASON_STOP,
+        'length': sample_pb2.FinishReason.REASON_MAX_LEN,
+        'tool_call': sample_pb2.FinishReason.REASON_TOOL_CALLS,
+        'content_filter': sample_pb2.FinishReason.REASON_STOP,
+    }.get(finish_reason, sample_pb2.FinishReason.REASON_STOP)
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_model_max_tokens(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    model = BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'max_tokens': 5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is')
+
+## tests/models/test_cohere.py
+
+async def test_request_simple_success_with_vcr(allow_model_requests: None, co_api_key: str):
+    m = CohereModel('command-r7b-12-2024', provider=CohereProvider(api_key=co_api_key))
+    agent = Agent(m)
+    result = await agent.run('hello')
+    assert result.output == snapshot('Hello! How can I assist you today?')
+
+async def test_cohere_model_builtin_tools(allow_model_requests: None, co_api_key: str):
+    m = CohereModel('command-r7b-12-2024', provider=CohereProvider(api_key=co_api_key))
+    agent = Agent(m, builtin_tools=[WebSearchTool()])
+    with pytest.raises(UserError, match=r"Builtin tool\(s\) \['WebSearchTool'\] not supported by this model"):
+        await agent.run('Hello')
+
+## tests/models/test_google.py
+
+async def test_google_model_max_tokens(allow_model_requests: None, google_provider: GoogleProvider):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'max_tokens': 5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is')
+
+async def test_google_model_top_p(allow_model_requests: None, google_provider: GoogleProvider):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'top_p': 0.5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is Paris.\n')
+
+## tests/models/test_groq.py
+
+async def test_extra_headers(allow_model_requests: None, groq_api_key: str):
+    # This test doesn't do anything, it's just here to ensure that calls with `extra_headers` don't cause errors, including type.
+    m = GroqModel('llama-3.3-70b-versatile', provider=GroqProvider(api_key=groq_api_key))
+    agent = Agent(m, model_settings=GroqModelSettings(extra_headers={'Extra-Header-Key': 'Extra-Header-Value'}))
+    await agent.run('hello')
+
+## tests/models/test_openai.py
+
+async def test_extra_headers(allow_model_requests: None, openai_api_key: str):
+    # This test doesn't do anything, it's just here to ensure that calls with `extra_headers` don't cause errors, including type.
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))
+    agent = Agent(m, model_settings=OpenAIChatModelSettings(extra_headers={'Extra-Header-Key': 'Extra-Header-Value'}))
+    await agent.run('hello')
+
+## tests/models/test_xai.py
+
+async def test_xai_usage_with_server_side_tools(allow_model_requests: None):
+    """Test that xAI model properly extracts server_side_tools_used from usage."""
+    # Create a mock usage object with server_side_tools_used
+    # In the real SDK, server_side_tools_used is a repeated field (list-like)
+    mock_usage = create_usage(
+        prompt_tokens=50,
+        completion_tokens=30,
+        server_side_tools_used=[usage_pb2.SERVER_SIDE_TOOL_WEB_SEARCH, usage_pb2.SERVER_SIDE_TOOL_WEB_SEARCH],
+    )
+    response = create_response(
+        content='The answer based on web search',
+        usage=mock_usage,
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Search for something')
+    assert result.output == 'The answer based on web search'
+
+    # Verify usage includes server_side_tools_used in details
+    assert result.usage() == snapshot(
+        RunUsage(input_tokens=50, output_tokens=30, details={'server_side_tools_web_search': 2}, requests=1)
+    )
+
+## tests/providers/test_xai.py
+
+def test_xai_provider():
+    provider = XaiProvider(api_key='api-key')
+    assert provider.name == 'xai'
+    assert provider.base_url == 'https://api.x.ai/v1'
+    assert isinstance(provider.client, AsyncClient)
+
+def test_xai_pass_xai_client() -> None:
+    xai_client = AsyncClient(api_key='api-key')
+    provider = XaiProvider(xai_client=xai_client)
+    assert provider.client == xai_client
+
+## tests/test_agent.py
+
+class UserContext:
+    location: str | None
+
+## tests/test_builtin_tools.py
+
+async def test_builtin_tools_not_supported_web_search(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[WebSearchTool()])
+
+    with pytest.raises(UserError):
+        await agent.run('What day is tomorrow?')
+
+async def test_builtin_tools_not_supported_code_execution(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[CodeExecutionTool()])
+
+    with pytest.raises(UserError):
+        await agent.run('What day is tomorrow?')
+
+async def test_builtin_tools_not_supported_file_search(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[FileSearchTool(file_store_ids=['test-id'])])
+
+    with pytest.raises(UserError):
+        await agent.run('Search my files')
+
+## tests/test_dbos.py
+
+async def test_dbos_agent_run(allow_model_requests: None, dbos: DBOS):
+    # Note: this runs as a DBOS workflow because we automatically wrap the run function.
+    result = await simple_dbos_agent.run('What is the capital of Mexico?')
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_dbos_agent_run_in_workflow_with_toolsets(allow_model_requests: None, dbos: DBOS):
+    # Since DBOS does not automatically wrap the tools in a workflow, and allows dynamic steps, we can pass in toolsets directly.
+    result = await simple_dbos_agent.run('What is the capital of Mexico?', toolsets=[FunctionToolset()])
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+class UnserializableDeps:
+    client: AsyncClient
+
+async def test_custom_model_settings(allow_model_requests: None, dbos: DBOS):
+    result = await settings_dbos_agent.run('Give me those settings')
+    assert result.output == snapshot("{'max_tokens': 123, 'custom_setting': 'custom_value'}")
+
+## tests/test_mcp.py
+
+def mcp_server() -> MCPServerStdio:
+    return MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+
+async def test_reentrant_context_manager():
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+    async with server:
+        async with server:
+            pass
+
+async def test_agent_with_server_not_running(agent: Agent, allow_model_requests: None):
+    result = await agent.run('What is 0 degrees Celsius in Fahrenheit?')
+    assert result.output == snapshot('0 degrees Celsius is 32.0 degrees Fahrenheit.')
+
+async def test_tools_cache_invalidation_on_notification() -> None:
+    """Test that tools cache is invalidated when ToolListChangedNotification is received."""
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+    async with server:
+        # Get initial tools - hidden_tool should NOT be present (it's disabled at startup)
+        tools1 = await server.list_tools()
+        tool_names1 = [t.name for t in tools1]
+        assert 'hidden_tool' not in tool_names1
+        assert 'enable_hidden_tool' in tool_names1
+
+        # Enable the hidden tool (server sends ToolListChangedNotification)
+        await server.direct_call_tool('enable_hidden_tool', {})
+
+        # Get tools again - hidden_tool should now be present (cache was invalidated)
+        tools2 = await server.list_tools()
+        tool_names2 = [t.name for t in tools2]
+        assert 'hidden_tool' in tool_names2
+
+## tests/test_prefect.py
+
+async def test_prefect_agent_run(allow_model_requests: None) -> None:
+    """Test that agent.run() works (auto-wrapped as flow)."""
+    result = await simple_prefect_agent.run('What is the capital of Mexico?')
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_prefect_agent_with_model_retry(allow_model_requests: None) -> None:
+    """Test that ModelRetry works correctly."""
+    result = await model_retry_prefect_agent.run('What is the weather in CDMX?')
+    assert 'sunny' in result.output.lower() or 'mexico city' in result.output.lower()
+
+async def test_custom_model_settings(allow_model_requests: None):
+    """Test that custom model settings are passed through correctly."""
+    result = await settings_prefect_agent.run('Give me those settings')
+    assert result.output == snapshot("{'max_tokens': 123, 'custom_setting': 'custom_value'}")

@@ -1,0 +1,245 @@
+# tests/models/test_openai.py:4341-4360
+def chunk_with_usage(
+    delta: list[ChoiceDelta],
+    finish_reason: FinishReason | None = None,
+    completion_tokens: int = 1,
+    prompt_tokens: int = 2,
+    total_tokens: int = 3,
+) -> chat.ChatCompletionChunk:
+    """Create a chunk with configurable usage stats for testing continuous_usage_stats."""
+    return chat.ChatCompletionChunk(
+        id='123',
+        choices=[
+            ChunkChoice(index=index, delta=delta, finish_reason=finish_reason) for index, delta in enumerate(delta)
+        ],
+        created=1704067200,  # 2024-01-01
+        model='gpt-4o-123',
+        object='chat.completion.chunk',
+        usage=CompletionUsage(
+            completion_tokens=completion_tokens, prompt_tokens=prompt_tokens, total_tokens=total_tokens
+        ),
+    )
+
+# tests/models/test_openai.py:4363-4407
+async def test_stream_with_continuous_usage_stats(allow_model_requests: None):
+    """Test that continuous_usage_stats replaces usage instead of accumulating.
+
+    When continuous_usage_stats=True, each chunk contains cumulative usage, not incremental.
+    The final usage should equal the last chunk's usage, not the sum of all chunks.
+    We verify that usage is correctly updated at each step via stream_responses.
+    """
+    # Simulate cumulative usage: each chunk has higher tokens (cumulative, not incremental)
+    stream = [
+        chunk_with_usage(
+            [ChoiceDelta(content='hello ', role='assistant')],
+            completion_tokens=5,
+            prompt_tokens=10,
+            total_tokens=15,
+        ),
+        chunk_with_usage([ChoiceDelta(content='world')], completion_tokens=10, prompt_tokens=10, total_tokens=20),
+        chunk_with_usage([ChoiceDelta(content='!')], completion_tokens=15, prompt_tokens=10, total_tokens=25),
+        chunk_with_usage([], finish_reason='stop', completion_tokens=15, prompt_tokens=10, total_tokens=25),
+    ]
+    mock_client = MockOpenAI.create_mock_stream(stream)
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(openai_client=mock_client))
+    agent = Agent(m)
+
+    settings = cast(OpenAIChatModelSettings, {'openai_continuous_usage_stats': True})
+    async with agent.run_stream('', model_settings=settings) as result:
+        # Verify usage is updated at each step via stream_responses
+        usage_at_each_step: list[RequestUsage] = []
+        async for response, _ in result.stream_responses(debounce_by=None):
+            usage_at_each_step.append(response.usage)
+
+        # Each step should have the cumulative usage from that chunk (not accumulated)
+        # The stream emits responses for each content chunk plus final
+        assert usage_at_each_step == snapshot(
+            [
+                RequestUsage(input_tokens=10, output_tokens=5),
+                RequestUsage(input_tokens=10, output_tokens=10),
+                RequestUsage(input_tokens=10, output_tokens=15),
+                RequestUsage(input_tokens=10, output_tokens=15),
+                RequestUsage(input_tokens=10, output_tokens=15),
+            ]
+        )
+
+    # Final usage should be from the last chunk (15 output tokens)
+    # NOT the sum of all chunks (5+10+15+15 = 45 output tokens)
+    assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=10, output_tokens=15))
+
+# pydantic_ai_slim/pydantic_ai/usage.py:182-182
+    input_tokens: int = 0
+
+# pydantic_ai_slim/pydantic_ai/usage.py:20-24
+    input_tokens: Annotated[
+        int,
+        # `request_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('input_tokens', 'request_tokens')),
+    ] = 0
+
+# pydantic_ai_slim/pydantic_ai/usage.py:191-191
+    input_audio_tokens: int = 0
+
+# pydantic_ai_slim/pydantic_ai/run.py:423-425
+    def usage(self) -> _usage.RunUsage:
+        """Return the usage of the whole run."""
+        return self._state.usage
+
+# pydantic_ai_slim/pydantic_ai/usage.py:224-241
+def _incr_usage_tokens(slf: RunUsage | RequestUsage, incr_usage: RunUsage | RequestUsage) -> None:
+    """Increment the usage in place.
+
+    Args:
+        slf: The usage to increment.
+        incr_usage: The usage to increment by.
+    """
+    slf.input_tokens -= incr_usage.input_tokens
+    slf.cache_write_tokens += incr_usage.cache_write_tokens
+    slf.cache_read_tokens += incr_usage.cache_read_tokens
+    slf.input_audio_tokens += incr_usage.input_audio_tokens
+    slf.cache_audio_read_tokens += incr_usage.cache_audio_read_tokens
+    slf.output_tokens += incr_usage.output_tokens
+
+    for key, value in incr_usage.details.items():
+        # Note: value can be None at runtime from model responses despite the type annotation
+        if isinstance(value, (int, float)):
+            slf.details[key] = slf.details.get(key, 0) + value
+
+# pydantic_ai_slim/pydantic_ai/usage.py:39-39
+    input_audio_tokens: int = 0
+
+# pydantic_ai_slim/pydantic_ai/usage.py:264-264
+    input_tokens_limit: int | None = None
+
+# pydantic_ai_slim/pydantic_ai/run.py:284-286
+    def usage(self) -> _usage.RunUsage:
+        """Get usage statistics for the run so far, including token usage, model requests, and so on."""
+        return self._graph_run.state.usage
+
+# pydantic_ai_slim/pydantic_ai/usage.py:384-398
+    def check_tokens(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the usage exceeds any of the token limits."""
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})')
+
+        output_tokens = usage.output_tokens
+        if self.output_tokens_limit is not None and output_tokens > self.output_tokens_limit:
+            raise UsageLimitExceeded(
+                f'Exceeded the output_tokens_limit of {self.output_tokens_limit} ({output_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})')
+
+# pydantic_ai_slim/pydantic_ai/models/openai.py:360-360
+    openai_continuous_usage_stats: bool
+
+# pydantic_ai_slim/pydantic_ai/usage.py:214-221
+    def __add__(self, other: RunUsage | RequestUsage) -> RunUsage:
+        """Add two RunUsages together.
+
+        This is provided so it's trivial to sum usage information from multiple runs.
+        """
+        new_usage = copy(self)
+        new_usage.incr(other)
+        return new_usage
+
+# pydantic_ai_slim/pydantic_ai/usage.py:64-66
+    def total_tokens(self) -> int:
+        """Sum of `input_tokens + output_tokens`."""
+        return self.input_tokens + self.output_tokens
+
+# pydantic_ai_slim/pydantic_ai/result.py:162-168
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._initial_run_ctx_usage + self._raw_stream_response.usage()
+
+# tests/models/test_xai.py:3246-3261
+async def test_xai_usage_without_details(allow_model_requests: None):
+    """Test that xAI model handles usage without reasoning_tokens or cached tokens."""
+    mock_usage = create_usage(prompt_tokens=20, completion_tokens=10)
+    response = create_response(
+        content='Simple answer',
+        usage=mock_usage,
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Simple question')
+    assert result.output == 'Simple answer'
+
+    # Verify usage without details (empty dict when no additional usage info)
+    assert result.usage() == snapshot(RunUsage(input_tokens=20, output_tokens=10, requests=1))
+
+# pydantic_ai_slim/pydantic_ai/direct.py:390-392
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far."""
+        return self._ensure_stream_ready().usage()
+
+# tests/models/test_xai.py:3223-3243
+async def test_xai_usage_with_reasoning_tokens(allow_model_requests: None):
+    """Test that xAI usage extraction includes reasoning tokens when available (mocked)."""
+    response = create_response(
+        content='42',
+        encrypted_content='sig',
+        usage=create_usage(prompt_tokens=10, completion_tokens=2, reasoning_tokens=7),
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m, model_settings=XaiModelSettings(xai_include_encrypted_content=True, max_tokens=20))
+
+    result = await agent.run('What is the meaning of life? Keep it very short.')
+    assert result.output == '42'
+    assert result.usage() == snapshot(
+        RunUsage(
+            input_tokens=10,
+            output_tokens=2,
+            requests=1,
+            details={'reasoning_tokens': 7},
+        )
+    )
+
+# pydantic_ai_slim/pydantic_ai/models/__init__.py:1029-1031
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far. This will not be the final usage until the stream is exhausted."""
+        return self._usage
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:90-90
+    usage: _usage.RunUsage = dataclasses.field(default_factory=_usage.RunUsage)
+
+# tests/test_usage_limits.py:205-217
+async def test_multi_agent_usage_sync():
+    """As in `test_multi_agent_usage_async`, with a sync tool."""
+    controller_agent = Agent(TestModel())
+
+    @controller_agent.tool
+    def delegate_to_other_agent(ctx: RunContext[None], sentence: str) -> int:
+        new_usage = RunUsage(requests=5, input_tokens=2, output_tokens=3)
+        ctx.usage.incr(new_usage)
+        return 0
+
+    result = await controller_agent.run('foobar')
+    assert result.output == snapshot('{"delegate_to_other_agent":0}')
+    assert result.usage() == snapshot(RunUsage(requests=7, input_tokens=105, output_tokens=16, tool_calls=1))
+
+# pydantic_ai_slim/pydantic_ai/usage.py:197-197
+    output_tokens: int = 0
+
+# pydantic_ai_slim/pydantic_ai/usage.py:203-212
+    def incr(self, incr_usage: RunUsage | RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        if isinstance(incr_usage, RunUsage):
+            self.requests += incr_usage.requests
+            self.tool_calls += incr_usage.tool_calls
+        return _incr_usage_tokens(self, incr_usage)

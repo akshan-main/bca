@@ -1,0 +1,1179 @@
+# tests/test_concurrency.py:411-426
+    async def test_limit_model_concurrency_helper(self):
+        """Test the limit_model_concurrency helper function."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel, limit_model_concurrency
+
+        # With limiter
+        model = limit_model_concurrency(TestModel(), limiter=5)
+        assert isinstance(model, ConcurrencyLimitedModel)
+
+        # Without limiter (returns original)
+        base_model = TestModel()
+        model = limit_model_concurrency(base_model, limiter=None)
+        assert model is base_model
+
+        # With model name string
+        model = limit_model_concurrency('test', limiter=5)
+        assert isinstance(model, ConcurrencyLimitedModel)
+
+# tests/test_concurrency.py:301-436
+class TestConcurrencyLimitedModel:
+    """Tests for the ConcurrencyLimitedModel wrapper."""
+
+    async def test_basic_concurrency_limit(self):
+        """Test that ConcurrencyLimitedModel limits concurrent requests."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        request_count = 0
+        max_concurrent = 0
+        lock = anyio.Lock()
+
+        base_model = TestModel()
+        original_request = TestModel.request.__get__(base_model)
+
+        async def tracking_request(*args: Any, **kwargs: Any):
+            nonlocal request_count, max_concurrent
+            async with lock:
+                request_count += 1
+                max_concurrent = max(max_concurrent, request_count)
+            try:
+                await anyio.sleep(0.1)  # Simulate slow request
+                return await original_request(*args, **kwargs)
+            finally:
+                async with lock:
+                    request_count -= 1
+
+        base_model.request = tracking_request
+
+        model = ConcurrencyLimitedModel(base_model, limiter=2)
+        agent = Agent(model)
+
+        async with anyio.create_task_group() as tg:
+            for i in range(5):
+                tg.start_soon(agent.run, f'prompt {i}')
+
+        assert max_concurrent <= 2
+
+    async def test_with_int_limiter(self):
+        """Test ConcurrencyLimitedModel with int limiter."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        model = ConcurrencyLimitedModel(TestModel(), limiter=5)
+        assert model._limiter.max_running == 5
+        assert model._limiter._max_queued is None
+
+    async def test_with_concurrency_limit(self):
+        """Test ConcurrencyLimitedModel with ConcurrencyLimit."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        model = ConcurrencyLimitedModel(TestModel(), limiter=ConcurrencyLimit(max_running=5, max_queued=10))
+        assert model._limiter.max_running == 5
+        assert model._limiter._max_queued == 10
+
+    async def test_with_shared_limiter(self):
+        """Test ConcurrencyLimitedModel with shared ConcurrencyLimiter."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        shared_limiter = ConcurrencyLimiter(max_running=3, name='shared-pool')
+        model1 = ConcurrencyLimitedModel(TestModel(), limiter=shared_limiter)
+        model2 = ConcurrencyLimitedModel(TestModel(), limiter=shared_limiter)
+
+        # Both models should share the same limiter
+        assert model1._limiter is model2._limiter
+        assert model1._limiter.name == 'shared-pool'
+
+    async def test_shared_limiter_limits_across_models(self):
+        """Test that shared limiter limits concurrent requests across multiple models."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        request_count = 0
+        max_concurrent = 0
+        lock = anyio.Lock()
+
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        def create_tracking_model():
+            base_model = TestModel()
+            original_request = TestModel.request.__get__(base_model)
+
+            async def tracking_request(*args: Any, **kwargs: Any):
+                nonlocal request_count, max_concurrent
+                async with lock:
+                    request_count += 1
+                    max_concurrent = max(max_concurrent, request_count)
+                try:
+                    await anyio.sleep(0.1)
+                    return await original_request(*args, **kwargs)
+                finally:
+                    async with lock:
+                        request_count -= 1
+
+            base_model.request = tracking_request
+            return ConcurrencyLimitedModel(base_model, limiter=shared_limiter)
+
+        model1 = create_tracking_model()
+        model2 = create_tracking_model()
+
+        agent1 = Agent(model1)
+        agent2 = Agent(model2)
+
+        # Run 3 requests on each agent (6 total), but limit is 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(agent1.run, f'prompt {i}')
+            for i in range(3):
+                tg.start_soon(agent2.run, f'prompt {i}')
+
+        # Should never exceed 2 concurrent requests across both models
+        assert max_concurrent <= 2
+
+    async def test_limit_model_concurrency_helper(self):
+        """Test the limit_model_concurrency helper function."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel, limit_model_concurrency
+
+        # With limiter
+        model = limit_model_concurrency(TestModel(), limiter=5)
+        assert isinstance(model, ConcurrencyLimitedModel)
+
+        # Without limiter (returns original)
+        base_model = TestModel()
+        model = limit_model_concurrency(base_model, limiter=None)
+        assert model is base_model
+
+        # With model name string
+        model = limit_model_concurrency('test', limiter=5)
+        assert isinstance(model, ConcurrencyLimitedModel)
+
+    async def test_model_properties_delegated(self):
+        """Test that model properties are properly delegated to wrapped model."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        base_model = TestModel(model_name='custom-test')
+        model = ConcurrencyLimitedModel(base_model, limiter=5)
+
+        assert model.model_name == 'custom-test'
+        assert model.system == 'test'
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:114-142
+def limit_model_concurrency(
+    model: Model | KnownModelName,
+    limiter: AnyConcurrencyLimit,
+) -> Model:
+    """Wrap a model with concurrency limiting.
+
+    This is a convenience function to wrap a model with concurrency limiting.
+    If the limiter is None, the model is returned unchanged.
+
+    Args:
+        model: The model to wrap.
+        limiter: The concurrency limit configuration.
+
+    Returns:
+        The wrapped model with concurrency limiting, or the original model if limiter is None.
+
+    Example:
+    ```python
+    from pydantic_ai.models.concurrency import limit_model_concurrency
+
+    model = limit_model_concurrency('openai:gpt-4o', limiter=5)
+    ```
+    """
+    normalized_limiter = normalize_to_limiter(limiter)
+    if normalized_limiter is not None:
+        from . import infer_model
+
+        return infer_model(model) if isinstance(model, str) else model
+    return ConcurrencyLimitedModel(model, normalized_limiter)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:103-103
+from .models.concurrency import ConcurrencyLimitedModel, limit_model_concurrency
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:27-111
+class ConcurrencyLimitedModel(WrapperModel):
+    """A model wrapper that limits concurrent requests to the underlying model.
+
+    This wrapper applies concurrency limiting at the model level, ensuring that
+    the number of concurrent requests to the model does not exceed the configured
+    limit. This is useful for:
+
+    - Respecting API rate limits
+    - Managing resource usage
+    - Sharing a concurrency pool across multiple models
+
+    Example usage:
+    ```python
+    from pydantic_ai import Agent
+    from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+    # Limit to 5 concurrent requests
+    model = ConcurrencyLimitedModel('openai:gpt-4o', limiter=5)
+    agent = Agent(model)
+
+    # Or share a limiter across multiple models
+    from pydantic_ai import ConcurrencyLimiter  # noqa E402
+
+    shared_limiter = ConcurrencyLimiter(max_running=10, name='openai-pool')
+    model1 = ConcurrencyLimitedModel('openai:gpt-4o', limiter=shared_limiter)
+    model2 = ConcurrencyLimitedModel('openai:gpt-4o-mini', limiter=shared_limiter)
+    ```
+    """
+
+    _limiter: AbstractConcurrencyLimiter
+
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        limiter: int | ConcurrencyLimit | AbstractConcurrencyLimiter,
+    ):
+        """Initialize the ConcurrencyLimitedModel.
+
+        Args:
+            wrapped: The model to wrap, either a Model instance or a known model name.
+            limiter: The concurrency limit configuration. Can be:
+                - An `int`: Simple limit on concurrent operations (unlimited queue).
+                - A `ConcurrencyLimit`: Full configuration with optional backpressure.
+                - An `AbstractConcurrencyLimiter`: A pre-created limiter for sharing across models.
+        """
+        super().__init__(wrapped)
+        if isinstance(limiter, AbstractConcurrencyLimiter):
+            self._limiter = limiter
+        else:
+            self._limiter = ConcurrencyLimiter.from_limit(limiter)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        """Make a request to the model with concurrency limiting."""
+        async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+            return await self.wrapped.request(messages, model_settings, model_request_parameters)
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> RequestUsage:
+        """Count tokens with concurrency limiting."""
+        async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+            return await self.wrapped.count_tokens(messages, model_settings, model_request_parameters)
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        """Make a streaming request to the model with concurrency limiting."""
+        async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+            async with self.wrapped.request_stream(
+                messages, model_settings, model_request_parameters, run_context
+            ) as response_stream:
+                yield response_stream
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:103-103
+from .models.concurrency import ConcurrencyLimitedModel, limit_model_concurrency
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:92-111
+    def __init__(
+        self,
+        *,
+        call_tools: list[str] | Literal['all'] = 'all',
+        custom_output_text: str | None = None,
+        custom_output_args: Any | None = None,
+        seed: int = 0,
+        model_name: str = 'test',
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize TestModel with optional settings and profile."""
+        self.call_tools = call_tools
+        self.custom_output_text = custom_output_text
+        self.custom_output_args = custom_output_args
+        self.seed = seed
+        self.last_model_request_parameters = None
+        self._model_name = model_name
+        self._system = 'test'
+        super().__init__(settings=settings, profile=profile)
+
+# tests/test_concurrency.py:338-344
+    async def test_with_int_limiter(self):
+        """Test ConcurrencyLimitedModel with int limiter."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        model = ConcurrencyLimitedModel(TestModel(), limiter=5)
+        assert model._limiter.max_running == 5
+        assert model._limiter._max_queued is None
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:58-76
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        limiter: int | ConcurrencyLimit | AbstractConcurrencyLimiter,
+    ):
+        """Initialize the ConcurrencyLimitedModel.
+
+        Args:
+            wrapped: The model to wrap, either a Model instance or a known model name.
+            limiter: The concurrency limit configuration. Can be:
+                - An `int`: Simple limit on concurrent operations (unlimited queue).
+                - A `ConcurrencyLimit`: Full configuration with optional backpressure.
+                - An `AbstractConcurrencyLimiter`: A pre-created limiter for sharing across models.
+        """
+        super().__init__(wrapped)
+        if isinstance(limiter, AbstractConcurrencyLimiter):
+            self._limiter = limiter
+        else:
+            self._limiter = ConcurrencyLimiter.from_limit(limiter)
+
+# tests/conftest.py:26-26
+import pydantic_ai.models
+
+# pydantic_evals/pydantic_evals/evaluators/__init__.py:1-10
+from .common import (
+    Contains,
+    Equals,
+    EqualsExpected,
+    HasMatchingSpan,
+    IsInstance,
+    LLMJudge,
+    MaxDuration,
+    OutputConfig,
+)
+
+# tests/models/test_anthropic.py:60-60
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, TestEnv, raise_if_exception, try_import
+
+# tests/models/test_bedrock.py:54-54
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, try_import
+
+# tests/models/test_cohere.py:33-33
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, raise_if_exception, try_import
+
+# tests/models/test_download_item.py:6-6
+from ..conftest import IsInstance, IsStr
+
+# tests/models/test_gemini_vertex.py:23-23
+from ..conftest import IsDatetime, IsInstance, IsStr, try_import
+
+# tests/models/test_google.py:79-79
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, try_import
+
+# tests/models/test_groq.py:52-52
+from ..conftest import IsDatetime, IsInstance, IsStr, raise_if_exception, try_import
+
+# tests/models/test_huggingface.py:41-41
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, raise_if_exception, try_import
+
+# tests/models/test_outlines.py:42-42
+from ..conftest import IsDatetime, IsInstance, IsStr, try_import
+
+# tests/models/test_xai.py:73-73
+from ..conftest import IsDatetime, IsInstance, IsNow, IsStr, try_import
+
+# tests/test_cli.py:8-8
+from dirty_equals import IsInstance, IsStr
+
+# tests/test_mcp.py:47-47
+from .conftest import IsDatetime, IsInstance, IsNow, IsStr, try_import
+
+# tests/test_concurrency.py:346-352
+    async def test_with_concurrency_limit(self):
+        """Test ConcurrencyLimitedModel with ConcurrencyLimit."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        model = ConcurrencyLimitedModel(TestModel(), limiter=ConcurrencyLimit(max_running=5, max_queued=10))
+        assert model._limiter.max_running == 5
+        assert model._limiter._max_queued == 10
+
+# tests/models/test_model_function.py:26-26
+from pydantic_ai.models.test import TestModel
+
+# tests/models/test_model_settings.py:13-13
+from pydantic_ai.models.test import TestModel
+
+# tests/models/test_model_test.py:34-34
+from pydantic_ai.models.test import TestModel, _chars, _JsonSchemaTestData  # pyright: ignore[reportPrivateUsage]
+
+# tests/test_ag_ui.py:56-56
+from pydantic_ai.models.test import TestModel
+
+# tests/test_agent.py:69-69
+from pydantic_ai.models.test import TestModel
+
+# tests/test_cli.py:15-15
+from pydantic_ai.models.test import TestModel
+
+# tests/test_concurrency.py:14-14
+from pydantic_ai.models.test import TestModel
+
+# tests/test_dbos.py:36-36
+from pydantic_ai.models.test import TestModel
+
+# tests/test_deps.py:4-4
+from pydantic_ai.models.test import TestModel
+
+# tests/test_direct.py:33-33
+from pydantic_ai.models.test import TestModel
+
+# tests/test_examples.py:47-47
+from pydantic_ai.models.test import TestModel
+
+# tests/test_fastmcp.py:16-16
+from pydantic_ai.models.test import TestModel
+
+# tests/test_logfire.py:18-18
+from pydantic_ai.models.test import TestModel
+
+# tests/test_mcp.py:43-43
+from pydantic_ai.models.test import TestModel
+
+# tests/test_native_output_schema.py:4-4
+from pydantic_ai.models.test import TestModel
+
+# tests/test_prefect.py:33-33
+from pydantic_ai.models.test import TestModel
+
+# tests/test_streaming.py:52-52
+from pydantic_ai.models.test import TestModel, TestStreamedResponse as ModelTestStreamedResponse
+
+# tests/test_temporal.py:52-52
+from pydantic_ai.models.test import TestModel
+
+# tests/test_tools.py:36-36
+from pydantic_ai.models.test import TestModel
+
+# tests/test_toolsets.py:27-27
+from pydantic_ai.models.test import TestModel
+
+# tests/test_ui.py:44-44
+from pydantic_ai.models.test import TestModel
+
+# tests/test_ui_web.py:16-16
+from pydantic_ai.models.test import TestModel
+
+# tests/test_usage_limits.py:27-27
+from pydantic_ai.models.test import TestModel
+
+# tests/test_vercel_ai.py:46-46
+from pydantic_ai.models.test import TestModel
+
+# tests/conftest.py:51-51
+pydantic_ai.models.ALLOW_MODEL_REQUESTS = False
+
+# tests/test_concurrency.py:354-364
+    async def test_with_shared_limiter(self):
+        """Test ConcurrencyLimitedModel with shared ConcurrencyLimiter."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        shared_limiter = ConcurrencyLimiter(max_running=3, name='shared-pool')
+        model1 = ConcurrencyLimitedModel(TestModel(), limiter=shared_limiter)
+        model2 = ConcurrencyLimitedModel(TestModel(), limiter=shared_limiter)
+
+        # Both models should share the same limiter
+        assert model1._limiter is model2._limiter
+        assert model1._limiter.name == 'shared-pool'
+
+# pydantic_ai_slim/pydantic_ai/agent/wrapper.py:39-40
+    def model(self) -> models.Model | models.KnownModelName | str | None:
+        return self.wrapped.model
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:82-82
+    last_model_request_parameters: ModelRequestParameters | None = field(default=None, init=False)
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:99-111
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        """Make a streaming request to the model with concurrency limiting."""
+        async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+            async with self.wrapped.request_stream(
+                messages, model_settings, model_request_parameters, run_context
+            ) as response_stream:
+                yield response_stream
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:78-86
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        """Make a request to the model with concurrency limiting."""
+        async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+            return await self.wrapped.request(messages, model_settings, model_request_parameters)
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:74-74
+    call_tools: list[str] | Literal['all'] = 'all'
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:76-76
+    custom_output_text: str | None = None
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:78-78
+    custom_output_args: Any | None = None
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:80-80
+    seed: int = 0
+
+# tests/test_concurrency.py:304-336
+    async def test_basic_concurrency_limit(self):
+        """Test that ConcurrencyLimitedModel limits concurrent requests."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        request_count = 0
+        max_concurrent = 0
+        lock = anyio.Lock()
+
+        base_model = TestModel()
+        original_request = TestModel.request.__get__(base_model)
+
+        async def tracking_request(*args: Any, **kwargs: Any):
+            nonlocal request_count, max_concurrent
+            async with lock:
+                request_count += 1
+                max_concurrent = max(max_concurrent, request_count)
+            try:
+                await anyio.sleep(0.1)  # Simulate slow request
+                return await original_request(*args, **kwargs)
+            finally:
+                async with lock:
+                    request_count -= 1
+
+        base_model.request = tracking_request
+
+        model = ConcurrencyLimitedModel(base_model, limiter=2)
+        agent = Agent(model)
+
+        async with anyio.create_task_group() as tg:
+            for i in range(5):
+                tg.start_soon(agent.run, f'prompt {i}')
+
+        assert max_concurrent <= 2
+
+# pydantic_evals/pydantic_evals/evaluators/common.py:132-147
+class IsInstance(Evaluator[object, object, object]):
+    """Check if the output is an instance of a type with the given name."""
+
+    type_name: str
+    evaluation_name: str | None = field(default=None)
+
+    def evaluate(self, ctx: EvaluatorContext[object, object, object]) -> EvaluationReason:
+        output = ctx.output
+        for cls in type(output).__mro__:
+            if cls.__name__ == self.type_name or cls.__qualname__ == self.type_name:
+                return EvaluationReason(value=True)
+
+        reason = f'output is of type {type(output).__name__}'
+        if type(output).__qualname__ != type(output).__name__:
+            reason += f' (qualname: {type(output).__qualname__})'
+        return EvaluationReason(value=False, reason=reason)
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:256-273
+def get_concurrency_context(
+    limiter: AbstractConcurrencyLimiter | None,
+    source: str = 'unnamed',
+) -> AbstractAsyncContextManager[None]:
+    """Get an async context manager for the concurrency limiter.
+
+    If limiter is None, returns a no-op context manager.
+
+    Args:
+        limiter: The AbstractConcurrencyLimiter or None.
+        source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+
+    Returns:
+        An async context manager.
+    """
+    if limiter is None:
+        return _null_context()
+    return _limiter_context(limiter, source)
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:86-88
+    def model(self) -> models.Model | models.KnownModelName | str | None:
+        """The default model configured for this agent."""
+        raise NotImplementedError
+
+# pydantic_ai_slim/pydantic_ai/direct.py:144-203
+def model_request_stream(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> AbstractAsyncContextManager[models.StreamedResponse]:
+    """Make a streamed async request to a model.
+
+    ```py {title="model_request_stream_example.py"}
+
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_stream
+
+
+    async def main():
+        messages = [ModelRequest.user_text_prompt('Who was Albert Einstein?')]  # (1)!
+        async with model_request_stream('openai:gpt-5-mini', messages) as stream:
+            chunks = []
+            async for chunk in stream:
+                chunks.append(chunk)
+            print(chunks)
+            '''
+            [
+                PartStartEvent(index=0, part=TextPart(content='Albert Einstein was ')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(
+                    index=0, delta=TextPartDelta(content_delta='a German-born theoretical ')
+                ),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='physicist.')),
+                PartEndEvent(
+                    index=0,
+                    part=TextPart(
+                        content='Albert Einstein was a German-born theoretical physicist.'
+                    ),
+                ),
+            ]
+            '''
+    ```
+
+    1. See [`ModelRequest.user_text_prompt`][pydantic_ai.messages.ModelRequest.user_text_prompt] for details.
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        A [stream response][pydantic_ai.models.StreamedResponse] async context manager.
+    """
+    model_instance = _prepare_model(model, instrument)
+    return model_instance.request_stream(
+        list(messages),
+        model_settings,
+        model_request_parameters or models.ModelRequestParameters(),
+    )
+
+# tests/test_concurrency.py:366-409
+    async def test_shared_limiter_limits_across_models(self):
+        """Test that shared limiter limits concurrent requests across multiple models."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        request_count = 0
+        max_concurrent = 0
+        lock = anyio.Lock()
+
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        def create_tracking_model():
+            base_model = TestModel()
+            original_request = TestModel.request.__get__(base_model)
+
+            async def tracking_request(*args: Any, **kwargs: Any):
+                nonlocal request_count, max_concurrent
+                async with lock:
+                    request_count += 1
+                    max_concurrent = max(max_concurrent, request_count)
+                try:
+                    await anyio.sleep(0.1)
+                    return await original_request(*args, **kwargs)
+                finally:
+                    async with lock:
+                        request_count -= 1
+
+            base_model.request = tracking_request
+            return ConcurrencyLimitedModel(base_model, limiter=shared_limiter)
+
+        model1 = create_tracking_model()
+        model2 = create_tracking_model()
+
+        agent1 = Agent(model1)
+        agent2 = Agent(model2)
+
+        # Run 3 requests on each agent (6 total), but limit is 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(agent1.run, f'prompt {i}')
+            for i in range(3):
+                tg.start_soon(agent2.run, f'prompt {i}')
+
+        # Should never exceed 2 concurrent requests across both models
+        assert max_concurrent <= 2
+
+# pydantic_ai_slim/pydantic_ai/direct.py:36-85
+async def model_request(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> messages.ModelResponse:
+    """Make a non-streamed request to a model.
+
+    ```py title="model_request_example.py"
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request
+
+
+    async def main():
+        model_response = await model_request(
+            'anthropic:claude-haiku-4-5',
+            [ModelRequest.user_text_prompt('What is the capital of France?')]  # (1)!
+        )
+        print(model_response)
+        '''
+        ModelResponse(
+            parts=[TextPart(content='The capital of France is Paris.')],
+            usage=RequestUsage(input_tokens=56, output_tokens=7),
+            model_name='claude-haiku-4-5',
+            timestamp=datetime.datetime(...),
+        )
+        '''
+    ```
+
+    1. See [`ModelRequest.user_text_prompt`][pydantic_ai.messages.ModelRequest.user_text_prompt] for details.
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        The model response and token usage associated with the request.
+    """
+    model_instance = _prepare_model(model, instrument)
+    return await model_instance.request(
+        list(messages),
+        model_settings,
+        model_request_parameters or models.ModelRequestParameters(),
+    )
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:88-96
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> RequestUsage:
+        """Count tokens with concurrency limiting."""
+        async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+            return await self.wrapped.count_tokens(messages, model_settings, model_request_parameters)
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:431-436
+    def model(self, value: models.Model | models.KnownModelName | str | None) -> None:
+        """Set the default model configured for this agent.
+
+        We allow `str` here since the actual list of allowed models changes frequently.
+        """
+        self._model = value
+
+# pydantic_ai_slim/pydantic_ai/direct.py:88-141
+def model_request_sync(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> messages.ModelResponse:
+    """Make a Synchronous, non-streamed request to a model.
+
+    This is a convenience method that wraps [`model_request`][pydantic_ai.direct.model_request] with
+    `loop.run_until_complete(...)`. You therefore can't use this method inside async code or if there's an active event loop.
+
+    ```py title="model_request_sync_example.py"
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_sync
+
+    model_response = model_request_sync(
+        'anthropic:claude-haiku-4-5',
+        [ModelRequest.user_text_prompt('What is the capital of France?')]  # (1)!
+    )
+    print(model_response)
+    '''
+    ModelResponse(
+        parts=[TextPart(content='The capital of France is Paris.')],
+        usage=RequestUsage(input_tokens=56, output_tokens=7),
+        model_name='claude-haiku-4-5',
+        timestamp=datetime.datetime(...),
+    )
+    '''
+    ```
+
+    1. See [`ModelRequest.user_text_prompt`][pydantic_ai.messages.ModelRequest.user_text_prompt] for details.
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        The model response and token usage associated with the request.
+    """
+    return _get_event_loop().run_until_complete(
+        model_request(
+            model,
+            list(messages),
+            model_settings=model_settings,
+            model_request_parameters=model_request_parameters,
+            instrument=instrument,
+        )
+    )
+
+# pydantic_ai_slim/pydantic_ai/direct.py:206-267
+def model_request_stream_sync(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> StreamedResponseSync:
+    """Make a streamed synchronous request to a model.
+
+    This is the synchronous version of [`model_request_stream`][pydantic_ai.direct.model_request_stream].
+    It uses threading to run the asynchronous stream in the background while providing a synchronous iterator interface.
+
+    ```py {title="model_request_stream_sync_example.py"}
+
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_stream_sync
+
+    messages = [ModelRequest.user_text_prompt('Who was Albert Einstein?')]
+    with model_request_stream_sync('openai:gpt-5-mini', messages) as stream:
+        chunks = []
+        for chunk in stream:
+            chunks.append(chunk)
+        print(chunks)
+        '''
+        [
+            PartStartEvent(index=0, part=TextPart(content='Albert Einstein was ')),
+            FinalResultEvent(tool_name=None, tool_call_id=None),
+            PartDeltaEvent(
+                index=0, delta=TextPartDelta(content_delta='a German-born theoretical ')
+            ),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='physicist.')),
+            PartEndEvent(
+                index=0,
+                part=TextPart(
+                    content='Albert Einstein was a German-born theoretical physicist.'
+                ),
+            ),
+        ]
+        '''
+    ```
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        A [sync stream response][pydantic_ai.direct.StreamedResponseSync] context manager.
+    """
+    async_stream_cm = model_request_stream(
+        model=model,
+        messages=list(messages),
+        model_settings=model_settings,
+        model_request_parameters=model_request_parameters,
+        instrument=instrument,
+    )
+
+    return StreamedResponseSync(async_stream_cm)
+
+# examples/pydantic_ai_examples/stream_markdown.py:28-32
+models: list[tuple[KnownModelName, str]] = [
+    ('google-gla:gemini-3-flash-preview', 'GEMINI_API_KEY'),
+    ('openai:gpt-5-mini', 'OPENAI_API_KEY'),
+    ('groq:llama-3.3-70b-versatile', 'GROQ_API_KEY'),
+]
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:28-28
+from . import _output, _system_prompt, exceptions, messages as _messages, models, result, usage as _usage
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:20-30
+from .. import (
+    _agent_graph,
+    _output,
+    _system_prompt,
+    _utils,
+    concurrency as _concurrency,
+    exceptions,
+    messages as _messages,
+    models,
+    usage as _usage,
+)
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:17-27
+from .. import (
+    _agent_graph,
+    _system_prompt,
+    _tool_manager,
+    _utils,
+    exceptions,
+    messages as _messages,
+    models,
+    result,
+    usage as _usage,
+)
+
+# pydantic_ai_slim/pydantic_ai/agent/wrapper.py:7-12
+from .. import (
+    _utils,
+    messages as _messages,
+    models,
+    usage as _usage,
+)
+
+# pydantic_ai_slim/pydantic_ai/direct.py:22-22
+from . import agent, messages, models, settings
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_agent.py:10-17
+from pydantic_ai import (
+    AbstractToolset,
+    AgentRunResultEvent,
+    _utils,
+    messages as _messages,
+    models,
+    usage as _usage,
+)
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_agent.py:13-20
+from pydantic_ai import (
+    AbstractToolset,
+    AgentRunResultEvent,
+    _utils,
+    messages as _messages,
+    models,
+    usage as _usage,
+)
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py:18-25
+from pydantic_ai import (
+    AbstractToolset,
+    AgentRunResultEvent,
+    _utils,
+    messages as _messages,
+    models,
+    usage as _usage,
+)
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py:15-15
+from pydantic_ai import ModelMessage, ModelResponse, ModelResponseStreamEvent, models
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:46-46
+from . import _mcp, _utils, exceptions, messages, models
+
+# pydantic_ai_slim/pydantic_ai/result.py:12-12
+from . import _utils, exceptions, messages as _messages, models
+
+# pydantic_evals/pydantic_evals/evaluators/common.py:9-9
+from pydantic_ai import models
+
+# pydantic_evals/pydantic_evals/evaluators/llm_as_a_judge.py:10-10
+from pydantic_ai import Agent, UserContent, models
+
+# pydantic_evals/pydantic_evals/generation.py:16-16
+from pydantic_ai import Agent, models
+
+# tests/test_streaming.py:18-45
+from pydantic_ai import (
+    Agent,
+    AgentRunResult,
+    AgentRunResultEvent,
+    AgentStreamEvent,
+    ExternalToolset,
+    FinalResultEvent,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    ImageUrl,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    RunContext,
+    TextPart,
+    TextPartDelta,
+    ToolCallPart,
+    ToolReturnPart,
+    UnexpectedModelBehavior,
+    UserError,
+    UserPromptPart,
+    capture_run_messages,
+    models,
+)
+
+# pydantic_ai_slim/pydantic_ai/embeddings/test.py:28-119
+class TestEmbeddingModel(EmbeddingModel):
+    """A mock embedding model for testing.
+
+    This model returns deterministic embeddings (all 1.0 values) and tracks
+    the settings used in the last call via the `last_settings` attribute.
+
+    Example:
+    ```python
+    from pydantic_ai import Embedder
+    from pydantic_ai.embeddings import TestEmbeddingModel
+
+    test_model = TestEmbeddingModel()
+    embedder = Embedder('openai:text-embedding-3-small')
+
+
+    async def main():
+        with embedder.override(model=test_model):
+            await embedder.embed_query('test')
+            assert test_model.last_settings is not None
+    ```
+    """
+
+    # NOTE: Avoid test discovery by pytest.
+    __test__ = False
+
+    _model_name: str
+    """The model name to report in results."""
+
+    _provider_name: str
+    """The provider name to report in results."""
+
+    _dimensions: int
+    """The number of dimensions for generated embeddings."""
+
+    last_settings: EmbeddingSettings | None = None
+    """The settings used in the most recent embed call."""
+
+    def __init__(
+        self,
+        model_name: str = 'test',
+        *,
+        provider_name: str = 'test',
+        dimensions: int = 8,
+        settings: EmbeddingSettings | None = None,
+    ):
+        """Initialize the test embedding model.
+
+        Args:
+            model_name: The model name to report in results.
+            provider_name: The provider name to report in results.
+            dimensions: The number of dimensions for the generated embeddings.
+            settings: Optional default settings for the model.
+        """
+        self._model_name = model_name
+        self._provider_name = provider_name
+        self._dimensions = dimensions
+        self.last_settings = None
+        super().__init__(settings=settings)
+
+    @property
+    def model_name(self) -> str:
+        """The embedding model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The embedding model provider."""
+        return self._provider_name
+
+    async def embed(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        inputs, settings = self.prepare_embed(inputs, settings)
+        self.last_settings = settings
+
+        dimensions = settings.get('dimensions') or self._dimensions
+
+        return EmbeddingResult(
+            embeddings=[[1.0] * dimensions] * len(inputs),
+            inputs=inputs,
+            input_type=input_type,
+            usage=RequestUsage(input_tokens=sum(_estimate_tokens(text) for text in inputs)),
+            model_name=self.model_name,
+            provider_name=self.system,
+            provider_response_id=str(uuid.uuid4()),
+        )
+
+    async def max_input_tokens(self) -> int | None:
+        return 1024
+
+    async def count_tokens(self, text: str) -> int:
+        return _estimate_tokens(text)
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:170-199
+    def __init__(
+        self,
+        model: EmbeddingModel | KnownEmbeddingModelName | str,
+        *,
+        settings: EmbeddingSettings | None = None,
+        defer_model_check: bool = True,
+        instrument: InstrumentationSettings | bool | None = None,
+    ) -> None:
+        """Initialize an Embedder.
+
+        Args:
+            model: The embedding model to use. Can be specified as:
+
+                - A model name string in the format `'provider:model-name'`
+                  (e.g., `'openai:text-embedding-3-small'`)
+                - An [`EmbeddingModel`][pydantic_ai.embeddings.EmbeddingModel] instance
+            settings: Optional [`EmbeddingSettings`][pydantic_ai.embeddings.EmbeddingSettings]
+                to use as defaults for all embed calls.
+            defer_model_check: Whether to defer model validation until first use.
+                Set to `False` to validate the model immediately on construction.
+            instrument: OpenTelemetry instrumentation settings. Set to `True` to enable with defaults,
+                or pass an [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize. If `None`, uses the value from
+                [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all].
+        """
+        self._model = model if defer_model_check else infer_embedding_model(model)
+        self._settings = settings
+        self.instrument = instrument
+
+        self._override_model: ContextVar[EmbeddingModel | None] = ContextVar('_override_model', default=None)
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:1613-1629
+    def set_mcp_sampling_model(self, model: models.Model | models.KnownModelName | str | None = None) -> None:
+        """Set the sampling model on all MCP servers registered with the agent.
+
+        If no sampling model is provided, the agent's model will be used.
+        """
+        try:
+            sampling_model = models.infer_model(model) if model else self._get_model(None)
+        except exceptions.UserError as e:
+            raise exceptions.UserError('No sampling model provided and no model set on the agent.') from e
+
+        from ..mcp import MCPServer
+
+        def _set_sampling_model(toolset: AbstractToolset[AgentDepsT]) -> None:
+            if isinstance(toolset, MCPServer):
+                toolset.sampling_model = sampling_model
+
+        self._get_toolset().apply(_set_sampling_model)
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py:216-217
+    def model(self) -> Model:
+        return self._temporal_model
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_agent.py:133-134
+    def model(self) -> Model:
+        return self._model

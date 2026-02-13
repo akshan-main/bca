@@ -1,0 +1,472 @@
+## httpx/_models.py
+
+def _is_known_encoding(encoding: str) -> bool:
+    """
+    Return `True` if `encoding` is a known codec.
+    """
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        return False
+    return True
+
+def _normalize_header_key(key: str | bytes, encoding: str | None = None) -> bytes:
+    """
+    Coerce str/bytes into a strictly byte-wise HTTP header key.
+    """
+    return key if isinstance(key, bytes) else key.encode(encoding or "ascii")
+
+def _normalize_header_value(value: str | bytes, encoding: str | None = None) -> bytes:
+    """
+    Coerce str/bytes into a strictly byte-wise HTTP header value.
+    """
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise TypeError(f"Header value must be str or bytes, not {type(value)}")
+    return value.encode(encoding or "ascii")
+
+def _parse_content_type_charset(content_type: str) -> str | None:
+    # We used to use `cgi.parse_header()` here, but `cgi` became a dead battery.
+    # See: https://peps.python.org/pep-0594/#cgi
+    msg = email.message.Message()
+    msg["content-type"] = content_type
+    return msg.get_content_charset(failobj=None)
+
+def _parse_header_links(value: str) -> list[dict[str, str]]:
+    """
+    Returns a list of parsed link headers, for more info see:
+    https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Link
+    The generic syntax of those is:
+    Link: < uri-reference >; param1=value1; param2="value2"
+    So for instance:
+    Link; '<http:/.../front.jpeg>; type="image/jpeg",<http://.../back.jpeg>;'
+    would return
+        [
+            {"url": "http:/.../front.jpeg", "type": "image/jpeg"},
+            {"url": "http://.../back.jpeg"},
+        ]
+    :param value: HTTP Link entity-header field
+    :return: list of parsed link headers
+    """
+    links: list[dict[str, str]] = []
+    replace_chars = " '\""
+    value = value.strip(replace_chars)
+    if not value:
+        return links
+    for val in re.split(", *<", value):
+        try:
+            url, params = val.split(";", 1)
+        except ValueError:
+            url, params = val, ""
+        link = {"url": url.strip("<> '\"")}
+        for param in params.split(";"):
+            try:
+                key, value = param.split("=")
+            except ValueError:
+                break
+            link[key.strip(replace_chars)] = value.strip(replace_chars)
+        links.append(link)
+    return links
+
+def _obfuscate_sensitive_headers(
+    items: typing.Iterable[tuple[typing.AnyStr, typing.AnyStr]],
+) -> typing.Iterator[tuple[typing.AnyStr, typing.AnyStr]]:
+    for k, v in items:
+        if to_str(k.lower()) in SENSITIVE_HEADERS:
+            v = to_bytes_or_str("[secure]", match_type_of=v)
+        yield k, v
+
+    def raw(self) -> list[tuple[bytes, bytes]]:
+        """
+        Returns a list of the raw header items, as byte pairs.
+        """
+        return [(raw_key, value) for raw_key, _, value in self._list]
+
+    def keys(self) -> typing.KeysView[str]:
+        return {key.decode(self.encoding): None for _, key, value in self._list}.keys()
+
+    def copy(self) -> Headers:
+        return Headers(self, encoding=self.encoding)
+
+    def __iter__(self) -> typing.Iterator[typing.Any]:
+        return iter(self.keys())
+
+    def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
+        """
+        A str-iterator over the decoded response content
+        that handles both gzip, deflate, etc but also detects the content's
+        string encoding.
+        """
+        decoder = TextDecoder(encoding=self.encoding or "utf-8")
+        chunker = TextChunker(chunk_size=chunk_size)
+        with request_context(request=self._request):
+            for byte_content in self.iter_bytes():
+                text_content = decoder.decode(byte_content)
+                for chunk in chunker.decode(text_content):
+                    yield chunk
+            text_content = decoder.flush()
+            for chunk in chunker.decode(text_content):
+                yield chunk  # pragma: no cover
+            for chunk in chunker.flush():
+                yield chunk
+
+    class _CookieCompatRequest(urllib.request.Request):
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
+
+        def __init__(self, request: Request) -> None:
+            super().__init__(
+                url=str(request.url),
+                headers=dict(request.headers),
+                method=request.method,
+            )
+            self.request = request
+
+        def add_unredirected_header(self, key: str, value: str) -> None:
+            super().add_unredirected_header(key, value)
+            self.request.headers[key] = value
+
+    class _CookieCompatResponse:
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
+
+        def __init__(self, response: Response) -> None:
+            self.response = response
+
+        def info(self) -> email.message.Message:
+            info = email.message.Message()
+            for key, value in self.response.headers.multi_items():
+                # Note that setting `info[key]` here is an "append" operation,
+                # not a "replace" operation.
+                # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
+                info[key] = value
+            return info
+
+        def info(self) -> email.message.Message:
+            info = email.message.Message()
+            for key, value in self.response.headers.multi_items():
+                # Note that setting `info[key]` here is an "append" operation,
+                # not a "replace" operation.
+                # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
+                info[key] = value
+            return info
+
+## tests/common.py
+
+TESTS_DIR = pathlib.Path(__file__).parent
+
+## tests/models/test_responses.py
+
+def test_cannot_read_after_response_closed():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    response.close()
+    with pytest.raises(httpx.StreamClosed):
+        response.read()
+
+## tests/test_decoders.py
+
+def test_deflate():
+    """
+    Deflate encoding may use either 'zlib' or 'deflate' in the wild.
+
+    https://stackoverflow.com/questions/1838699/how-can-i-decompress-a-gzip-stream-with-zlib#answer-22311297
+    """
+    body = b"test 123"
+    compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    compressed_body = compressor.compress(body) + compressor.flush()
+
+    headers = [(b"Content-Encoding", b"deflate")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_zlib():
+    """
+    Deflate encoding may use either 'zlib' or 'deflate' in the wild.
+
+    https://stackoverflow.com/questions/1838699/how-can-i-decompress-a-gzip-stream-with-zlib#answer-22311297
+    """
+    body = b"test 123"
+    compressed_body = zlib.compress(body)
+
+    headers = [(b"Content-Encoding", b"deflate")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_gzip():
+    body = b"test 123"
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    compressed_body = compressor.compress(body) + compressor.flush()
+
+    headers = [(b"Content-Encoding", b"gzip")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_brotli():
+    body = b"test 123"
+    compressed_body = b"\x8b\x03\x80test 123\x03"
+
+    headers = [(b"Content-Encoding", b"br")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_zstd():
+    body = b"test 123"
+    compressed_body = zstd.compress(body)
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_zstd_decoding_error():
+    compressed_body = "this_is_not_zstd_compressed_data"
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(
+            200,
+            headers=headers,
+            content=compressed_body,
+        )
+
+def test_zstd_empty():
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(200, headers=headers, content=b"")
+    assert response.content == b""
+
+def test_zstd_truncated():
+    body = b"test 123"
+    compressed_body = zstd.compress(body)
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(
+            200,
+            headers=headers,
+            content=compressed_body[1:3],
+        )
+
+def test_zstd_multiframe():
+    # test inspired by urllib3 test suite
+    data = (
+        # Zstandard frame
+        zstd.compress(b"foo")
+        # skippable frame (must be ignored)
+        + bytes.fromhex(
+            "50 2A 4D 18"  # Magic_Number (little-endian)
+            "07 00 00 00"  # Frame_Size (little-endian)
+            "00 00 00 00 00 00 00"  # User_Data
+        )
+        # Zstandard frame
+        + zstd.compress(b"bar")
+    )
+    compressed_body = io.BytesIO(data)
+
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(200, headers=headers, content=compressed_body)
+    response.read()
+    assert response.content == b"foobar"
+
+def test_multi():
+    body = b"test 123"
+
+    deflate_compressor = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    compressed_body = deflate_compressor.compress(body) + deflate_compressor.flush()
+
+    gzip_compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+    compressed_body = (
+        gzip_compressor.compress(compressed_body) + gzip_compressor.flush()
+    )
+
+    headers = [(b"Content-Encoding", b"deflate, gzip")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+def test_multi_with_identity():
+    body = b"test 123"
+    compressed_body = b"\x8b\x03\x80test 123\x03"
+
+    headers = [(b"Content-Encoding", b"br, identity")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+    headers = [(b"Content-Encoding", b"identity, br")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compressed_body,
+    )
+    assert response.content == body
+
+async def test_streaming():
+    body = b"test 123"
+    compressor = zlib.compressobj(9, zlib.DEFLATED, zlib.MAX_WBITS | 16)
+
+    async def compress(body: bytes) -> typing.AsyncIterator[bytes]:
+        yield compressor.compress(body)
+        yield compressor.flush()
+
+    headers = [(b"Content-Encoding", b"gzip")]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=compress(body),
+    )
+    assert not hasattr(response, "body")
+    assert await response.aread() == body
+
+def test_empty_content(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=b"",
+    )
+    assert response.content == b""
+
+def test_decoding_errors(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    compressed_body = b"invalid"
+    with pytest.raises(httpx.DecodingError):
+        request = httpx.Request("GET", "https://example.org")
+        httpx.Response(200, headers=headers, content=compressed_body, request=request)
+
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(200, headers=headers, content=compressed_body)
+
+async def test_text_decoder_with_autodetect(data, encoding):
+    async def iterator() -> typing.AsyncIterator[bytes]:
+        nonlocal data
+        for chunk in data:
+            yield chunk
+
+    def autodetect(content):
+        return chardet.detect(content).get("encoding")
+
+    # Accessing `.text` on a read response.
+    response = httpx.Response(200, content=iterator(), default_encoding=autodetect)
+    await response.aread()
+    assert response.text == (b"".join(data)).decode(encoding)
+
+    # Streaming `.aiter_text` iteratively.
+    # Note that if we streamed the text *without* having read it first, then
+    # we won't get a `charset_normalizer` guess, and will instead always rely
+    # on utf-8 if no charset is specified.
+    text = "".join([part async for part in response.aiter_text()])
+    assert text == (b"".join(data)).decode(encoding)
+
+async def test_text_decoder_known_encoding():
+    async def iterator() -> typing.AsyncIterator[bytes]:
+        yield b"\x83g"
+        yield b"\x83"
+        yield b"\x89\x83x\x83\x8b"
+
+    response = httpx.Response(
+        200,
+        headers=[(b"Content-Type", b"text/html; charset=shift-jis")],
+        content=iterator(),
+    )
+
+    await response.aread()
+    assert "".join(response.text) == "トラベル"
+
+def test_text_decoder_empty_cases():
+    response = httpx.Response(200, content=b"")
+    assert response.text == ""
+
+    response = httpx.Response(200, content=[b""])
+    response.read()
+    assert response.text == ""
+
+def test_streaming_text_decoder(
+    data: typing.Iterable[bytes], expected: list[str]
+) -> None:
+    response = httpx.Response(200, content=iter(data))
+    assert list(response.iter_text()) == expected
+
+def test_line_decoder_nl():
+    response = httpx.Response(200, content=[b""])
+    assert list(response.iter_lines()) == []
+
+    response = httpx.Response(200, content=[b"", b"a\n\nb\nc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    # Issue #1033
+    response = httpx.Response(
+        200, content=[b"", b"12345\n", b"foo ", b"bar ", b"baz\n"]
+    )
+    assert list(response.iter_lines()) == ["12345", "foo bar baz"]
+
+def test_line_decoder_cr():
+    response = httpx.Response(200, content=[b"", b"a\r\rb\rc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    response = httpx.Response(200, content=[b"", b"a\r\rb\rc\r"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    # Issue #1033
+    response = httpx.Response(
+        200, content=[b"", b"12345\r", b"foo ", b"bar ", b"baz\r"]
+    )
+    assert list(response.iter_lines()) == ["12345", "foo bar baz"]
+
+def test_line_decoder_crnl():
+    response = httpx.Response(200, content=[b"", b"a\r\n\r\nb\r\nc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    response = httpx.Response(200, content=[b"", b"a\r\n\r\nb\r\nc\r\n"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    response = httpx.Response(200, content=[b"", b"a\r", b"\n\r\nb\r\nc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    # Issue #1033
+    response = httpx.Response(200, content=[b"", b"12345\r\n", b"foo bar baz\r\n"])
+    assert list(response.iter_lines()) == ["12345", "foo bar baz"]
+
+def test_invalid_content_encoding_header():
+    headers = [(b"Content-Encoding", b"invalid-header")]
+    body = b"test 123"
+
+    response = httpx.Response(
+        200,
+        headers=headers,
+        content=body,
+    )
+    assert response.content == body

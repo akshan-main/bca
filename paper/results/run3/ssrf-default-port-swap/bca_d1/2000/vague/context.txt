@@ -1,0 +1,217 @@
+## pydantic_evals/pydantic_evals/otel/_context_in_memory_span_exporter.py
+
+    def shutdown(self) -> None:
+        """Shut downs the exporter.
+
+        Calls to export after the exporter has been shut down will fail.
+        """
+        self._stopped = True
+
+## pydantic_evals/pydantic_evals/reporting/__init__.py
+
+class ReportCase(Generic[InputsT, OutputT, MetadataT]):
+    """A single case in an evaluation report."""
+
+    name: str
+    """The name of the [case][pydantic_evals.Case]."""
+    inputs: InputsT
+    """The inputs to the task, from [`Case.inputs`][pydantic_evals.dataset.Case.inputs]."""
+    metadata: MetadataT | None
+    """Any metadata associated with the case, from [`Case.metadata`][pydantic_evals.dataset.Case.metadata]."""
+    expected_output: OutputT | None
+    """The expected output of the task, from [`Case.expected_output`][pydantic_evals.dataset.Case.expected_output]."""
+    output: OutputT
+    """The output of the task execution."""
+
+    metrics: dict[str, float | int]
+    attributes: dict[str, Any]
+
+    scores: dict[str, EvaluationResult[int | float]]
+    labels: dict[str, EvaluationResult[str]]
+    assertions: dict[str, EvaluationResult[bool]]
+
+    task_duration: float
+    total_duration: float  # includes evaluator execution time
+
+    source_case_name: str | None = None
+    """The original case name before run-indexing. Serves as the aggregation key
+    for multi-run experiments. None when repeat == 1."""
+
+    trace_id: str | None = None
+    """The trace ID of the case span."""
+    span_id: str | None = None
+    """The span ID of the case span."""
+
+    evaluator_failures: list[EvaluatorFailure] = field(default_factory=list[EvaluatorFailure])
+
+## tests/evals/test_report_evaluators.py
+
+def _make_report(cases: list[ReportCase]) -> EvaluationReport:
+    return EvaluationReport(name='test', cases=cases)
+
+def test_confusion_matrix_labels_requires_key():
+    evaluator = ConfusionMatrixEvaluator(predicted_from='labels', predicted_key=None)
+    cases = [_make_report_case('c1', expected_output='a', labels={})]
+    report = _make_report(cases)
+    ctx = ReportEvaluatorContext(name='test', report=report, experiment_metadata=None)
+
+    with pytest.raises(ValueError, match="'key' is required"):
+        evaluator.evaluate(ctx)
+
+def test_precision_recall_assertions_requires_key():
+    evaluator = PrecisionRecallEvaluator(
+        score_from='scores',
+        score_key='s',
+        positive_from='assertions',
+        positive_key=None,
+    )
+    cases = [_make_report_case('c1', scores={'s': 0.5})]
+    report = _make_report(cases)
+    ctx = ReportEvaluatorContext(name='test', report=report, experiment_metadata=None)
+
+    with pytest.raises(ValueError, match="'positive_key' is required"):
+        evaluator.evaluate(ctx)
+
+def test_precision_recall_labels_requires_key():
+    evaluator = PrecisionRecallEvaluator(
+        score_from='scores',
+        score_key='s',
+        positive_from='labels',
+        positive_key=None,
+    )
+    cases = [_make_report_case('c1', scores={'s': 0.5})]
+    report = _make_report(cases)
+    ctx = ReportEvaluatorContext(name='test', report=report, experiment_metadata=None)
+
+    with pytest.raises(ValueError, match="'positive_key' is required"):
+        evaluator.evaluate(ctx)
+
+def test_report_rendering_include_analyses_false():
+    cases = [
+        _make_report_case('c1', output='cat', expected_output='cat'),
+    ]
+    report = _make_report(cases)
+    report.analyses = [
+        ScalarResult(title='Accuracy', value=100.0, unit='%'),
+    ]
+
+    rendered = report.render(width=120, include_analyses=False)
+    assert 'Accuracy: 100.0 %' not in rendered
+
+def test_report_rendering_scalar_without_unit():
+    """ScalarResult rendering without a unit."""
+    report = _make_report([_make_report_case('c1', output='x', expected_output='x')])
+    report.analyses = [
+        ScalarResult(title='Count', value=10),
+    ]
+
+    rendered = report.render(width=120)
+    assert 'Count: 10' in rendered
+
+async def test_report_evaluator_exception_during_evaluate():
+    """Report evaluator that raises an exception records a failure."""
+
+    @dataclass
+    class BrokenEvaluator(ReportEvaluator):
+        def evaluate(self, ctx: ReportEvaluatorContext) -> ReportAnalysis:
+            raise RuntimeError('evaluator broke')
+
+    dataset = Dataset[str, str, None](
+        cases=[Case(inputs='hello', expected_output='world')],
+        report_evaluators=[BrokenEvaluator()],
+    )
+
+    async def task(inputs: str) -> str:
+        return inputs
+
+    report = await dataset.evaluate(task, progress=False)
+    assert len(report.report_evaluator_failures) == 1
+    assert 'evaluator broke' in report.report_evaluator_failures[0].error_message
+
+## tests/evals/test_reporting.py
+
+def sample_report(sample_report_case: ReportCase) -> EvaluationReport:
+    return EvaluationReport(
+        cases=[sample_report_case],
+        name='test_report',
+    )
+
+## tests/evals/test_reports.py
+
+def sample_report(sample_report_case: ReportCase) -> EvaluationReport:
+    return EvaluationReport(
+        cases=[sample_report_case],
+        name='test_report',
+    )
+
+async def test_report_init(sample_report_case: ReportCase):
+    """Test EvaluationReport initialization."""
+    report = EvaluationReport(
+        cases=[sample_report_case],
+        name='test_report',
+    )
+
+    assert report.name == 'test_report'
+    assert len(report.cases) == 1
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_cache_skipped_for_unsupported_models(
+    allow_model_requests: None, bedrock_provider: BedrockProvider
+):
+    """All cache settings should be silently skipped for models that don't support prompt caching."""
+    # Meta models don't support prompt caching
+    model = BedrockConverseModel('meta.llama3-70b-instruct-v1:0', provider=bedrock_provider)
+
+    # Test CachePoint markers are skipped
+    messages_with_cache_points: list[ModelMessage] = [
+        ModelRequest(
+            parts=[UserPromptPart(content=['First chunk', CachePoint(), 'Second chunk', CachePoint(), 'Question'])]
+        )
+    ]
+    _, bedrock_messages = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        messages_with_cache_points, ModelRequestParameters(), BedrockModelSettings()
+    )
+    assert bedrock_messages[0]['content'] == snapshot(
+        [{'text': 'First chunk'}, {'text': 'Second chunk'}, {'text': 'Question'}]
+    )
+
+    # Test bedrock_cache_instructions is skipped
+    messages_with_system: list[ModelMessage] = [
+        ModelRequest(parts=[SystemPromptPart(content='System instructions.'), UserPromptPart(content='Hi!')])
+    ]
+    system_prompt, _ = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        messages_with_system, ModelRequestParameters(), BedrockModelSettings(bedrock_cache_instructions=True)
+    )
+    assert system_prompt == snapshot([{'text': 'System instructions.'}])
+
+    # Test bedrock_cache_messages is skipped
+    messages_user: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content='User message.')])]
+    _, bedrock_messages = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        messages_user, ModelRequestParameters(), BedrockModelSettings(bedrock_cache_messages=True)
+    )
+    assert bedrock_messages[0]['content'] == snapshot([{'text': 'User message.'}])
+
+## tests/models/test_google.py
+
+async def test_http_video_url_downloads_on_google_gla(mocker: MockerFixture):
+    """HTTP VideoUrls are downloaded on google-gla with video_metadata preserved."""
+    model = GoogleModel('gemini-1.5-flash', provider=GoogleProvider(api_key='test-key'))
+
+    mock_download = mocker.patch(
+        'pydantic_ai.models.google.download_item',
+        return_value={'data': b'fake video data', 'data_type': 'video/mp4'},
+    )
+
+    video = VideoUrl(
+        url='https://example.com/video.mp4',
+        vendor_metadata={'start_offset': '10s', 'end_offset': '20s'},
+    )
+    content = await model._map_user_prompt(UserPromptPart(content=[video]))  # pyright: ignore[reportPrivateUsage]
+
+    mock_download.assert_called_once()
+    assert len(content) == 1
+    assert 'inline_data' in content[0]
+    assert 'file_data' not in content[0]
+    # video_metadata is preserved even when video is downloaded
+    assert content[0].get('video_metadata') == {'start_offset': '10s', 'end_offset': '20s'}

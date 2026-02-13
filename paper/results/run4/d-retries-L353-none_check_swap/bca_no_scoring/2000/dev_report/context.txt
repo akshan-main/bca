@@ -1,0 +1,205 @@
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+class RetryConfig(TypedDict, total=False):
+    """The configuration for tenacity-based retrying.
+
+    These are precisely the arguments to the tenacity `retry` decorator, and they are generally
+    used internally by passing them to that decorator via `@retry(**config)` or similar.
+
+    All fields are optional, and if not provided, the default values from the `tenacity.retry` decorator will be used.
+    """
+
+    sleep: Callable[[int | float], None | Awaitable[None]]
+    """A sleep strategy to use for sleeping between retries.
+
+    Tenacity's default for this argument is `tenacity.nap.sleep`."""
+
+    stop: StopBaseT
+    """
+    A stop strategy to determine when to stop retrying.
+
+    Tenacity's default for this argument is `tenacity.stop.stop_never`."""
+
+    wait: WaitBaseT
+    """
+    A wait strategy to determine how long to wait between retries.
+
+    Tenacity's default for this argument is `tenacity.wait.wait_none`."""
+
+    retry: SyncRetryBaseT | RetryBaseT
+    """A retry strategy to determine which exceptions should trigger a retry.
+
+    Tenacity's default for this argument is `tenacity.retry.retry_if_exception_type()`."""
+
+    before: Callable[[RetryCallState], None | Awaitable[None]]
+    """
+    A callable that is called before each retry attempt.
+
+    Tenacity's default for this argument is `tenacity.before.before_nothing`."""
+
+    after: Callable[[RetryCallState], None | Awaitable[None]]
+    """
+    A callable that is called after each retry attempt.
+
+    Tenacity's default for this argument is `tenacity.after.after_nothing`."""
+
+    before_sleep: Callable[[RetryCallState], None | Awaitable[None]] | None
+    """
+    An optional callable that is called before sleeping between retries.
+
+    Tenacity's default for this argument is `None`."""
+
+    reraise: bool
+    """Whether to reraise the last exception if the retry attempts are exhausted, or raise a RetryError instead.
+
+    Tenacity's default for this argument is `False`."""
+
+    retry_error_cls: type[RetryError]
+    """The exception class to raise when the retry attempts are exhausted and `reraise` is False.
+
+    Tenacity's default for this argument is `tenacity.RetryError`."""
+
+    retry_error_callback: Callable[[RetryCallState], Any | Awaitable[Any]] | None
+    """An optional callable that is called when the retry attempts are exhausted and `reraise` is False.
+
+    Tenacity's default for this argument is `None`."""
+
+    wait: WaitBaseT
+
+## tests/test_tenacity.py
+
+class TestIntegration:
+    """Integration tests combining transports with wait strategies."""
+
+    async def test_async_transport_with_wait_retry_after(self):
+        """Test AsyncTenacityTransport with wait_retry_after strategy."""
+        mock_transport = AsyncMock(spec=httpx.AsyncBaseTransport)
+        mock_response_fail = Mock(spec=httpx.Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.headers = {'retry-after': '1'}
+        mock_response_success = Mock(spec=httpx.Response)
+        mock_response_success.status_code = 200
+
+        mock_transport.handle_async_request.side_effect = [mock_response_fail, mock_response_success]
+
+        # Track validation calls
+        validation_calls: list[int] = []
+
+        def validate_response(response: httpx.Response):
+            validation_calls.append(response.status_code)
+            if response.status_code == 429:
+                raise httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            wait=wait_retry_after(max_wait=5),  # Short max_wait for tests
+            stop=stop_after_attempt(3),
+            reraise=True,
+        )
+        transport = AsyncTenacityTransport(config, mock_transport, validate_response)
+
+        request = httpx.Request('GET', 'https://example.com')
+
+        # Time the request to ensure retry-after wait was respected
+        start_time = asyncio.get_event_loop().time()
+        result = await transport.handle_async_request(request)
+        end_time = asyncio.get_event_loop().time()
+
+        assert result is mock_response_success
+        assert mock_transport.handle_async_request.call_count == 2
+        assert validation_calls == [429, 200]  # First call failed, second succeeded
+        # Should have waited approximately 1 second (allow some tolerance)
+        assert 0.8 <= (end_time - start_time) <= 2.0
+
+    def test_sync_transport_with_wait_retry_after(self):
+        """Test TenacityTransport with wait_retry_after strategy."""
+        mock_transport = Mock(spec=httpx.BaseTransport)
+        mock_response_fail = Mock(spec=httpx.Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.headers = {'retry-after': '30'}  # 30 seconds, will be capped
+        mock_response_success = Mock(spec=httpx.Response)
+        mock_response_success.status_code = 200
+
+        mock_transport.handle_request.side_effect = [mock_response_fail, mock_response_success]
+
+        def validate_response(response: httpx.Response):
+            if response.status_code == 429:
+                raise httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            wait=wait_retry_after(max_wait=0.1),  # Cap at 0.1 seconds for tests
+            stop=stop_after_attempt(3),
+            reraise=True,
+        )
+        transport = TenacityTransport(config, mock_transport, validate_response)
+
+        request = httpx.Request('GET', 'https://example.com')
+
+        # Time the request to ensure max_wait was respected
+        start_time = time.time()
+        result = transport.handle_request(request)
+        end_time = time.time()
+
+        assert result is mock_response_success
+        assert mock_transport.handle_request.call_count == 2
+        # Should have waited approximately 0.2 seconds (capped by max_wait)
+        duration = end_time - start_time
+        assert 0.1 <= duration <= 0.2
+
+class TestConnectionPool:
+    class AlwaysReturnHTTP429Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(429)
+            self.send_header('Retry-After', '1')
+            self.end_headers()
+            self.wfile.write(b'Rate limited')
+
+    def start_test_server(self, port: int = 8429) -> HTTPServer:
+        server = HTTPServer(('localhost', port), self.AlwaysReturnHTTP429Handler)
+
+        def run_server():
+            server.serve_forever()
+
+        server_thread = threading.Thread(target=run_server, daemon=True)
+        server_thread.start()
+        time.sleep(0.1)
+        return server
+
+    async def test_connection_pool(self):
+        server = self.start_test_server(8429)
+        test_url = 'http://localhost:8429/test'
+
+        def validate_response(response: httpx.Response) -> None:
+            response.raise_for_status()
+
+        retry_strategy = RetryConfig(
+            stop=stop_after_attempt(5),
+            wait=wait_retry_after(max_wait=5, fallback_strategy=wait_fixed(2)),
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            reraise=True,
+        )
+
+        transport = AsyncTenacityTransport(
+            config=retry_strategy,
+            validate_response=validate_response,
+            wrapped=httpx.AsyncHTTPTransport(
+                limits=httpx.Limits(max_connections=2, max_keepalive_connections=2, keepalive_expiry=30)
+            ),
+        )
+
+        client = httpx.AsyncClient(transport=transport)
+
+        with pytest.raises(httpx.HTTPStatusError, match='429 Too Many Requests'):
+            try:
+                await client.get(test_url)
+            finally:
+                await client.aclose()
+                server.shutdown()
+
+    class AlwaysReturnHTTP429Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(429)
+            self.send_header('Retry-After', '1')
+            self.end_headers()
+            self.wfile.write(b'Rate limited')

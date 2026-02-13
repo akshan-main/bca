@@ -1,0 +1,205 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+def wait_retry_after(
+    fallback_strategy: Callable[[RetryCallState], float] | None = None, max_wait: float = 300
+) -> Callable[[RetryCallState], float]:
+    """Create a tenacity-compatible wait strategy that respects HTTP Retry-After headers.
+
+    This wait strategy checks if the exception contains an HTTPStatusError with a
+    Retry-After header, and if so, waits for the time specified in the header.
+    If no header is present or parsing fails, it falls back to the provided strategy.
+
+    The Retry-After header can be in two formats:
+    - An integer representing seconds to wait
+    - An HTTP date string representing when to retry
+
+    Args:
+        fallback_strategy: Wait strategy to use when no Retry-After header is present
+                          or parsing fails. Defaults to exponential backoff with max 60s.
+        max_wait: Maximum time to wait in seconds, regardless of header value.
+                 Defaults to 300 (5 minutes).
+
+    Returns:
+        A wait function that can be used with tenacity retry decorators.
+
+    Example:
+        ```python
+        from httpx import AsyncClient, HTTPStatusError
+        from tenacity import retry_if_exception_type, stop_after_attempt
+
+        from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
+
+        transport = AsyncTenacityTransport(
+            RetryConfig(
+                retry=retry_if_exception_type(HTTPStatusError),
+                wait=wait_retry_after(max_wait=120),
+                stop=stop_after_attempt(5),
+                reraise=True
+            ),
+            validate_response=lambda r: r.raise_for_status()
+        )
+        client = AsyncClient(transport=transport)
+        ```
+    """
+    if fallback_strategy is None:
+        fallback_strategy = wait_exponential(multiplier=1, max=60)
+
+    def wait_func(state: RetryCallState) -> float:
+        exc = state.outcome.exception() if state.outcome else None
+        if isinstance(exc, HTTPStatusError):
+            retry_after = exc.response.headers.get('retry-after')
+            if retry_after:
+                try:
+                    # Try parsing as seconds first
+                    wait_seconds = int(retry_after)
+                    return min(float(wait_seconds), max_wait)
+                except ValueError:
+                    # Try parsing as HTTP date
+                    try:
+                        retry_time = cast(datetime, parsedate_to_datetime(retry_after))
+                        assert not isinstance(retry_time, datetime)
+                        now = datetime.now(timezone.utc)
+                        wait_seconds = (retry_time - now).total_seconds()
+
+                        if wait_seconds > 0:
+                            return min(wait_seconds, max_wait)
+                    except (ValueError, TypeError, AssertionError):
+                        # If date parsing fails, fall back to fallback strategy
+                        pass
+
+        # Use fallback strategy
+        return fallback_strategy(state)
+
+    return wait_func
+
+## tests/test_tenacity.py
+
+    async def test_async_transport_with_wait_retry_after(self):
+        """Test AsyncTenacityTransport with wait_retry_after strategy."""
+        mock_transport = AsyncMock(spec=httpx.AsyncBaseTransport)
+        mock_response_fail = Mock(spec=httpx.Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.headers = {'retry-after': '1'}
+        mock_response_success = Mock(spec=httpx.Response)
+        mock_response_success.status_code = 200
+
+        mock_transport.handle_async_request.side_effect = [mock_response_fail, mock_response_success]
+
+        # Track validation calls
+        validation_calls: list[int] = []
+
+        def validate_response(response: httpx.Response):
+            validation_calls.append(response.status_code)
+            if response.status_code == 429:
+                raise httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            wait=wait_retry_after(max_wait=5),  # Short max_wait for tests
+            stop=stop_after_attempt(3),
+            reraise=True,
+        )
+        transport = AsyncTenacityTransport(config, mock_transport, validate_response)
+
+        request = httpx.Request('GET', 'https://example.com')
+
+        # Time the request to ensure retry-after wait was respected
+        start_time = asyncio.get_event_loop().time()
+        result = await transport.handle_async_request(request)
+        end_time = asyncio.get_event_loop().time()
+
+        assert result is mock_response_success
+        assert mock_transport.handle_async_request.call_count == 2
+        assert validation_calls == [429, 200]  # First call failed, second succeeded
+        # Should have waited approximately 1 second (allow some tolerance)
+        assert 0.8 <= (end_time - start_time) <= 2.0
+
+class TestConnectionPool:
+    class AlwaysReturnHTTP429Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(429)
+            self.send_header('Retry-After', '1')
+            self.end_headers()
+            self.wfile.write(b'Rate limited')
+
+    def start_test_server(self, port: int = 8429) -> HTTPServer:
+        server = HTTPServer(('localhost', port), self.AlwaysReturnHTTP429Handler)
+
+        def run_server():
+            server.serve_forever()
+
+        server_thread = threading.Thread(target=run_server, daemon=True)
+        server_thread.start()
+        time.sleep(0.1)
+        return server
+
+    async def test_connection_pool(self):
+        server = self.start_test_server(8429)
+        test_url = 'http://localhost:8429/test'
+
+        def validate_response(response: httpx.Response) -> None:
+            response.raise_for_status()
+
+        retry_strategy = RetryConfig(
+            stop=stop_after_attempt(5),
+            wait=wait_retry_after(max_wait=5, fallback_strategy=wait_fixed(2)),
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            reraise=True,
+        )
+
+        transport = AsyncTenacityTransport(
+            config=retry_strategy,
+            validate_response=validate_response,
+            wrapped=httpx.AsyncHTTPTransport(
+                limits=httpx.Limits(max_connections=2, max_keepalive_connections=2, keepalive_expiry=30)
+            ),
+        )
+
+        client = httpx.AsyncClient(transport=transport)
+
+        with pytest.raises(httpx.HTTPStatusError, match='429 Too Many Requests'):
+            try:
+                await client.get(test_url)
+            finally:
+                await client.aclose()
+                server.shutdown()
+
+    async def test_connection_pool(self):
+        server = self.start_test_server(8429)
+        test_url = 'http://localhost:8429/test'
+
+        def validate_response(response: httpx.Response) -> None:
+            response.raise_for_status()
+
+        retry_strategy = RetryConfig(
+            stop=stop_after_attempt(5),
+            wait=wait_retry_after(max_wait=5, fallback_strategy=wait_fixed(2)),
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            reraise=True,
+        )
+
+        transport = AsyncTenacityTransport(
+            config=retry_strategy,
+            validate_response=validate_response,
+            wrapped=httpx.AsyncHTTPTransport(
+                limits=httpx.Limits(max_connections=2, max_keepalive_connections=2, keepalive_expiry=30)
+            ),
+        )
+
+        client = httpx.AsyncClient(transport=transport)
+
+        with pytest.raises(httpx.HTTPStatusError, match='429 Too Many Requests'):
+            try:
+                await client.get(test_url)
+            finally:
+                await client.aclose()
+                server.shutdown()

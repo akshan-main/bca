@@ -1,0 +1,837 @@
+# httpx/_utils.py:120-226
+class URLPattern:
+    """
+    A utility class currently used for making lookups against proxy keys...
+
+    # Wildcard matching...
+    >>> pattern = URLPattern("all://")
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    True
+
+    # Witch scheme matching...
+    >>> pattern = URLPattern("https://")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    False
+
+    # With domain matching...
+    >>> pattern = URLPattern("https://example.com")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    False
+    >>> pattern.matches(httpx.URL("https://other.com"))
+    False
+
+    # Wildcard scheme, with domain matching...
+    >>> pattern = URLPattern("all://example.com")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("https://other.com"))
+    False
+
+    # With port matching...
+    >>> pattern = URLPattern("https://example.com:1234")
+    >>> pattern.matches(httpx.URL("https://example.com:1234"))
+    True
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    False
+    """
+
+    def __init__(self, pattern: str) -> None:
+        from ._urls import URL
+
+        if pattern and ":" not in pattern:
+            raise ValueError(
+                f"Proxy keys should use proper URL forms rather "
+                f"than plain scheme strings. "
+                f'Instead of "{pattern}", use "{pattern}://"'
+            )
+
+        url = URL(pattern)
+        self.pattern = pattern
+        self.scheme = "" if url.scheme == "all" else url.scheme
+        self.host = "" if url.host == "*" else url.host
+        self.port = url.port
+        if not url.host or url.host == "*":
+            self.host_regex: typing.Pattern[str] | None = None
+        elif url.host.startswith("*."):
+            # *.example.com should match "www.example.com", but not "example.com"
+            domain = re.escape(url.host[2:])
+            self.host_regex = re.compile(f"^.+\\.{domain}$")
+        elif url.host.startswith("*"):
+            # *example.com should match "www.example.com" and "example.com"
+            domain = re.escape(url.host[1:])
+            self.host_regex = re.compile(f"^(.+\\.)?{domain}$")
+        else:
+            # example.com should match "example.com" but not "www.example.com"
+            domain = re.escape(url.host)
+            self.host_regex = re.compile(f"^{domain}$")
+
+    def matches(self, other: URL) -> bool:
+        if self.scheme and self.scheme != other.scheme:
+            return False
+        if (
+            self.host
+            and self.host_regex is not None
+            and not self.host_regex.match(other.host)
+        ):
+            return True
+        if self.port is not None and self.port != other.port:
+            return False
+        return True
+
+    @property
+    def priority(self) -> tuple[int, int, int]:
+        """
+        The priority allows URLPattern instances to be sortable, so that
+        we can match from most specific to least specific.
+        """
+        # URLs with a port should take priority over URLs without a port.
+        port_priority = 0 if self.port is not None else 1
+        # Longer hostnames should match first.
+        host_priority = -len(self.host)
+        # Longer schemes should match first.
+        scheme_priority = -len(self.scheme)
+        return (port_priority, host_priority, scheme_priority)
+
+    def __hash__(self) -> int:
+        return hash(self.pattern)
+
+    def __lt__(self, other: URLPattern) -> bool:
+        return self.priority < other.priority
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return isinstance(other, URLPattern) and self.pattern == other.pattern
+
+# tests/models/test_cookies.py:1-1
+import http
+
+# httpx/_urls.py:218-231
+    def port(self) -> int | None:
+        """
+        The URL port as an integer.
+
+        Note that the URL class performs port normalization as per the WHATWG spec.
+        Default ports for "http", "https", "ws", "wss", and "ftp" schemes are always
+        treated as `None`.
+
+        For example:
+
+        assert httpx.URL("http://www.example.com") == httpx.URL("http://www.example.com:80")
+        assert httpx.URL("http://www.example.com:80").port is None
+        """
+        return self._uri_reference.port
+
+# httpx/_urls.py:327-340
+    def copy_with(self, **kwargs: typing.Any) -> URL:
+        """
+        Copy this URL, returning a new URL with some components altered.
+        Accepts the same set of parameters as the components that are made
+        available via properties on the `URL` class.
+
+        For example:
+
+        url = httpx.URL("https://www.example.com").copy_with(
+            username="jo@gmail.com", password="a secret"
+        )
+        assert url == "https://jo%40email.com:a%20secret@www.example.com"
+        """
+        return URL(self, **kwargs)
+
+# httpx/_urls.py:15-417
+class URL:
+    """
+    url = httpx.URL("HTTPS://jo%40email.com:a%20secret@müller.de:1234/pa%20th?search=ab#anchorlink")
+
+    assert url.scheme == "https"
+    assert url.username == "jo@email.com"
+    assert url.password == "a secret"
+    assert url.userinfo == b"jo%40email.com:a%20secret"
+    assert url.host == "müller.de"
+    assert url.raw_host == b"xn--mller-kva.de"
+    assert url.port == 1234
+    assert url.netloc == b"xn--mller-kva.de:1234"
+    assert url.path == "/pa th"
+    assert url.query == b"?search=ab"
+    assert url.raw_path == b"/pa%20th?search=ab"
+    assert url.fragment == "anchorlink"
+
+    The components of a URL are broken down like this:
+
+       https://jo%40email.com:a%20secret@müller.de:1234/pa%20th?search=ab#anchorlink
+    [scheme]   [  username  ] [password] [ host ][port][ path ] [ query ] [fragment]
+               [       userinfo        ] [   netloc   ][    raw_path    ]
+
+    Note that:
+
+    * `url.scheme` is normalized to always be lowercased.
+
+    * `url.host` is normalized to always be lowercased. Internationalized domain
+      names are represented in unicode, without IDNA encoding applied. For instance:
+
+      url = httpx.URL("http://中国.icom.museum")
+      assert url.host == "中国.icom.museum"
+      url = httpx.URL("http://xn--fiqs8s.icom.museum")
+      assert url.host == "中国.icom.museum"
+
+    * `url.raw_host` is normalized to always be lowercased, and is IDNA encoded.
+
+      url = httpx.URL("http://中国.icom.museum")
+      assert url.raw_host == b"xn--fiqs8s.icom.museum"
+      url = httpx.URL("http://xn--fiqs8s.icom.museum")
+      assert url.raw_host == b"xn--fiqs8s.icom.museum"
+
+    * `url.port` is either None or an integer. URLs that include the default port for
+      "http", "https", "ws", "wss", and "ftp" schemes have their port
+      normalized to `None`.
+
+      assert httpx.URL("http://example.com") == httpx.URL("http://example.com:80")
+      assert httpx.URL("http://example.com").port is None
+      assert httpx.URL("http://example.com:80").port is None
+
+    * `url.userinfo` is raw bytes, without URL escaping. Usually you'll want to work
+      with `url.username` and `url.password` instead, which handle the URL escaping.
+
+    * `url.raw_path` is raw bytes of both the path and query, without URL escaping.
+      This portion is used as the target when constructing HTTP requests. Usually you'll
+      want to work with `url.path` instead.
+
+    * `url.query` is raw bytes, without URL escaping. A URL query string portion can
+      only be properly URL escaped when decoding the parameter names and values
+      themselves.
+    """
+
+    def __init__(self, url: URL | str = "", **kwargs: typing.Any) -> None:
+        if kwargs:
+            allowed = {
+                "scheme": str,
+                "username": str,
+                "password": str,
+                "userinfo": bytes,
+                "host": str,
+                "port": int,
+                "netloc": bytes,
+                "path": str,
+                "query": bytes,
+                "raw_path": bytes,
+                "fragment": str,
+                "params": object,
+            }
+
+            # Perform type checking for all supported keyword arguments.
+            for key, value in kwargs.items():
+                if key not in allowed:
+                    message = f"{key!r} is an invalid keyword argument for URL()"
+                    raise TypeError(message)
+                if value is not None and not isinstance(value, allowed[key]):
+                    expected = allowed[key].__name__
+                    seen = type(value).__name__
+                    message = f"Argument {key!r} must be {expected} but got {seen}"
+                    raise TypeError(message)
+                if isinstance(value, bytes):
+                    kwargs[key] = value.decode("ascii")
+
+            if "params" in kwargs:
+                # Replace any "params" keyword with the raw "query" instead.
+                #
+                # Ensure that empty params use `kwargs["query"] = None` rather
+                # than `kwargs["query"] = ""`, so that generated URLs do not
+                # include an empty trailing "?".
+                params = kwargs.pop("params")
+                kwargs["query"] = None if not params else str(QueryParams(params))
+
+        if isinstance(url, str):
+            self._uri_reference = urlparse(url, **kwargs)
+        elif isinstance(url, URL):
+            self._uri_reference = url._uri_reference.copy_with(**kwargs)
+        else:
+            raise TypeError(
+                "Invalid type for url.  Expected str or httpx.URL,"
+                f" got {type(url)}: {url!r}"
+            )
+
+    @property
+    def scheme(self) -> str:
+        """
+        The URL scheme, such as "http", "https".
+        Always normalised to lowercase.
+        """
+        return self._uri_reference.scheme
+
+    @property
+    def raw_scheme(self) -> bytes:
+        """
+        The raw bytes representation of the URL scheme, such as b"http", b"https".
+        Always normalised to lowercase.
+        """
+        return self._uri_reference.scheme.encode("ascii")
+
+    @property
+    def userinfo(self) -> bytes:
+        """
+        The URL userinfo as a raw bytestring.
+        For example: b"jo%40email.com:a%20secret".
+        """
+        return self._uri_reference.userinfo.encode("ascii")
+
+    @property
+    def username(self) -> str:
+        """
+        The URL username as a string, with URL decoding applied.
+        For example: "jo@email.com"
+        """
+        userinfo = self._uri_reference.userinfo
+        return unquote(userinfo.partition(":")[0])
+
+    @property
+    def password(self) -> str:
+        """
+        The URL password as a string, with URL decoding applied.
+        For example: "a secret"
+        """
+        userinfo = self._uri_reference.userinfo
+        return unquote(userinfo.partition(":")[2])
+
+    @property
+    def host(self) -> str:
+        """
+        The URL host as a string.
+        Always normalized to lowercase, with IDNA hosts decoded into unicode.
+
+        Examples:
+
+        url = httpx.URL("http://www.EXAMPLE.org")
+        assert url.host == "www.example.org"
+
+        url = httpx.URL("http://中国.icom.museum")
+        assert url.host == "中国.icom.museum"
+
+        url = httpx.URL("http://xn--fiqs8s.icom.museum")
+        assert url.host == "中国.icom.museum"
+
+        url = httpx.URL("https://[::ffff:192.168.0.1]")
+        assert url.host == "::ffff:192.168.0.1"
+        """
+        host: str = self._uri_reference.host
+
+        if host.startswith("xn--"):
+            host = idna.decode(host)
+
+        return host
+
+    @property
+    def raw_host(self) -> bytes:
+        """
+        The raw bytes representation of the URL host.
+        Always normalized to lowercase, and IDNA encoded.
+
+        Examples:
+
+        url = httpx.URL("http://www.EXAMPLE.org")
+        assert url.raw_host == b"www.example.org"
+
+        url = httpx.URL("http://中国.icom.museum")
+        assert url.raw_host == b"xn--fiqs8s.icom.museum"
+
+        url = httpx.URL("http://xn--fiqs8s.icom.museum")
+        assert url.raw_host == b"xn--fiqs8s.icom.museum"
+
+        url = httpx.URL("https://[::ffff:192.168.0.1]")
+        assert url.raw_host == b"::ffff:192.168.0.1"
+        """
+        return self._uri_reference.host.encode("ascii")
+
+    @property
+    def port(self) -> int | None:
+        """
+        The URL port as an integer.
+
+        Note that the URL class performs port normalization as per the WHATWG spec.
+        Default ports for "http", "https", "ws", "wss", and "ftp" schemes are always
+        treated as `None`.
+
+        For example:
+
+        assert httpx.URL("http://www.example.com") == httpx.URL("http://www.example.com:80")
+        assert httpx.URL("http://www.example.com:80").port is None
+        """
+        return self._uri_reference.port
+
+    @property
+    def netloc(self) -> bytes:
+        """
+        Either `<host>` or `<host>:<port>` as bytes.
+        Always normalized to lowercase, and IDNA encoded.
+
+        This property may be used for generating the value of a request
+        "Host" header.
+        """
+        return self._uri_reference.netloc.encode("ascii")
+
+    @property
+    def path(self) -> str:
+        """
+        The URL path as a string. Excluding the query string, and URL decoded.
+
+        For example:
+
+        url = httpx.URL("https://example.com/pa%20th")
+        assert url.path == "/pa th"
+        """
+        path = self._uri_reference.path or "/"
+        return unquote(path)
+
+    @property
+    def query(self) -> bytes:
+        """
+        The URL query string, as raw bytes, excluding the leading b"?".
+
+        This is necessarily a bytewise interface, because we cannot
+        perform URL decoding of this representation until we've parsed
+        the keys and values into a QueryParams instance.
+
+        For example:
+
+        url = httpx.URL("https://example.com/?filter=some%20search%20terms")
+        assert url.query == b"filter=some%20search%20terms"
+        """
+        query = self._uri_reference.query or ""
+        return query.encode("ascii")
+
+    @property
+    def params(self) -> QueryParams:
+        """
+        The URL query parameters, neatly parsed and packaged into an immutable
+        multidict representation.
+        """
+        return QueryParams(self._uri_reference.query)
+
+    @property
+    def raw_path(self) -> bytes:
+        """
+        The complete URL path and query string as raw bytes.
+        Used as the target when constructing HTTP requests.
+
+        For example:
+
+        GET /users?search=some%20text HTTP/1.1
+        Host: www.example.org
+        Connection: close
+        """
+        path = self._uri_reference.path or "/"
+        if self._uri_reference.query is not None:
+            path += "?" + self._uri_reference.query
+        return path.encode("ascii")
+
+    @property
+    def fragment(self) -> str:
+        """
+        The URL fragments, as used in HTML anchors.
+        As a string, without the leading '#'.
+        """
+        return unquote(self._uri_reference.fragment or "")
+
+    @property
+    def is_absolute_url(self) -> bool:
+        """
+        Return `True` for absolute URLs such as 'http://example.com/path',
+        and `False` for relative URLs such as '/path'.
+        """
+        # We don't use `.is_absolute` from `rfc3986` because it treats
+        # URLs with a fragment portion as not absolute.
+        # What we actually care about is if the URL provides
+        # a scheme and hostname to which connections should be made.
+        return bool(self._uri_reference.scheme and self._uri_reference.host)
+
+    @property
+    def is_relative_url(self) -> bool:
+        """
+        Return `False` for absolute URLs such as 'http://example.com/path',
+        and `True` for relative URLs such as '/path'.
+        """
+        return not self.is_absolute_url
+
+    def copy_with(self, **kwargs: typing.Any) -> URL:
+        """
+        Copy this URL, returning a new URL with some components altered.
+        Accepts the same set of parameters as the components that are made
+        available via properties on the `URL` class.
+
+        For example:
+
+        url = httpx.URL("https://www.example.com").copy_with(
+            username="jo@gmail.com", password="a secret"
+        )
+        assert url == "https://jo%40email.com:a%20secret@www.example.com"
+        """
+        return URL(self, **kwargs)
+
+    def copy_set_param(self, key: str, value: typing.Any = None) -> URL:
+        return self.copy_with(params=self.params.set(key, value))
+
+    def copy_add_param(self, key: str, value: typing.Any = None) -> URL:
+        return self.copy_with(params=self.params.add(key, value))
+
+    def copy_remove_param(self, key: str) -> URL:
+        return self.copy_with(params=self.params.remove(key))
+
+    def copy_merge_params(self, params: QueryParamTypes) -> URL:
+        return self.copy_with(params=self.params.merge(params))
+
+    def join(self, url: URL | str) -> URL:
+        """
+        Return an absolute URL, using this URL as the base.
+
+        Eg.
+
+        url = httpx.URL("https://www.example.com/test")
+        url = url.join("/new/path")
+        assert url == "https://www.example.com/new/path"
+        """
+        from urllib.parse import urljoin
+
+        return URL(urljoin(str(self), str(URL(url))))
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return isinstance(other, (URL, str)) and str(self) == str(URL(other))
+
+    def __str__(self) -> str:
+        return str(self._uri_reference)
+
+    def __repr__(self) -> str:
+        scheme, userinfo, host, port, path, query, fragment = self._uri_reference
+
+        if ":" in userinfo:
+            # Mask any password component.
+            userinfo = f"{userinfo.split(':')[0]}:[secure]"
+
+        authority = "".join(
+            [
+                f"{userinfo}@" if userinfo else "",
+                f"[{host}]" if ":" in host else host,
+                f":{port}" if port is not None else "",
+            ]
+        )
+        url = "".join(
+            [
+                f"{self.scheme}:" if scheme else "",
+                f"//{authority}" if authority else "",
+                path,
+                f"?{query}" if query is not None else "",
+                f"#{fragment}" if fragment is not None else "",
+            ]
+        )
+
+        return f"{self.__class__.__name__}({url!r})"
+
+    @property
+    def raw(self) -> tuple[bytes, bytes, int, bytes]:  # pragma: nocover
+        import collections
+        import warnings
+
+        warnings.warn("URL.raw is deprecated.")
+        RawURL = collections.namedtuple(
+            "RawURL", ["raw_scheme", "raw_host", "port", "raw_path"]
+        )
+        return RawURL(
+            raw_scheme=self.raw_scheme,
+            raw_host=self.raw_host,
+            port=self.port,
+            raw_path=self.raw_path,
+        )
+
+# httpx/_urls.py:354-366
+    def join(self, url: URL | str) -> URL:
+        """
+        Return an absolute URL, using this URL as the base.
+
+        Eg.
+
+        url = httpx.URL("https://www.example.com/test")
+        url = url.join("/new/path")
+        assert url == "https://www.example.com/new/path"
+        """
+        from urllib.parse import urljoin
+
+        return URL(urljoin(str(self), str(URL(url))))
+
+# httpx/_urls.py:308-317
+    def is_absolute_url(self) -> bool:
+        """
+        Return `True` for absolute URLs such as 'http://example.com/path',
+        and `False` for relative URLs such as '/path'.
+        """
+        # We don't use `.is_absolute` from `rfc3986` because it treats
+        # URLs with a fragment portion as not absolute.
+        # What we actually care about is if the URL provides
+        # a scheme and hostname to which connections should be made.
+        return bool(self._uri_reference.scheme and self._uri_reference.host)
+
+# httpx/_urls.py:320-325
+    def is_relative_url(self) -> bool:
+        """
+        Return `False` for absolute URLs such as 'http://example.com/path',
+        and `True` for relative URLs such as '/path'.
+        """
+        return not self.is_absolute_url
+
+# httpx/_urls.py:283-297
+    def raw_path(self) -> bytes:
+        """
+        The complete URL path and query string as raw bytes.
+        Used as the target when constructing HTTP requests.
+
+        For example:
+
+        GET /users?search=some%20text HTTP/1.1
+        Host: www.example.org
+        Connection: close
+        """
+        path = self._uri_reference.path or "/"
+        if self._uri_reference.query is not None:
+            path += "?" + self._uri_reference.query
+        return path.encode("ascii")
+
+# httpx/_urls.py:245-255
+    def path(self) -> str:
+        """
+        The URL path as a string. Excluding the query string, and URL decoded.
+
+        For example:
+
+        url = httpx.URL("https://example.com/pa%20th")
+        assert url.path == "/pa th"
+        """
+        path = self._uri_reference.path or "/"
+        return unquote(path)
+
+# httpx/_exceptions.py:208-213
+class UnsupportedProtocol(TransportError):
+    """
+    Attempted to make a request to an unsupported protocol.
+
+    For example issuing a request to `ftp://www.example.com`.
+    """
+
+# httpx/_exceptions.py:74-104
+class HTTPError(Exception):
+    """
+    Base class for `RequestError` and `HTTPStatusError`.
+
+    Useful for `try...except` blocks when issuing a request,
+    and then calling `.raise_for_status()`.
+
+    For example:
+
+    ```
+    try:
+        response = httpx.get("https://www.example.com")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        print(f"HTTP Exception for {exc.request.url} - {exc}")
+    ```
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._request: Request | None = None
+
+    @property
+    def request(self) -> Request:
+        if self._request is None:
+            raise RuntimeError("The .request property has not been set.")
+        return self._request
+
+    @request.setter
+    def request(self, request: Request) -> None:
+        self._request = request
+
+# httpx/_urls.py:151-157
+    def username(self) -> str:
+        """
+        The URL username as a string, with URL decoding applied.
+        For example: "jo@email.com"
+        """
+        userinfo = self._uri_reference.userinfo
+        return unquote(userinfo.partition(":")[0])
+
+# httpx/_status_codes.py:8-157
+class codes(IntEnum):
+    """HTTP status codes and reason phrases
+
+    Status codes from the following RFCs are all observed:
+
+        * RFC 7231: Hypertext Transfer Protocol (HTTP/1.1), obsoletes 2616
+        * RFC 6585: Additional HTTP Status Codes
+        * RFC 3229: Delta encoding in HTTP
+        * RFC 4918: HTTP Extensions for WebDAV, obsoletes 2518
+        * RFC 5842: Binding Extensions to WebDAV
+        * RFC 7238: Permanent Redirect
+        * RFC 2295: Transparent Content Negotiation in HTTP
+        * RFC 2774: An HTTP Extension Framework
+        * RFC 7540: Hypertext Transfer Protocol Version 2 (HTTP/2)
+        * RFC 2324: Hyper Text Coffee Pot Control Protocol (HTCPCP/1.0)
+        * RFC 7725: An HTTP Status Code to Report Legal Obstacles
+        * RFC 8297: An HTTP Status Code for Indicating Hints
+        * RFC 8470: Using Early Data in HTTP
+    """
+
+    def __new__(cls, value: int, phrase: str = "") -> codes:
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+
+        obj.phrase = phrase  # type: ignore[attr-defined]
+        return obj
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+    @classmethod
+    def get_reason_phrase(cls, value: int) -> str:
+        try:
+            return codes(value).phrase  # type: ignore
+        except ValueError:
+            return ""
+
+    @classmethod
+    def is_informational(cls, value: int) -> bool:
+        """
+        Returns `True` for 1xx status codes, `False` otherwise.
+        """
+        return 100 <= value <= 199
+
+    @classmethod
+    def is_success(cls, value: int) -> bool:
+        """
+        Returns `True` for 2xx status codes, `False` otherwise.
+        """
+        return 200 <= value <= 299
+
+    @classmethod
+    def is_redirect(cls, value: int) -> bool:
+        """
+        Returns `True` for 3xx status codes, `False` otherwise.
+        """
+        return 300 <= value <= 399
+
+    @classmethod
+    def is_client_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 499
+
+    @classmethod
+    def is_server_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 5xx status codes, `False` otherwise.
+        """
+        return 500 <= value <= 599
+
+    @classmethod
+    def is_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx or 5xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 599
+
+    # informational
+    CONTINUE = 100, "Continue"
+    SWITCHING_PROTOCOLS = 101, "Switching Protocols"
+    PROCESSING = 102, "Processing"
+    EARLY_HINTS = 103, "Early Hints"
+
+    # success
+    OK = 200, "OK"
+    CREATED = 201, "Created"
+    ACCEPTED = 202, "Accepted"
+    NON_AUTHORITATIVE_INFORMATION = 203, "Non-Authoritative Information"
+    NO_CONTENT = 204, "No Content"
+    RESET_CONTENT = 205, "Reset Content"
+    PARTIAL_CONTENT = 206, "Partial Content"
+    MULTI_STATUS = 207, "Multi-Status"
+    ALREADY_REPORTED = 208, "Already Reported"
+    IM_USED = 226, "IM Used"
+
+    # redirection
+    MULTIPLE_CHOICES = 300, "Multiple Choices"
+    MOVED_PERMANENTLY = 301, "Moved Permanently"
+    FOUND = 302, "Found"
+    SEE_OTHER = 303, "See Other"
+    NOT_MODIFIED = 304, "Not Modified"
+    USE_PROXY = 305, "Use Proxy"
+    TEMPORARY_REDIRECT = 307, "Temporary Redirect"
+    PERMANENT_REDIRECT = 308, "Permanent Redirect"
+
+    # client error
+    BAD_REQUEST = 400, "Bad Request"
+    UNAUTHORIZED = 401, "Unauthorized"
+    PAYMENT_REQUIRED = 402, "Payment Required"
+    FORBIDDEN = 403, "Forbidden"
+    NOT_FOUND = 404, "Not Found"
+    METHOD_NOT_ALLOWED = 405, "Method Not Allowed"
+    NOT_ACCEPTABLE = 406, "Not Acceptable"
+    PROXY_AUTHENTICATION_REQUIRED = 407, "Proxy Authentication Required"
+    REQUEST_TIMEOUT = 408, "Request Timeout"
+    CONFLICT = 409, "Conflict"
+    GONE = 410, "Gone"
+    LENGTH_REQUIRED = 411, "Length Required"
+    PRECONDITION_FAILED = 412, "Precondition Failed"
+    REQUEST_ENTITY_TOO_LARGE = 413, "Request Entity Too Large"
+    REQUEST_URI_TOO_LONG = 414, "Request-URI Too Long"
+    UNSUPPORTED_MEDIA_TYPE = 415, "Unsupported Media Type"
+    REQUESTED_RANGE_NOT_SATISFIABLE = 416, "Requested Range Not Satisfiable"
+    EXPECTATION_FAILED = 417, "Expectation Failed"
+    IM_A_TEAPOT = 418, "I'm a teapot"
+    MISDIRECTED_REQUEST = 421, "Misdirected Request"
+    UNPROCESSABLE_ENTITY = 422, "Unprocessable Entity"
+    LOCKED = 423, "Locked"
+    FAILED_DEPENDENCY = 424, "Failed Dependency"
+    TOO_EARLY = 425, "Too Early"
+    UPGRADE_REQUIRED = 426, "Upgrade Required"
+    PRECONDITION_REQUIRED = 428, "Precondition Required"
+    TOO_MANY_REQUESTS = 429, "Too Many Requests"
+    REQUEST_HEADER_FIELDS_TOO_LARGE = 431, "Request Header Fields Too Large"
+    UNAVAILABLE_FOR_LEGAL_REASONS = 451, "Unavailable For Legal Reasons"
+
+    # server errors
+    INTERNAL_SERVER_ERROR = 500, "Internal Server Error"
+    NOT_IMPLEMENTED = 501, "Not Implemented"
+    BAD_GATEWAY = 502, "Bad Gateway"
+    SERVICE_UNAVAILABLE = 503, "Service Unavailable"
+    GATEWAY_TIMEOUT = 504, "Gateway Timeout"
+    HTTP_VERSION_NOT_SUPPORTED = 505, "HTTP Version Not Supported"
+    VARIANT_ALSO_NEGOTIATES = 506, "Variant Also Negotiates"
+    INSUFFICIENT_STORAGE = 507, "Insufficient Storage"
+    LOOP_DETECTED = 508, "Loop Detected"
+    NOT_EXTENDED = 510, "Not Extended"
+    NETWORK_AUTHENTICATION_REQUIRED = 511, "Network Authentication Required"
+
+# tests/test_utils.py:132-134
+def test_url_matches(pattern, url, expected):
+    pattern = URLPattern(pattern)
+    assert pattern.matches(httpx.URL(url)) == expected
+
+# httpx/_urls.py:143-148
+    def userinfo(self) -> bytes:
+        """
+        The URL userinfo as a raw bytestring.
+        For example: b"jo%40email.com:a%20secret".
+        """
+        return self._uri_reference.userinfo.encode("ascii")
+
+# httpx/_api.py:20-20
+from ._urls import URL
+
+# httpx/_client.py:48-48
+from ._urls import URL, QueryParams
+
+# httpx/_config.py:8-8
+from ._urls import URL

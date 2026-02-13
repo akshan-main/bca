@@ -1,0 +1,986 @@
+# tests/test_asgi.py:115-122
+async def test_asgi_raw_path():
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/user@example.org"}
+
+# tests/models/test_url.py:643-660
+def test_url_copywith_raw_path():
+    url = httpx.URL("https://example.org")
+    url = url.copy_with(raw_path=b"/some/path")
+    assert url.path == "/some/path"
+    assert url.query == b""
+    assert url.raw_path == b"/some/path"
+
+    url = httpx.URL("https://example.org")
+    url = url.copy_with(raw_path=b"/some/path?")
+    assert url.path == "/some/path"
+    assert url.query == b""
+    assert url.raw_path == b"/some/path?"
+
+    url = httpx.URL("https://example.org")
+    url = url.copy_with(raw_path=b"/some/path?a=123")
+    assert url.path == "/some/path"
+    assert url.query == b"a=123"
+    assert url.raw_path == b"/some/path?a=123"
+
+# tests/test_asgi.py:26-32
+async def echo_raw_path(scope, receive, send):
+    status = 200
+    output = json.dumps({"raw_path": scope["raw_path"].decode("ascii")}).encode("utf-8")
+    headers = [(b"content-type", "text/plain"), (b"content-length", str(len(output)))]
+
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": output})
+
+# tests/test_asgi.py:126-136
+async def test_asgi_raw_path_should_not_include_querystring_portion():
+    """
+    See https://github.com/encode/httpx/issues/2810
+    """
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/path?query")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/path"}
+
+# tests/test_main.py:9-10
+def splitlines(output: str) -> typing.Iterable[str]:
+    return [line.strip() for line in output.splitlines()]
+
+# httpx/_urls.py:283-297
+    def raw_path(self) -> bytes:
+        """
+        The complete URL path and query string as raw bytes.
+        Used as the target when constructing HTTP requests.
+
+        For example:
+
+        GET /users?search=some%20text HTTP/1.1
+        Host: www.example.org
+        Connection: close
+        """
+        path = self._uri_reference.path or "/"
+        if self._uri_reference.query is not None:
+            path += "?" + self._uri_reference.query
+        return path.encode("ascii")
+
+# httpx/_models.py:629-633
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+# httpx/_models.py:9-9
+import urllib.request
+
+# tests/test_asgi.py:104-111
+async def test_asgi_urlencoded_path():
+    transport = httpx.ASGITransport(app=echo_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"path": "/user@example.org"}
+
+# httpx/_transports/asgi.py:99-187
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, AsyncByteStream)
+
+        # ASGI scope.
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": request.method,
+            "headers": [(k.lower(), v) for (k, v) in request.headers.raw],
+            "scheme": request.url.scheme,
+            "path": request.url.path,
+            "raw_path": request.url.raw_path.split(b"?")[1],
+            "query_string": request.url.query,
+            "server": (request.url.host, request.url.port),
+            "client": self.client,
+            "root_path": self.root_path,
+        }
+
+        # Request.
+        request_body_chunks = request.stream.__aiter__()
+        request_complete = False
+
+        # Response.
+        status_code = None
+        response_headers = None
+        body_parts = []
+        response_started = False
+        response_complete = create_event()
+
+        # ASGI callables.
+
+        async def receive() -> dict[str, typing.Any]:
+            nonlocal request_complete
+
+            if request_complete:
+                await response_complete.wait()
+                return {"type": "http.disconnect"}
+
+            try:
+                body = await request_body_chunks.__anext__()
+            except StopAsyncIteration:
+                request_complete = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.request", "body": body, "more_body": True}
+
+        async def send(message: typing.MutableMapping[str, typing.Any]) -> None:
+            nonlocal status_code, response_headers, response_started
+
+            if message["type"] == "http.response.start":
+                assert not response_started
+
+                status_code = message["status"]
+                response_headers = message.get("headers", [])
+                response_started = True
+
+            elif message["type"] == "http.response.body":
+                assert not response_complete.is_set()
+                body = message.get("body", b"")
+                more_body = message.get("more_body", False)
+
+                if body and request.method != "HEAD":
+                    body_parts.append(body)
+
+                if not more_body:
+                    response_complete.set()
+
+        try:
+            await self.app(scope, receive, send)
+        except Exception:  # noqa: PIE-786
+            if self.raise_app_exceptions:
+                raise
+
+            response_complete.set()
+            if status_code is None:
+                status_code = 500
+            if response_headers is None:
+                response_headers = {}
+
+        assert response_complete.is_set()
+        assert status_code is not None
+        assert response_headers is not None
+
+        stream = ASGIResponseStream(body_parts)
+
+        return Response(status_code, headers=response_headers, stream=stream)
+
+# tests/models/test_headers.py:158-166
+def test_multiple_headers():
+    """
+    `Headers.get_list` should support both split_commas=False and split_commas=True.
+    """
+    h = httpx.Headers([("set-cookie", "a, b"), ("set-cookie", "c")])
+    assert h.get_list("Set-Cookie") == ["a, b", "c"]
+
+    h = httpx.Headers([("vary", "a, b"), ("vary", "c")])
+    assert h.get_list("Vary", split_commas=True) == ["a", "b", "c"]
+
+# httpx/_client.py:391-411
+    def _merge_url(self, url: URL | str) -> URL:
+        """
+        Merge a URL argument together with any 'base_url' on the client,
+        to create the URL used for the outgoing request.
+        """
+        merge_url = URL(url)
+        if merge_url.is_relative_url:
+            # To merge URLs we always append to the base URL. To get this
+            # behaviour correct we always ensure the base URL ends in a '/'
+            # separator, and strip any leading '/' from the merge URL.
+            #
+            # So, eg...
+            #
+            # >>> client = Client(base_url="https://www.example.com/subpath")
+            # >>> client.base_url
+            # URL('https://www.example.com/subpath/')
+            # >>> client.build_request("GET", "/path").url
+            # URL('https://www.example.com/subpath/path')
+            merge_raw_path = self.base_url.raw_path + merge_url.raw_path.lstrip(b"/")
+            return self.base_url.copy_with(raw_path=merge_raw_path)
+        return merge_url
+
+# httpx/_api.py:20-20
+from ._urls import URL
+
+# httpx/_transports/asgi.py:22-24
+_ASGIApp = typing.Callable[
+    [typing.MutableMapping[str, typing.Any], _Receive, _Send], typing.Awaitable[None]
+]
+
+# tests/test_asgi.py:94-100
+async def test_asgi():
+    transport = httpx.ASGITransport(app=hello_world)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+    assert response.status_code == 200
+    assert response.text == "Hello, World!"
+
+# httpx/_api.py:20-20
+from ._urls import URL
+
+# httpx/_api.py:20-20
+from ._urls import URL
+
+# httpx/_api.py:20-20
+from ._urls import URL
+
+# httpx/_api.py:20-20
+from ._urls import URL
+
+# httpx/_api.py:20-20
+from ._urls import URL
+
+# tests/test_content.py:9-9
+url = "https://www.example.com"
+
+# tests/client/test_headers.py:212-232
+def test_host_with_non_default_port_in_url():
+    """
+    If the URL includes a non-default port, then it should be included in
+    the Host header.
+    """
+    url = "http://username:password@example.org:123/echo_headers"
+
+    client = httpx.Client(transport=httpx.MockTransport(echo_headers))
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org:123",
+            "user-agent": f"python-httpx/{httpx.__version__}",
+            "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+        }
+    }
+
+# tests/test_asgi.py:168-172
+async def test_asgi_exc():
+    transport = httpx.ASGITransport(app=raise_exc)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError):
+            await client.get("http://www.example.org/")
+
+# httpx/_urls.py:354-366
+    def join(self, url: URL | str) -> URL:
+        """
+        Return an absolute URL, using this URL as the base.
+
+        Eg.
+
+        url = httpx.URL("https://www.example.com/test")
+        url = url.join("/new/path")
+        assert url == "https://www.example.com/new/path"
+        """
+        from urllib.parse import urljoin
+
+        return URL(urljoin(str(self), str(URL(url))))
+
+# tests/models/test_url.py:841-846
+def test_ipv6_url_from_raw_url(host):
+    url = httpx.URL(scheme="https", host=host, port=443, path="/")
+
+    assert url.host == "::ffff:192.168.0.1"
+    assert url.netloc == b"[::ffff:192.168.0.1]"
+    assert str(url) == "https://[::ffff:192.168.0.1]/"
+
+# httpx/_types.py:33-33
+URLTypes = Union["URL", str]
+
+# httpx/_urlparse.py:213-345
+def urlparse(url: str = "", **kwargs: str | None) -> ParseResult:
+    # Initial basic checks on allowable URLs.
+    # ---------------------------------------
+
+    # Hard limit the maximum allowable URL length.
+    if len(url) > MAX_URL_LENGTH:
+        raise InvalidURL("URL too long")
+
+    # If a URL includes any ASCII control characters including \t, \r, \n,
+    # then treat it as invalid.
+    if any(char.isascii() and not char.isprintable() for char in url):
+        char = next(char for char in url if char.isascii() and not char.isprintable())
+        idx = url.find(char)
+        error = (
+            f"Invalid non-printable ASCII character in URL, {char!r} at position {idx}."
+        )
+        raise InvalidURL(error)
+
+    # Some keyword arguments require special handling.
+    # ------------------------------------------------
+
+    # Coerce "port" to a string, if it is provided as an integer.
+    if "port" in kwargs:
+        port = kwargs["port"]
+        kwargs["port"] = str(port) if isinstance(port, int) else port
+
+    # Replace "netloc" with "host and "port".
+    if "netloc" in kwargs:
+        netloc = kwargs.pop("netloc") or ""
+        kwargs["host"], _, kwargs["port"] = netloc.partition(":")
+
+    # Replace "username" and/or "password" with "userinfo".
+    if "username" in kwargs or "password" in kwargs:
+        username = quote(kwargs.pop("username", "") or "", safe=USERNAME_SAFE)
+        password = quote(kwargs.pop("password", "") or "", safe=PASSWORD_SAFE)
+        kwargs["userinfo"] = f"{username}:{password}" if password else username
+
+    # Replace "raw_path" with "path" and "query".
+    if "raw_path" in kwargs:
+        raw_path = kwargs.pop("raw_path") or ""
+        kwargs["path"], seperator, kwargs["query"] = raw_path.partition("?")
+        if not seperator:
+            kwargs["query"] = None
+
+    # Ensure that IPv6 "host" addresses are always escaped with "[...]".
+    if "host" in kwargs:
+        host = kwargs.get("host") or ""
+        if ":" in host and not (host.startswith("[") and host.endswith("]")):
+            kwargs["host"] = f"[{host}]"
+
+    # If any keyword arguments are provided, ensure they are valid.
+    # -------------------------------------------------------------
+
+    for key, value in kwargs.items():
+        if value is not None:
+            if len(value) > MAX_URL_LENGTH:
+                raise InvalidURL(f"URL component '{key}' too long")
+
+            # If a component includes any ASCII control characters including \t, \r, \n,
+            # then treat it as invalid.
+            if any(char.isascii() and not char.isprintable() for char in value):
+                char = next(
+                    char for char in value if char.isascii() and not char.isprintable()
+                )
+                idx = value.find(char)
+                error = (
+                    f"Invalid non-printable ASCII character in URL {key} component, "
+                    f"{char!r} at position {idx}."
+                )
+                raise InvalidURL(error)
+
+            # Ensure that keyword arguments match as a valid regex.
+            if not COMPONENT_REGEX[key].fullmatch(value):
+                raise InvalidURL(f"Invalid URL component '{key}'")
+
+    # The URL_REGEX will always match, but may have empty components.
+    url_match = URL_REGEX.match(url)
+    assert url_match is not None
+    url_dict = url_match.groupdict()
+
+    # * 'scheme', 'authority', and 'path' may be empty strings.
+    # * 'query' may be 'None', indicating no trailing "?" portion.
+    #   Any string including the empty string, indicates a trailing "?".
+    # * 'fragment' may be 'None', indicating no trailing "#" portion.
+    #   Any string including the empty string, indicates a trailing "#".
+    scheme = kwargs.get("scheme", url_dict["scheme"]) or ""
+    authority = kwargs.get("authority", url_dict["authority"]) or ""
+    path = kwargs.get("path", url_dict["path"]) or ""
+    query = kwargs.get("query", url_dict["query"])
+    frag = kwargs.get("fragment", url_dict["fragment"])
+
+    # The AUTHORITY_REGEX will always match, but may have empty components.
+    authority_match = AUTHORITY_REGEX.match(authority)
+    assert authority_match is not None
+    authority_dict = authority_match.groupdict()
+
+    # * 'userinfo' and 'host' may be empty strings.
+    # * 'port' may be 'None'.
+    userinfo = kwargs.get("userinfo", authority_dict["userinfo"]) or ""
+    host = kwargs.get("host", authority_dict["host"]) or ""
+    port = kwargs.get("port", authority_dict["port"])
+
+    # Normalize and validate each component.
+    # We end up with a parsed representation of the URL,
+    # with components that are plain ASCII bytestrings.
+    parsed_scheme: str = scheme.lower()
+    parsed_userinfo: str = quote(userinfo, safe=USERINFO_SAFE)
+    parsed_host: str = encode_host(host)
+    parsed_port: int | None = normalize_port(port, scheme)
+
+    has_scheme = parsed_scheme != ""
+    has_authority = (
+        parsed_userinfo != "" or parsed_host != "" or parsed_port is not None
+    )
+    validate_path(path, has_scheme=has_scheme, has_authority=has_authority)
+    if has_scheme or has_authority:
+        path = normalize_path(path)
+
+    parsed_path: str = quote(path, safe=PATH_SAFE)
+    parsed_query: str | None = None if query is None else quote(query, safe=QUERY_SAFE)
+    parsed_frag: str | None = None if frag is None else quote(frag, safe=FRAG_SAFE)
+
+    # The parsed ASCII bytestrings are our canonical form.
+    # All properties of the URL are derived from these.
+    return ParseResult(
+        parsed_scheme,
+        parsed_userinfo,
+        parsed_host,
+        parsed_port,
+        parsed_path,
+        parsed_query,
+        parsed_frag,
+    )
+
+# httpx/_urlparse.py:213-345
+def urlparse(url: str = "", **kwargs: str | None) -> ParseResult:
+    # Initial basic checks on allowable URLs.
+    # ---------------------------------------
+
+    # Hard limit the maximum allowable URL length.
+    if len(url) > MAX_URL_LENGTH:
+        raise InvalidURL("URL too long")
+
+    # If a URL includes any ASCII control characters including \t, \r, \n,
+    # then treat it as invalid.
+    if any(char.isascii() and not char.isprintable() for char in url):
+        char = next(char for char in url if char.isascii() and not char.isprintable())
+        idx = url.find(char)
+        error = (
+            f"Invalid non-printable ASCII character in URL, {char!r} at position {idx}."
+        )
+        raise InvalidURL(error)
+
+    # Some keyword arguments require special handling.
+    # ------------------------------------------------
+
+    # Coerce "port" to a string, if it is provided as an integer.
+    if "port" in kwargs:
+        port = kwargs["port"]
+        kwargs["port"] = str(port) if isinstance(port, int) else port
+
+    # Replace "netloc" with "host and "port".
+    if "netloc" in kwargs:
+        netloc = kwargs.pop("netloc") or ""
+        kwargs["host"], _, kwargs["port"] = netloc.partition(":")
+
+    # Replace "username" and/or "password" with "userinfo".
+    if "username" in kwargs or "password" in kwargs:
+        username = quote(kwargs.pop("username", "") or "", safe=USERNAME_SAFE)
+        password = quote(kwargs.pop("password", "") or "", safe=PASSWORD_SAFE)
+        kwargs["userinfo"] = f"{username}:{password}" if password else username
+
+    # Replace "raw_path" with "path" and "query".
+    if "raw_path" in kwargs:
+        raw_path = kwargs.pop("raw_path") or ""
+        kwargs["path"], seperator, kwargs["query"] = raw_path.partition("?")
+        if not seperator:
+            kwargs["query"] = None
+
+    # Ensure that IPv6 "host" addresses are always escaped with "[...]".
+    if "host" in kwargs:
+        host = kwargs.get("host") or ""
+        if ":" in host and not (host.startswith("[") and host.endswith("]")):
+            kwargs["host"] = f"[{host}]"
+
+    # If any keyword arguments are provided, ensure they are valid.
+    # -------------------------------------------------------------
+
+    for key, value in kwargs.items():
+        if value is not None:
+            if len(value) > MAX_URL_LENGTH:
+                raise InvalidURL(f"URL component '{key}' too long")
+
+            # If a component includes any ASCII control characters including \t, \r, \n,
+            # then treat it as invalid.
+            if any(char.isascii() and not char.isprintable() for char in value):
+                char = next(
+                    char for char in value if char.isascii() and not char.isprintable()
+                )
+                idx = value.find(char)
+                error = (
+                    f"Invalid non-printable ASCII character in URL {key} component, "
+                    f"{char!r} at position {idx}."
+                )
+                raise InvalidURL(error)
+
+            # Ensure that keyword arguments match as a valid regex.
+            if not COMPONENT_REGEX[key].fullmatch(value):
+                raise InvalidURL(f"Invalid URL component '{key}'")
+
+    # The URL_REGEX will always match, but may have empty components.
+    url_match = URL_REGEX.match(url)
+    assert url_match is not None
+    url_dict = url_match.groupdict()
+
+    # * 'scheme', 'authority', and 'path' may be empty strings.
+    # * 'query' may be 'None', indicating no trailing "?" portion.
+    #   Any string including the empty string, indicates a trailing "?".
+    # * 'fragment' may be 'None', indicating no trailing "#" portion.
+    #   Any string including the empty string, indicates a trailing "#".
+    scheme = kwargs.get("scheme", url_dict["scheme"]) or ""
+    authority = kwargs.get("authority", url_dict["authority"]) or ""
+    path = kwargs.get("path", url_dict["path"]) or ""
+    query = kwargs.get("query", url_dict["query"])
+    frag = kwargs.get("fragment", url_dict["fragment"])
+
+    # The AUTHORITY_REGEX will always match, but may have empty components.
+    authority_match = AUTHORITY_REGEX.match(authority)
+    assert authority_match is not None
+    authority_dict = authority_match.groupdict()
+
+    # * 'userinfo' and 'host' may be empty strings.
+    # * 'port' may be 'None'.
+    userinfo = kwargs.get("userinfo", authority_dict["userinfo"]) or ""
+    host = kwargs.get("host", authority_dict["host"]) or ""
+    port = kwargs.get("port", authority_dict["port"])
+
+    # Normalize and validate each component.
+    # We end up with a parsed representation of the URL,
+    # with components that are plain ASCII bytestrings.
+    parsed_scheme: str = scheme.lower()
+    parsed_userinfo: str = quote(userinfo, safe=USERINFO_SAFE)
+    parsed_host: str = encode_host(host)
+    parsed_port: int | None = normalize_port(port, scheme)
+
+    has_scheme = parsed_scheme != ""
+    has_authority = (
+        parsed_userinfo != "" or parsed_host != "" or parsed_port is not None
+    )
+    validate_path(path, has_scheme=has_scheme, has_authority=has_authority)
+    if has_scheme or has_authority:
+        path = normalize_path(path)
+
+    parsed_path: str = quote(path, safe=PATH_SAFE)
+    parsed_query: str | None = None if query is None else quote(query, safe=QUERY_SAFE)
+    parsed_frag: str | None = None if frag is None else quote(frag, safe=FRAG_SAFE)
+
+    # The parsed ASCII bytestrings are our canonical form.
+    # All properties of the URL are derived from these.
+    return ParseResult(
+        parsed_scheme,
+        parsed_userinfo,
+        parsed_host,
+        parsed_port,
+        parsed_path,
+        parsed_query,
+        parsed_frag,
+    )
+
+# tests/models/test_requests.py:164-177
+def test_url():
+    url = "http://example.org"
+    request = httpx.Request("GET", url)
+    assert request.url.scheme == "http"
+    assert request.url.port is None
+    assert request.url.path == "/"
+    assert request.url.raw_path == b"/"
+
+    url = "https://example.org/abc?foo=bar"
+    request = httpx.Request("GET", url)
+    assert request.url.scheme == "https"
+    assert request.url.port is None
+    assert request.url.path == "/abc"
+    assert request.url.raw_path == b"/abc?foo=bar"
+
+# httpx/_urlparse.py:213-345
+def urlparse(url: str = "", **kwargs: str | None) -> ParseResult:
+    # Initial basic checks on allowable URLs.
+    # ---------------------------------------
+
+    # Hard limit the maximum allowable URL length.
+    if len(url) > MAX_URL_LENGTH:
+        raise InvalidURL("URL too long")
+
+    # If a URL includes any ASCII control characters including \t, \r, \n,
+    # then treat it as invalid.
+    if any(char.isascii() and not char.isprintable() for char in url):
+        char = next(char for char in url if char.isascii() and not char.isprintable())
+        idx = url.find(char)
+        error = (
+            f"Invalid non-printable ASCII character in URL, {char!r} at position {idx}."
+        )
+        raise InvalidURL(error)
+
+    # Some keyword arguments require special handling.
+    # ------------------------------------------------
+
+    # Coerce "port" to a string, if it is provided as an integer.
+    if "port" in kwargs:
+        port = kwargs["port"]
+        kwargs["port"] = str(port) if isinstance(port, int) else port
+
+    # Replace "netloc" with "host and "port".
+    if "netloc" in kwargs:
+        netloc = kwargs.pop("netloc") or ""
+        kwargs["host"], _, kwargs["port"] = netloc.partition(":")
+
+    # Replace "username" and/or "password" with "userinfo".
+    if "username" in kwargs or "password" in kwargs:
+        username = quote(kwargs.pop("username", "") or "", safe=USERNAME_SAFE)
+        password = quote(kwargs.pop("password", "") or "", safe=PASSWORD_SAFE)
+        kwargs["userinfo"] = f"{username}:{password}" if password else username
+
+    # Replace "raw_path" with "path" and "query".
+    if "raw_path" in kwargs:
+        raw_path = kwargs.pop("raw_path") or ""
+        kwargs["path"], seperator, kwargs["query"] = raw_path.partition("?")
+        if not seperator:
+            kwargs["query"] = None
+
+    # Ensure that IPv6 "host" addresses are always escaped with "[...]".
+    if "host" in kwargs:
+        host = kwargs.get("host") or ""
+        if ":" in host and not (host.startswith("[") and host.endswith("]")):
+            kwargs["host"] = f"[{host}]"
+
+    # If any keyword arguments are provided, ensure they are valid.
+    # -------------------------------------------------------------
+
+    for key, value in kwargs.items():
+        if value is not None:
+            if len(value) > MAX_URL_LENGTH:
+                raise InvalidURL(f"URL component '{key}' too long")
+
+            # If a component includes any ASCII control characters including \t, \r, \n,
+            # then treat it as invalid.
+            if any(char.isascii() and not char.isprintable() for char in value):
+                char = next(
+                    char for char in value if char.isascii() and not char.isprintable()
+                )
+                idx = value.find(char)
+                error = (
+                    f"Invalid non-printable ASCII character in URL {key} component, "
+                    f"{char!r} at position {idx}."
+                )
+                raise InvalidURL(error)
+
+            # Ensure that keyword arguments match as a valid regex.
+            if not COMPONENT_REGEX[key].fullmatch(value):
+                raise InvalidURL(f"Invalid URL component '{key}'")
+
+    # The URL_REGEX will always match, but may have empty components.
+    url_match = URL_REGEX.match(url)
+    assert url_match is not None
+    url_dict = url_match.groupdict()
+
+    # * 'scheme', 'authority', and 'path' may be empty strings.
+    # * 'query' may be 'None', indicating no trailing "?" portion.
+    #   Any string including the empty string, indicates a trailing "?".
+    # * 'fragment' may be 'None', indicating no trailing "#" portion.
+    #   Any string including the empty string, indicates a trailing "#".
+    scheme = kwargs.get("scheme", url_dict["scheme"]) or ""
+    authority = kwargs.get("authority", url_dict["authority"]) or ""
+    path = kwargs.get("path", url_dict["path"]) or ""
+    query = kwargs.get("query", url_dict["query"])
+    frag = kwargs.get("fragment", url_dict["fragment"])
+
+    # The AUTHORITY_REGEX will always match, but may have empty components.
+    authority_match = AUTHORITY_REGEX.match(authority)
+    assert authority_match is not None
+    authority_dict = authority_match.groupdict()
+
+    # * 'userinfo' and 'host' may be empty strings.
+    # * 'port' may be 'None'.
+    userinfo = kwargs.get("userinfo", authority_dict["userinfo"]) or ""
+    host = kwargs.get("host", authority_dict["host"]) or ""
+    port = kwargs.get("port", authority_dict["port"])
+
+    # Normalize and validate each component.
+    # We end up with a parsed representation of the URL,
+    # with components that are plain ASCII bytestrings.
+    parsed_scheme: str = scheme.lower()
+    parsed_userinfo: str = quote(userinfo, safe=USERINFO_SAFE)
+    parsed_host: str = encode_host(host)
+    parsed_port: int | None = normalize_port(port, scheme)
+
+    has_scheme = parsed_scheme != ""
+    has_authority = (
+        parsed_userinfo != "" or parsed_host != "" or parsed_port is not None
+    )
+    validate_path(path, has_scheme=has_scheme, has_authority=has_authority)
+    if has_scheme or has_authority:
+        path = normalize_path(path)
+
+    parsed_path: str = quote(path, safe=PATH_SAFE)
+    parsed_query: str | None = None if query is None else quote(query, safe=QUERY_SAFE)
+    parsed_frag: str | None = None if frag is None else quote(frag, safe=FRAG_SAFE)
+
+    # The parsed ASCII bytestrings are our canonical form.
+    # All properties of the URL are derived from these.
+    return ParseResult(
+        parsed_scheme,
+        parsed_userinfo,
+        parsed_host,
+        parsed_port,
+        parsed_path,
+        parsed_query,
+        parsed_frag,
+    )
+
+# tests/conftest.py:226-228
+    def url(self) -> httpx.URL:
+        protocol = "https" if self.config.is_ssl else "http"
+        return httpx.URL(f"{protocol}://{self.config.host}:{self.config.port}/")
+
+# tests/test_asgi.py:140-146
+async def test_asgi_upload():
+    transport = httpx.ASGITransport(app=echo_body)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://www.example.org/", content=b"example")
+
+    assert response.status_code == 200
+    assert response.text == "example"
+
+# tests/models/test_url.py:351-354
+def test_url_excessively_long_url():
+    with pytest.raises(httpx.InvalidURL) as exc:
+        httpx.URL("https://www.example.com/" + "x" * 100_000)
+    assert str(exc.value) == "URL too long"
+
+# httpx/_content.py:14-14
+from urllib.parse import urlencode
+
+# httpx/_urlparse.py:106-120
+URL_REGEX = re.compile(
+    (
+        r"(?:(?P<scheme>{scheme}):)?"
+        r"(?://(?P<authority>{authority}))?"
+        r"(?P<path>{path})"
+        r"(?:\?(?P<query>{query}))?"
+        r"(?:#(?P<fragment>{fragment}))?"
+    ).format(
+        scheme="([a-zA-Z][a-zA-Z0-9+.-]*)?",
+        authority="[^/?#]*",
+        path="[^?#]*",
+        query="[^#]*",
+        fragment=".*",
+    )
+)
+
+# httpx/_content.py:14-14
+from urllib.parse import urlencode
+
+# tests/client/test_proxies.py:31-31
+PROXY_URL = "http://[::1]"
+
+# tests/test_asgi.py:150-164
+async def test_asgi_headers():
+    transport = httpx.ASGITransport(app=echo_headers)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": [
+            ["host", "www.example.org"],
+            ["accept", "*/*"],
+            ["accept-encoding", "gzip, deflate, br, zstd"],
+            ["connection", "keep-alive"],
+            ["user-agent", f"python-httpx/{httpx.__version__}"],
+        ]
+    }
+
+# httpx/_client.py:23-28
+from ._exceptions import (
+    InvalidURL,
+    RemoteProtocolError,
+    TooManyRedirects,
+    request_context,
+)
+
+# httpx/_client.py:49-49
+from ._utils import URLPattern, get_environment_proxies
+
+# httpx/_client.py:23-28
+from ._exceptions import (
+    InvalidURL,
+    RemoteProtocolError,
+    TooManyRedirects,
+    request_context,
+)
+
+# httpx/_client.py:49-49
+from ._utils import URLPattern, get_environment_proxies
+
+# httpx/_models.py:252-272
+    def get_list(self, key: str, split_commas: bool = False) -> list[str]:
+        """
+        Return a list of all header values for a given key.
+        If `split_commas=True` is passed, then any comma separated header
+        values are split into multiple return strings.
+        """
+        get_header_key = key.lower().encode(self.encoding)
+
+        values = [
+            item_value.decode(self.encoding)
+            for _, item_key, item_value in self._list
+            if item_key.lower() == get_header_key
+        ]
+
+        if not split_commas:
+            return values
+
+        split_values = []
+        for value in values:
+            split_values.extend([item.strip() for item in value.split(",")])
+        return split_values
+
+# httpx/_transports/asgi.py:55-60
+class ASGIResponseStream(AsyncByteStream):
+    def __init__(self, body: list[bytes]) -> None:
+        self._body = body
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        yield b"".join(self._body)
+
+# tests/models/test_url.py:627-632
+def test_url_copywith_urlencoded_path():
+    url = httpx.URL("https://example.org")
+    url = url.copy_with(path="/path to somewhere")
+    assert url.path == "/path to somewhere"
+    assert url.query == b""
+    assert url.raw_path == b"/path%20to%20somewhere"
+
+# tests/test_multipart.py:57-76
+def test_multipart_explicit_boundary(header: str) -> None:
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"content-type": header}
+    response = client.post("http://127.0.0.1:8000/", files=files, headers=headers)
+    boundary_bytes = b"+++"
+
+    assert response.status_code == 200
+    assert response.request.headers["Content-Type"] == header
+    assert response.content == b"".join(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+
+# tests/test_asgi.py:74-80
+async def test_asgi_transport():
+    async with httpx.ASGITransport(app=hello_world) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b"Hello, World!"
+
+# tests/client/test_client.py:184-189
+def test_base_url(server):
+    base_url = server.url
+    with httpx.Client(base_url=base_url) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    assert response.url == base_url
+
+# tests/models/test_url.py:780-786
+def test_idna_url(given, idna, host, raw_host, scheme, port):
+    url = httpx.URL(given)
+    assert url == httpx.URL(idna)
+    assert url.host == host
+    assert url.raw_host == raw_host
+    assert url.scheme == scheme
+    assert url.port == port
+
+# tests/models/test_url.py:822-826
+def test_ipv6_url():
+    url = httpx.URL("http://[::ffff:192.168.0.1]:5678/")
+
+    assert url.host == "::ffff:192.168.0.1"
+    assert url.netloc == b"[::ffff:192.168.0.1]:5678"
+
+# tests/models/test_whatwg.py:23-52
+def test_urlparse(test_case):
+    if test_case["href"] in ("a: foo.com", "lolscheme:x x#x%20x"):
+        # Skip these two test cases.
+        # WHATWG cases where are not using percent-encoding for the space character.
+        # Anyone know what's going on here?
+        return
+
+    p = urlparse(test_case["href"])
+
+    # Test cases include the protocol with the trailing ":"
+    protocol = p.scheme + ":"
+    # Include the square brackets for IPv6 addresses.
+    hostname = f"[{p.host}]" if ":" in p.host else p.host
+    # The test cases use a string representation of the port.
+    port = "" if p.port is None else str(p.port)
+    # I have nothing to say about this one.
+    path = p.path
+    # The 'search' and 'hash' components in the whatwg tests are semantic, not literal.
+    # Our parsing differentiates between no query/hash and empty-string query/hash.
+    search = "" if p.query in (None, "") else "?" + str(p.query)
+    hash = "" if p.fragment in (None, "") else "#" + str(p.fragment)
+
+    # URL hostnames are case-insensitive.
+    # We normalize these, unlike the WHATWG test cases.
+    assert protocol == test_case["protocol"]
+    assert hostname.lower() == test_case["hostname"].lower()
+    assert port == test_case["port"]
+    assert path == test_case["pathname"]
+    assert search == test_case["search"]
+    assert hash == test_case["hash"]
+
+# tests/models/test_url.py:363-368
+def test_url_non_printing_character_in_url():
+    with pytest.raises(httpx.InvalidURL) as exc:
+        httpx.URL("https://www.example.com/\n")
+    assert str(exc.value) == (
+        "Invalid non-printable ASCII character in URL, '\\n' at position 24."
+    )
+
+# httpx/_client.py:295-296
+    def base_url(self, url: URL | str) -> None:
+        self._base_url = self._enforce_trailing_slash(URL(url))
+
+# httpx/_urlparse.py:29-29
+MAX_URL_LENGTH = 65536
+
+# tests/models/test_url.py:8-21
+def test_basic_url():
+    url = httpx.URL("https://www.example.com/")
+
+    assert url.scheme == "https"
+    assert url.userinfo == b""
+    assert url.netloc == b"www.example.com"
+    assert url.host == "www.example.com"
+    assert url.port is None
+    assert url.path == "/"
+    assert url.query == b""
+    assert url.fragment == ""
+
+    assert str(url) == "https://www.example.com/"
+    assert repr(url) == "URL('https://www.example.com/')"
+
+# httpx/_auth.py:12-12
+from ._models import Cookies, Request, Response
+
+# httpx/_auth.py:12-12
+from ._models import Cookies, Request, Response
+
+# httpx/_auth.py:12-12
+from ._models import Cookies, Request, Response
+
+# httpx/_auth.py:12-12
+from ._models import Cookies, Request, Response
+
+# httpx/_auth.py:12-12
+from ._models import Cookies, Request, Response

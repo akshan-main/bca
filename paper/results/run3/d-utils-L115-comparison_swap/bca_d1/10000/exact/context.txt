@@ -1,0 +1,1015 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/_a2a.py
+
+from typing import Any, Generic, TypeVar
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+from abc import ABC, abstractmethod
+
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+def build_url_with_ip(resolved: ResolvedUrl) -> str:
+    """Build a URL using a resolved IP address instead of the hostname.
+
+    For IPv6 addresses, wraps them in brackets as required by URL syntax.
+    """
+    scheme = 'https' if resolved.is_https else 'http'
+    default_port = 443 if resolved.is_https else 80
+
+    # IPv6 addresses need brackets in URLs
+    try:
+        ip_obj = ipaddress.ip_address(resolved.resolved_ip)
+        if isinstance(ip_obj, ipaddress.IPv6Address):
+            host_part = f'[{resolved.resolved_ip}]'
+        else:
+            host_part = resolved.resolved_ip
+    except ValueError:
+        host_part = resolved.resolved_ip
+
+    # Only include port if non-default
+    if resolved.port != default_port:
+        host_part = f'{host_part}:{resolved.port}'
+
+    return urlunparse((scheme, host_part, resolved.path, '', '', ''))
+
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+    async def read_resource(
+        self, uri: str | Resource
+    ) -> str | messages.BinaryContent | list[str | messages.BinaryContent]:
+        """Read the contents of a specific resource by URI.
+
+        Args:
+            uri: The URI of the resource to read, or a Resource object.
+
+        Returns:
+            The resource contents. If the resource has a single content item, returns that item directly.
+            If the resource has multiple content items, returns a list of items.
+
+        Raises:
+            MCPError: If the server returns an error.
+        """
+        resource_uri = uri if isinstance(uri, str) else uri.uri
+        async with self:  # Ensure server is running
+            try:
+                result = await self._client.read_resource(AnyUrl(resource_uri))
+            except mcp_exceptions.McpError as e:
+                raise MCPError.from_mcp_sdk(e) from e
+
+        return (
+            self._get_content(result.contents[0])
+            if len(result.contents) == 1
+            else [self._get_content(resource) for resource in result.contents]
+        )
+
+    async def _map_tool_result_part(
+        self, part: mcp_types.ContentBlock
+    ) -> str | messages.BinaryContent | dict[str, Any] | list[Any]:
+        # See https://github.com/jlowin/fastmcp/blob/main/docs/servers/tools.mdx#return-values
+
+        if isinstance(part, mcp_types.TextContent):
+            text = part.text
+            if text.startswith(('[', '{')):
+                try:
+                    return pydantic_core.from_json(text)
+                except ValueError:
+                    pass
+            return text
+        elif isinstance(part, mcp_types.ImageContent):
+            return messages.BinaryImage(data=base64.b64decode(part.data), media_type=part.mimeType)
+        elif isinstance(part, mcp_types.AudioContent):
+            # NOTE: The FastMCP server doesn't support audio content.
+            # See <https://github.com/modelcontextprotocol/python-sdk/issues/952> for more details.
+            return messages.BinaryContent(
+                data=base64.b64decode(part.data), media_type=part.mimeType
+            )  # pragma: no cover
+        elif isinstance(part, mcp_types.EmbeddedResource):
+            resource = part.resource
+            return self._get_content(resource)
+        elif isinstance(part, mcp_types.ResourceLink):
+            return await self.read_resource(str(part.uri))
+        else:
+            assert_never(part)
+
+    def _get_content(
+        self, resource: mcp_types.TextResourceContents | mcp_types.BlobResourceContents
+    ) -> str | messages.BinaryContent:
+        if isinstance(resource, mcp_types.TextResourceContents):
+            return resource.text
+        elif isinstance(resource, mcp_types.BlobResourceContents):
+            return messages.BinaryContent.narrow_type(
+                messages.BinaryContent(
+                    data=base64.b64decode(resource.blob), media_type=resource.mimeType or 'application/octet-stream'
+                )
+            )
+        else:
+            assert_never(resource)
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class BinaryContent:
+    """Binary content, e.g. an audio or image file."""
+
+    data: bytes
+    """The binary file data.
+
+    Use `.base64` to get the base64-encoded string.
+    """
+
+    _: KW_ONLY
+
+    media_type: AudioMediaType | ImageMediaType | DocumentMediaType | str
+    """The media type of the binary data."""
+
+    vendor_metadata: dict[str, Any] | None = None
+    """Vendor-specific metadata for the file.
+
+    Supported by:
+    - `GoogleModel`: `BinaryContent.vendor_metadata` is used as `video_metadata`: https://ai.google.dev/gemini-api/docs/video-understanding#customize-video-processing
+    - `OpenAIChatModel`, `OpenAIResponsesModel`: `BinaryContent.vendor_metadata['detail']` is used as `detail` setting for images
+    - `XaiModel`: `BinaryContent.vendor_metadata['detail']` is used as `detail` setting for images
+    """
+
+    _identifier: Annotated[str | None, pydantic.Field(alias='identifier', default=None, exclude=True)] = field(
+        compare=False, default=None
+    )
+
+    kind: Literal['binary'] = 'binary'
+    """Type identifier, this is available on all parts as a discriminator."""
+
+    # `pydantic_dataclass` replaces `__init__` so this method is never used.
+    # The signature is kept so that pyright/IDE hints recognize the `identifier` alias for the `_identifier` field.
+    def __init__(
+        self,
+        data: bytes,
+        *,
+        media_type: AudioMediaType | ImageMediaType | DocumentMediaType | str,
+        identifier: str | None = None,
+        vendor_metadata: dict[str, Any] | None = None,
+        kind: Literal['binary'] = 'binary',
+        # Required for inline-snapshot which expects all dataclass `__init__` methods to take all field names as kwargs.
+        _identifier: str | None = None,
+    ) -> None: ...  # pragma: no cover
+
+    @staticmethod
+    def narrow_type(bc: BinaryContent) -> BinaryContent | BinaryImage:
+        """Narrow the type of the `BinaryContent` to `BinaryImage` if it's an image."""
+        if bc.is_image:
+            return BinaryImage(
+                data=bc.data,
+                media_type=bc.media_type,
+                identifier=bc.identifier,
+                vendor_metadata=bc.vendor_metadata,
+            )
+        else:
+            return bc
+
+    @classmethod
+    def from_data_uri(cls, data_uri: str) -> BinaryContent:
+        """Create a `BinaryContent` from a data URI."""
+        prefix = 'data:'
+        if not data_uri.startswith(prefix):
+            raise ValueError('Data URI must start with "data:"')
+        media_type, data = data_uri[len(prefix) :].split(';base64,', 1)
+        return cls.narrow_type(cls(data=base64.b64decode(data), media_type=media_type))
+
+    @classmethod
+    def from_path(cls, path: PathLike[str]) -> BinaryContent:
+        """Create a `BinaryContent` from a path.
+
+        Defaults to 'application/octet-stream' if the media type cannot be inferred.
+
+        Raises:
+            FileNotFoundError: if the file does not exist.
+            PermissionError: if the file cannot be read.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f'File not found: {path}')
+        media_type, _ = _mime_types.guess_type(path)
+        if media_type is None:
+            media_type = 'application/octet-stream'
+
+        return cls.narrow_type(cls(data=path.read_bytes(), media_type=media_type))
+
+    @pydantic.computed_field
+    @property
+    def identifier(self) -> str:
+        """Identifier for the binary content, such as a unique ID.
+
+        This identifier can be provided to the model in a message to allow it to refer to this file in a tool call argument,
+        and the tool can look up the file in question by iterating over the message history and finding the matching `BinaryContent`.
+
+        This identifier is only automatically passed to the model when the `BinaryContent` is returned by a tool.
+        If you're passing the `BinaryContent` as a user message, it's up to you to include a separate text part with the identifier,
+        e.g. "This is file <identifier>:" preceding the `BinaryContent`.
+
+        It's also included in inline-text delimiters for providers that require inlining text documents, so the model can
+        distinguish multiple files.
+        """
+        return self._identifier or _multi_modal_content_identifier(self.data)
+
+    @property
+    def data_uri(self) -> str:
+        """Convert the `BinaryContent` to a data URI."""
+        return f'data:{self.media_type};base64,{self.base64}'
+
+    @property
+    def base64(self) -> str:
+        """Return the binary data as a base64-encoded string. Default encoding is UTF-8."""
+        return base64.b64encode(self.data).decode()
+
+    @property
+    def is_audio(self) -> bool:
+        """Return `True` if the media type is an audio type."""
+        return self.media_type.startswith('audio/')
+
+    @property
+    def is_image(self) -> bool:
+        """Return `True` if the media type is an image type."""
+        return self.media_type.startswith('image/')
+
+    @property
+    def is_video(self) -> bool:
+        """Return `True` if the media type is a video type."""
+        return self.media_type.startswith('video/')
+
+    @property
+    def is_document(self) -> bool:
+        """Return `True` if the media type is a document type."""
+        return self.media_type in _document_format_lookup
+
+    @property
+    def format(self) -> str:
+        """The file format of the binary content."""
+        try:
+            if self.is_audio:
+                return _audio_format_lookup[self.media_type]
+            elif self.is_image:
+                return _image_format_lookup[self.media_type]
+            elif self.is_video:
+                return _video_format_lookup[self.media_type]
+            else:
+                return _document_format_lookup[self.media_type]
+        except KeyError as e:
+            raise ValueError(f'Unknown media type: {self.media_type}') from e
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    def narrow_type(bc: BinaryContent) -> BinaryContent | BinaryImage:
+        """Narrow the type of the `BinaryContent` to `BinaryImage` if it's an image."""
+        if bc.is_image:
+            return BinaryImage(
+                data=bc.data,
+                media_type=bc.media_type,
+                identifier=bc.identifier,
+                vendor_metadata=bc.vendor_metadata,
+            )
+        else:
+            return bc
+
+## pydantic_ai_slim/pydantic_ai/models/bedrock.py
+
+    def _get_tools(self, model_request_parameters: ModelRequestParameters) -> list[ToolTypeDef]:
+        return [self._map_tool_definition(r) for r in model_request_parameters.tool_defs.values()]
+
+    def _map_tool_definition(f: ToolDefinition) -> ToolTypeDef:
+        tool_spec: ToolSpecificationTypeDef = {'name': f.name, 'inputSchema': {'json': f.parameters_json_schema}}
+
+        if f.description:  # pragma: no branch
+            tool_spec['description'] = f.description
+
+        return {'toolSpec': tool_spec}
+
+    def _map_tool_config(
+        self,
+        model_request_parameters: ModelRequestParameters,
+        model_settings: BedrockModelSettings | None,
+    ) -> ToolConfigurationTypeDef | None:
+        tools = self._get_tools(model_request_parameters)
+        for tool in model_request_parameters.builtin_tools:
+            if tool.kind == CodeExecutionTool.kind:
+                tools.append({'systemTool': {'name': 'nova_code_interpreter'}})
+            else:
+                raise NotImplementedError(
+                    f"Builtin tool '{tool.kind}' is not supported yet. If it should be, please file an issue."
+                )
+
+        if not tools:
+            return None
+
+        profile = BedrockModelProfile.from_profile(self.profile)
+        if (
+            model_settings
+            and model_settings.get('bedrock_cache_tool_definitions')
+            and profile.bedrock_supports_tool_caching
+        ):
+            tools.append({'cachePoint': {'type': 'default'}})
+
+        tool_choice: ToolChoiceTypeDef
+        if not model_request_parameters.allow_text_output:
+            tool_choice = {'any': {}}
+        else:
+            tool_choice = {'auto': {}}
+
+        tool_config: ToolConfigurationTypeDef = {'tools': tools}
+        if tool_choice and BedrockModelProfile.from_profile(self.profile).bedrock_supports_tool_choice:
+            tool_config['toolChoice'] = tool_choice
+
+        return tool_config
+
+## pydantic_ai_slim/pydantic_ai/models/mistral.py
+
+    def _generate_user_output_format(self, schemas: list[dict[str, Any]]) -> MistralUserMessage:
+        """Get a message with an example of the expected output format."""
+        examples: list[dict[str, Any]] = []
+        for schema in schemas:
+            typed_dict_definition: dict[str, Any] = {}
+            for key, value in schema.get('properties', {}).items():
+                typed_dict_definition[key] = self._get_python_type(value)
+            examples.append(typed_dict_definition)
+
+        example_schema = examples[0] if len(examples) == 1 else examples
+        return MistralUserMessage(content=self.json_mode_schema_prompt.format(schema=example_schema))
+
+    def _get_python_type(cls, value: dict[str, Any]) -> str:
+        """Return a string representation of the Python type for a single JSON schema property.
+
+        This function handles recursion for nested arrays/objects and `anyOf`.
+        """
+        # 1) Handle anyOf first, because it's a different schema structure
+        if any_of := value.get('anyOf'):
+            # Simplistic approach: pick the first option in anyOf
+            # (In reality, you'd possibly want to merge or union types)
+            return f'Optional[{cls._get_python_type(any_of[0])}]'
+
+        # 2) If we have a top-level "type" field
+        value_type = value.get('type')
+        if not value_type:
+            # No explicit type; fallback
+            return 'Any'
+
+        # 3) Direct simple type mapping (string, integer, float, bool, None)
+        if value_type in SIMPLE_JSON_TYPE_MAPPING and value_type != 'array' and value_type != 'object':
+            return SIMPLE_JSON_TYPE_MAPPING[value_type]
+
+        # 4) Array: Recursively get the item type
+        if value_type == 'array':
+            items = value.get('items', {})
+            return f'list[{cls._get_python_type(items)}]'
+
+        # 5) Object: Check for additionalProperties
+        if value_type == 'object':
+            additional_properties = value.get('additionalProperties', {})
+            if isinstance(additional_properties, bool):
+                return 'bool'  # pragma: lax no cover
+            additional_properties_type = additional_properties.get('type')
+            if (
+                additional_properties_type in SIMPLE_JSON_TYPE_MAPPING
+                and additional_properties_type != 'array'
+                and additional_properties_type != 'object'
+            ):
+                # dict[str, bool/int/float/etc...]
+                return f'dict[str, {SIMPLE_JSON_TYPE_MAPPING[additional_properties_type]}]'
+            elif additional_properties_type == 'array':
+                array_items = additional_properties.get('items', {})
+                return f'dict[str, list[{cls._get_python_type(array_items)}]]'
+            elif additional_properties_type == 'object':
+                # nested dictionary of unknown shape
+                return 'dict[str, dict[str, Any]]'
+            else:
+                # If no additionalProperties type or something else, default to a generic dict
+                return 'dict[str, Any]'
+
+        # 6) Fallback
+        return 'Any'
+
+## pydantic_ai_slim/pydantic_ai/models/openrouter.py
+
+    type: Literal['file']
+
+## pydantic_ai_slim/pydantic_ai/providers/bedrock.py
+
+    def get_credentials(self) -> None:  # type: ignore[reportIncompatibleMethodOverride]
+        return None
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py
+
+    type: Literal['file'] = 'file'
+
+    type: Literal['dynamic-tool'] = 'dynamic-tool'
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py
+
+    type: Literal['error'] = 'error'
+
+    type: Literal['tool-output-error'] = 'tool-output-error'
+
+## pydantic_graph/pydantic_graph/_utils.py
+
+def get_union_args(tp: Any) -> tuple[Any, ...]:
+    """Extract the arguments of a Union type if `response_type` is a union, otherwise return an empty tuple."""
+    # similar to `pydantic_ai_slim/pydantic_ai/_result.py:get_union_args`
+    if typing_objects.is_typealiastype(tp):
+        tp = tp.__value__  # pragma: no cover
+
+    origin = get_origin(tp)
+    if is_union_origin(origin):
+        return get_args(tp)
+    else:
+        return (tp,)
+
+def get_parent_namespace(frame: types.FrameType | None) -> dict[str, Any] | None:
+    """Attempt to get the namespace where the graph was defined.
+
+    If the graph is defined with generics `Graph[a, b]` then another frame is inserted, and we have to skip that
+    to get the correct namespace.
+    """
+    if frame is not None:  # pragma: no branch
+        if back := frame.f_back:  # pragma: no branch
+            if back.f_globals.get('__name__') == 'typing':
+                # If the class calling this function is generic, explicitly parameterizing the class
+                # results in a `typing._GenericAlias` instance, which proxies instantiation calls to the
+                # "real" class and thus adding an extra frame to the call. To avoid pulling anything
+                # from the `typing` module, use the correct frame (the one before):
+                return get_parent_namespace(back)
+            else:
+                return back.f_locals
+
+## pydantic_graph/pydantic_graph/beta/graph_builder.py
+
+    def add(self, *edges: EdgePath[StateT, DepsT]) -> None:  # noqa: C901
+        """Add one or more edge paths to the graph.
+
+        This method processes edge paths and automatically creates any necessary
+        fork nodes for broadcasts and maps.
+
+        Args:
+            *edges: The edge paths to add to the graph
+        """
+
+        def _handle_path(p: Path):
+            """Process a path and create necessary fork nodes.
+
+            Args:
+                p: The path to process
+            """
+            for item in p.items:
+                if isinstance(item, BroadcastMarker):
+                    new_node = Fork[Any, Any](id=item.fork_id, is_map=False, downstream_join_id=None)
+                    self._insert_node(new_node)
+                    for path in item.paths:
+                        _handle_path(Path(items=[*path.items]))
+                elif isinstance(item, MapMarker):
+                    new_node = Fork[Any, Any](id=item.fork_id, is_map=True, downstream_join_id=item.downstream_join_id)
+                    self._insert_node(new_node)
+                elif isinstance(item, DestinationMarker):
+                    pass
+
+        def _handle_destination_node(d: AnyDestinationNode):
+            if id(d) in destination_ids:
+                return  # prevent infinite recursion if there is a cycle of decisions
+
+            destination_ids.add(id(d))
+            destinations.append(d)
+            self._insert_node(d)
+            if isinstance(d, Decision):
+                for branch in d.branches:
+                    _handle_path(branch.path)
+                    for d2 in branch.destinations:
+                        _handle_destination_node(d2)
+
+        destination_ids = set[int]()
+        destinations: list[AnyDestinationNode] = []
+        for edge in edges:
+            for source_node in edge.sources:
+                self._insert_node(source_node)
+                self._edges_by_source[source_node.id].append(edge.path)
+            for destination_node in edge.destinations:
+                _handle_destination_node(destination_node)
+            _handle_path(edge.path)
+
+        # Automatically create edges from step function return hints including `BaseNode`s
+        for destination in destinations:
+            if not isinstance(destination, Step) or isinstance(destination, NodeStep):
+                continue
+            parent_namespace = _utils.get_parent_namespace(inspect.currentframe())
+            type_hints = get_type_hints(destination.call, localns=parent_namespace, include_extras=True)
+            try:
+                return_hint = type_hints['return']
+            except KeyError:
+                pass
+            else:
+                edge = self._edge_from_return_hint(destination, return_hint)
+                if edge is not None:
+                    self.add(edge)
+
+    def node(
+        self,
+        node_type: type[BaseNode[StateT, DepsT, GraphOutputT]],
+    ) -> EdgePath[StateT, DepsT]:
+        """Create an edge path from a BaseNode class.
+
+        This method integrates v1-style BaseNode classes into the v2 graph
+        system by analyzing their type hints and creating appropriate edges.
+
+        Args:
+            node_type: The BaseNode subclass to integrate
+
+        Returns:
+            An EdgePath representing the node and its connections
+
+        Raises:
+            GraphSetupError: If the node type is missing required type hints
+        """
+        parent_namespace = _utils.get_parent_namespace(inspect.currentframe())
+        type_hints = get_type_hints(node_type.run, localns=parent_namespace, include_extras=True)
+        try:
+            return_hint = type_hints['return']
+        except KeyError as e:  # pragma: no cover
+            raise exceptions.GraphSetupError(
+                f'Node {node_type} is missing a return type hint on its `run` method'
+            ) from e
+
+        node = NodeStep(node_type)
+
+        edge = self._edge_from_return_hint(node, return_hint)
+        if not edge:  # pragma: no cover
+            raise exceptions.GraphSetupError(f'Node {node_type} is missing a return type hint on its `run` method')
+
+        return edge
+
+## pydantic_graph/pydantic_graph/graph.py
+
+    def __init__(
+        self,
+        *,
+        nodes: Sequence[type[BaseNode[StateT, DepsT, RunEndT]]],
+        name: str | None = None,
+        state_type: type[StateT] | _utils.Unset = _utils.UNSET,
+        run_end_type: type[RunEndT] | _utils.Unset = _utils.UNSET,
+        auto_instrument: bool = True,
+    ):
+        """Create a graph from a sequence of nodes.
+
+        Args:
+            nodes: The nodes which make up the graph, nodes need to be unique and all be generic in the same
+                state type.
+            name: Optional name for the graph, if not provided the name will be inferred from the calling frame
+                on the first call to a graph method.
+            state_type: The type of the state for the graph, this can generally be inferred from `nodes`.
+            run_end_type: The type of the result of running the graph, this can generally be inferred from `nodes`.
+            auto_instrument: Whether to create a span for the graph run and the execution of each node's run method.
+        """
+        self.name = name
+        self._state_type = state_type
+        self._run_end_type = run_end_type
+        self.auto_instrument = auto_instrument
+
+        parent_namespace = _utils.get_parent_namespace(inspect.currentframe())
+        self.node_defs = {}
+        for node in nodes:
+            self._register_node(node, parent_namespace)
+
+        self._validate_edges()
+
+    def get_nodes(self) -> Sequence[type[BaseNode[StateT, DepsT, RunEndT]]]:
+        """Get the nodes in the graph."""
+        return [node_def.node for node_def in self.node_defs.values()]
+
+## pydantic_graph/pydantic_graph/persistence/__init__.py
+
+class BaseStatePersistence(ABC, Generic[StateT, RunEndT]):
+    """Abstract base class for storing the state of a graph run.
+
+    Each instance of a `BaseStatePersistence` subclass should be used for a single graph run.
+    """
+
+    @abstractmethod
+    async def snapshot_node(self, state: StateT, next_node: BaseNode[StateT, Any, RunEndT]) -> None:
+        """Snapshot the state of a graph, when the next step is to run a node.
+
+        This method should add a [`NodeSnapshot`][pydantic_graph.persistence.NodeSnapshot] to persistence.
+
+        Args:
+            state: The state of the graph.
+            next_node: The next node to run.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def snapshot_node_if_new(
+        self, snapshot_id: str, state: StateT, next_node: BaseNode[StateT, Any, RunEndT]
+    ) -> None:
+        """Snapshot the state of a graph if the snapshot ID doesn't already exist in persistence.
+
+        This method will generally call [`snapshot_node`][pydantic_graph.persistence.BaseStatePersistence.snapshot_node]
+        but should do so in an atomic way.
+
+        Args:
+            snapshot_id: The ID of the snapshot to check.
+            state: The state of the graph.
+            next_node: The next node to run.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def snapshot_end(self, state: StateT, end: End[RunEndT]) -> None:
+        """Snapshot the state of a graph when the graph has ended.
+
+        This method should add an [`EndSnapshot`][pydantic_graph.persistence.EndSnapshot] to persistence.
+
+        Args:
+            state: The state of the graph.
+            end: data from the end of the run.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_run(self, snapshot_id: str) -> AbstractAsyncContextManager[None]:
+        """Record the run of the node, or error if the node is already running.
+
+        Args:
+            snapshot_id: The ID of the snapshot to record.
+
+        Raises:
+            GraphNodeRunningError: if the node status it not `'created'` or `'pending'`.
+            LookupError: if the snapshot ID is not found in persistence.
+
+        Returns:
+            An async context manager that records the run of the node.
+
+        In particular this should set:
+
+        - [`NodeSnapshot.status`][pydantic_graph.persistence.NodeSnapshot.status] to `'running'` and
+          [`NodeSnapshot.start_ts`][pydantic_graph.persistence.NodeSnapshot.start_ts] when the run starts.
+        - [`NodeSnapshot.status`][pydantic_graph.persistence.NodeSnapshot.status] to `'success'` or `'error'` and
+          [`NodeSnapshot.duration`][pydantic_graph.persistence.NodeSnapshot.duration] when the run finishes.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def load_next(self) -> NodeSnapshot[StateT, RunEndT] | None:
+        """Retrieve a node snapshot with status `'created`' and set its status to `'pending'`.
+
+        This is used by [`Graph.iter_from_persistence`][pydantic_graph.graph.Graph.iter_from_persistence]
+        to get the next node to run.
+
+        Returns: The snapshot, or `None` if no snapshot with status `'created`' exists.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def load_all(self) -> list[Snapshot[StateT, RunEndT]]:
+        """Load the entire history of snapshots.
+
+        `load_all` is not used by pydantic-graph itself, instead it's provided to make it convenient to
+        get all [snapshots][pydantic_graph.persistence.Snapshot] from persistence.
+
+        Returns: The list of snapshots.
+        """
+        raise NotImplementedError
+
+    def set_graph_types(self, graph: Graph[StateT, Any, RunEndT]) -> None:
+        """Set the types of the state and run end from a graph.
+
+        You generally won't need to customise this method, instead implement
+        [`set_types`][pydantic_graph.persistence.BaseStatePersistence.set_types] and
+        [`should_set_types`][pydantic_graph.persistence.BaseStatePersistence.should_set_types].
+        """
+        if self.should_set_types():
+            with _utils.set_nodes_type_context(graph.get_nodes()):
+                self.set_types(*graph.inferred_types)
+
+    def should_set_types(self) -> bool:
+        """Whether types need to be set.
+
+        Implementations should override this method to return `True` when types have not been set if they are needed.
+        """
+        return False
+
+    def set_types(self, state_type: type[StateT], run_end_type: type[RunEndT]) -> None:
+        """Set the types of the state and run end.
+
+        This can be used to create [type adapters][pydantic.TypeAdapter] for serializing and deserializing snapshots,
+        e.g. with [`build_snapshot_list_type_adapter`][pydantic_graph.persistence.build_snapshot_list_type_adapter].
+
+        Args:
+            state_type: The state type.
+            run_end_type: The run end type.
+        """
+        pass
+
+    def set_graph_types(self, graph: Graph[StateT, Any, RunEndT]) -> None:
+        """Set the types of the state and run end from a graph.
+
+        You generally won't need to customise this method, instead implement
+        [`set_types`][pydantic_graph.persistence.BaseStatePersistence.set_types] and
+        [`should_set_types`][pydantic_graph.persistence.BaseStatePersistence.should_set_types].
+        """
+        if self.should_set_types():
+            with _utils.set_nodes_type_context(graph.get_nodes()):
+                self.set_types(*graph.inferred_types)
+
+## tests/mcp_server.py
+
+async def get_log_level(ctx: Context) -> str:  # type: ignore
+    """Get the current log level.
+
+    Returns:
+        The current log level.
+    """
+    await ctx.info('this is a log message')
+    return log_level
+
+## tests/models/mock_xai.py
+
+def _get_example_tool_output(
+    tool_type: chat_pb2.ToolCallType,
+    content: ToolCallOutputType | None = None,
+) -> ToolCallOutputType:
+    """Return content if provided, otherwise a realistic default for the tool type."""
+    if content is not None:
+        return content
+    if tool_type == chat_pb2.ToolCallType.TOOL_CALL_TYPE_CODE_EXECUTION_TOOL:
+        return {'stdout': '4\n', 'stderr': '', 'output_files': {}, 'error': '', 'ret': ''}
+    elif tool_type == chat_pb2.ToolCallType.TOOL_CALL_TYPE_WEB_SEARCH_TOOL:
+        return {}  # Web search has no content currently, in future will return inline citations
+    elif tool_type == chat_pb2.ToolCallType.TOOL_CALL_TYPE_MCP_TOOL:
+        return [
+            {
+                'id': 'issue_001',
+                'identifier': 'PROJ-123',
+                'title': 'example-issue',
+                'description': 'example-issue description',
+                'status': 'Todo',
+                'priority': {'value': 3, 'name': 'Medium'},
+                'url': 'https://linear.app/team/issue/PROJ-123/example-issue',
+            }
+        ]
+    else:  # pragma: no cover
+        # Unknown tool type - return empty dict as fallback
+        return {}
+
+def create_code_execution_response(
+    code: str,
+    content: ToolCallOutputType | None = None,
+    *,
+    tool_call_id: str = 'code_exec_001',
+    assistant_text: str,
+) -> chat_types.Response:
+    """Create a Response with code execution tool outputs.
+
+    Args:
+        assistant_text: Text for the final assistant message (required to match real API).
+
+    Example:
+        >>> response = create_code_execution_response(
+        ...     code='2 + 2',
+        ...     content={'stdout': '4\\n', 'stderr': '', 'output_files': {}, 'error': '', 'ret': ''},
+        ...     assistant_text='The result is 4.',
+        ... )
+    """
+    tool_type = chat_pb2.ToolCallType.TOOL_CALL_TYPE_CODE_EXECUTION_TOOL
+    actual_content = _get_example_tool_output(tool_type, content)
+    outputs = _create_builtin_tool_outputs(
+        tool_name='code_execution',
+        arguments={'code': code},
+        content=actual_content,
+        tool_call_id=tool_call_id,
+        tool_type=tool_type,
+        initial_status=chat_pb2.ToolCallStatus.TOOL_CALL_STATUS_COMPLETED,
+    )
+    # Add final assistant message (matching real API behavior)
+    outputs.append(
+        chat_pb2.CompletionOutput(
+            index=len(outputs),
+            finish_reason=sample_pb2.FinishReason.REASON_STOP,
+            message=chat_pb2.CompletionMessage(
+                role=chat_pb2.MessageRole.ROLE_ASSISTANT,
+                content=assistant_text,
+            ),
+        )
+    )
+    return _build_response_with_outputs(response_id=f'grok-{tool_call_id}', outputs=outputs)
+
+def create_web_search_response(
+    query: str,
+    content: ToolCallOutputType | None = None,
+    *,
+    tool_call_id: str = 'web_search_001',
+    assistant_text: str,
+) -> chat_types.Response:
+    """Create a Response with web search tool outputs.
+
+    Args:
+        assistant_text: Text for the final assistant message (required to match real API).
+
+    Example:
+        >>> response = create_web_search_response(
+        ...     query='date of Jan 1 in 2026',
+        ...     content='Thursday',
+        ...     assistant_text='January 1, 2026 is a Thursday.',
+        ... )
+    """
+    tool_type = chat_pb2.ToolCallType.TOOL_CALL_TYPE_WEB_SEARCH_TOOL
+    actual_content = _get_example_tool_output(tool_type, content)
+    outputs = _create_builtin_tool_outputs(
+        tool_name='web_search',
+        arguments={'query': query},
+        content=actual_content,
+        tool_call_id=tool_call_id,
+        tool_type=tool_type,
+        initial_status=chat_pb2.ToolCallStatus.TOOL_CALL_STATUS_COMPLETED,
+    )
+    # Add final assistant message (matching real API behavior)
+    outputs.append(
+        chat_pb2.CompletionOutput(
+            index=len(outputs),
+            finish_reason=sample_pb2.FinishReason.REASON_STOP,
+            message=chat_pb2.CompletionMessage(
+                role=chat_pb2.MessageRole.ROLE_ASSISTANT,
+                content=assistant_text,
+            ),
+        )
+    )
+    return _build_response_with_outputs(response_id=f'grok-{tool_call_id}', outputs=outputs)
+
+def create_mcp_server_response(
+    server_id: str,
+    tool_name: str,
+    tool_input: ToolCallArgumentsType | None = None,
+    content: ToolCallOutputType | None = None,
+    *,
+    tool_call_id: str = 'mcp_001',
+    assistant_text: str,
+) -> chat_types.Response:
+    """Create a Response with MCP server tool outputs.
+
+    Args:
+        assistant_text: Text for the final assistant message (required to match real API).
+
+    Example:
+        >>> response = create_mcp_server_response(
+        ...     server_id='linear',
+        ...     tool_name='list_issues',
+        ...     content=[{'id': 'issue_001'}],
+        ...     assistant_text='Found 1 issue.',
+        ... )
+    """
+    full_tool_name = f'{server_id}.{tool_name}'
+    tool_type = chat_pb2.ToolCallType.TOOL_CALL_TYPE_MCP_TOOL
+    actual_content = _get_example_tool_output(tool_type, content)
+    outputs = _create_builtin_tool_outputs(
+        tool_name=full_tool_name,
+        arguments=tool_input or {},
+        content=actual_content,
+        tool_call_id=tool_call_id,
+        tool_type=tool_type,
+        initial_status=chat_pb2.ToolCallStatus.TOOL_CALL_STATUS_COMPLETED,
+    )
+    # Add final assistant message (matching real API behavior)
+    outputs.append(
+        chat_pb2.CompletionOutput(
+            index=len(outputs),
+            finish_reason=sample_pb2.FinishReason.REASON_STOP,
+            message=chat_pb2.CompletionMessage(
+                role=chat_pb2.MessageRole.ROLE_ASSISTANT,
+                content=assistant_text,
+            ),
+        )
+    )
+    return _build_response_with_outputs(response_id=f'grok-{tool_call_id}', outputs=outputs)
+
+## tests/test_ssrf.py
+
+    def test_http_default_port(self) -> None:
+        resolved = ResolvedUrl(
+            resolved_ip='203.0.113.50', hostname='example.com', port=80, is_https=False, path='/path'
+        )
+        url = build_url_with_ip(resolved)
+        assert url == 'http://203.0.113.50/path'
+
+    def test_https_default_port(self) -> None:
+        resolved = ResolvedUrl(
+            resolved_ip='203.0.113.50', hostname='example.com', port=443, is_https=True, path='/path'
+        )
+        url = build_url_with_ip(resolved)
+        assert url == 'https://203.0.113.50/path'
+
+    def test_custom_port(self) -> None:
+        resolved = ResolvedUrl(
+            resolved_ip='203.0.113.50', hostname='example.com', port=8080, is_https=False, path='/path'
+        )
+        url = build_url_with_ip(resolved)
+        assert url == 'http://203.0.113.50:8080/path'
+
+    def test_ipv6_address(self) -> None:
+        resolved = ResolvedUrl(resolved_ip='2001:db8::1', hostname='example.com', port=443, is_https=True, path='/path')
+        url = build_url_with_ip(resolved)
+        assert url == 'https://[2001:db8::1]/path'
+
+    def test_ipv6_address_custom_port(self) -> None:
+        resolved = ResolvedUrl(
+            resolved_ip='2001:db8::1', hostname='example.com', port=8443, is_https=True, path='/path'
+        )
+        url = build_url_with_ip(resolved)
+        assert url == 'https://[2001:db8::1]:8443/path'

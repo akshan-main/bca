@@ -1,0 +1,223 @@
+# tests/test_agent.py:6793-6878
+async def test_run_with_deferred_tool_results_errors():
+    agent = Agent('test')
+
+    message_history: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=['Hello', 'world'])])]
+
+    with pytest.raises(
+        UserError,
+        match='Tool call results were provided, but the message history does not contain a `ModelResponse`.',
+    ):
+        await agent.run(
+            'Hello again',
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(parts=[TextPart(content='Hello to you too!')]),
+    ]
+
+    with pytest.raises(
+        UserError,
+        match='Tool call results were provided, but the message history does not contain any unprocessed tool calls.',
+    ):
+        await agent.run(
+            'Hello again',
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(parts=[ToolCallPart(tool_name='say_hello')]),
+    ]
+
+    with pytest.raises(
+        UserError, match='Cannot provide a new user prompt when the message history contains unprocessed tool calls.'
+    ):
+        await agent.run('Hello', message_history=message_history)
+
+    with pytest.raises(UserError, match='Tool call results need to be provided for all deferred tool calls.'):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(),
+        )
+
+    with pytest.raises(UserError, match='Tool call results were provided, but the message history is empty.'):
+        await agent.run(
+            'Hello again',
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(tool_name='run_me', tool_call_id='run_me'),
+                ToolCallPart(tool_name='run_me_too', tool_call_id='run_me_too'),
+                ToolCallPart(tool_name='defer_me', tool_call_id='defer_me'),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name='run_me', tool_call_id='run_me', content='Success'),
+                RetryPromptPart(tool_name='run_me_too', tool_call_id='run_me_too', content='Failure'),
+            ]
+        ),
+    ]
+
+    with pytest.raises(UserError, match="Tool call 'run_me' was already executed and its result cannot be overridden."):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(
+                calls={'run_me': 'Failure', 'defer_me': 'Failure'},
+            ),
+        )
+
+    with pytest.raises(
+        UserError, match="Tool call 'run_me_too' was already executed and its result cannot be overridden."
+    ):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(
+                calls={'run_me_too': 'Success', 'defer_me': 'Failure'},
+            ),
+        )
+
+# tests/test_exceptions.py:70-74
+def test_tool_retry_error_str_with_string_content():
+    """Test that ToolRetryError uses string content as message automatically."""
+    part = RetryPromptPart(content='error from tool', tool_name='my_tool')
+    error = ToolRetryError(part)
+    assert str(error) == 'error from tool'
+
+# tests/test_vercel_ai.py:2731-2816
+async def test_adapter_dump_messages_with_retry_no_tool_name():
+    """Test dumping messages with retry prompts without tool_name (e.g., output validation errors)."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Give me a number')]),
+        ModelResponse(parts=[TextPart(content='Not a valid number')]),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content='Output validation failed: expected integer',
+                    # No tool_name - this is an output validation error, not a tool error
+                )
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Give me a number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Not a valid number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'text',
+                        'text': """\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                        'state': 'done',
+                        'provider_metadata': None,
+                    }
+                ],
+            },
+        ]
+    )
+
+    # Verify roundtrip
+    # Note: This is a lossy conversion - RetryPromptPart without tool_call_id becomes a user text message.
+    # When loaded back, it creates a UserPromptPart instead of RetryPromptPart.
+    # So we check it's value and then replace it with the original RetryPromptPart to assert equality
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    assert reloaded_messages[2] == snapshot(
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content="""\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                    timestamp=IsDatetime(),
+                )
+            ]
+        )
+    )
+    # Get original tool_call_id and replace with original RetryPromptPart
+    original_retry = messages[2].parts[0]
+    assert isinstance(original_retry, RetryPromptPart)
+    reloaded_messages[2] = ModelRequest(
+        parts=[
+            RetryPromptPart(
+                content='Output validation failed: expected integer', tool_call_id=original_retry.tool_call_id
+            )
+        ]
+    )
+    _sync_timestamps(messages, reloaded_messages)
+    assert reloaded_messages == messages
+
+# tests/test_temporal.py:1647-1651
+class SimpleAgentWorkflowWithRunToolsets:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await simple_temporal_agent.run(prompt, toolsets=[FunctionToolset()])
+        return result.output  # pragma: no cover
+
+# tests/test_temporal.py:1734-1738
+class SimpleAgentWorkflowWithOverrideTools:
+    @workflow.run
+    async def run(self, prompt: str) -> None:
+        with simple_temporal_agent.override(tools=[get_weather]):
+            pass
+
+# tests/test_temporal.py:1705-1709
+class SimpleAgentWorkflowWithOverrideToolsets:
+    @workflow.run
+    async def run(self, prompt: str) -> None:
+        with simple_temporal_agent.override(toolsets=[FunctionToolset()]):
+            pass
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# tests/test_temporal.py:1649-1651
+    async def run(self, prompt: str) -> str:
+        result = await simple_temporal_agent.run(prompt, toolsets=[FunctionToolset()])
+        return result.output  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/models/groq.py:664-664
+    message: str

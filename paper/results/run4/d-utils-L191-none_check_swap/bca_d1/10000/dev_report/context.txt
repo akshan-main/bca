@@ -1,0 +1,1047 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/store.py
+
+class AnalysisStore:
+    @classmethod
+    @logfire.instrument('Add analysis to store')
+    async def add(cls, analysis: Analysis):
+        await cls._get_store().put.aio(analysis.profile.email, analysis.model_dump())
+
+    @classmethod
+    @logfire.instrument('List analyses from store')
+    async def list(cls) -> list[Analysis]:
+        return [
+            Analysis.model_validate(analysis)
+            async for analysis in cls._get_store().values.aio()
+        ]
+
+    @classmethod
+    @logfire.instrument('Clear analyses from store')
+    async def clear(cls):
+        await cls._get_store().clear.aio()
+
+    @classmethod
+    def _get_store(cls) -> modal.Dict:
+        return modal.Dict.from_name('analyses', create_if_missing=True)  # type: ignore ### [/analysis_store]
+
+    async def list(cls) -> list[Analysis]:
+        return [
+            Analysis.model_validate(analysis)
+            async for analysis in cls._get_store().values.aio()
+        ]
+
+    async def clear(cls):
+        await cls._get_store().clear.aio()
+
+## pydantic_ai_slim/pydantic_ai/_a2a.py
+
+from typing import Any, Generic, TypeVar
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def disable_threads() -> Iterator[None]:
+    """Context manager to disable thread-based execution for sync functions.
+
+    Inside this context, sync functions will execute inline rather than
+    being sent to a thread pool via [`anyio.to_thread.run_sync`][anyio.to_thread.run_sync].
+
+    This is useful in environments where threading is restricted, such as
+    Temporal workflows which use a sandboxed event loop.
+
+    Yields:
+        None
+    """
+    token = _disable_threads.set(True)
+    try:
+        yield
+    finally:
+        _disable_threads.reset(token)
+
+async def group_by_temporal(
+    aiterable: AsyncIterable[T], soft_max_interval: float | None
+) -> AsyncIterator[AsyncIterable[list[T]]]:
+    """Group items from an async iterable into lists based on time interval between them.
+
+    Effectively, this debounces the iterator.
+
+    This returns a context manager usable as an iterator so any pending tasks can be cancelled if an error occurs
+    during iteration.
+
+    Usage:
+
+    ```python
+    async with group_by_temporal(yield_groups(), 0.1) as groups_iter:
+        async for groups in groups_iter:
+            print(groups)
+    ```
+
+    Args:
+        aiterable: The async iterable to group.
+        soft_max_interval: Maximum interval over which to group items, this should avoid a trickle of items causing
+            a group to never be yielded. It's a soft max in the sense that once we're over this time, we yield items
+            as soon as `anext(aiter)` returns. If `None`, no grouping/debouncing is performed
+
+    Returns:
+        A context manager usable as an async iterable of lists of items produced by the input async iterable.
+    """
+    if soft_max_interval is not None:
+
+        async def async_iter_groups_noop() -> AsyncIterator[list[T]]:
+            async for item in aiterable:
+                yield [item]
+
+        yield async_iter_groups_noop()
+        return
+
+    # we might wait for the next item more than once, so we store the task to await next time
+    task: asyncio.Task[T] | None = None
+
+    async def async_iter_groups() -> AsyncIterator[list[T]]:
+        nonlocal task
+
+        assert soft_max_interval is not None and soft_max_interval >= 0, 'soft_max_interval must be a positive number'
+        buffer: list[T] = []
+        group_start_time = time.monotonic()
+
+        aiterator = aiter(aiterable)
+        while True:
+            if group_start_time is None:
+                # group hasn't started, we just wait for the maximum interval
+                wait_time = soft_max_interval
+            else:
+                # wait for the time remaining in the group
+                wait_time = soft_max_interval - (time.monotonic() - group_start_time)
+
+            # if there's no current task, we get the next one
+            if task is None:
+                # anext(aiter) returns an Awaitable[T], not a Coroutine which asyncio.create_task expects
+                # so far, this doesn't seem to be a problem
+                task = asyncio.create_task(anext(aiterator))  # pyright: ignore[reportArgumentType,reportUnknownVariableType]
+
+            # we use asyncio.wait to avoid cancelling the coroutine if it's not done
+            done, _ = await asyncio.wait((task,), timeout=wait_time)
+
+            if done:
+                # the one task we waited for completed
+                try:
+                    item = done.pop().result()
+                except StopAsyncIteration:
+                    # if the task raised StopAsyncIteration, we're done iterating
+                    if buffer:
+                        yield buffer
+                    task = None
+                    break
+                else:
+                    # we got an item, add it to the buffer and set task to None to get the next item
+                    buffer.append(item)
+                    task = None
+                    # if this is the first item in the group, set the group start time
+                    if group_start_time is None:
+                        group_start_time = time.monotonic()
+            elif buffer:
+                # otherwise if the task timeout expired and we have items in the buffer, yield the buffer
+                yield buffer
+                # clear the buffer and reset the group start time ready for the next group
+                buffer = []
+                group_start_time = None
+
+    try:
+        yield async_iter_groups()
+    finally:  # pragma: no cover
+        # after iteration if a tasks still exists, cancel it, this will only happen if an error occurred
+        if task:
+            task.cancel('Cancelling due to error in iterator')
+            with suppress(asyncio.CancelledError):
+                await task
+
+class PeekableAsyncStream(Generic[T]):
+    """Wraps an async iterable of type T and allows peeking at the *next* item without consuming it.
+
+    We only buffer one item at a time (the next item). Once that item is yielded, it is discarded.
+    This is a single-pass stream.
+    """
+
+    def __init__(self, source: AsyncIterable[T]):
+        self._source = source
+        self._source_iter: AsyncIterator[T] | None = None
+        self._buffer: T | Unset = UNSET
+        self._exhausted = False
+
+    async def peek(self) -> T | Unset:
+        """Returns the next item that would be yielded without consuming it.
+
+        Returns None if the stream is exhausted.
+        """
+        if self._exhausted:
+            return UNSET
+
+        # If we already have a buffered item, just return it.
+        if not isinstance(self._buffer, Unset):
+            return self._buffer
+
+        # Otherwise, we need to fetch the next item from the underlying iterator.
+        if self._source_iter is None:
+            self._source_iter = aiter(self._source)
+
+        try:
+            self._buffer = await anext(self._source_iter)
+        except StopAsyncIteration:
+            self._exhausted = True
+            return UNSET
+
+        return self._buffer
+
+    async def is_exhausted(self) -> bool:
+        """Returns True if the stream is exhausted, False otherwise."""
+        return isinstance(await self.peek(), Unset)
+
+    def __aiter__(self) -> AsyncIterator[T]:
+        # For a single-pass iteration, we can return self as the iterator.
+        return self
+
+    async def __anext__(self) -> T:
+        """Yields the buffered item if present, otherwise fetches the next item from the underlying source.
+
+        Raises StopAsyncIteration if the stream is exhausted.
+        """
+        if self._exhausted:
+            raise StopAsyncIteration
+
+        # If we have a buffered item, yield it.
+        if not isinstance(self._buffer, Unset):
+            item = self._buffer
+            self._buffer = UNSET
+            return item
+
+        # Otherwise, fetch the next item from the source.
+        if self._source_iter is None:
+            self._source_iter = aiter(self._source)
+
+        try:
+            return await anext(self._source_iter)
+        except StopAsyncIteration:
+            self._exhausted = True
+            raise
+
+    async def peek(self) -> T | Unset:
+        """Returns the next item that would be yielded without consuming it.
+
+        Returns None if the stream is exhausted.
+        """
+        if self._exhausted:
+            return UNSET
+
+        # If we already have a buffered item, just return it.
+        if not isinstance(self._buffer, Unset):
+            return self._buffer
+
+        # Otherwise, we need to fetch the next item from the underlying iterator.
+        if self._source_iter is None:
+            self._source_iter = aiter(self._source)
+
+        try:
+            self._buffer = await anext(self._source_iter)
+        except StopAsyncIteration:
+            self._exhausted = True
+            return UNSET
+
+        return self._buffer
+
+    async def is_exhausted(self) -> bool:
+        """Returns True if the stream is exhausted, False otherwise."""
+        return isinstance(await self.peek(), Unset)
+
+def merge_json_schema_defs(schemas: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Merges the `$defs` from different JSON schemas into a single deduplicated `$defs`, handling name collisions of `$defs` that are not the same, and rewrites `$ref`s to point to the new `$defs`.
+
+    Returns a tuple of the rewritten schemas and a dictionary of the new `$defs`.
+    """
+    all_defs: dict[str, dict[str, Any]] = {}
+    rewritten_schemas: list[dict[str, Any]] = []
+
+    for schema in schemas:
+        if '$defs' not in schema:
+            rewritten_schemas.append(schema)
+            continue
+
+        schema = schema.copy()
+        defs = schema.pop('$defs', None)
+        schema_name_mapping: dict[str, str] = {}
+
+        # Process definitions and build mapping
+        for name, def_schema in defs.items():
+            if name not in all_defs:
+                all_defs[name] = def_schema
+                schema_name_mapping[name] = name
+            elif def_schema != all_defs[name]:
+                new_name = name
+                if title := schema.get('title'):
+                    new_name = f'{title}_{name}'
+
+                i = 1
+                original_new_name = new_name
+                new_name = f'{new_name}_{i}'
+                while new_name in all_defs:
+                    i += 1
+                    new_name = f'{original_new_name}_{i}'
+
+                all_defs[new_name] = def_schema
+                schema_name_mapping[name] = new_name
+
+        _update_mapped_json_schema_refs(schema, schema_name_mapping)
+        rewritten_schemas.append(schema)
+
+    return rewritten_schemas, all_defs
+
+def validate_empty_kwargs(_kwargs: dict[str, Any]) -> None:
+    """Validate that no unknown kwargs remain after processing.
+
+    Args:
+        _kwargs: Dictionary of remaining kwargs after specific ones have been processed.
+
+    Raises:
+        UserError: If any unknown kwargs remain.
+    """
+    if _kwargs:
+        unknown_kwargs = ', '.join(f'`{k}`' for k in _kwargs.keys())
+        raise exceptions.UserError(f'Unknown keyword arguments: {unknown_kwargs}')
+
+def strip_markdown_fences(text: str) -> str:
+    if text.startswith('{'):
+        return text
+
+    match = re.search(_MARKDOWN_FENCES_PATTERN, text)
+    if match:
+        return match.group(1)
+
+    return text
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+class AgentStream
+    ...  # (skeleton: full source omitted for budget)
+
+    async def stream_responses(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[_messages.ModelResponse]:
+        """Asynchronously stream the (unvalidated) model responses for the agent."""
+        # if the message currently has any parts with content, yield before streaming
+        msg = self.response
+        for part in msg.parts:
+            if part.has_content():
+                yield msg
+                break
+
+        async with _utils.group_by_temporal(self, debounce_by) as group_iter:
+            async for _items in group_iter:
+                yield self.response  # current state of the response
+
+    async def _stream_response_text(
+        self, *, delta: bool = False, debounce_by: float | None = 0.1
+    ) -> AsyncIterator[str]:
+        """Stream the response as an async iterable of text."""
+
+        # Define a "merged" version of the iterator that will yield items that have already been retrieved
+        # and items that we receive while streaming. We define a dedicated async iterator for this so we can
+        # pass the combined stream to the group_by_temporal function within `_stream_text_deltas` below.
+        async def _stream_text_deltas_ungrouped() -> AsyncIterator[tuple[str, int]]:
+            # yields tuples of (text_content, part_index)
+            # we don't currently make use of the part_index, but in principle this may be useful
+            # so we retain it here for now to make possible future refactors simpler
+            msg = self.response
+            for i, part in enumerate(msg.parts):
+                if isinstance(part, _messages.TextPart) and part.content:
+                    yield part.content, i
+
+            last_text_index: int | None = None
+            async for event in self._raw_stream_response:
+                if (
+                    isinstance(event, _messages.PartStartEvent)
+                    and isinstance(event.part, _messages.TextPart)
+                    and event.part.content
+                ):
+                    last_text_index = event.index
+                    yield event.part.content, event.index
+                elif (
+                    isinstance(event, _messages.PartDeltaEvent)
+                    and isinstance(event.delta, _messages.TextPartDelta)
+                    and event.delta.content_delta
+                ):
+                    last_text_index = event.index
+                    yield event.delta.content_delta, event.index
+                elif (
+                    isinstance(event, _messages.PartStartEvent)
+                    and isinstance(event.part, _messages.BuiltinToolCallPart)
+                    and last_text_index is not None
+                ):
+                    # Text parts that are interrupted by a built-in tool call should not be joined together directly
+                    yield '\n\n', event.index
+                    last_text_index = None
+
+        async def _stream_text_deltas() -> AsyncIterator[str]:
+            async with _utils.group_by_temporal(_stream_text_deltas_ungrouped(), debounce_by) as group_iter:
+                async for items in group_iter:
+                    # Note: we are currently just dropping the part index on the group here
+                    yield ''.join([content for content, _ in items])
+
+        if delta:
+            async for text in _stream_text_deltas():
+                yield text
+        else:
+            # a quick benchmark shows it's faster to build up a string with concat when we're
+            # yielding at each step
+            deltas: list[str] = []
+            async for text in _stream_text_deltas():
+                deltas.append(text)
+                yield ''.join(deltas)
+
+## pydantic_evals/pydantic_evals/evaluators/llm_as_a_judge.py
+
+async def judge_output_expected(
+    output: Any,
+    expected_output: Any,
+    rubric: str,
+    model: models.Model | models.KnownModelName | str | None = None,
+    model_settings: ModelSettings | None = None,
+) -> GradingOutput:
+    """Judge the output of a model based on the expected output, output, and a rubric.
+
+    If the model is not specified, a default model is used. The default model starts as 'openai:gpt-5.2',
+    but this can be changed using the `set_default_judge_model` function.
+    """
+    user_prompt = _build_prompt(output=output, rubric=rubric, expected_output=expected_output)
+    return (
+        await _judge_output_expected_agent.run(
+            user_prompt, model=model or _default_model, model_settings=model_settings
+        )
+    ).output
+
+## tests/conftest.py
+
+class TestEnv:
+    __test__ = False
+
+    def __init__(self):
+        self.envars: dict[str, str | None] = {}
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+    def reset(self) -> None:
+        for name, value in self.envars.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value  # pragma: lax no cover
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+## tests/evals/test_evaluator_common.py
+
+async def test_equals_expected():
+    """Test EqualsExpected evaluator."""
+    evaluator = EqualsExpected()
+
+    # Test with matching output and expected output
+    assert evaluator.evaluate(MockContext(output=42, expected_output=42)) is True
+
+    # Test with non-matching output and expected output
+    assert evaluator.evaluate(MockContext(output=42, expected_output=43)) is False
+
+    # Test with no expected output
+    assert evaluator.evaluate(MockContext(output=42, expected_output=None)) == {}
+
+## tests/models/mock_async_stream.py
+
+class MockAsyncStream(Generic[T]):
+    """Wraps a synchronous iterator in an asynchronous interface.
+
+    This class allows a synchronous iterator to be treated as an
+    asynchronous iterator, enabling iteration in `async for` loops
+    and usage within `async with` blocks.
+
+    Example usage:
+        async def example():
+            sync_iter = iter([1, 2, 3])
+            async_stream = MockAsyncStream(sync_iter)
+
+            async for item in async_stream:
+                print(item)
+
+            async with MockAsyncStream(sync_iter) as stream:
+                async for item in stream:
+                    print(item)
+    """
+
+    _iter: Iterator[T]
+    """The underlying synchronous iterator."""
+
+    async def __anext__(self) -> T:
+        """Return the next item from the synchronous iterator as if it were asynchronous.
+
+        Calls `_utils.sync_anext` to retrieve the next item from the underlying
+        synchronous iterator. If the iterator is exhausted, `StopAsyncIteration`
+        is raised.
+        """
+        next = _utils.sync_anext(self._iter)
+        raise_if_exception(next)
+        return next
+
+    def __aiter__(self) -> MockAsyncStream[T]:
+        return self
+
+    async def __aenter__(self) -> MockAsyncStream[T]:
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        pass
+
+## tests/test_examples.py
+
+def mock_group_by_temporal(aiter: Any, soft_max_interval: float | None) -> Any:
+    """Mock group_by_temporal to avoid debouncing, since the iterators above have no delay."""
+    return group_by_temporal(aiter, None)
+
+## tests/test_utils.py
+
+pytestmark = pytest.mark.anyio
+
+async def test_group_by_temporal(interval: float | None, expected: list[list[int]]):
+    async def yield_groups() -> AsyncIterator[int]:
+        yield 1
+        await asyncio.sleep(0.02)
+        yield 2
+        await asyncio.sleep(0.02)
+        yield 3
+        await asyncio.sleep(0.02)
+
+    async with group_by_temporal(yield_groups(), soft_max_interval=interval) as groups_iter:
+        groups: list[list[int]] = [g async for g in groups_iter]
+        assert groups == expected
+
+def test_check_object_json_schema():
+    object_schema = {'type': 'object', 'properties': {'a': {'type': 'string'}}}
+    assert check_object_json_schema(object_schema) == object_schema
+
+    assert check_object_json_schema(
+        {
+            '$defs': {
+                'JsonModel': {
+                    'properties': {
+                        'type': {'title': 'Type', 'type': 'string'},
+                        'items': {'anyOf': [{'type': 'string'}, {'type': 'null'}]},
+                    },
+                    'required': ['type', 'items'],
+                    'title': 'JsonModel',
+                    'type': 'object',
+                }
+            },
+            '$ref': '#/$defs/JsonModel',
+        }
+    ) == {
+        'properties': {
+            'items': {'anyOf': [{'type': 'string'}, {'type': 'null'}]},
+            'type': {'title': 'Type', 'type': 'string'},
+        },
+        'required': ['type', 'items'],
+        'title': 'JsonModel',
+        'type': 'object',
+    }
+
+    # Can't remove the recursive ref here:
+    assert check_object_json_schema(
+        {
+            '$defs': {
+                'JsonModel': {
+                    'properties': {
+                        'type': {'title': 'Type', 'type': 'string'},
+                        'items': {'anyOf': [{'$ref': '#/$defs/JsonModel'}, {'type': 'null'}]},
+                    },
+                    'required': ['type', 'items'],
+                    'title': 'JsonModel',
+                    'type': 'object',
+                }
+            },
+            '$ref': '#/$defs/JsonModel',
+        }
+    ) == {
+        '$defs': {
+            'JsonModel': {
+                'properties': {
+                    'items': {'anyOf': [{'$ref': '#/$defs/JsonModel'}, {'type': 'null'}]},
+                    'type': {'title': 'Type', 'type': 'string'},
+                },
+                'required': ['type', 'items'],
+                'title': 'JsonModel',
+                'type': 'object',
+            }
+        },
+        '$ref': '#/$defs/JsonModel',
+    }
+
+    array_schema = {'type': 'array', 'items': {'type': 'string'}}
+    with pytest.raises(UserError, match='^Schema must be an object$'):
+        check_object_json_schema(array_schema)
+
+async def test_peekable_async_stream(peek_first: bool):
+    async_stream = MockAsyncStream(iter([1, 2, 3]))
+    peekable_async_stream = PeekableAsyncStream(async_stream)
+
+    items: list[int] = []
+
+    # We need to both peek before starting the stream, and not, to achieve full coverage
+    if peek_first:
+        assert not await peekable_async_stream.is_exhausted()
+        assert await peekable_async_stream.peek() == 1
+
+    async for item in peekable_async_stream:
+        items.append(item)
+
+        # The next line is included mostly for the sake of achieving coverage
+        assert await peekable_async_stream.peek() == (item + 1 if item < 3 else UNSET)
+
+    assert await peekable_async_stream.is_exhausted()
+    assert await peekable_async_stream.peek() is UNSET
+    assert items == [1, 2, 3]
+
+def test_package_versions(capsys: pytest.CaptureFixture[str]):
+    if os.getenv('CI'):
+        with capsys.disabled():  # pragma: lax no cover
+            print('\npackage versions:')
+            packages = sorted((package.metadata['Name'], package.version) for package in distributions())
+            for name, version in packages:
+                print(f'{name:30} {version}')
+
+async def test_run_in_executor_with_contextvars() -> None:
+    ctx_var = contextvars.ContextVar('test_var', default='default')
+    ctx_var.set('original_value')
+
+    result = await run_in_executor(ctx_var.get)
+    assert result == ctx_var.get()
+
+    ctx_var.set('new_value')
+    result = await run_in_executor(ctx_var.get)
+    assert result == ctx_var.get()
+
+    # show that the old version did not work
+    old_result = asyncio.get_running_loop().run_in_executor(None, ctx_var.get)
+    assert old_result != ctx_var.get()
+
+async def test_run_in_executor_with_disable_threads() -> None:
+    from pydantic_ai._utils import disable_threads
+
+    calls: list[str] = []
+
+    def sync_func() -> str:
+        calls.append('called')
+        return 'result'
+
+    # Without disable_threads, should use threading
+    result = await run_in_executor(sync_func)
+    assert result == 'result'
+    assert calls == ['called']
+
+    # With disable_threads enabled, should execute directly
+    calls.clear()
+    with disable_threads():
+        result = await run_in_executor(sync_func)
+        assert result == 'result'
+        assert calls == ['called']
+
+def test_is_async_callable():
+    def sync_func(): ...  # pragma: no branch
+
+    assert is_async_callable(sync_func) is False
+
+    async def async_func(): ...  # pragma: no branch
+
+    assert is_async_callable(async_func) is True
+
+    class AsyncCallable:
+        async def __call__(self): ...  # pragma: no branch
+
+    partial_async_callable = functools.partial(AsyncCallable())
+    assert is_async_callable(partial_async_callable) is True
+
+def test_merge_json_schema_defs():
+    foo_bar_schema = {
+        '$defs': {
+            'Bar': {
+                'description': 'Bar description',
+                'properties': {'bar': {'type': 'string'}},
+                'required': ['bar'],
+                'title': 'Bar',
+                'type': 'object',
+            },
+            'Foo': {
+                'description': 'Foo description',
+                'properties': {'foo': {'type': 'string'}},
+                'required': ['foo'],
+                'title': 'Foo',
+                'type': 'object',
+            },
+        },
+        'properties': {'foo': {'$ref': '#/$defs/Foo'}, 'bar': {'$ref': '#/$defs/Bar'}},
+        'required': ['foo', 'bar'],
+        'type': 'object',
+        'title': 'FooBar',
+    }
+
+    foo_bar_baz_schema = {
+        '$defs': {
+            'Baz': {
+                'description': 'Baz description',
+                'properties': {'baz': {'type': 'string'}},
+                'required': ['baz'],
+                'title': 'Baz',
+                'type': 'object',
+            },
+            'Foo': {
+                'description': 'Foo description. Note that this is different from the Foo in foo_bar_schema!',
+                'properties': {'foo': {'type': 'int'}},
+                'required': ['foo'],
+                'title': 'Foo',
+                'type': 'object',
+            },
+            'Bar': {
+                'description': 'Bar description',
+                'properties': {'bar': {'type': 'string'}},
+                'required': ['bar'],
+                'title': 'Bar',
+                'type': 'object',
+            },
+        },
+        'properties': {'foo': {'$ref': '#/$defs/Foo'}, 'baz': {'$ref': '#/$defs/Baz'}, 'bar': {'$ref': '#/$defs/Bar'}},
+        'required': ['foo', 'baz', 'bar'],
+        'type': 'object',
+        'title': 'FooBarBaz',
+    }
+
+    # A schema with no title that will cause numeric suffixes
+    no_title_schema = {
+        '$defs': {
+            'Foo': {
+                'description': 'Another different Foo',
+                'properties': {'foo': {'type': 'boolean'}},
+                'required': ['foo'],
+                'title': 'Foo',
+                'type': 'object',
+            },
+            'Bar': {
+                'description': 'Another different Bar',
+                'properties': {'bar': {'type': 'number'}},
+                'required': ['bar'],
+                'title': 'Bar',
+                'type': 'object',
+            },
+        },
+        'properties': {'foo': {'$ref': '#/$defs/Foo'}, 'bar': {'$ref': '#/$defs/Bar'}},
+        'required': ['foo', 'bar'],
+        'type': 'object',
+    }
+
+    # Another schema with no title that will cause more numeric suffixes
+    another_no_title_schema = {
+        '$defs': {
+            'Foo': {
+                'description': 'Yet another different Foo',
+                'properties': {'foo': {'type': 'array'}},
+                'required': ['foo'],
+                'title': 'Foo',
+                'type': 'object',
+            },
+            'Bar': {
+                'description': 'Yet another different Bar',
+                'properties': {'bar': {'type': 'object'}},
+                'required': ['bar'],
+                'title': 'Bar',
+                'type': 'object',
+            },
+        },
+        'properties': {'foo': {'$ref': '#/$defs/Foo'}, 'bar': {'$ref': '#/$defs/Bar'}},
+        'required': ['foo', 'bar'],
+        'type': 'object',
+    }
+
+    # Schema with nested properties, array items, prefixItems, and anyOf/oneOf
+    complex_schema = {
+        '$defs': {
+            'Nested': {
+                'description': 'A nested type',
+                'properties': {'nested': {'type': 'string'}},
+                'required': ['nested'],
+                'title': 'Nested',
+                'type': 'object',
+            },
+            'ArrayItem': {
+                'description': 'An array item type',
+                'properties': {'item': {'type': 'string'}},
+                'required': ['item'],
+                'title': 'ArrayItem',
+                'type': 'object',
+            },
+            'UnionType': {
+                'description': 'A union type',
+                'properties': {'union': {'type': 'string'}},
+                'required': ['union'],
+                'title': 'UnionType',
+                'type': 'object',
+            },
+        },
+        'properties': {
+            'nested_props': {
+                'type': 'object',
+                'properties': {
+                    'deep_nested': {'$ref': '#/$defs/Nested'},
+                },
+            },
+            'array_with_items': {
+                'type': 'array',
+                'items': {'$ref': '#/$defs/ArrayItem'},
+            },
+            'array_with_prefix': {
+                'type': 'array',
+                'prefixItems': [
+                    {'$ref': '#/$defs/ArrayItem'},
+                    {'$ref': '#/$defs/Nested'},
+                ],
+            },
+            'union_anyOf': {
+                'anyOf': [
+                    {'$ref': '#/$defs/UnionType'},
+                    {'$ref': '#/$defs/Nested'},
+                ],
+            },
+            'union_oneOf': {
+                'oneOf': [
+                    {'$ref': '#/$defs/UnionType'},
+                    {'$ref': '#/$defs/ArrayItem'},
+                ],
+            },
+        },
+        'type': 'object',
+        'title': 'ComplexSchema',
+    }
+
+    schemas = [foo_bar_schema, foo_bar_baz_schema, no_title_schema, another_no_title_schema, complex_schema]
+    rewritten_schemas, all_defs = merge_json_schema_defs(schemas)
+    assert all_defs == snapshot(
+        {
+            'Bar': {
+                'description': 'Bar description',
+                'properties': {'bar': {'type': 'string'}},
+                'required': ['bar'],
+                'title': 'Bar',
+                'type': 'object',
+            },
+            'Foo': {
+                'description': 'Foo description',
+                'properties': {'foo': {'type': 'string'}},
+                'required': ['foo'],
+                'title': 'Foo',
+                'type': 'object',
+            },
+            'Baz': {
+                'description': 'Baz description',
+                'properties': {'baz': {'type': 'string'}},
+                'required': ['baz'],
+                'title': 'Baz',
+                'type': 'object',
+            },
+            'FooBarBaz_Foo_1': {
+                'description': 'Foo description. Note that this is different from the Foo in foo_bar_schema!',
+                'properties': {'foo': {'type': 'int'}},
+                'required': ['foo'],
+                'title': 'Foo',
+                'type': 'object',
+            },
+            'Foo_1': {
+                'description': 'Another different Foo',
+                'properties': {'foo': {'type': 'boolean'}},
+                'required': ['foo'],
+                'title': 'Foo',
+                'type': 'object',
+            },
+            'Bar_1': {
+                'description': 'Another different Bar',
+                'properties': {'bar': {'type': 'number'}},
+                'required': ['bar'],
+                'title': 'Bar',
+                'type': 'object',
+            },
+            'Foo_2': {
+                'description': 'Yet another different Foo',
+                'properties': {'foo': {'type': 'array'}},
+                'required': ['foo'],
+                'title': 'Foo',
+                'type': 'object',
+            },
+            'Bar_2': {
+                'description': 'Yet another different Bar',
+                'properties': {'bar': {'type': 'object'}},
+                'required': ['bar'],
+                'title': 'Bar',
+                'type': 'object',
+            },
+            'Nested': {
+                'description': 'A nested type',
+                'properties': {'nested': {'type': 'string'}},
+                'required': ['nested'],
+                'title': 'Nested',
+                'type': 'object',
+            },
+            'ArrayItem': {
+                'description': 'An array item type',
+                'properties': {'item': {'type': 'string'}},
+                'required': ['item'],
+                'title': 'ArrayItem',
+                'type': 'object',
+            },
+            'UnionType': {
+                'description': 'A union type',
+                'properties': {'union': {'type': 'string'}},
+                'required': ['union'],
+                'title': 'UnionType',
+                'type': 'object',
+            },
+        }
+    )
+    assert rewritten_schemas == snapshot(
+        [
+            {
+                'properties': {'foo': {'$ref': '#/$defs/Foo'}, 'bar': {'$ref': '#/$defs/Bar'}},
+                'required': ['foo', 'bar'],
+                'type': 'object',
+                'title': 'FooBar',
+            },
+            {
+                'properties': {
+                    'foo': {'$ref': '#/$defs/FooBarBaz_Foo_1'},
+                    'baz': {'$ref': '#/$defs/Baz'},
+                    'bar': {'$ref': '#/$defs/Bar'},
+                },
+                'required': ['foo', 'baz', 'bar'],
+                'type': 'object',
+                'title': 'FooBarBaz',
+            },
+            {
+                'properties': {'foo': {'$ref': '#/$defs/Foo_1'}, 'bar': {'$ref': '#/$defs/Bar_1'}},
+                'required': ['foo', 'bar'],
+                'type': 'object',
+            },
+            {
+                'properties': {'foo': {'$ref': '#/$defs/Foo_2'}, 'bar': {'$ref': '#/$defs/Bar_2'}},
+                'required': ['foo', 'bar'],
+                'type': 'object',
+            },
+            {
+                'properties': {
+                    'nested_props': {
+                        'type': 'object',
+                        'properties': {
+                            'deep_nested': {'$ref': '#/$defs/Nested'},
+                        },
+                    },
+                    'array_with_items': {
+                        'type': 'array',
+                        'items': {'$ref': '#/$defs/ArrayItem'},
+                    },
+                    'array_with_prefix': {
+                        'type': 'array',
+                        'prefixItems': [
+                            {'$ref': '#/$defs/ArrayItem'},
+                            {'$ref': '#/$defs/Nested'},
+                        ],
+                    },
+                    'union_anyOf': {
+                        'anyOf': [
+                            {'$ref': '#/$defs/UnionType'},
+                            {'$ref': '#/$defs/Nested'},
+                        ],
+                    },
+                    'union_oneOf': {
+                        'oneOf': [
+                            {'$ref': '#/$defs/UnionType'},
+                            {'$ref': '#/$defs/ArrayItem'},
+                        ],
+                    },
+                },
+                'type': 'object',
+                'title': 'ComplexSchema',
+            },
+        ]
+    )
+
+def test_strip_markdown_fences():
+    assert strip_markdown_fences('{"foo": "bar"}') == '{"foo": "bar"}'
+    assert strip_markdown_fences('```json\n{"foo": "bar"}\n```') == '{"foo": "bar"}'
+    assert strip_markdown_fences('```json\n{\n  "foo": "bar"\n}') == '{\n  "foo": "bar"\n}'
+    assert (
+        strip_markdown_fences('{"foo": "```json\\n{"foo": "bar"}\\n```"}')
+        == '{"foo": "```json\\n{"foo": "bar"}\\n```"}'
+    )
+    assert (
+        strip_markdown_fences('Here is some beautiful JSON:\n\n```\n{"foo": "bar"}\n``` Nice right?')
+        == '{"foo": "bar"}'
+    )
+    assert strip_markdown_fences('No JSON to be found') == 'No JSON to be found'
+
+def test_validate_empty_kwargs_empty():
+    """Test that empty dict passes validation."""
+    validate_empty_kwargs({})
+
+def test_validate_empty_kwargs_with_unknown():
+    """Test that unknown kwargs raise UserError."""
+    with pytest.raises(UserError, match='Unknown keyword arguments: `unknown_arg`'):
+        validate_empty_kwargs({'unknown_arg': 'value'})
+
+def test_validate_empty_kwargs_multiple_unknown():
+    """Test that multiple unknown kwargs are properly formatted."""
+    with pytest.raises(UserError, match='Unknown keyword arguments: `arg1`, `arg2`'):
+        validate_empty_kwargs({'arg1': 'value1', 'arg2': 'value2'})
+
+def test_validate_empty_kwargs_message_format():
+    """Test that the error message format matches expected pattern."""
+    with pytest.raises(UserError) as exc_info:
+        validate_empty_kwargs({'test_arg': 'test_value'})
+
+    assert 'Unknown keyword arguments: `test_arg`' in str(exc_info.value)
+
+def test_validate_empty_kwargs_preserves_order():
+    """Test that multiple kwargs preserve order in error message."""
+    kwargs = {'first': '1', 'second': '2', 'third': '3'}
+    with pytest.raises(UserError) as exc_info:
+        validate_empty_kwargs(kwargs)
+
+    error_msg = str(exc_info.value)
+    assert '`first`' in error_msg
+    assert '`second`' in error_msg
+    assert '`third`' in error_msg

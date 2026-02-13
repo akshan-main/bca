@@ -1,0 +1,427 @@
+## examples/pydantic_ai_examples/ag_ui/api/predictive_state_updates.py
+
+async def document_predict_state() -> list[CustomEvent]:
+    """Enable document state prediction.
+
+    Returns:
+        CustomEvent containing the event to enable state prediction.
+    """
+    return [
+        CustomEvent(
+            type=EventType.CUSTOM,
+            name='PredictState',
+            value=[
+                {
+                    'state_key': 'document',
+                    'tool': 'write_document',
+                    'tool_argument': 'document',
+                },
+            ],
+        ),
+    ]
+
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/_cli/__init__.py
+
+    def __init__(self, special_suggestions: list[str] | None = None):
+        super().__init__()
+        self.special_suggestions = special_suggestions or []
+
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+def is_cloud_metadata_ip(ip_str: str) -> bool:
+    """Check if an IP address is a cloud metadata endpoint.
+
+    These are always blocked for security reasons, even with allow_local=True.
+    """
+    return ip_str in _CLOUD_METADATA_IPS
+
+def build_url_with_ip(resolved: ResolvedUrl) -> str:
+    """Build a URL using a resolved IP address instead of the hostname.
+
+    For IPv6 addresses, wraps them in brackets as required by URL syntax.
+    """
+    scheme = 'https' if resolved.is_https else 'http'
+    default_port = 443 if resolved.is_https else 80
+
+    # IPv6 addresses need brackets in URLs
+    try:
+        ip_obj = ipaddress.ip_address(resolved.resolved_ip)
+        if isinstance(ip_obj, ipaddress.IPv6Address):
+            host_part = f'[{resolved.resolved_ip}]'
+        else:
+            host_part = resolved.resolved_ip
+    except ValueError:
+        host_part = resolved.resolved_ip
+
+    # Only include port if non-default
+    if resolved.port != default_port:
+        host_part = f'{host_part}:{resolved.port}'
+
+    return urlunparse((scheme, host_part, resolved.path, '', '', ''))
+
+def resolve_redirect_url(current_url: str, location: str) -> str:
+    """Resolve a redirect location against the current URL.
+
+    Args:
+        current_url: The URL that returned the redirect.
+        location: The Location header value (absolute or relative).
+
+    Returns:
+        The absolute URL to follow.
+    """
+    parsed_location = urlparse(location)
+
+    # Check if it's an absolute URL (has scheme) or protocol-relative URL (has netloc but no scheme)
+    if parsed_location.scheme:
+        return location
+    if parsed_location.netloc:
+        # Protocol-relative URL (e.g., "//example.com/path") - use current scheme
+        parsed_current = urlparse(current_url)
+        return urlunparse(
+            (
+                parsed_current.scheme,
+                parsed_location.netloc,
+                parsed_location.path,
+                '',
+                parsed_location.query,
+                parsed_location.fragment,
+            )
+        )
+
+    # Relative URL - resolve against current URL
+    parsed_current = urlparse(current_url)
+    if location.startswith('/'):
+        # Absolute path
+        return urlunparse((parsed_current.scheme, parsed_current.netloc, location, '', '', ''))
+    else:
+        # Relative path
+        base_path = parsed_current.path.rsplit('/', 1)[0]
+        return urlunparse((parsed_current.scheme, parsed_current.netloc, f'{base_path}/{location}', '', '', ''))
+
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+## pydantic_ai_slim/pydantic_ai/direct.py
+
+    def __iter__(self) -> Iterator[messages.ModelResponseStreamEvent]:
+        """Stream the response as an iterable of [`ModelResponseStreamEvent`][pydantic_ai.messages.ModelResponseStreamEvent]s."""
+        self._check_context_manager_usage()
+
+        while True:
+            item = self._queue.get()
+            if item is None:  # End of stream
+                break
+            elif isinstance(item, Exception):
+                raise item
+            else:
+                yield item
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        task_config: TaskConfig,
+        event_stream_handler: EventStreamHandler[Any] | None = None,
+    ):
+        super().__init__(model)
+        self.task_config = default_task_config | (task_config or {})
+        self.event_stream_handler = event_stream_handler
+
+        @task
+        async def wrapped_request(
+            messages: list[ModelMessage],
+            model_settings: ModelSettings | None,
+            model_request_parameters: ModelRequestParameters,
+        ) -> ModelResponse:
+            response = await super(PrefectModel, self).request(messages, model_settings, model_request_parameters)
+            return response
+
+        self._wrapped_request = wrapped_request
+
+        @task
+        async def request_stream_task(
+            messages: list[ModelMessage],
+            model_settings: ModelSettings | None,
+            model_request_parameters: ModelRequestParameters,
+            ctx: RunContext[Any] | None,
+        ) -> ModelResponse:
+            async with super(PrefectModel, self).request_stream(
+                messages, model_settings, model_request_parameters, ctx
+            ) as streamed_response:
+                if self.event_stream_handler is not None:
+                    assert ctx is not None, (
+                        'A Prefect model cannot be used with `pydantic_ai.direct.model_request_stream()` as it requires a `run_context`. '
+                        'Set an `event_stream_handler` on the agent and use `agent.run()` instead.'
+                    )
+                    await self.event_stream_handler(ctx, streamed_response)
+
+                # Consume the entire stream
+                async for _ in streamed_response:
+                    pass
+            response = streamed_response.get()
+            return response
+
+        self._wrapped_request_stream = request_stream_task
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py
+
+class _EventStreamHandlerParams:
+    event: _messages.AgentStreamEvent
+    serialized_run_context: Any
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def __aiter__(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        """Stream the response as an async iterable of [`ModelResponseStreamEvent`][pydantic_ai.messages.ModelResponseStreamEvent]s.
+
+        This proxies the `_event_iterator()` and emits all events, while also checking for matches
+        on the result schema and emitting a [`FinalResultEvent`][pydantic_ai.messages.FinalResultEvent] if/when the
+        first match is found.
+        """
+        if self._event_iterator is None:
+
+            async def iterator_with_final_event(
+                iterator: AsyncIterator[ModelResponseStreamEvent],
+            ) -> AsyncIterator[ModelResponseStreamEvent]:
+                async for event in iterator:
+                    yield event
+                    if (
+                        final_result_event := _get_final_result_event(event, self.model_request_parameters)
+                    ) is not None:
+                        self.final_result_event = final_result_event
+                        yield final_result_event
+                        break
+
+                # If we broke out of the above loop, we need to yield the rest of the events
+                # If we didn't, this will just be a no-op
+                async for event in iterator:
+                    yield event
+
+            async def iterator_with_part_end(
+                iterator: AsyncIterator[ModelResponseStreamEvent],
+            ) -> AsyncIterator[ModelResponseStreamEvent]:
+                last_start_event: PartStartEvent | None = None
+
+                def part_end_event(next_part: ModelResponsePart | None = None) -> PartEndEvent | None:
+                    if not last_start_event:
+                        return None
+
+                    index = last_start_event.index
+                    part = self._parts_manager.get_parts()[index]
+                    if not isinstance(part, TextPart | ThinkingPart | BaseToolCallPart):
+                        # Parts other than these 3 don't have deltas, so don't need an end part.
+                        return None
+
+                    return PartEndEvent(
+                        index=index,
+                        part=part,
+                        next_part_kind=next_part.part_kind if next_part else None,
+                    )
+
+                async for event in iterator:
+                    if isinstance(event, PartStartEvent):
+                        if last_start_event:
+                            end_event = part_end_event(event.part)
+                            if end_event:
+                                yield end_event
+
+                            event.previous_part_kind = last_start_event.part.part_kind
+                        last_start_event = event
+
+                    yield event
+
+                end_event = part_end_event()
+                if end_event:
+                    yield end_event
+
+            self._event_iterator = iterator_with_part_end(iterator_with_final_event(self._get_event_iterator()))
+        return self._event_iterator
+
+def _get_final_result_event(e: ModelResponseStreamEvent, params: ModelRequestParameters) -> FinalResultEvent | None:
+    """Return an appropriate FinalResultEvent if `e` corresponds to a part that will produce a final result."""
+    if isinstance(e, PartStartEvent):
+        new_part = e.part
+        if (isinstance(new_part, TextPart) and params.allow_text_output) or (
+            isinstance(new_part, FilePart) and params.allow_image_output and isinstance(new_part.content, BinaryImage)
+        ):
+            return FinalResultEvent(tool_name=None, tool_call_id=None)
+        elif isinstance(new_part, ToolCallPart) and (tool_def := params.tool_defs.get(new_part.tool_name)):
+            if tool_def.kind == 'output':
+                return FinalResultEvent(tool_name=new_part.tool_name, tool_call_id=new_part.tool_call_id)
+            elif tool_def.defer:
+                return FinalResultEvent(tool_name=None, tool_call_id=None)
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def __aiter__(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        """Stream [`ModelResponseStreamEvent`][pydantic_ai.messages.ModelResponseStreamEvent]s."""
+        if self._agent_stream_iterator is None:
+            self._agent_stream_iterator = _get_usage_checking_stream_response(
+                self._raw_stream_response, self._usage_limits, self.usage
+            )
+
+        return self._agent_stream_iterator
+
+def _get_usage_checking_stream_response(
+    stream_response: models.StreamedResponse,
+    limits: UsageLimits | None,
+    get_usage: Callable[[], RunUsage],
+) -> AsyncIterator[ModelResponseStreamEvent]:
+    if limits is not None and limits.has_token_limits():
+
+        async def _usage_checking_iterator():
+            async for item in stream_response:
+                limits.check_tokens(get_usage())
+                yield item
+
+        return _usage_checking_iterator()
+    else:
+        return aiter(stream_response)
+
+## pydantic_ai_slim/pydantic_ai/ui/_adapter.py
+
+    def transform_stream(
+        self,
+        stream: AsyncIterator[NativeEvent],
+        on_complete: OnCompleteFunc[EventT] | None = None,
+    ) -> AsyncIterator[EventT]:
+        """Transform a stream of Pydantic AI events into protocol-specific events.
+
+        Args:
+            stream: The stream of Pydantic AI events to transform.
+            on_complete: Optional callback function called when the agent run completes successfully.
+                The callback receives the completed [`AgentRunResult`][pydantic_ai.agent.AgentRunResult] and can optionally yield additional protocol-specific events.
+        """
+        return self.build_event_stream().transform_stream(stream, on_complete=on_complete)
+
+## pydantic_evals/pydantic_evals/_utils.py
+
+def get_event_loop():
+    try:
+        event_loop = asyncio.get_event_loop()
+    except RuntimeError:  # pragma: lax no cover
+        event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(event_loop)
+    return event_loop
+
+## tests/models/test_instrumented.py
+
+def test_deprecated_event_mode_warning():
+    with pytest.warns(
+        UserWarning,
+        match='event_mode is only relevant for version=1 which is deprecated and will be removed in a future release',
+    ):
+        settings = InstrumentationSettings(event_mode='logs')
+    assert settings.event_mode == 'logs'
+    assert settings.version == 1
+    assert InstrumentationSettings().version == 2
+
+## tests/test_ag_ui.py
+
+async def send_snapshot() -> StateSnapshotEvent:
+    """Display the recipe to the user.
+
+    Returns:
+        StateSnapshotEvent.
+    """
+    return StateSnapshotEvent(
+        type=EventType.STATE_SNAPSHOT,
+        snapshot={'key': 'value'},
+    )

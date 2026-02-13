@@ -1,0 +1,495 @@
+## httpx/_auth.py
+
+    def __init__(self, func: typing.Callable[[Request], Request]) -> None:
+        self._func = func
+
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
+## httpx/_client.py
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+## httpx/_content.py
+
+    def __init__(self, stream: bytes) -> None:
+        self._stream = stream
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self._stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._stream
+
+## httpx/_decoders.py
+
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def decode(self, data: bytes) -> str:
+        return self.decoder.decode(data)
+
+    def flush(self) -> str:
+        return self.decoder.decode(b"", True)
+
+## httpx/_exceptions.py
+
+class TransportError(RequestError):
+    """
+    Base class for all exceptions that occur at the level of the Transport API.
+    """
+
+class TimeoutException(TransportError):
+    """
+    The base class for timeout errors.
+
+    An operation has timed out.
+    """
+
+class ReadTimeout(TimeoutException):
+    """
+    Timed out while receiving data from the host.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+## httpx/_models.py
+
+    def encoding(self, value: str) -> None:
+        self._encoding = value
+
+    def keys(self) -> typing.KeysView[str]:
+        return {key.decode(self.encoding): None for _, key, value in self._list}.keys()
+
+    def copy(self) -> Headers:
+        return Headers(self, encoding=self.encoding)
+
+    def __iter__(self) -> typing.Iterator[typing.Any]:
+        return iter(self.keys())
+
+    def __setitem__(self, name: str, value: str) -> None:
+        return self.set(name, value)
+
+## httpx/_transports/asgi.py
+
+class ASGIResponseStream(AsyncByteStream):
+    def __init__(self, body: list[bytes]) -> None:
+        self._body = body
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        yield b"".join(self._body)
+
+    def __init__(self, body: list[bytes]) -> None:
+        self._body = body
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        yield b"".join(self._body)
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, AsyncByteStream)
+
+        # ASGI scope.
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": request.method,
+            "headers": [(k.lower(), v) for (k, v) in request.headers.raw],
+            "scheme": request.url.scheme,
+            "path": request.url.path,
+            "raw_path": request.url.raw_path.split(b"?")[0],
+            "query_string": request.url.query,
+            "server": (request.url.host, request.url.port),
+            "client": self.client,
+            "root_path": self.root_path,
+        }
+
+        # Request.
+        request_body_chunks = request.stream.__aiter__()
+        request_complete = False
+
+        # Response.
+        status_code = None
+        response_headers = None
+        body_parts = []
+        response_started = False
+        response_complete = create_event()
+
+        # ASGI callables.
+
+        async def receive() -> dict[str, typing.Any]:
+            nonlocal request_complete
+
+            if request_complete:
+                await response_complete.wait()
+                return {"type": "http.disconnect"}
+
+            try:
+                body = await request_body_chunks.__anext__()
+            except StopAsyncIteration:
+                request_complete = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.request", "body": body, "more_body": True}
+
+        async def send(message: typing.MutableMapping[str, typing.Any]) -> None:
+            nonlocal status_code, response_headers, response_started
+
+            if message["type"] == "http.response.start":
+                assert not response_started
+
+                status_code = message["status"]
+                response_headers = message.get("headers", [])
+                response_started = True
+
+            elif message["type"] == "http.response.body":
+                assert not response_complete.is_set()
+                body = message.get("body", b"")
+                more_body = message.get("more_body", False)
+
+                if body and request.method != "HEAD":
+                    body_parts.append(body)
+
+                if not more_body:
+                    response_complete.set()
+
+        try:
+            await self.app(scope, receive, send)
+        except Exception:  # noqa: PIE-786
+            if self.raise_app_exceptions:
+                raise
+
+            response_complete.set()
+            if status_code is None:
+                status_code = 500
+            if response_headers is None:
+                response_headers = {}
+
+        assert response_complete.is_set()
+        assert status_code is not None
+        assert response_headers is not None
+
+        stream = ASGIResponseStream(body_parts)
+
+        return Response(status_code, headers=response_headers, stream=stream)
+
+## httpx/_transports/base.py
+
+    async def __aenter__(self: A) -> A:
+        return self
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        raise NotImplementedError(
+            "The 'handle_async_request' method must be implemented."
+        )  # pragma: no cover
+
+    async def aclose(self) -> None:
+        pass
+
+## httpx/_transports/default.py
+
+def map_httpcore_exceptions() -> typing.Iterator[None]:
+    global HTTPCORE_EXC_MAP
+    if len(HTTPCORE_EXC_MAP) == 0:
+        HTTPCORE_EXC_MAP = _load_httpcore_exceptions()
+    try:
+        yield
+    except Exception as exc:
+        mapped_exc = None
+
+        for from_exc, to_exc in HTTPCORE_EXC_MAP.items():
+            if not isinstance(exc, from_exc):
+                continue
+            # We want to map to the most specific exception we can find.
+            # Eg if `exc` is an `httpcore.ReadTimeout`, we want to map to
+            # `httpx.ReadTimeout`, not just `httpx.TimeoutException`.
+            if mapped_exc is None or issubclass(to_exc, mapped_exc):
+                mapped_exc = to_exc
+
+        if mapped_exc is None:  # pragma: no cover
+            raise
+
+        message = str(exc)
+        raise mapped_exc(message) from exc
+
+    def __init__(self, httpcore_stream: typing.Iterable[bytes]) -> None:
+        self._httpcore_stream = httpcore_stream
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        with map_httpcore_exceptions():
+            for part in self._httpcore_stream:
+                yield part
+
+    def close(self) -> None:
+        if hasattr(self._httpcore_stream, "close"):
+            self._httpcore_stream.close()
+
+    def __enter__(self: T) -> T:  # Use generics for subclass support.
+        self._pool.__enter__()
+        return self
+
+    def handle_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, SyncByteStream)
+        import httpcore
+
+        req = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        )
+        with map_httpcore_exceptions():
+            resp = self._pool.handle_request(req)
+
+        assert isinstance(resp.stream, typing.Iterable)
+
+        return Response(
+            status_code=resp.status,
+            headers=resp.headers,
+            stream=ResponseStream(resp.stream),
+            extensions=resp.extensions,
+        )
+
+    def close(self) -> None:
+        self._pool.close()
+
+    def __init__(self, httpcore_stream: typing.AsyncIterable[bytes]) -> None:
+        self._httpcore_stream = httpcore_stream
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        with map_httpcore_exceptions():
+            async for part in self._httpcore_stream:
+                yield part
+
+    async def aclose(self) -> None:
+        if hasattr(self._httpcore_stream, "aclose"):
+            await self._httpcore_stream.aclose()
+
+## httpx/_transports/mock.py
+
+    def __init__(self, handler: SyncHandler | AsyncHandler) -> None:
+        self.handler = handler
+
+    def handle_request(
+        self,
+        request: Request,
+    ) -> Response:
+        request.read()
+        response = self.handler(request)
+        if not isinstance(response, Response):  # pragma: no cover
+            raise TypeError("Cannot use an async handler in a sync Client")
+        return response
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        await request.aread()
+        response = self.handler(request)
+
+        # Allow handler to *optionally* be an `async` function.
+        # If it is, then the `response` variable need to be awaited to actually
+        # return the result.
+
+        if not isinstance(response, Response):
+            response = await response
+
+        return response
+
+## httpx/_transports/wsgi.py
+
+    def __init__(self, result: typing.Iterable[bytes]) -> None:
+        self._close = getattr(result, "close", None)
+        self._result = _skip_leading_empty_chunks(result)
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        for part in self._result:
+            yield part
+
+    def close(self) -> None:
+        if self._close is not None:
+            self._close()
+
+    def handle_request(self, request: Request) -> Response:
+        request.read()
+        wsgi_input = io.BytesIO(request.content)
+
+        port = request.url.port or {"http": 80, "https": 443}[request.url.scheme]
+        environ = {
+            "wsgi.version": (1, 0),
+            "wsgi.url_scheme": request.url.scheme,
+            "wsgi.input": wsgi_input,
+            "wsgi.errors": self.wsgi_errors or sys.stderr,
+            "wsgi.multithread": True,
+            "wsgi.multiprocess": False,
+            "wsgi.run_once": False,
+            "REQUEST_METHOD": request.method,
+            "SCRIPT_NAME": self.script_name,
+            "PATH_INFO": request.url.path,
+            "QUERY_STRING": request.url.query.decode("ascii"),
+            "SERVER_NAME": request.url.host,
+            "SERVER_PORT": str(port),
+            "SERVER_PROTOCOL": "HTTP/1.1",
+            "REMOTE_ADDR": self.remote_addr,
+        }
+        for header_key, header_value in request.headers.raw:
+            key = header_key.decode("ascii").upper().replace("-", "_")
+            if key not in ("CONTENT_TYPE", "CONTENT_LENGTH"):
+                key = "HTTP_" + key
+            environ[key] = header_value.decode("ascii")
+
+        seen_status = None
+        seen_response_headers = None
+        seen_exc_info = None
+
+        def start_response(
+            status: str,
+            response_headers: list[tuple[str, str]],
+            exc_info: OptExcInfo | None = None,
+        ) -> typing.Callable[[bytes], typing.Any]:
+            nonlocal seen_status, seen_response_headers, seen_exc_info
+            seen_status = status
+            seen_response_headers = response_headers
+            seen_exc_info = exc_info
+            return lambda _: None
+
+        result = self.app(environ, start_response)
+
+        stream = WSGIByteStream(result)
+
+        assert seen_status is not None
+        assert seen_response_headers is not None
+        if seen_exc_info and seen_exc_info[0] and self.raise_app_exceptions:
+            raise seen_exc_info[1]
+
+        status_code = int(seen_status.split()[0])
+        headers = [
+            (key.encode("ascii"), value.encode("ascii"))
+            for key, value in seen_response_headers
+        ]
+
+        return Response(status_code, headers=headers, stream=stream)
+
+## httpx/_urlparse.py
+
+def PERCENT(string: str) -> str:
+    return "".join([f"%{byte:02X}" for byte in string.encode("utf-8")])
+
+## tests/client/test_client.py
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+## tests/client/test_headers.py
+
+def echo_repeated_headers_items(request: httpx.Request) -> httpx.Response:
+    data = {"headers": list(request.headers.items())}
+    return httpx.Response(200, json=data)
+
+def test_header_does_not_exist():
+    headers = httpx.Headers({"foo": "bar"})
+    with pytest.raises(KeyError):
+        del headers["baz"]
+
+## tests/client/test_redirects.py
+
+def test_invalid_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.RemoteProtocolError):
+        client.get("http://example.org/invalid_redirect", follow_redirects=True)
+
+def test_redirect_loop():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get("https://example.org/redirect_loop", follow_redirects=True)
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.SyncByteStream)
+        list(request.stream)
+        return self.handler(request)  # type: ignore[return-value]
+
+## tests/models/test_responses.py
+
+def streaming_body() -> typing.Iterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+async def async_streaming_body() -> typing.AsyncIterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+def test_decode_error_with_request(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    broken_compressed_body = b"xxxxxxxxxxxxxx"
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(
+            200,
+            headers=headers,
+            content=broken_compressed_body,
+        )
+
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(
+            200,
+            headers=headers,
+            content=broken_compressed_body,
+            request=httpx.Request("GET", "https://www.example.org/"),
+        )
+
+## tests/test_api.py
+
+def test_get_invalid_url():
+    with pytest.raises(httpx.UnsupportedProtocol):
+        httpx.get("invalid://example.org")
+
+## tests/test_exceptions.py
+
+def test_request_attribute() -> None:
+    # Exception without request attribute
+    exc = httpx.ReadTimeout("Read operation timed out")
+    with pytest.raises(RuntimeError):
+        exc.request  # noqa: B018
+
+    # Exception with request attribute
+    request = httpx.Request("GET", "https://www.example.com")
+    exc = httpx.ReadTimeout("Read operation timed out", request=request)
+    assert exc.request == request
+
+## tests/test_main.py
+
+def splitlines(output: str) -> typing.Iterable[str]:
+    return [line.strip() for line in output.splitlines()]
+
+def remove_date_header(lines: typing.Iterable[str]) -> typing.Iterable[str]:
+    return [line for line in lines if not line.startswith("date:")]

@@ -1,0 +1,244 @@
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+## httpx/_decoders.py
+
+class ContentDecoder:
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+class IdentityDecoder(ContentDecoder):
+    """
+    Handle unencoded data.
+    """
+
+    def decode(self, data: bytes) -> bytes:
+        return data
+
+    def flush(self) -> bytes:
+        return b""
+
+    def decode(self, data: bytes) -> bytes:
+        return data
+
+    def flush(self) -> bytes:
+        return b""
+
+    def decode(self, data: bytes) -> bytes:
+        was_first_attempt = self.first_attempt
+        self.first_attempt = False
+        try:
+            return self.decompressor.decompress(data)
+        except zlib.error as exc:
+            if was_first_attempt:
+                self.decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+                return self.decode(data)
+            raise DecodingError(str(exc)) from exc
+
+    def decode(self, data: bytes) -> bytes:
+        try:
+            return self.decompressor.decompress(data)
+        except zlib.error as exc:
+            raise DecodingError(str(exc)) from exc
+
+    def decode(self, data: bytes) -> bytes:
+        if not data:
+            return b""
+        self.seen_data = True
+        try:
+            return self._decompress(data)
+        except brotli.error as exc:
+            raise DecodingError(str(exc)) from exc
+
+    def decode(self, data: bytes) -> bytes:
+        assert zstandard is not None
+        self.seen_data = True
+        output = io.BytesIO()
+        try:
+            output.write(self.decompressor.decompress(data))
+            while self.decompressor.eof and self.decompressor.unused_data:
+                unused_data = self.decompressor.unused_data
+                self.decompressor = zstandard.ZstdDecompressor().decompressobj()
+                output.write(self.decompressor.decompress(unused_data))
+        except zstandard.ZstdError as exc:
+            raise DecodingError(str(exc)) from exc
+        return output.getvalue()
+
+    def __init__(self, children: typing.Sequence[ContentDecoder]) -> None:
+        """
+        'children' should be a sequence of decoders in the order in which
+        each was applied.
+        """
+        # Note that we reverse the order for decoding.
+        self.children = list(reversed(children))
+
+    def decode(self, data: bytes) -> str:
+        return self.decoder.decode(data)
+
+## tests/client/test_async_client.py
+
+async def test_get_invalid_url(server, url):
+    async with httpx.AsyncClient() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            await client.get(url)
+
+def hello_world(request):
+    return httpx.Response(200, text="Hello, world!")
+
+## tests/client/test_client.py
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+def test_get_invalid_url(server, url):
+    with httpx.Client() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            client.get(url)
+
+## tests/client/test_redirects.py
+
+def test_invalid_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.RemoteProtocolError):
+        client.get("http://example.org/invalid_redirect", follow_redirects=True)
+
+def test_redirect_loop():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get("https://example.org/redirect_loop", follow_redirects=True)
+
+def test_cross_subdomain_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_subdomain"
+    response = client.get(url, follow_redirects=True)
+    assert response.url == "https://www.example.org/cross_subdomain"
+
+## tests/models/test_responses.py
+
+def streaming_body() -> typing.Iterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+async def async_streaming_body() -> typing.AsyncIterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+## tests/test_asgi.py
+
+async def test_asgi_exc_after_response():
+    transport = httpx.ASGITransport(app=raise_exc_after_response)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError):
+            await client.get("http://www.example.org/")
+
+## tests/test_decoders.py
+
+def test_decoders_empty_cases(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    response = httpx.Response(content=b"", status_code=200, headers=headers)
+    assert response.read() == b""
+
+async def test_text_decoder_with_autodetect(data, encoding):
+    async def iterator() -> typing.AsyncIterator[bytes]:
+        nonlocal data
+        for chunk in data:
+            yield chunk
+
+    def autodetect(content):
+        return chardet.detect(content).get("encoding")
+
+    # Accessing `.text` on a read response.
+    response = httpx.Response(200, content=iterator(), default_encoding=autodetect)
+    await response.aread()
+    assert response.text == (b"".join(data)).decode(encoding)
+
+    # Streaming `.aiter_text` iteratively.
+    # Note that if we streamed the text *without* having read it first, then
+    # we won't get a `charset_normalizer` guess, and will instead always rely
+    # on utf-8 if no charset is specified.
+    text = "".join([part async for part in response.aiter_text()])
+    assert text == (b"".join(data)).decode(encoding)
+
+def test_streaming_text_decoder(
+    data: typing.Iterable[bytes], expected: list[str]
+) -> None:
+    response = httpx.Response(200, content=iter(data))
+    assert list(response.iter_text()) == expected
+
+def test_line_decoder_nl():
+    response = httpx.Response(200, content=[b""])
+    assert list(response.iter_lines()) == []
+
+    response = httpx.Response(200, content=[b"", b"a\n\nb\nc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    # Issue #1033
+    response = httpx.Response(
+        200, content=[b"", b"12345\n", b"foo ", b"bar ", b"baz\n"]
+    )
+    assert list(response.iter_lines()) == ["12345", "foo bar baz"]
+
+def test_line_decoder_cr():
+    response = httpx.Response(200, content=[b"", b"a\r\rb\rc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    response = httpx.Response(200, content=[b"", b"a\r\rb\rc\r"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    # Issue #1033
+    response = httpx.Response(
+        200, content=[b"", b"12345\r", b"foo ", b"bar ", b"baz\r"]
+    )
+    assert list(response.iter_lines()) == ["12345", "foo bar baz"]
+
+def test_line_decoder_crnl():
+    response = httpx.Response(200, content=[b"", b"a\r\n\r\nb\r\nc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    response = httpx.Response(200, content=[b"", b"a\r\n\r\nb\r\nc\r\n"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    response = httpx.Response(200, content=[b"", b"a\r", b"\n\r\nb\r\nc"])
+    assert list(response.iter_lines()) == ["a", "", "b", "c"]
+
+    # Issue #1033
+    response = httpx.Response(200, content=[b"", b"12345\r\n", b"foo bar baz\r\n"])
+    assert list(response.iter_lines()) == ["12345", "foo bar baz"]
+
+## tests/test_main.py
+
+def splitlines(output: str) -> typing.Iterable[str]:
+    return [line.strip() for line in output.splitlines()]
+
+def remove_date_header(lines: typing.Iterable[str]) -> typing.Iterable[str]:
+    return [line for line in lines if not line.startswith("date:")]
+
+## tests/test_wsgi.py
+
+def test_wsgi_exc():
+    transport = httpx.WSGITransport(app=raise_exc)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(ValueError):
+        client.get("http://www.example.org/")
+
+def test_wsgi_http_error():
+    transport = httpx.WSGITransport(app=partial(raise_exc, exc=RuntimeError))
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")

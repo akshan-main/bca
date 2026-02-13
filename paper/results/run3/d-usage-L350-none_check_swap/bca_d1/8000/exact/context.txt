@@ -1,0 +1,719 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## examples/pydantic_ai_examples/question_graph.py
+
+from pydantic_graph import (
+    BaseNode,
+    End,
+    Graph,
+    GraphRunContext,
+)
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+class AgentNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], result.FinalResult[NodeRunEndT]]):
+    """The base class for all agent nodes.
+
+    Using subclass of `BaseNode` for all nodes reduces the amount of boilerplate of generics everywhere
+    """
+
+class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
+    """The node that makes a request to the model using the last message in state.message_history."""
+
+    request: _messages.ModelRequest
+
+    _result: CallToolsNode[DepsT, NodeRunEndT] | None = field(repr=False, init=False, default=None)
+    _did_stream: bool = field(repr=False, init=False, default=False)
+
+    async def run(
+        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+    ) -> CallToolsNode[DepsT, NodeRunEndT]:
+        if self._result is not None:
+            return self._result
+
+        if self._did_stream:
+            # `self._result` gets set when exiting the `stream` contextmanager, so hitting this
+            # means that the stream was started but not finished before `run()` was called
+            raise exceptions.AgentRunError('You must finish streaming before calling run()')  # pragma: no cover
+
+        return await self._make_request(ctx)
+
+    @asynccontextmanager
+    async def stream(
+        self,
+        ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, T]],
+    ) -> AsyncIterator[result.AgentStream[DepsT, T]]:
+        assert not self._did_stream, 'stream() should only be called once per node'
+
+        model_settings, model_request_parameters, message_history, run_context = await self._prepare_request(ctx)
+        with set_current_run_context(run_context):
+            async with ctx.deps.model.request_stream(
+                message_history, model_settings, model_request_parameters, run_context
+            ) as streamed_response:
+                self._did_stream = True
+                ctx.state.usage.requests += 1
+                agent_stream = result.AgentStream[DepsT, T](
+                    _raw_stream_response=streamed_response,
+                    _output_schema=ctx.deps.output_schema,
+                    _model_request_parameters=model_request_parameters,
+                    _output_validators=ctx.deps.output_validators,
+                    _run_ctx=build_run_context(ctx),
+                    _usage_limits=ctx.deps.usage_limits,
+                    _tool_manager=ctx.deps.tool_manager,
+                    _metadata_getter=lambda: ctx.state.metadata,
+                )
+                yield agent_stream
+                # In case the user didn't manually consume the full stream, ensure it is fully consumed here,
+                # otherwise usage won't be properly counted:
+                async for _ in agent_stream:
+                    pass
+
+        model_response = streamed_response.get()
+
+        self._finish_handling(ctx, model_response)
+        assert self._result is not None  # this should be set by the previous line
+
+    async def _make_request(
+        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+    ) -> CallToolsNode[DepsT, NodeRunEndT]:
+        if self._result is not None:
+            return self._result  # pragma: no cover
+
+        model_settings, model_request_parameters, message_history, run_context = await self._prepare_request(ctx)
+        with set_current_run_context(run_context):
+            model_response = await ctx.deps.model.request(message_history, model_settings, model_request_parameters)
+        ctx.state.usage.requests += 1
+
+        return self._finish_handling(ctx, model_response)
+
+    async def _prepare_request(
+        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+    ) -> tuple[ModelSettings | None, models.ModelRequestParameters, list[_messages.ModelMessage], RunContext[DepsT]]:
+        self.request.timestamp = now_utc()
+        self.request.run_id = self.request.run_id or ctx.state.run_id
+        ctx.state.message_history.append(self.request)
+
+        ctx.state.run_step += 1
+
+        run_context = build_run_context(ctx)
+
+        # This will raise errors for any tool name conflicts
+        ctx.deps.tool_manager = await ctx.deps.tool_manager.for_run_step(run_context)
+
+        original_history = ctx.state.message_history[:]
+        message_history = await _process_message_history(original_history, ctx.deps.history_processors, run_context)
+        # `ctx.state.message_history` is the same list used by `capture_run_messages`, so we should replace its contents, not the reference
+        ctx.state.message_history[:] = message_history
+        # Update the new message index to ensure `result.new_messages()` returns the correct messages
+        ctx.deps.new_message_index -= len(original_history) - len(message_history)
+
+        # Merge possible consecutive trailing `ModelRequest`s into one, with tool call parts before user parts,
+        # but don't store it in the message history on state. This is just for the benefit of model classes that want clear user/assistant boundaries.
+        # See `tests/test_tools.py::test_parallel_tool_return_with_deferred` for an example where this is necessary
+        message_history = _clean_message_history(message_history)
+
+        model_request_parameters = await _prepare_request_parameters(ctx)
+
+        model_settings = ctx.deps.model_settings
+        usage = ctx.state.usage
+        if ctx.deps.usage_limits.count_tokens_before_request:
+            # Copy to avoid modifying the original usage object with the counted usage
+            usage = deepcopy(usage)
+
+            counted_usage = await ctx.deps.model.count_tokens(message_history, model_settings, model_request_parameters)
+            usage.incr(counted_usage)
+
+        ctx.deps.usage_limits.check_before_request(usage)
+
+        return model_settings, model_request_parameters, message_history, run_context
+
+    def _finish_handling(
+        self,
+        ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]],
+        response: _messages.ModelResponse,
+    ) -> CallToolsNode[DepsT, NodeRunEndT]:
+        response.run_id = response.run_id or ctx.state.run_id
+        # Update usage
+        ctx.state.usage.incr(response.usage)
+        if ctx.deps.usage_limits:  # pragma: no branch
+            ctx.deps.usage_limits.check_tokens(ctx.state.usage)
+
+        # Append the model response to state.message_history
+        ctx.state.message_history.append(response)
+
+        # Set the `_result` attribute since we can't use `return` in an async iterator
+        self._result = CallToolsNode(response)
+
+        return self._result
+
+    __repr__ = dataclasses_no_defaults_repr
+
+    async def _prepare_request(
+        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+    ) -> tuple[ModelSettings | None, models.ModelRequestParameters, list[_messages.ModelMessage], RunContext[DepsT]]:
+        self.request.timestamp = now_utc()
+        self.request.run_id = self.request.run_id or ctx.state.run_id
+        ctx.state.message_history.append(self.request)
+
+        ctx.state.run_step += 1
+
+        run_context = build_run_context(ctx)
+
+        # This will raise errors for any tool name conflicts
+        ctx.deps.tool_manager = await ctx.deps.tool_manager.for_run_step(run_context)
+
+        original_history = ctx.state.message_history[:]
+        message_history = await _process_message_history(original_history, ctx.deps.history_processors, run_context)
+        # `ctx.state.message_history` is the same list used by `capture_run_messages`, so we should replace its contents, not the reference
+        ctx.state.message_history[:] = message_history
+        # Update the new message index to ensure `result.new_messages()` returns the correct messages
+        ctx.deps.new_message_index -= len(original_history) - len(message_history)
+
+        # Merge possible consecutive trailing `ModelRequest`s into one, with tool call parts before user parts,
+        # but don't store it in the message history on state. This is just for the benefit of model classes that want clear user/assistant boundaries.
+        # See `tests/test_tools.py::test_parallel_tool_return_with_deferred` for an example where this is necessary
+        message_history = _clean_message_history(message_history)
+
+        model_request_parameters = await _prepare_request_parameters(ctx)
+
+        model_settings = ctx.deps.model_settings
+        usage = ctx.state.usage
+        if ctx.deps.usage_limits.count_tokens_before_request:
+            # Copy to avoid modifying the original usage object with the counted usage
+            usage = deepcopy(usage)
+
+            counted_usage = await ctx.deps.model.count_tokens(message_history, model_settings, model_request_parameters)
+            usage.incr(counted_usage)
+
+        ctx.deps.usage_limits.check_before_request(usage)
+
+        return model_settings, model_request_parameters, message_history, run_context
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/embeddings/cohere.py
+
+def _map_usage(response: EmbedByTypeResponse, provider: str, provider_url: str, model: str) -> RequestUsage:
+    u = response.meta
+    if u is None or u.billed_units is None:
+        return RequestUsage()  # pragma: no cover
+    usage_data = {
+        k: int(v)
+        for k, v in u.billed_units.model_dump(exclude_none=True).items()
+        if isinstance(v, int | float) and v > 0
+    }
+    details = {k: int(v) for k, v in usage_data.items() if k != 'input_tokens' and isinstance(v, int | float) and v > 0}
+    response_data = dict(model=model, meta=dict(billed_units=usage_data))
+
+    return RequestUsage.extract(
+        response_data,
+        provider=provider,
+        provider_url=provider_url,
+        provider_fallback='cohere',
+        api_flavor='embeddings',
+        details=details,
+    )
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far. This will not be the final usage until the stream is exhausted."""
+        return self._usage
+
+def check_allow_model_requests() -> None:
+    """Check if model requests are allowed.
+
+    If you're defining your own models that have costs or latency associated with their use, you should call this in
+    [`Model.request`][pydantic_ai.models.Model.request] and [`Model.request_stream`][pydantic_ai.models.Model.request_stream].
+
+    Raises:
+        RuntimeError: If model requests are not allowed.
+    """
+    if not ALLOW_MODEL_REQUESTS:
+        raise RuntimeError('Model requests are not allowed, since ALLOW_MODEL_REQUESTS is False')
+
+## pydantic_ai_slim/pydantic_ai/models/anthropic.py
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> usage.RequestUsage:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+
+        response = await self._messages_count_tokens(
+            messages, cast(AnthropicModelSettings, model_settings or {}), model_request_parameters
+        )
+
+        return usage.RequestUsage(input_tokens=response.input_tokens)
+
+## pydantic_ai_slim/pydantic_ai/models/google.py
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> usage.RequestUsage:
+        check_allow_model_requests()
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        model_settings = cast(GoogleModelSettings, model_settings or {})
+        contents, generation_config = await self._build_content_and_config(
+            messages, model_settings, model_request_parameters
+        )
+
+        # Annoyingly, the type of `GenerateContentConfigDict.get` is "partially `Unknown`" because `response_schema` includes `typing._UnionGenericAlias`,
+        # so without this we'd need `pyright: ignore[reportUnknownMemberType]` on every line and wouldn't get type checking anyway.
+        generation_config = cast(dict[str, Any], generation_config)
+
+        config = CountTokensConfigDict(
+            http_options=generation_config.get('http_options'),
+        )
+        if self._provider.name != 'google-gla':
+            # The fields are not supported by the Gemini API per https://github.com/googleapis/python-genai/blob/7e4ec284dc6e521949626f3ed54028163ef9121d/google/genai/models.py#L1195-L1214
+            config.update(  # pragma: lax no cover
+                system_instruction=generation_config.get('system_instruction'),
+                tools=cast(list[ToolDict], generation_config.get('tools')),
+                # Annoyingly, GenerationConfigDict has fewer fields than GenerateContentConfigDict, and no extra fields are allowed.
+                generation_config=GenerationConfigDict(
+                    temperature=generation_config.get('temperature'),
+                    top_p=generation_config.get('top_p'),
+                    max_output_tokens=generation_config.get('max_output_tokens'),
+                    stop_sequences=generation_config.get('stop_sequences'),
+                    presence_penalty=generation_config.get('presence_penalty'),
+                    frequency_penalty=generation_config.get('frequency_penalty'),
+                    seed=generation_config.get('seed'),
+                    thinking_config=generation_config.get('thinking_config'),
+                    media_resolution=generation_config.get('media_resolution'),
+                    response_mime_type=generation_config.get('response_mime_type'),
+                    response_json_schema=generation_config.get('response_json_schema'),
+                ),
+            )
+
+        response = await self.client.aio.models.count_tokens(
+            model=self._model_name,
+            contents=contents,
+            config=config,
+        )
+        if response.total_tokens is None:
+            raise UnexpectedModelBehavior(  # pragma: no cover
+                'Total tokens missing from Gemini response', str(response)
+            )
+        return usage.RequestUsage(
+            input_tokens=response.total_tokens,
+        )
+
+## pydantic_ai_slim/pydantic_ai/models/openai.py
+
+    def _map_usage(self, response: chat.ChatCompletion) -> usage.RequestUsage:
+        return _map_usage(response, self._provider.name, self._provider.base_url, self.model_name)
+
+    def _map_usage(self, response: ChatCompletionChunk) -> usage.RequestUsage:
+        return _map_usage(response, self._provider_name, self._provider_url, self.model_name)
+
+    def _map_usage(self, response: responses.Response) -> usage.RequestUsage:
+        return _map_usage(response, self._provider_name, self._provider_url, self.model_name)
+
+## pydantic_ai_slim/pydantic_ai/profiles/__init__.py
+
+class ModelProfile:
+    """Describes how requests to and responses from specific models or families of models need to be constructed and processed to get the best results, independent of the model and provider classes used."""
+
+    supports_tools: bool = True
+    """Whether the model supports tools."""
+    supports_json_schema_output: bool = False
+    """Whether the model supports JSON schema output.
+
+    This is also referred to as 'native' support for structured output.
+    Relates to the `NativeOutput` output type.
+    """
+    supports_json_object_output: bool = False
+    """Whether the model supports a dedicated mode to enforce JSON output, without necessarily sending a schema.
+
+    E.g. [OpenAI's JSON mode](https://platform.openai.com/docs/guides/structured-outputs#json-mode)
+    Relates to the `PromptedOutput` output type.
+    """
+    supports_image_output: bool = False
+    """Whether the model supports image output."""
+    default_structured_output_mode: StructuredOutputMode = 'tool'
+    """The default structured output mode to use for the model."""
+    prompted_output_template: str = dedent(
+        """
+        Always respond with a JSON object that's compatible with this schema:
+
+        {schema}
+
+        Don't include any text or Markdown fencing before or after.
+        """
+    )
+    """The instructions template to use for prompted structured output. The '{schema}' placeholder will be replaced with the JSON schema for the output."""
+    native_output_requires_schema_in_instructions: bool = False
+    """Whether to add prompted output template in native structured output mode"""
+    json_schema_transformer: type[JsonSchemaTransformer] | None = None
+    """The transformer to use to make JSON schemas for tools and structured output compatible with the model."""
+
+    thinking_tags: tuple[str, str] = ('<think>', '</think>')
+    """The tags used to indicate thinking parts in the model's output. Defaults to ('<think>', '</think>')."""
+
+    ignore_streamed_leading_whitespace: bool = False
+    """Whether to ignore leading whitespace when streaming a response.
+
+    This is a workaround for models that emit `<think>\n</think>\n\n` or an empty text part ahead of tool calls (e.g. Ollama + Qwen3),
+    which we don't want to end up treating as a final result when using `run_stream` with `str` a valid `output_type`.
+
+    This is currently only used by `OpenAIChatModel`, `HuggingFaceModel`, and `GroqModel`.
+    """
+
+    supported_builtin_tools: frozenset[type[AbstractBuiltinTool]] = field(
+        default_factory=lambda: SUPPORTED_BUILTIN_TOOLS
+    )
+    """The set of builtin tool types that this model/profile supports.
+
+    Defaults to ALL builtin tools. Profile functions should explicitly
+    restrict this based on model capabilities.
+    """
+
+    @classmethod
+    def from_profile(cls, profile: ModelProfile | None) -> Self:
+        """Build a ModelProfile subclass instance from a ModelProfile instance."""
+        if isinstance(profile, cls):
+            return profile
+        return cls().update(profile)
+
+    def update(self, profile: ModelProfile | None) -> Self:
+        """Update this ModelProfile (subclass) instance with the non-default values from another ModelProfile instance."""
+        if not profile:
+            return self
+        field_names = set(f.name for f in fields(self))
+        non_default_attrs = {
+            f.name: getattr(profile, f.name)
+            for f in fields(profile)
+            if f.name in field_names and getattr(profile, f.name) != f.default
+        }
+        return replace(self, **non_default_attrs)
+
+    def update(self, profile: ModelProfile | None) -> Self:
+        """Update this ModelProfile (subclass) instance with the non-default values from another ModelProfile instance."""
+        if not profile:
+            return self
+        field_names = set(f.name for f in fields(self))
+        non_default_attrs = {
+            f.name: getattr(profile, f.name)
+            for f in fields(profile)
+            if f.name in field_names and getattr(profile, f.name) != f.default
+        }
+        return replace(self, **non_default_attrs)
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._initial_run_ctx_usage + self._raw_stream_response.usage()
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._streamed_run_result.usage()
+
+def _get_usage_checking_stream_response(
+    stream_response: models.StreamedResponse,
+    limits: UsageLimits | None,
+    get_usage: Callable[[], RunUsage],
+) -> AsyncIterator[ModelResponseStreamEvent]:
+    if limits is not None and limits.has_token_limits():
+
+        async def _usage_checking_iterator():
+            async for item in stream_response:
+                limits.check_tokens(get_usage())
+                yield item
+
+        return _usage_checking_iterator()
+    else:
+        return aiter(stream_response)
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def usage(self) -> _usage.RunUsage:
+        """Get usage statistics for the run so far, including token usage, model requests, and so on."""
+        return self._graph_run.state.usage
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+class RequestUsage
+    """LLM usage associated with a single request.
+
+    This is an implementation of `genai_prices.types.AbstractUsage` so it can be used to calculate the price of the
+    request using [genai-prices](https://github.com/pydantic/genai-prices)."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def incr(self, incr_usage: RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        return _incr_usage_tokens(self, incr_usage)
+
+    def __add__(self, other: RequestUsage) -> RequestUsage:
+        """Add two RequestUsages together.
+
+        This is provided so it's trivial to sum usage information from multiple parts of a response.
+
+        **WARNING:** this CANNOT be used to sum multiple requests without breaking some pricing calculations.
+        """
+        new_usage = copy(self)
+        new_usage.incr(other)
+        return new_usage
+
+    def incr(self, incr_usage: RunUsage | RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        if isinstance(incr_usage, RunUsage):
+            self.requests += incr_usage.requests
+            self.tool_calls += incr_usage.tool_calls
+        return _incr_usage_tokens(self, incr_usage)
+
+    def __add__(self, other: RunUsage | RequestUsage) -> RunUsage:
+        """Add two RunUsages together.
+
+        This is provided so it's trivial to sum usage information from multiple runs.
+        """
+        new_usage = copy(self)
+        new_usage.incr(other)
+        return new_usage
+
+def _incr_usage_tokens(slf: RunUsage | RequestUsage, incr_usage: RunUsage | RequestUsage) -> None:
+    """Increment the usage in place.
+
+    Args:
+        slf: The usage to increment.
+        incr_usage: The usage to increment by.
+    """
+    slf.input_tokens += incr_usage.input_tokens
+    slf.cache_write_tokens += incr_usage.cache_write_tokens
+    slf.cache_read_tokens += incr_usage.cache_read_tokens
+    slf.input_audio_tokens += incr_usage.input_audio_tokens
+    slf.cache_audio_read_tokens += incr_usage.cache_audio_read_tokens
+    slf.output_tokens += incr_usage.output_tokens
+
+    for key, value in incr_usage.details.items():
+        # Note: value can be None at runtime from model responses despite the type annotation
+        if isinstance(value, (int, float)):
+            slf.details[key] = slf.details.get(key, 0) + value
+
+    def response_tokens_limit(self) -> int | None:
+        return self.output_tokens_limit
+
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+        # deprecated:
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+    ):
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit if input_tokens_limit is not None else request_tokens_limit
+        self.output_tokens_limit = output_tokens_limit if output_tokens_limit is None else response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    def check_tokens(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the usage exceeds any of the token limits."""
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})')
+
+        output_tokens = usage.output_tokens
+        if self.output_tokens_limit is not None and output_tokens > self.output_tokens_limit:
+            raise UsageLimitExceeded(
+                f'Exceeded the output_tokens_limit of {self.output_tokens_limit} ({output_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})')
+
+## pydantic_evals/pydantic_evals/otel/span_tree.py
+
+class SpanTree:
+    """A container that builds a hierarchy of SpanNode objects from a list of finished spans.
+
+    You can then search or iterate the tree to make your assertions (using DFS for traversal).
+    """
+
+    roots: list[SpanNode] = field(default_factory=list[SpanNode])
+    nodes_by_id: dict[str, SpanNode] = field(default_factory=dict[str, SpanNode])
+
+    # -------------------------------------------------------------------------
+    # Construction
+    # -------------------------------------------------------------------------
+    def __post_init__(self):
+        self._rebuild_tree()
+
+    def add_spans(self, spans: list[SpanNode]) -> None:
+        """Add a list of spans to the tree, rebuilding the tree structure."""
+        for span in spans:
+            self.nodes_by_id[span.node_key] = span
+        self._rebuild_tree()
+
+    def add_readable_spans(self, readable_spans: list[ReadableSpan]):
+        self.add_spans([SpanNode.from_readable_span(span) for span in readable_spans])
+
+    def _rebuild_tree(self):
+        # Ensure spans are ordered by start_timestamp so that roots and children end up in the right order
+        nodes = list(self.nodes_by_id.values())
+        nodes.sort(key=lambda node: node.start_timestamp or datetime.min)
+        self.nodes_by_id = {node.node_key: node for node in nodes}
+
+        # Build the parent/child relationships
+        for node in self.nodes_by_id.values():
+            parent_node_key = node.parent_node_key
+            if parent_node_key is not None:
+                parent_node = self.nodes_by_id.get(parent_node_key)
+                if parent_node is not None:
+                    parent_node.add_child(node)
+
+        # Determine the roots
+        # A node is a "root" if its parent is None or if its parent's span_id is not in the current set of spans.
+        self.roots = []
+        for node in self.nodes_by_id.values():
+            parent_node_key = node.parent_node_key
+            if parent_node_key is None or parent_node_key not in self.nodes_by_id:
+                self.roots.append(node)
+
+    # -------------------------------------------------------------------------
+    # Node filtering and iteration
+    # -------------------------------------------------------------------------
+    def find(self, predicate: SpanQuery | SpanPredicate) -> list[SpanNode]:
+        """Find all nodes in the entire tree that match the predicate, scanning from each root in DFS order."""
+        return list(self._filter(predicate))
+
+    def first(self, predicate: SpanQuery | SpanPredicate) -> SpanNode | None:
+        """Find the first node that matches a predicate, scanning from each root in DFS order. Returns `None` if not found."""
+        return next(self._filter(predicate), None)
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+    def _filter(self, predicate: SpanQuery | SpanPredicate) -> Iterator[SpanNode]:
+        for node in self:
+            if node.matches(predicate):
+                yield node
+
+    def __iter__(self) -> Iterator[SpanNode]:
+        """Return an iterator over all nodes in the tree."""
+        return iter(self.nodes_by_id.values())
+
+    # -------------------------------------------------------------------------
+    # String representation
+    # -------------------------------------------------------------------------
+    def repr_xml(
+        self,
+        include_children: bool = True,
+        include_trace_id: bool = False,
+        include_span_id: bool = False,
+        include_start_timestamp: bool = False,
+        include_duration: bool = False,
+    ) -> str:
+        """Return an XML-like string representation of the tree, optionally including children, trace_id, span_id, duration, and timestamps."""
+        if not self.roots:
+            return '<SpanTree />'
+        repr_parts = [
+            '<SpanTree>',
+            *[
+                indent(
+                    root.repr_xml(
+                        include_children=include_children,
+                        include_trace_id=include_trace_id,
+                        include_span_id=include_span_id,
+                        include_start_timestamp=include_start_timestamp,
+                        include_duration=include_duration,
+                    ),
+                    '  ',
+                )
+                for root in self.roots
+            ],
+            '</SpanTree>',
+        ]
+        return '\n'.join(repr_parts)
+
+    def __str__(self):
+        return f'<SpanTree num_roots={len(self.roots)} total_spans={len(self.nodes_by_id)} />'
+
+    def __repr__(self):
+        return self.repr_xml()
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+## tests/test_usage_limits.py
+
+async def test_multi_agent_usage_sync():
+    """As in `test_multi_agent_usage_async`, with a sync tool."""
+    controller_agent = Agent(TestModel())
+
+    @controller_agent.tool
+    def delegate_to_other_agent(ctx: RunContext[None], sentence: str) -> int:
+        new_usage = RunUsage(requests=5, input_tokens=2, output_tokens=3)
+        ctx.usage.incr(new_usage)
+        return 0
+
+    result = await controller_agent.run('foobar')
+    assert result.output == snapshot('{"delegate_to_other_agent":0}')
+    assert result.usage() == snapshot(RunUsage(requests=7, input_tokens=105, output_tokens=16, tool_calls=1))

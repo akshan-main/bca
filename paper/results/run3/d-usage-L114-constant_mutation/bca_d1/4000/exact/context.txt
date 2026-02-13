@@ -1,0 +1,391 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/embeddings/google.py
+
+def _map_usage(
+    response: EmbedContentResponse,
+    provider: str,
+    provider_url: str,
+    model: str,
+) -> RequestUsage:
+    """Map Google embedding response to RequestUsage.
+
+    Note: The Gemini API (google-gla) doesn't return token usage information.
+    Vertex AI (google-vertex) returns token_count in embedding statistics.
+    """
+    total_tokens = 0
+    if response.embeddings:  # pragma: no branch
+        for emb in response.embeddings:
+            if emb.statistics and emb.statistics.token_count:
+                total_tokens += int(emb.statistics.token_count)  # pragma: lax no cover -- requires vertexai
+
+    return RequestUsage(input_tokens=total_tokens)
+
+## pydantic_ai_slim/pydantic_ai/embeddings/openai.py
+
+def _map_usage(
+    usage: Usage | None,
+    provider: str,
+    provider_url: str,
+    model: str,
+) -> RequestUsage:
+    # OpenAI SDK types say CreateEmbeddingResponse.usage will always be set, in reality some OpenAI-compatible APIs omit it.
+    if usage is None:
+        return RequestUsage()
+
+    usage_data = usage.model_dump(exclude_none=True)
+    details = {k: v for k, v in usage_data.items() if k not in {'prompt_tokens', 'total_tokens'} if isinstance(v, int)}
+    response_data = dict(model=model, usage=usage_data)
+
+    return RequestUsage.extract(
+        response_data,
+        provider=provider,
+        provider_url=provider_url,
+        provider_fallback='openai',
+        api_flavor='embeddings',
+        details=details,
+    )
+
+## pydantic_ai_slim/pydantic_ai/embeddings/voyageai.py
+
+def _map_usage(total_tokens: int) -> RequestUsage:
+    return RequestUsage(input_tokens=total_tokens)
+
+## pydantic_ai_slim/pydantic_ai/models/cohere.py
+
+def _map_usage(response: V2ChatResponse) -> usage.RequestUsage:
+    u = response.usage
+    if u is None:
+        return usage.RequestUsage()
+    else:
+        details: dict[str, int] = {}
+        if u.billed_units is not None:
+            if u.billed_units.input_tokens:  # pragma: no branch
+                details['input_tokens'] = int(u.billed_units.input_tokens)
+            if u.billed_units.output_tokens:
+                details['output_tokens'] = int(u.billed_units.output_tokens)
+            if u.billed_units.search_units:  # pragma: no cover
+                details['search_units'] = int(u.billed_units.search_units)
+            if u.billed_units.classifications:  # pragma: no cover
+                details['classifications'] = int(u.billed_units.classifications)
+
+        request_tokens = int(u.tokens.input_tokens) if u.tokens and u.tokens.input_tokens else 0
+        response_tokens = int(u.tokens.output_tokens) if u.tokens and u.tokens.output_tokens else 0
+        return usage.RequestUsage(
+            input_tokens=request_tokens,
+            output_tokens=response_tokens,
+            details=details,
+        )
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+class _GeminiUsageMetaData(TypedDict, total=False):
+    """See <https://ai.google.dev/api/generate-content#UsageMetadata>.
+
+    The docs suggest all fields are required, but some are actually not required, so we assume they are all optional.
+    """
+
+    prompt_token_count: Annotated[int, pydantic.Field(alias='promptTokenCount')]
+    candidates_token_count: NotRequired[Annotated[int, pydantic.Field(alias='candidatesTokenCount')]]
+    total_token_count: Annotated[int, pydantic.Field(alias='totalTokenCount')]
+    cached_content_token_count: NotRequired[Annotated[int, pydantic.Field(alias='cachedContentTokenCount')]]
+    thoughts_token_count: NotRequired[Annotated[int, pydantic.Field(alias='thoughtsTokenCount')]]
+    tool_use_prompt_token_count: NotRequired[Annotated[int, pydantic.Field(alias='toolUsePromptTokenCount')]]
+    prompt_tokens_details: NotRequired[
+        Annotated[list[_GeminiModalityTokenCount], pydantic.Field(alias='promptTokensDetails')]
+    ]
+    cache_tokens_details: NotRequired[
+        Annotated[list[_GeminiModalityTokenCount], pydantic.Field(alias='cacheTokensDetails')]
+    ]
+    candidates_tokens_details: NotRequired[
+        Annotated[list[_GeminiModalityTokenCount], pydantic.Field(alias='candidatesTokensDetails')]
+    ]
+    tool_use_prompt_tokens_details: NotRequired[
+        Annotated[list[_GeminiModalityTokenCount], pydantic.Field(alias='toolUsePromptTokensDetails')]
+    ]
+
+def _metadata_as_usage(response: _GeminiResponse) -> usage.RequestUsage:
+    metadata = response.get('usage_metadata')
+    if metadata is None:
+        return usage.RequestUsage()
+    details: dict[str, int] = {}
+    if cached_content_token_count := metadata.get('cached_content_token_count', 0):
+        details['cached_content_tokens'] = cached_content_token_count
+
+    if thoughts_token_count := metadata.get('thoughts_token_count', 0):
+        details['thoughts_tokens'] = thoughts_token_count
+
+    if tool_use_prompt_token_count := metadata.get('tool_use_prompt_token_count', 0):
+        details['tool_use_prompt_tokens'] = tool_use_prompt_token_count
+
+    input_audio_tokens = 0
+    output_audio_tokens = 0
+    cache_audio_read_tokens = 0
+    for key, metadata_details in metadata.items():
+        if key.endswith('_details') and metadata_details:
+            metadata_details = cast(list[_GeminiModalityTokenCount], metadata_details)
+            suffix = key.removesuffix('_details')
+            for detail in metadata_details:
+                modality = detail['modality']
+                details[f'{modality.lower()}_{suffix}'] = value = detail.get('token_count', 0)
+                if value and modality == 'AUDIO':
+                    if key == 'prompt_tokens_details':
+                        input_audio_tokens = value
+                    elif key == 'candidates_tokens_details':
+                        output_audio_tokens = value
+                    elif key == 'cache_tokens_details':  # pragma: no branch
+                        cache_audio_read_tokens = value
+
+    return usage.RequestUsage(
+        input_tokens=metadata.get('prompt_token_count', 0),
+        output_tokens=metadata.get('candidates_token_count', 0) + thoughts_token_count,
+        cache_read_tokens=cached_content_token_count,
+        input_audio_tokens=input_audio_tokens,
+        output_audio_tokens=output_audio_tokens,
+        cache_audio_read_tokens=cache_audio_read_tokens,
+        details=details,
+    )
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+class UsageBase:
+    input_tokens: Annotated[
+        int,
+        # `request_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('input_tokens', 'request_tokens')),
+    ] = 0
+    """Number of input/prompt tokens."""
+
+    cache_write_tokens: int = 0
+    """Number of tokens written to the cache."""
+    cache_read_tokens: int = 0
+    """Number of tokens read from the cache."""
+
+    output_tokens: Annotated[
+        int,
+        # `response_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('output_tokens', 'response_tokens')),
+    ] = 0
+    """Number of output/completion tokens."""
+
+    input_audio_tokens: int = 0
+    """Number of audio input tokens."""
+    cache_audio_read_tokens: int = 0
+    """Number of audio tokens read from the cache."""
+    output_audio_tokens: int = 0
+    """Number of audio output tokens."""
+
+    details: Annotated[
+        dict[str, int],
+        # `details` can not be `None` any longer, but we still want to support deserializing model responses stored in a DB before this was changed
+        BeforeValidator(lambda d: d or {}),
+    ] = dataclasses.field(default_factory=dict[str, int])
+    """Any extra details returned by the model."""
+
+    @property
+    @deprecated('`request_tokens` is deprecated, use `input_tokens` instead')
+    def request_tokens(self) -> int:
+        return self.input_tokens
+
+    @property
+    @deprecated('`response_tokens` is deprecated, use `output_tokens` instead')
+    def response_tokens(self) -> int:
+        return self.output_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Sum of `input_tokens + output_tokens`."""
+        return self.input_tokens + self.output_tokens
+
+    def opentelemetry_attributes(self) -> dict[str, int]:
+        """Get the token usage values as OpenTelemetry attributes."""
+        result: dict[str, int] = {}
+        if self.input_tokens:
+            result['gen_ai.usage.input_tokens'] = self.input_tokens
+        if self.output_tokens:
+            result['gen_ai.usage.output_tokens'] = self.output_tokens
+
+        details = self.details.copy()
+        if self.cache_write_tokens:
+            details['cache_write_tokens'] = self.cache_write_tokens
+        if self.cache_read_tokens:
+            details['cache_read_tokens'] = self.cache_read_tokens
+        if self.input_audio_tokens:
+            details['input_audio_tokens'] = self.input_audio_tokens
+        if self.cache_audio_read_tokens:
+            details['cache_audio_read_tokens'] = self.cache_audio_read_tokens
+        if self.output_audio_tokens:
+            details['output_audio_tokens'] = self.output_audio_tokens
+        if details:
+            prefix = 'gen_ai.usage.details.'
+            for key, value in details.items():
+                # Skipping check for value since spec implies all detail values are relevant
+                if value:
+                    result[prefix + key] = value
+        return result
+
+    def __repr__(self):
+        kv_pairs = (f'{f.name}={value!r}' for f in fields(self) if (value := getattr(self, f.name)))
+        return f'{self.__class__.__qualname__}({", ".join(kv_pairs)})'
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+    def opentelemetry_attributes(self) -> dict[str, int]:
+        """Get the token usage values as OpenTelemetry attributes."""
+        result: dict[str, int] = {}
+        if self.input_tokens:
+            result['gen_ai.usage.input_tokens'] = self.input_tokens
+        if self.output_tokens:
+            result['gen_ai.usage.output_tokens'] = self.output_tokens
+
+        details = self.details.copy()
+        if self.cache_write_tokens:
+            details['cache_write_tokens'] = self.cache_write_tokens
+        if self.cache_read_tokens:
+            details['cache_read_tokens'] = self.cache_read_tokens
+        if self.input_audio_tokens:
+            details['input_audio_tokens'] = self.input_audio_tokens
+        if self.cache_audio_read_tokens:
+            details['cache_audio_read_tokens'] = self.cache_audio_read_tokens
+        if self.output_audio_tokens:
+            details['output_audio_tokens'] = self.output_audio_tokens
+        if details:
+            prefix = 'gen_ai.usage.details.'
+            for key, value in details.items():
+                # Skipping check for value since spec implies all detail values are relevant
+                if value:
+                    result[prefix + key] = value
+        return result
+
+    def __repr__(self):
+        kv_pairs = (f'{f.name}={value!r}' for f in fields(self) if (value := getattr(self, f.name)))
+        return f'{self.__class__.__qualname__}({", ".join(kv_pairs)})'
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+class RequestUsage
+    """LLM usage associated with a single request.
+
+    This is an implementation of `genai_prices.types.AbstractUsage` so it can be used to calculate the price of the
+    request using [genai-prices](https://github.com/pydantic/genai-prices)."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def incr(self, incr_usage: RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        return _incr_usage_tokens(self, incr_usage)
+
+    def incr(self, incr_usage: RunUsage | RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        if isinstance(incr_usage, RunUsage):
+            self.requests += incr_usage.requests
+            self.tool_calls += incr_usage.tool_calls
+        return _incr_usage_tokens(self, incr_usage)
+
+def _incr_usage_tokens(slf: RunUsage | RequestUsage, incr_usage: RunUsage | RequestUsage) -> None:
+    """Increment the usage in place.
+
+    Args:
+        slf: The usage to increment.
+        incr_usage: The usage to increment by.
+    """
+    slf.input_tokens += incr_usage.input_tokens
+    slf.cache_write_tokens += incr_usage.cache_write_tokens
+    slf.cache_read_tokens += incr_usage.cache_read_tokens
+    slf.input_audio_tokens += incr_usage.input_audio_tokens
+    slf.cache_audio_read_tokens += incr_usage.cache_audio_read_tokens
+    slf.output_tokens += incr_usage.output_tokens
+
+    for key, value in incr_usage.details.items():
+        # Note: value can be None at runtime from model responses despite the type annotation
+        if isinstance(value, (int, float)):
+            slf.details[key] = slf.details.get(key, 0) + value
+
+class Usage(RunUsage):
+    """Deprecated alias for `RunUsage`."""
+
+## tests/models/test_cohere.py
+
+async def test_request_simple_usage(allow_model_requests: None):
+    c = completion_message(
+        AssistantMessageResponse(
+            content=[TextAssistantMessageResponseContentItem(text='world')],
+            role='assistant',
+        ),
+        usage=cohere.Usage(
+            tokens=cohere.UsageTokens(input_tokens=1, output_tokens=1),
+            billed_units=cohere.UsageBilledUnits(input_tokens=1, output_tokens=1),
+        ),
+    )
+    mock_client = MockAsyncClientV2.create_mock(c)
+    m = CohereModel('command-r7b-12-2024', provider=CohereProvider(cohere_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Hello')
+    assert result.output == 'world'
+    assert result.usage() == snapshot(
+        RunUsage(
+            requests=1,
+            input_tokens=1,
+            output_tokens=1,
+            details={
+                'input_tokens': 1,
+                'output_tokens': 1,
+            },
+        )
+    )
+
+## tests/models/test_gemini.py
+
+def gemini_response(content: _GeminiContent, finish_reason: Literal['STOP'] | None = 'STOP') -> _GeminiResponse:
+    candidate = _GeminiCandidates(content=content, index=0, safety_ratings=[])
+    if finish_reason:  # pragma: no branch
+        candidate['finish_reason'] = finish_reason
+    return _GeminiResponse(candidates=[candidate], usage_metadata=example_usage(), model_version='gemini-1.5-flash-123')
+
+def example_usage() -> _GeminiUsageMetaData:
+    return _GeminiUsageMetaData(prompt_token_count=1, candidates_token_count=2, total_token_count=3)
+
+async def test_stream_text_no_data(get_gemini_client: GetGeminiClient):
+    responses = [_GeminiResponse(candidates=[], usage_metadata=example_usage())]
+    json_data = _gemini_streamed_response_ta.dump_json(responses, by_alias=True)
+    stream = AsyncByteStreamList([json_data[:100], json_data[100:200], json_data[200:]])
+    gemini_client = get_gemini_client(stream)
+    m = GeminiModel('gemini-1.5-flash', provider=GoogleGLAProvider(http_client=gemini_client))
+    agent = Agent(m)
+    with pytest.raises(UnexpectedModelBehavior, match='Streamed response ended without con'):
+        async with agent.run_stream('Hello'):
+            pass
+
+def gemini_no_content_response(
+    safety_ratings: list[_GeminiSafetyRating], finish_reason: Literal['SAFETY'] | None = 'SAFETY'
+) -> _GeminiResponse:
+    candidate = _GeminiCandidates(safety_ratings=safety_ratings)
+    if finish_reason:  # pragma: no branch
+        candidate['finish_reason'] = finish_reason
+    return _GeminiResponse(candidates=[candidate], usage_metadata=example_usage())
+
+def test_map_empty_usage():
+    response = gemini_response(_content_model_response(ModelResponse(parts=[TextPart('Hello world')])))
+    assert 'usage_metadata' in response
+    del response['usage_metadata']
+
+    assert _metadata_as_usage(response) == RequestUsage()

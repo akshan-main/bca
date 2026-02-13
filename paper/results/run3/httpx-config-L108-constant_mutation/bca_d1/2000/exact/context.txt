@@ -1,0 +1,260 @@
+## httpx/_client.py
+
+    def timeout(self, timeout: TimeoutTypes) -> None:
+        self._timeout = Timeout(timeout)
+
+## httpx/_config.py
+
+DEFAULT_TIMEOUT_CONFIG = Timeout(timeout=5.0)
+
+## httpx/_exceptions.py
+
+class ReadTimeout(TimeoutException):
+    """
+    Timed out while receiving data from the host.
+    """
+
+class ReadError(NetworkError):
+    """
+    Failed to receive data from the network.
+    """
+
+## httpx/_models.py
+
+    def read(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.Iterable)
+            self._content = b"".join(self.stream)
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.AsyncIterable)
+            self._content = b"".join([part async for part in self.stream])
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    def read(self) -> bytes:
+        """
+        Read and return the response content.
+        """
+        if not hasattr(self, "_content"):
+            self._content = b"".join(self.iter_bytes())
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the response content.
+        """
+        if not hasattr(self, "_content"):
+            self._content = b"".join([part async for part in self.aiter_bytes()])
+        return self._content
+
+## httpx/_multipart.py
+
+def get_multipart_boundary_from_content_type(
+    content_type: bytes | None,
+) -> bytes | None:
+    if not content_type or not content_type.startswith(b"multipart/form-data"):
+        return None
+    # parse boundary according to
+    # https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
+    if b";" in content_type:
+        for section in content_type.split(b";"):
+            if section.strip().lower().startswith(b"boundary="):
+                return section.strip()[len(b"boundary=") :].strip(b'"')
+    return None
+
+## tests/client/test_async_client.py
+
+async def test_stream_response(server):
+    async with httpx.AsyncClient() as client:
+        async with client.stream("GET", server.url) as response:
+            body = await response.aread()
+
+    assert response.status_code == 200
+    assert body == b"Hello, world!"
+    assert response.content == b"Hello, world!"
+
+## tests/models/test_requests.py
+
+async def test_aread_and_stream_data():
+    # Ensure a request may still be streamed if it has been read.
+    # Needed for cases such as authentication classes that read the request body.
+    request = httpx.Request("POST", "http://example.org", json={"test": 123})
+    await request.aread()
+    assert request.stream is not None
+    assert isinstance(request.stream, typing.AsyncIterable)
+    content = b"".join([part async for part in request.stream])
+    assert content == request.content
+
+## tests/models/test_responses.py
+
+def test_read():
+    response = httpx.Response(
+        200,
+        content=b"Hello, world!",
+    )
+
+    assert response.status_code == 200
+    assert response.text == "Hello, world!"
+    assert response.encoding == "utf-8"
+    assert response.is_closed
+
+    content = response.read()
+
+    assert content == b"Hello, world!"
+    assert response.content == b"Hello, world!"
+    assert response.is_closed
+
+def test_empty_read():
+    response = httpx.Response(200)
+
+    assert response.status_code == 200
+    assert response.text == ""
+    assert response.encoding == "utf-8"
+    assert response.is_closed
+
+    content = response.read()
+
+    assert content == b""
+    assert response.content == b""
+    assert response.is_closed
+
+async def test_aread():
+    response = httpx.Response(
+        200,
+        content=b"Hello, world!",
+    )
+
+    assert response.status_code == 200
+    assert response.text == "Hello, world!"
+    assert response.encoding == "utf-8"
+    assert response.is_closed
+
+    content = await response.aread()
+
+    assert content == b"Hello, world!"
+    assert response.content == b"Hello, world!"
+    assert response.is_closed
+
+async def test_empty_aread():
+    response = httpx.Response(200)
+
+    assert response.status_code == 200
+    assert response.text == ""
+    assert response.encoding == "utf-8"
+    assert response.is_closed
+
+    content = await response.aread()
+
+    assert content == b""
+    assert response.content == b""
+    assert response.is_closed
+
+async def test_async_streaming_response():
+    response = httpx.Response(
+        200,
+        content=async_streaming_body(),
+    )
+
+    assert response.status_code == 200
+    assert not response.is_closed
+
+    content = await response.aread()
+
+    assert content == b"Hello, world!"
+    assert response.content == b"Hello, world!"
+    assert response.is_closed
+
+async def test_cannot_aread_after_stream_consumed():
+    response = httpx.Response(
+        200,
+        content=async_streaming_body(),
+    )
+
+    content = b""
+    async for part in response.aiter_bytes():
+        content += part
+
+    with pytest.raises(httpx.StreamConsumed):
+        await response.aread()
+
+async def test_cannot_aread_after_response_closed():
+    response = httpx.Response(
+        200,
+        content=async_streaming_body(),
+    )
+
+    await response.aclose()
+    with pytest.raises(httpx.StreamClosed):
+        await response.aread()
+
+## tests/test_asgi.py
+
+async def test_asgi_transport():
+    async with httpx.ASGITransport(app=hello_world) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b"Hello, World!"
+
+async def test_asgi_transport_no_body():
+    async with httpx.ASGITransport(app=echo_body) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b""
+
+## tests/test_config.py
+
+def test_timeout_from_one_value_and_default():
+    timeout = httpx.Timeout(5.0, pool=60.0)
+    assert timeout == httpx.Timeout(timeout=(5.0, 5.0, 5.0, 60.0))
+
+def test_timeout_missing_default():
+    with pytest.raises(ValueError):
+        httpx.Timeout(pool=60.0)
+
+def test_timeout_from_config_instance():
+    timeout = httpx.Timeout(timeout=5.0)
+    assert httpx.Timeout(timeout) == httpx.Timeout(timeout=5.0)
+
+## tests/test_exceptions.py
+
+def test_request_attribute() -> None:
+    # Exception without request attribute
+    exc = httpx.ReadTimeout("Read operation timed out")
+    with pytest.raises(RuntimeError):
+        exc.request  # noqa: B018
+
+    # Exception with request attribute
+    request = httpx.Request("GET", "https://www.example.com")
+    exc = httpx.ReadTimeout("Read operation timed out", request=request)
+    assert exc.request == request
+
+## tests/test_timeouts.py
+
+async def test_read_timeout(server):
+    timeout = httpx.Timeout(None, read=1e-6)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with pytest.raises(httpx.ReadTimeout):
+            await client.get(server.url.copy_with(path="/slow_response"))

@@ -1,0 +1,438 @@
+# tests/test_ssrf.py:432-459
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:50-50
+_MAX_REDIRECTS = 0
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:50-50
+_MAX_REDIRECTS = 0
+
+# tests/test_ssrf.py:484-501
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:257-294
+def resolve_redirect_url(current_url: str, location: str) -> str:
+    """Resolve a redirect location against the current URL.
+
+    Args:
+        current_url: The URL that returned the redirect.
+        location: The Location header value (absolute or relative).
+
+    Returns:
+        The absolute URL to follow.
+    """
+    parsed_location = urlparse(location)
+
+    # Check if it's an absolute URL (has scheme) or protocol-relative URL (has netloc but no scheme)
+    if parsed_location.scheme:
+        return location
+    if parsed_location.netloc:
+        # Protocol-relative URL (e.g., "//example.com/path") - use current scheme
+        parsed_current = urlparse(current_url)
+        return urlunparse(
+            (
+                parsed_current.scheme,
+                parsed_location.netloc,
+                parsed_location.path,
+                '',
+                parsed_location.query,
+                parsed_location.fragment,
+            )
+        )
+
+    # Relative URL - resolve against current URL
+    parsed_current = urlparse(current_url)
+    if location.startswith('/'):
+        # Absolute path
+        return urlunparse((parsed_current.scheme, parsed_current.netloc, location, '', '', ''))
+    else:
+        # Relative path
+        base_path = parsed_current.path.rsplit('/', 1)[0]
+        return urlunparse((parsed_current.scheme, parsed_current.netloc, f'{base_path}/{location}', '', '', ''))
+
+# examples/pydantic_ai_examples/flight_booking.py:109-110
+class Failed(BaseModel):
+    """Unable to extract a seat selection."""
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:257-294
+def resolve_redirect_url(current_url: str, location: str) -> str:
+    """Resolve a redirect location against the current URL.
+
+    Args:
+        current_url: The URL that returned the redirect.
+        location: The Location header value (absolute or relative).
+
+    Returns:
+        The absolute URL to follow.
+    """
+    parsed_location = urlparse(location)
+
+    # Check if it's an absolute URL (has scheme) or protocol-relative URL (has netloc but no scheme)
+    if parsed_location.scheme:
+        return location
+    if parsed_location.netloc:
+        # Protocol-relative URL (e.g., "//example.com/path") - use current scheme
+        parsed_current = urlparse(current_url)
+        return urlunparse(
+            (
+                parsed_current.scheme,
+                parsed_location.netloc,
+                parsed_location.path,
+                '',
+                parsed_location.query,
+                parsed_location.fragment,
+            )
+        )
+
+    # Relative URL - resolve against current URL
+    parsed_current = urlparse(current_url)
+    if location.startswith('/'):
+        # Absolute path
+        return urlunparse((parsed_current.scheme, parsed_current.netloc, location, '', '', ''))
+    else:
+        # Relative path
+        base_path = parsed_current.path.rsplit('/', 1)[0]
+        return urlunparse((parsed_current.scheme, parsed_current.netloc, f'{base_path}/{location}', '', '', ''))
+
+# tests/test_streaming.py:2603-2651
+async def test_output_tool_validation_failure_events():
+    """Test that output tools that fail validation emit events during streaming."""
+
+    def call_final_result_with_bad_data(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        """Mock function that calls final_result tool with invalid data."""
+        assert info.output_tools is not None
+        return ModelResponse(
+            parts=[
+                ToolCallPart('final_result', {'bad_value': 'invalid'}),  # Invalid field name
+                ToolCallPart('final_result', {'value': 'valid'}),  # Valid field name
+            ]
+        )
+
+    agent = Agent(FunctionModel(call_final_result_with_bad_data), output_type=OutputType)
+
+    events: list[Any] = []
+    async with agent.iter('test') as agent_run:
+        async for node in agent_run:
+            if Agent.is_call_tools_node(node):
+                async with node.stream(agent_run.ctx) as event_stream:
+                    async for event in event_stream:
+                        events.append(event)
+
+    assert events == snapshot(
+        [
+            FunctionToolCallEvent(
+                part=ToolCallPart(
+                    tool_name='final_result',
+                    args={'bad_value': 'invalid'},
+                    tool_call_id=IsStr(),
+                ),
+            ),
+            FunctionToolResultEvent(
+                result=RetryPromptPart(
+                    content=[
+                        ErrorDetails(
+                            type='missing',
+                            loc=('value',),
+                            msg='Field required',
+                            input={'bad_value': 'invalid'},
+                        ),
+                    ],
+                    tool_name='final_result',
+                    tool_call_id=IsStr(),
+                    timestamp=IsNow(tz=timezone.utc),
+                )
+            ),
+        ]
+    )
+
+# tests/test_ssrf.py:269-298
+class TestResolveRedirectUrl:
+    """Tests for resolve_redirect_url function."""
+
+    def test_absolute_url(self) -> None:
+        """Test that absolute URLs are returned as-is."""
+        result = resolve_redirect_url('https://example.com/path', 'https://other.com/new-path')
+        assert result == 'https://other.com/new-path'
+
+    def test_protocol_relative_url(self) -> None:
+        """Test that protocol-relative URLs use the current scheme."""
+        result = resolve_redirect_url('https://example.com/path', '//other.com/new-path')
+        assert result == 'https://other.com/new-path'
+
+        result = resolve_redirect_url('http://example.com/path', '//other.com/new-path')
+        assert result == 'http://other.com/new-path'
+
+    def test_absolute_path(self) -> None:
+        """Test that absolute paths are resolved against the current URL."""
+        result = resolve_redirect_url('https://example.com/old/path', '/new/path')
+        assert result == 'https://example.com/new/path'
+
+    def test_relative_path(self) -> None:
+        """Test that relative paths are resolved against the current URL."""
+        result = resolve_redirect_url('https://example.com/old/path', 'new-file.txt')
+        assert result == 'https://example.com/old/new-file.txt'
+
+    def test_protocol_relative_url_preserves_query_and_fragment(self) -> None:
+        """Test that protocol-relative URLs preserve query strings and fragments."""
+        result = resolve_redirect_url('https://example.com/path', '//cdn.example.com/file.txt?token=abc#section')
+        assert result == 'https://cdn.example.com/file.txt?token=abc#section'
+
+# tests/test_ag_ui.py:791-869
+async def test_tool_local_single_event() -> None:
+    """Test local tool call that returns a single event."""
+
+    encoder = EventEncoder()
+
+    async def stream_function(
+        messages: list[ModelMessage], agent_info: AgentInfo
+    ) -> AsyncIterator[DeltaToolCalls | str]:
+        if len(messages) == 1:
+            # First call - make a tool call
+            yield {0: DeltaToolCall(name='send_snapshot')}
+            yield {0: DeltaToolCall(json_args='{}')}
+        else:
+            # Second call - return text result
+            yield encoder.encode(await send_snapshot())
+
+    agent = Agent(
+        model=FunctionModel(stream_function=stream_function),
+        tools=[send_snapshot],
+    )
+
+    run_input = create_input(
+        UserMessage(
+            id='msg_1',
+            content='Please call send_snapshot',
+        ),
+    )
+    events = await run_and_collect_events(agent, run_input)
+
+    assert events == snapshot(
+        [
+            {
+                'type': 'RUN_STARTED',
+                'timestamp': IsInt(),
+                'threadId': (thread_id := IsSameStr()),
+                'runId': (run_id := IsSameStr()),
+            },
+            {
+                'type': 'TOOL_CALL_START',
+                'timestamp': IsInt(),
+                'toolCallId': (tool_call_id := IsSameStr()),
+                'toolCallName': 'send_snapshot',
+                'parentMessageId': IsStr(),
+            },
+            {'type': 'TOOL_CALL_ARGS', 'timestamp': IsInt(), 'toolCallId': tool_call_id, 'delta': '{}'},
+            {'type': 'TOOL_CALL_END', 'timestamp': IsInt(), 'toolCallId': tool_call_id},
+            {
+                'type': 'TOOL_CALL_RESULT',
+                'timestamp': IsInt(),
+                'messageId': IsStr(),
+                'toolCallId': tool_call_id,
+                'content': '{"type":"STATE_SNAPSHOT","timestamp":null,"raw_event":null,"snapshot":{"key":"value"}}',
+                'role': 'tool',
+            },
+            {'type': 'STATE_SNAPSHOT', 'timestamp': IsInt(), 'snapshot': {'key': 'value'}},
+            {
+                'type': 'TEXT_MESSAGE_START',
+                'timestamp': IsInt(),
+                'messageId': (message_id := IsSameStr()),
+                'role': 'assistant',
+            },
+            {
+                'type': 'TEXT_MESSAGE_CONTENT',
+                'timestamp': IsInt(),
+                'messageId': message_id,
+                'delta': """\
+data: {"type":"STATE_SNAPSHOT","snapshot":{"key":"value"}}
+
+""",
+            },
+            {'type': 'TEXT_MESSAGE_END', 'timestamp': IsInt(), 'messageId': message_id},
+            {
+                'type': 'RUN_FINISHED',
+                'timestamp': IsInt(),
+                'threadId': thread_id,
+                'runId': run_id,
+            },
+        ]
+    )
+
+# tests/test_ssrf.py:461-482
+    async def test_redirect_to_private_ip_blocked(self) -> None:
+        """Test that redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'http://internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com (public), second for internal.local (private)
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/test_ssrf.py:550-581
+    async def test_protocol_relative_redirect(self) -> None:
+        """Test that protocol-relative redirects are handled correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+            # Verify second request was to cdn.example.com with https
+            second_call = mock_client.get.call_args_list[1]
+            assert second_call[1]['headers']['Host'] == 'cdn.example.com'
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:297-368
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+# tests/models/test_model_test.py:13-13
+from anyio import Event

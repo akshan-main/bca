@@ -1,0 +1,1069 @@
+## examples/pydantic_ai_examples/chat_app.py
+
+class Database:
+    """Rudimentary database to store chat messages in SQLite.
+
+    The SQLite standard library package is synchronous, so we
+    use a thread pool executor to run queries asynchronously.
+    """
+
+    con: sqlite3.Connection
+    _loop: asyncio.AbstractEventLoop
+    _executor: ThreadPoolExecutor
+
+    @classmethod
+    @asynccontextmanager
+    async def connect(
+        cls, file: Path = THIS_DIR / '.chat_app_messages.sqlite'
+    ) -> AsyncIterator[Database]:
+        with logfire.span('connect to DB'):
+            loop = asyncio.get_event_loop()
+            executor = ThreadPoolExecutor(max_workers=1)
+            con = await loop.run_in_executor(executor, cls._connect, file)
+            slf = cls(con, loop, executor)
+        try:
+            yield slf
+        finally:
+            await slf._asyncify(con.close)
+
+    @staticmethod
+    def _connect(file: Path) -> sqlite3.Connection:
+        con = sqlite3.connect(str(file))
+        con = logfire.instrument_sqlite3(con)
+        cur = con.cursor()
+        cur.execute(
+            'CREATE TABLE IF NOT EXISTS messages (id INT PRIMARY KEY, message_list TEXT);'
+        )
+        con.commit()
+        return con
+
+    async def add_messages(self, messages: bytes):
+        await self._asyncify(
+            self._execute,
+            'INSERT INTO messages (message_list) VALUES (?);',
+            messages,
+            commit=True,
+        )
+        await self._asyncify(self.con.commit)
+
+    async def get_messages(self) -> list[ModelMessage]:
+        c = await self._asyncify(
+            self._execute, 'SELECT message_list FROM messages order by id'
+        )
+        rows = await self._asyncify(c.fetchall)
+        messages: list[ModelMessage] = []
+        for row in rows:
+            messages.extend(ModelMessagesTypeAdapter.validate_json(row[0]))
+        return messages
+
+    def _execute(
+        self, sql: LiteralString, *args: Any, commit: bool = False
+    ) -> sqlite3.Cursor:
+        cur = self.con.cursor()
+        cur.execute(sql, args)
+        if commit:
+            self.con.commit()
+        return cur
+
+    async def _asyncify(
+        self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
+    ) -> R:
+        return await self._loop.run_in_executor(  # type: ignore
+            self._executor,
+            partial(func, **kwargs),
+            *args,  # type: ignore
+        )
+
+    async def add_messages(self, messages: bytes):
+        await self._asyncify(
+            self._execute,
+            'INSERT INTO messages (message_list) VALUES (?);',
+            messages,
+            commit=True,
+        )
+        await self._asyncify(self.con.commit)
+
+    async def _asyncify(
+        self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
+    ) -> R:
+        return await self._loop.run_in_executor(  # type: ignore
+            self._executor,
+            partial(func, **kwargs),
+            *args,  # type: ignore
+        )
+
+## pydantic_ai_slim/pydantic_ai/__init__.py
+
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+from abc import ABC, abstractmethod
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class FileUrl(ABC):
+    """Abstract base class for any URL-based file."""
+
+    url: str
+    """The URL of the file."""
+
+    _: KW_ONLY
+
+    force_download: ForceDownloadMode = False
+    """Controls whether the file is downloaded and how SSRF protection is applied:
+
+    * If `False`, the URL is sent directly to providers that support it. For providers that don't,
+      the file is downloaded with SSRF protection (blocks private IPs and cloud metadata).
+    * If `True`, the file is always downloaded with SSRF protection (blocks private IPs and cloud metadata).
+    * If `'allow-local'`, the file is always downloaded, allowing private IPs but still blocking cloud metadata.
+    """
+
+    vendor_metadata: dict[str, Any] | None = None
+    """Vendor-specific metadata for the file.
+
+    Supported by:
+    - `GoogleModel`: `VideoUrl.vendor_metadata` is used as `video_metadata`: https://ai.google.dev/gemini-api/docs/video-understanding#customize-video-processing
+    - `OpenAIChatModel`, `OpenAIResponsesModel`: `ImageUrl.vendor_metadata['detail']` is used as `detail` setting for images
+    - `XaiModel`: `ImageUrl.vendor_metadata['detail']` is used as `detail` setting for images
+    """
+
+    _media_type: Annotated[str | None, pydantic.Field(alias='media_type', default=None, exclude=True)] = field(
+        compare=False, default=None
+    )
+
+    _identifier: Annotated[str | None, pydantic.Field(alias='identifier', default=None, exclude=True)] = field(
+        compare=False, default=None
+    )
+
+    # `pydantic_dataclass` replaces `__init__` so this method is never used.
+    # The signature is kept so that pyright/IDE hints recognize the `media_type` and `identifier` aliases.
+    def __init__(
+        self,
+        url: str,
+        *,
+        media_type: str | None = None,
+        identifier: str | None = None,
+        force_download: ForceDownloadMode = False,
+        vendor_metadata: dict[str, Any] | None = None,
+        # Required for inline-snapshot which expects all dataclass `__init__` methods to take all field names as kwargs.
+        _media_type: str | None = None,
+        _identifier: str | None = None,
+    ) -> None: ...  # pragma: no cover
+
+    @pydantic.computed_field
+    @property
+    def media_type(self) -> str:
+        """Return the media type of the file, based on the URL or the provided `media_type`."""
+        return self._media_type and self._infer_media_type()
+
+    @pydantic.computed_field
+    @property
+    def identifier(self) -> str:
+        """The identifier of the file, such as a unique ID.
+
+        This identifier can be provided to the model in a message to allow it to refer to this file in a tool call argument,
+        and the tool can look up the file in question by iterating over the message history and finding the matching `FileUrl`.
+
+        This identifier is only automatically passed to the model when the `FileUrl` is returned by a tool.
+        If you're passing the `FileUrl` as a user message, it's up to you to include a separate text part with the identifier,
+        e.g. "This is file <identifier>:" preceding the `FileUrl`.
+
+        It's also included in inline-text delimiters for providers that require inlining text documents, so the model can
+        distinguish multiple files.
+        """
+        return self._identifier or _multi_modal_content_identifier(self.url)
+
+    @abstractmethod
+    def _infer_media_type(self) -> str:
+        """Infer the media type of the file based on the URL."""
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def format(self) -> str:
+        """The file format."""
+        raise NotImplementedError
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    _media_type: Annotated[str | None, pydantic.Field(alias='media_type', default=None, exclude=True)] = field(
+        compare=False, default=None
+    )
+
+    def media_type(self) -> str:
+        """Return the media type of the file, based on the URL or the provided `media_type`."""
+        return self._media_type and self._infer_media_type()
+
+    def _infer_media_type(self) -> str:
+        """Infer the media type of the file based on the URL."""
+        raise NotImplementedError
+
+class VideoUrl(FileUrl):
+    """A URL to a video."""
+
+    url: str
+    """The URL of the video."""
+
+    _: KW_ONLY
+
+    kind: Literal['video-url'] = 'video-url'
+    """Type identifier, this is available on all parts as a discriminator."""
+
+    # `pydantic_dataclass` replaces `__init__` so this method is never used.
+    # The signature is kept so that pyright/IDE hints recognize the aliases for the `_media_type` and `_identifier` fields.
+    def __init__(
+        self,
+        url: str,
+        *,
+        media_type: str | None = None,
+        identifier: str | None = None,
+        force_download: ForceDownloadMode = False,
+        vendor_metadata: dict[str, Any] | None = None,
+        kind: Literal['video-url'] = 'video-url',
+        # Required for inline-snapshot which expects all dataclass `__init__` methods to take all field names as kwargs.
+        _media_type: str | None = None,
+        _identifier: str | None = None,
+    ) -> None: ...  # pragma: no cover
+
+    def _infer_media_type(self) -> str:
+        """Return the media type of the video, based on the url."""
+        # Assume that YouTube videos are mp4 because there would be no extension
+        # to infer from. This should not be a problem, as Gemini disregards media
+        # type for YouTube URLs.
+        if self.is_youtube:
+            return 'video/mp4'
+
+        mime_type, _ = _mime_types.guess_type(self.url)
+        if mime_type is None:
+            raise ValueError(
+                f'Could not infer media type from video URL: {self.url}. Explicitly provide a `media_type` instead.'
+            )
+        return mime_type
+
+    @property
+    def is_youtube(self) -> bool:
+        """True if the URL has a YouTube domain."""
+        parsed = urlparse(self.url)
+        hostname = parsed.hostname
+        return hostname in ('youtu.be', 'youtube.com', 'www.youtube.com')
+
+    @property
+    def format(self) -> VideoFormat:
+        """The file format of the video.
+
+        The choice of supported formats were based on the Bedrock Converse API. Other APIs don't require to use a format.
+        """
+        return _video_format_lookup[self.media_type]
+
+    def _infer_media_type(self) -> str:
+        """Return the media type of the video, based on the url."""
+        # Assume that YouTube videos are mp4 because there would be no extension
+        # to infer from. This should not be a problem, as Gemini disregards media
+        # type for YouTube URLs.
+        if self.is_youtube:
+            return 'video/mp4'
+
+        mime_type, _ = _mime_types.guess_type(self.url)
+        if mime_type is None:
+            raise ValueError(
+                f'Could not infer media type from video URL: {self.url}. Explicitly provide a `media_type` instead.'
+            )
+        return mime_type
+
+    def _infer_media_type(self) -> str:
+        """Return the media type of the audio file, based on the url.
+
+        References:
+        - Gemini: https://ai.google.dev/gemini-api/docs/audio#supported-formats
+        """
+        mime_type, _ = _mime_types.guess_type(self.url)
+        if mime_type is None:
+            raise ValueError(
+                f'Could not infer media type from audio URL: {self.url}. Explicitly provide a `media_type` instead.'
+            )
+        return mime_type
+
+class ImageUrl(FileUrl):
+    """A URL to an image."""
+
+    url: str
+    """The URL of the image."""
+
+    _: KW_ONLY
+
+    kind: Literal['image-url'] = 'image-url'
+    """Type identifier, this is available on all parts as a discriminator."""
+
+    # `pydantic_dataclass` replaces `__init__` so this method is never used.
+    # The signature is kept so that pyright/IDE hints recognize the aliases for the `_media_type` and `_identifier` fields.
+    def __init__(
+        self,
+        url: str,
+        *,
+        media_type: str | None = None,
+        identifier: str | None = None,
+        force_download: ForceDownloadMode = False,
+        vendor_metadata: dict[str, Any] | None = None,
+        kind: Literal['image-url'] = 'image-url',
+        # Required for inline-snapshot which expects all dataclass `__init__` methods to take all field names as kwargs.
+        _media_type: str | None = None,
+        _identifier: str | None = None,
+    ) -> None: ...  # pragma: no cover
+
+    def _infer_media_type(self) -> str:
+        """Return the media type of the image, based on the url."""
+        mime_type, _ = _mime_types.guess_type(self.url)
+        if mime_type is None:
+            raise ValueError(
+                f'Could not infer media type from image URL: {self.url}. Explicitly provide a `media_type` instead.'
+            )
+        return mime_type
+
+    @property
+    def format(self) -> ImageFormat:
+        """The file format of the image.
+
+        The choice of supported formats were based on the Bedrock Converse API. Other APIs don't require to use a format.
+        """
+        return _image_format_lookup[self.media_type]
+
+    def _infer_media_type(self) -> str:
+        """Return the media type of the image, based on the url."""
+        mime_type, _ = _mime_types.guess_type(self.url)
+        if mime_type is None:
+            raise ValueError(
+                f'Could not infer media type from image URL: {self.url}. Explicitly provide a `media_type` instead.'
+            )
+        return mime_type
+
+class DocumentUrl(FileUrl):
+    """The URL of the document."""
+
+    url: str
+    """The URL of the document."""
+
+    _: KW_ONLY
+
+    kind: Literal['document-url'] = 'document-url'
+    """Type identifier, this is available on all parts as a discriminator."""
+
+    # `pydantic_dataclass` replaces `__init__` so this method is never used.
+    # The signature is kept so that pyright/IDE hints recognize the aliases for the `_media_type` and `_identifier` fields.
+    def __init__(
+        self,
+        url: str,
+        *,
+        media_type: str | None = None,
+        identifier: str | None = None,
+        force_download: ForceDownloadMode = False,
+        vendor_metadata: dict[str, Any] | None = None,
+        kind: Literal['document-url'] = 'document-url',
+        # Required for inline-snapshot which expects all dataclass `__init__` methods to take all field names as kwargs.
+        _media_type: str | None = None,
+        _identifier: str | None = None,
+    ) -> None: ...  # pragma: no cover
+
+    def _infer_media_type(self) -> str:
+        """Return the media type of the document, based on the url."""
+        mime_type, _ = _mime_types.guess_type(self.url)
+        if mime_type is None:
+            raise ValueError(
+                f'Could not infer media type from document URL: {self.url}. Explicitly provide a `media_type` instead.'
+            )
+        return mime_type
+
+    @property
+    def format(self) -> DocumentFormat:
+        """The file format of the document.
+
+        The choice of supported formats were based on the Bedrock Converse API. Other APIs don't require to use a format.
+        """
+        media_type = self.media_type
+        try:
+            return _document_format_lookup[media_type]
+        except KeyError as e:
+            raise ValueError(f'Unknown document media type: {media_type}') from e
+
+    def _infer_media_type(self) -> str:
+        """Return the media type of the document, based on the url."""
+        mime_type, _ = _mime_types.guess_type(self.url)
+        if mime_type is None:
+            raise ValueError(
+                f'Could not infer media type from document URL: {self.url}. Explicitly provide a `media_type` instead.'
+            )
+        return mime_type
+
+    _: KW_ONLY
+
+    def has_content(self) -> bool:
+        """Return `True` if the tool return has content."""
+        return self.content is not None  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/models/openai.py
+
+    def _is_text_like_media_type(media_type: str) -> bool:
+        return (
+            media_type.startswith('text/')
+            or media_type == 'application/json'
+            or media_type.endswith('+json')
+            or media_type == 'application/xml'
+            or media_type.endswith('+xml')
+            or media_type in ('application/x-yaml', 'application/yaml')
+        )
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+    def _bool_gen(self) -> bool:
+        """Generate a boolean from a JSON Schema boolean."""
+        return bool(self.seed % 2)
+
+## pydantic_ai_slim/pydantic_ai/providers/sambanova.py
+
+    def name(self) -> str:
+        """Return the provider name."""
+        return 'sambanova'
+
+    def base_url(self) -> str:
+        """Return the base URL."""
+        return self._base_url
+
+    def client(self) -> AsyncOpenAI:
+        """Return the AsyncOpenAI client."""
+        return self._client
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def response(self) -> _messages.ModelResponse:
+        """Return the current state of the response."""
+        if self._run_result is not None:
+            return self._run_result.response
+        elif self._stream_response is not None:
+            return self._stream_response.get()
+        else:
+            raise ValueError('No stream response or run result provided')  # pragma: no cover
+
+    def response(self) -> _messages.ModelResponse:
+        """Return the current state of the response."""
+        return self._streamed_run_result.response
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def all_messages(self) -> list[_messages.ModelMessage]:
+        """Return all messages for the run so far.
+
+        Messages from older runs are included.
+        """
+        return self.ctx.state.message_history
+
+    def all_messages_json(self, *, output_tool_return_content: str | None = None) -> bytes:
+        """Return all messages from [`all_messages`][pydantic_ai.agent.AgentRun.all_messages] as JSON bytes.
+
+        Returns:
+            JSON bytes representing the messages.
+        """
+        return _messages.ModelMessagesTypeAdapter.dump_json(self.all_messages())
+
+    def new_messages(self) -> list[_messages.ModelMessage]:
+        """Return new messages for the run so far.
+
+        Messages from older runs are excluded.
+        """
+        return self.all_messages()[self.ctx.deps.new_message_index :]
+
+    def new_messages_json(self) -> bytes:
+        """Return new messages from [`new_messages`][pydantic_ai.agent.AgentRun.new_messages] as JSON bytes.
+
+        Returns:
+            JSON bytes representing the new messages.
+        """
+        return _messages.ModelMessagesTypeAdapter.dump_json(self.new_messages())
+
+    def _set_output_tool_return(self, return_content: str) -> list[_messages.ModelMessage]:
+        """Set return content for the output tool.
+
+        Useful if you want to continue the conversation and want to set the response to the output tool call.
+        """
+        if not self._output_tool_name:
+            raise ValueError('Cannot set output tool return content when the return type is `str`.')
+
+        messages = self._state.message_history
+        last_message = messages[-1]
+        for idx, part in enumerate(last_message.parts):
+            if isinstance(part, _messages.ToolReturnPart) and part.tool_name == self._output_tool_name:
+                # Only do deepcopy when we have to modify
+                copied_messages = list(messages)
+                copied_last = deepcopy(last_message)
+                copied_last.parts[idx].content = return_content  # type: ignore[misc]
+                copied_messages[-1] = copied_last
+                return copied_messages
+
+        raise LookupError(f'No tool call found with tool name {self._output_tool_name!r}.')
+
+    def all_messages(self, *, output_tool_return_content: str | None = None) -> list[_messages.ModelMessage]:
+        """Return the history of _messages.
+
+        Args:
+            output_tool_return_content: The return content of the tool call to set in the last message.
+                This provides a convenient way to modify the content of the output tool call if you want to continue
+                the conversation and want to set the response to the output tool call. If `None`, the last message will
+                not be modified.
+
+        Returns:
+            List of messages.
+        """
+        if output_tool_return_content is not None:
+            return self._set_output_tool_return(output_tool_return_content)
+        else:
+            return self._state.message_history
+
+    def response(self) -> _messages.ModelResponse:
+        """Return the last response from the message history."""
+        # The response may not be the very last item if it contained an output tool call. See `CallToolsNode._handle_final_result`.
+        for message in reversed(self.all_messages()):
+            if isinstance(message, _messages.ModelResponse):
+                return message
+        raise ValueError('No response found in the message history')  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/toolsets/fastmcp.py
+
+UNKNOWN_BINARY_MEDIA_TYPE = 'application/octet-stream'
+
+## pydantic_ai_slim/pydantic_ai/ui/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the protocol-specific run input."""
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/ui/_event_stream.py
+
+    async def handle_builtin_tool_return(self, part: BuiltinToolReturnPart) -> AsyncIterator[EventT]:
+        """Handle a `BuiltinToolReturnPart`.
+
+        Args:
+            part: The builtin tool return part.
+        """
+        return  # pragma: no cover
+        yield  # Make this an async generator
+
+## pydantic_ai_slim/pydantic_ai/ui/ag_ui/_adapter.py
+
+    def label(self) -> str:
+        """Return the label for this toolset."""
+        return 'the AG-UI frontend tools'  # pragma: no cover
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the AG-UI run input."""
+        return self.load_messages(self.run_input.messages)
+
+## pydantic_ai_slim/pydantic_ai/ui/ag_ui/_event_stream.py
+
+    async def handle_builtin_tool_return(self, part: BuiltinToolReturnPart) -> AsyncIterator[BaseEvent]:
+        tool_call_id = self._builtin_tool_call_ids[part.tool_call_id]
+        yield ToolCallResultEvent(
+            message_id=self.new_message_id(),
+            type=EventType.TOOL_CALL_RESULT,
+            role='tool',
+            tool_call_id=tool_call_id,
+            content=part.model_response_str(),
+        )
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the Vercel AI run input."""
+        return self.load_messages(self.run_input.messages)
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_event_stream.py
+
+    async def handle_builtin_tool_return(self, part: BuiltinToolReturnPart) -> AsyncIterator[BaseChunk]:
+        yield ToolOutputAvailableChunk(
+            tool_call_id=part.tool_call_id,
+            output=self._tool_return_output(part),
+            provider_executed=True,
+        )
+
+    def _tool_return_output(self, part: BaseToolReturnPart) -> Any:
+        output = part.model_response_object()
+        # Unwrap the return value from the output dictionary if it exists
+        return output.get('return_value', output)
+
+## pydantic_graph/pydantic_graph/beta/graph.py
+
+    def __aiter__(self) -> AsyncIterator[EndMarker[OutputT] | Sequence[GraphTask]]:
+        """Return self as an async iterator.
+
+        Returns:
+            Self for async iteration
+        """
+        return self
+
+## pydantic_graph/pydantic_graph/graph.py
+
+from .persistence import BaseStatePersistence
+
+## pydantic_graph/pydantic_graph/nodes.py
+
+    def deep_copy(self) -> Self:
+        """Returns a deep copy of the node."""
+        return copy.deepcopy(self)
+
+## pydantic_graph/pydantic_graph/persistence/in_mem.py
+
+class FullStatePersistence(BaseStatePersistence[StateT, RunEndT]):
+    """In memory state persistence that hold a list of snapshots."""
+
+    deep_copy: bool = True
+    """Whether to deep copy the state and nodes when storing them.
+
+    Defaults to `True` so even if nodes or state are modified after the snapshot is taken,
+    the persistence history will record the value at the time of the snapshot.
+    """
+    history: list[Snapshot[StateT, RunEndT]] = field(default_factory=list[Snapshot[StateT, RunEndT]])
+    """List of snapshots taken during the graph run."""
+    _snapshots_type_adapter: pydantic.TypeAdapter[list[Snapshot[StateT, RunEndT]]] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    async def snapshot_node(self, state: StateT, next_node: BaseNode[StateT, Any, RunEndT]) -> None:
+        snapshot = NodeSnapshot(
+            state=self._prep_state(state),
+            node=next_node.deep_copy() if self.deep_copy else next_node,
+        )
+        self.history.append(snapshot)
+
+    async def snapshot_node_if_new(
+        self, snapshot_id: str, state: StateT, next_node: BaseNode[StateT, Any, RunEndT]
+    ) -> None:
+        if not any(s.id == snapshot_id for s in self.history):
+            await self.snapshot_node(state, next_node)
+
+    async def snapshot_end(self, state: StateT, end: End[RunEndT]) -> None:
+        snapshot = EndSnapshot(
+            state=self._prep_state(state),
+            result=end.deep_copy_data() if self.deep_copy else end,
+        )
+        self.history.append(snapshot)
+
+    @asynccontextmanager
+    async def record_run(self, snapshot_id: str) -> AsyncIterator[None]:
+        try:
+            snapshot = next(s for s in self.history if s.id == snapshot_id)
+        except StopIteration as e:
+            raise LookupError(f'No snapshot found with id={snapshot_id!r}') from e
+
+        assert isinstance(snapshot, NodeSnapshot), 'Only NodeSnapshot can be recorded'
+        exceptions.GraphNodeStatusError.check(snapshot.status)
+        snapshot.status = 'running'
+        snapshot.start_ts = _utils.now_utc()
+        start = perf_counter()
+        try:
+            yield
+        except Exception:
+            snapshot.duration = perf_counter() - start
+            snapshot.status = 'error'
+            raise
+        else:
+            snapshot.duration = perf_counter() - start
+            snapshot.status = 'success'
+
+    async def load_next(self) -> NodeSnapshot[StateT, RunEndT] | None:
+        if snapshot := next((s for s in self.history if isinstance(s, NodeSnapshot) and s.status == 'created'), None):
+            snapshot.status = 'pending'
+            return copy.deepcopy(snapshot)
+
+    async def load_all(self) -> list[Snapshot[StateT, RunEndT]]:
+        return self.history
+
+    def should_set_types(self) -> bool:
+        return self._snapshots_type_adapter is None
+
+    def set_types(self, state_type: type[StateT], run_end_type: type[RunEndT]) -> None:
+        self._snapshots_type_adapter = build_snapshot_list_type_adapter(state_type, run_end_type)
+
+    def dump_json(self, *, indent: int | None = None) -> bytes:
+        """Dump the history to JSON bytes."""
+        assert self._snapshots_type_adapter is not None, 'type adapter must be set to use `dump_json`'
+        return self._snapshots_type_adapter.dump_json(self.history, indent=indent)
+
+    def load_json(self, json_data: str | bytes | bytearray) -> None:
+        """Load the history from JSON."""
+        assert self._snapshots_type_adapter is not None, 'type adapter must be set to use `load_json`'
+        self.history = self._snapshots_type_adapter.validate_json(json_data)
+
+    def _prep_state(self, state: StateT) -> StateT:
+        """Prepare state for snapshot, uses [`copy.deepcopy`][copy.deepcopy] by default."""
+        if not self.deep_copy or state is None:
+            return state
+        else:
+            return copy.deepcopy(state)
+
+    def dump_json(self, *, indent: int | None = None) -> bytes:
+        """Dump the history to JSON bytes."""
+        assert self._snapshots_type_adapter is not None, 'type adapter must be set to use `dump_json`'
+        return self._snapshots_type_adapter.dump_json(self.history, indent=indent)
+
+## tests/graph/beta/test_v1_v2_integration.py
+
+async def test_v1_node_conditional_return():
+    """Test v1 nodes with conditional returns creating implicit decisions."""
+
+    @dataclass
+    class RouterNode(BaseNode[IntegrationState, None, str]):
+        value: int
+
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> PathA | PathB:
+            if self.value < 10:
+                return PathA()
+            else:
+                return PathB()
+
+    @dataclass
+    class PathA(BaseNode[IntegrationState, None, str]):
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> End[str]:
+            return End('Path A')
+
+    @dataclass
+    class PathB(BaseNode[IntegrationState, None, str]):
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> End[str]:
+            return End('Path B')
+
+    g = GraphBuilder(state_type=IntegrationState, input_type=int, output_type=str)
+
+    @g.step
+    async def create_router(ctx: StepContext[IntegrationState, None, int]) -> RouterNode:
+        return RouterNode(ctx.inputs)
+
+    g.add(
+        g.node(RouterNode),
+        g.node(PathA),
+        g.node(PathB),
+        g.edge_from(g.start_node).to(create_router),
+    )
+
+    graph = g.build()
+
+    assert str(graph) == snapshot("""\
+stateDiagram-v2
+  create_router
+  RouterNode
+  state decision <<choice>>
+  PathA
+  PathB
+
+  [*] --> create_router
+  create_router --> RouterNode
+  RouterNode --> decision
+  decision --> PathA
+  decision --> PathB
+  PathA --> [*]
+  PathB --> [*]\
+""")
+
+    # Test path A
+    result_a = await graph.run(state=IntegrationState(), inputs=5)
+    assert result_a == 'Path A'
+
+    # Test path B
+    result_b = await graph.run(state=IntegrationState(), inputs=15)
+    assert result_b == 'Path B'
+
+## tests/models/test_anthropic.py
+
+    def messages(self) -> Any:
+        return type('Messages', (), {'create': self.messages_create, 'count_tokens': self.messages_count_tokens})
+
+## tests/models/test_huggingface.py
+
+async def test_unsupported_media_types(allow_model_requests: None, content_item: Any, error_message: str):
+    model = HuggingFaceModel(
+        'Qwen/Qwen2.5-VL-72B-Instruct',
+        provider=HuggingFaceProvider(api_key='x'),
+    )
+    agent = Agent(model)
+
+    with pytest.raises(NotImplementedError, match=error_message):
+        await agent.run(['hello', content_item])
+
+## tests/models/test_model_function.py
+
+async def return_last(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+    last = messages[-1].parts[-1]
+    response = asdict(last)
+    response.pop('timestamp', None)
+    response['message_count'] = len(messages)
+    return ModelResponse(parts=[TextPart(' '.join(f'{k}={v!r}' for k, v in response.items()))])
+
+## tests/models/test_xai.py
+
+async def test_xai_binary_content_unknown_media_type_raises(allow_model_requests: None):
+    """Cover the unsupported BinaryContent media type branch."""
+    response = create_response(content='ok', usage=create_usage(prompt_tokens=1, completion_tokens=1))
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    # Neither image/*, audio/*, nor a known document type => should fail during prompt mapping.
+    bc = BinaryContent(b'123', media_type='video/mp4')
+    with pytest.raises(RuntimeError, match='Unsupported binary content type: video/mp4'):
+        await agent.run(['hello', bc])
+
+## tests/test_agent.py
+
+def test_image_url_serializable_missing_media_type():
+    agent = Agent('test')
+    content = ImageUrl('https://example.com/chart.jpeg')
+    result = agent.run_sync(['Hello', content])
+    serialized = result.all_messages_json()
+    assert json.loads(serialized) == snapshot(
+        [
+            {
+                'parts': [
+                    {
+                        'content': [
+                            'Hello',
+                            {
+                                'url': 'https://example.com/chart.jpeg',
+                                'force_download': False,
+                                'vendor_metadata': None,
+                                'kind': 'image-url',
+                                'media_type': 'image/jpeg',
+                                'identifier': 'a72e39',
+                            },
+                        ],
+                        'timestamp': IsStr(),
+                        'part_kind': 'user-prompt',
+                    }
+                ],
+                'timestamp': IsStr(),
+                'instructions': None,
+                'kind': 'request',
+                'run_id': IsStr(),
+                'metadata': None,
+            },
+            {
+                'parts': [
+                    {
+                        'content': 'success (no tool calls)',
+                        'id': None,
+                        'provider_name': None,
+                        'part_kind': 'text',
+                        'provider_details': None,
+                    }
+                ],
+                'usage': {
+                    'input_tokens': 51,
+                    'cache_write_tokens': 0,
+                    'cache_read_tokens': 0,
+                    'output_tokens': 4,
+                    'input_audio_tokens': 0,
+                    'cache_audio_read_tokens': 0,
+                    'output_audio_tokens': 0,
+                    'details': {},
+                },
+                'model_name': 'test',
+                'timestamp': IsStr(),
+                'provider_name': None,
+                'provider_details': None,
+                'provider_url': None,
+                'provider_response_id': None,
+                'kind': 'response',
+                'finish_reason': None,
+                'run_id': IsStr(),
+                'metadata': None,
+            },
+        ]
+    )
+
+    # We also need to be able to round trip the serialized messages.
+    messages = ModelMessagesTypeAdapter.validate_json(serialized)
+    part = messages[0].parts[0]
+    assert isinstance(part, UserPromptPart)
+    content = part.content[1]
+    assert isinstance(content, ImageUrl)
+    assert content.media_type == 'image/jpeg'
+    assert messages == result.all_messages()
+
+## tests/test_concurrency.py
+
+    async def test_returns_context_when_provided(self):
+        """Test that get_concurrency_context returns a working context."""
+        limiter = ConcurrencyLimiter(max_running=1)
+        async with get_concurrency_context(limiter, 'test'):
+            pass  # Should acquire and release
+
+    async def test_returns_null_context_when_none(self):
+        """Test that get_concurrency_context returns a no-op context when None."""
+        async with get_concurrency_context(None, 'test'):
+            pass  # Should be a no-op
+
+## tests/test_dbos.py
+
+def return_settings(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+    return ModelResponse(parts=[TextPart(str(agent_info.model_settings))])
+
+## tests/test_messages.py
+
+def test_binary_image_requires_image_media_type():
+    # Valid image media type should work
+    img = BinaryImage(data=b'test', media_type='image/png')
+    assert img.is_image
+
+    # Non-image media type should raise
+    with pytest.raises(ValueError, match='`BinaryImage` must have a media type that starts with "image/"'):
+        BinaryImage(data=b'test', media_type='text/plain')
+
+def test_binary_content_unknown_media_type():
+    with pytest.raises(ValueError, match='Unknown media type: application/custom'):
+        binary_content = BinaryContent(data=b'Hello, world!', media_type='application/custom')
+        binary_content.format
+
+## tests/test_prefect.py
+
+def return_settings(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+    return ModelResponse(parts=[TextPart(str(agent_info.model_settings))])
+
+## tests/test_temporal.py
+
+def return_settings(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+    return ModelResponse(parts=[TextPart(str(agent_info.model_settings))])
+
+async def test_document_url_serialization_preserves_media_type(allow_model_requests: None, client: Client):
+    """Test that `DocumentUrl` with custom `media_type` is preserved through Temporal serialization.
+
+    This is a regression test for https://github.com/pydantic/pydantic-ai/issues/3949
+    where `DocumentUrl.media_type` (a computed field) was lost during Temporal activity
+    serialization because the backing field `_media_type` was excluded from serialization.
+    """
+    async with Worker(
+        client,
+        task_queue=TASK_QUEUE,
+        workflows=[DocumentUrlAgentWorkflow],
+        plugins=[AgentPlugin(document_url_temporal_agent)],
+    ):
+        output = await client.execute_workflow(
+            DocumentUrlAgentWorkflow.run,
+            args=['Return a document'],
+            id=DocumentUrlAgentWorkflow.__name__,
+            task_queue=TASK_QUEUE,
+        )
+        assert output == snapshot(
+            DocumentUrl(url='https://example.com/doc/12345', _media_type='application/pdf', _identifier='eb8998')
+        )
+
+## tests/test_tenacity.py
+
+        def do_GET(self):
+            self.send_response(429)
+            self.send_header('Retry-After', '1')
+            self.end_headers()
+            self.wfile.write(b'Rate limited')
+
+## tests/test_ui.py
+
+    def messages(self) -> list[ModelMessage]:
+        return self.load_messages(self.run_input.messages)
+
+    async def handle_builtin_tool_return(self, part: BuiltinToolReturnPart) -> AsyncIterator[str]:
+        yield f'<builtin-tool-return name={part.tool_name!r}>{part.content}</builtin-tool-return>'
+
+## tests/test_vercel_ai.py
+
+async def test_adapter_dump_messages_with_builtin_tool_without_return():
+    """Test dumping messages with a builtin tool call that has no return in the same message."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Search for something')]),
+        ModelResponse(
+            parts=[
+                BuiltinToolCallPart(
+                    tool_name='web_search',
+                    args={'query': 'orphan query'},
+                    tool_call_id='orphan_tool_id',
+                    provider_name='openai',
+                ),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Search for something', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'tool-web_search',
+                        'tool_call_id': 'orphan_tool_id',
+                        'state': 'input-available',
+                        'input': '{"query":"orphan query"}',
+                        'provider_executed': True,
+                        'call_provider_metadata': {
+                            'pydantic_ai': {'provider_name': 'openai'}
+                        },  # No return part, so defaults to normal call provider name
+                    }
+                ],
+            },
+        ]
+    )

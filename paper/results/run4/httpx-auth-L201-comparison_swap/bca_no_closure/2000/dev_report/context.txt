@@ -1,0 +1,220 @@
+## httpx/_api.py
+
+def get(
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `GET` request.
+
+    **Parameters**: See `httpx.request`.
+
+    Note that the `data`, `files`, `json` and `content` parameters are not available
+    on this function, as `GET` requests should not include a request body.
+    """
+    return request(
+        "GET",
+        url,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+## httpx/_client.py
+
+    def auth(self, auth: AuthTypes) -> None:
+        self._auth = self._build_auth(auth)
+
+## httpx/_models.py
+
+    def get(self, key: str, default: typing.Any = None) -> typing.Any:
+        """
+        Return a header value. If multiple occurrences of the header occur
+        then concatenate them together with commas.
+        """
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+## httpx/_urls.py
+
+    def get(self, key: typing.Any, default: typing.Any = None) -> typing.Any:
+        """
+        Get a value from the query param for a given key. If the key occurs
+        more than once, then only the first value is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get("a") == "123"
+        """
+        if key in self._dict:
+            return self._dict[str(key)][0]
+        return default
+
+    def __getitem__(self, key: typing.Any) -> str:
+        return self._dict[key][0]
+
+## tests/test_auth.py
+
+def test_basic_auth():
+    auth = httpx.BasicAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    # The initial request should include a basic auth header.
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert request.headers["Authorization"].startswith("Basic")
+
+    # No other requests are made.
+    response = httpx.Response(content=b"Hello, world!", status_code=200)
+    with pytest.raises(StopIteration):
+        flow.send(response)
+
+def test_digest_auth_with_200():
+    auth = httpx.DigestAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    # The initial request should not include an auth header.
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    # If a 200 response is returned, then no other requests are made.
+    response = httpx.Response(content=b"Hello, world!", status_code=200)
+    with pytest.raises(StopIteration):
+        flow.send(response)
+
+def test_digest_auth_with_401_nonce_counting():
+    auth = httpx.DigestAuth(username="user", password="pass")
+    request = httpx.Request("GET", "https://www.example.com")
+
+    # The initial request should not include an auth header.
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    # If a 401 response is returned, then a digest auth request is made.
+    headers = {
+        "WWW-Authenticate": 'Digest realm="...", qop="auth", nonce="...", opaque="..."'
+    }
+    response = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers, request=request
+    )
+    first_request = flow.send(response)
+    assert first_request.headers["Authorization"].startswith("Digest")
+
+    # Each subsequent request contains the digest header by default...
+    request = httpx.Request("GET", "https://www.example.com")
+    flow = auth.sync_auth_flow(request)
+    second_request = next(flow)
+    assert second_request.headers["Authorization"].startswith("Digest")
+
+    # ... and the client nonce count (nc) is increased
+    first_nc = parse_keqv_list(first_request.headers["Authorization"].split(", "))["nc"]
+    second_nc = parse_keqv_list(second_request.headers["Authorization"].split(", "))[
+        "nc"
+    ]
+    assert int(first_nc, 16) + 1 == int(second_nc, 16)
+
+    # No other requests are made.
+    response = httpx.Response(content=b"Hello, world!", status_code=200)
+    with pytest.raises(StopIteration):
+        flow.send(response)
+
+def set_cookies(request: httpx.Request) -> httpx.Response:
+    headers = {
+        "Set-Cookie": "session=.session_value...",
+        "WWW-Authenticate": 'Digest realm="...", qop="auth", nonce="...", opaque="..."',
+    }
+    if request.url.path == "/auth":
+        return httpx.Response(
+            content=b"Auth required", status_code=401, headers=headers
+        )
+    else:
+        raise NotImplementedError()  # pragma: no cover
+
+def test_digest_auth_setting_cookie_in_request():
+    url = "https://www.example.com/auth"
+    client = httpx.Client(transport=httpx.MockTransport(set_cookies))
+    request = client.build_request("GET", url)
+
+    auth = httpx.DigestAuth(username="user", password="pass")
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    response = client.get(url)
+    assert len(response.cookies) > 0
+    assert response.cookies["session"] == ".session_value..."
+
+    request = flow.send(response)
+    assert request.headers["Authorization"].startswith("Digest")
+    assert request.headers["Cookie"] == "session=.session_value..."
+
+    # No other requests are made.
+    response = httpx.Response(
+        content=b"Hello, world!", status_code=200, request=request
+    )
+    with pytest.raises(StopIteration):
+        flow.send(response)
+
+def test_digest_auth_rfc_2069():
+    # Example from https://datatracker.ietf.org/doc/html/rfc2069#section-2.4
+    # with corrected response from https://www.rfc-editor.org/errata/eid749
+
+    auth = httpx.DigestAuth(username="Mufasa", password="CircleOfLife")
+    request = httpx.Request("GET", "https://www.example.com/dir/index.html")
+
+    # The initial request should not include an auth header.
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    # If a 401 response is returned, then a digest auth request is made.
+    headers = {
+        "WWW-Authenticate": (
+            'Digest realm="testrealm@host.com", '
+            'nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", '
+            'opaque="5ccc069c403ebaf9f0171e9517f40e41"'
+        )
+    }
+    response = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers, request=request
+    )
+    request = flow.send(response)
+    assert request.headers["Authorization"].startswith("Digest")
+    assert 'username="Mufasa"' in request.headers["Authorization"]
+    assert 'realm="testrealm@host.com"' in request.headers["Authorization"]
+    assert (
+        'nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093"' in request.headers["Authorization"]
+    )
+    assert 'uri="/dir/index.html"' in request.headers["Authorization"]
+    assert (
+        'opaque="5ccc069c403ebaf9f0171e9517f40e41"' in request.headers["Authorization"]
+    )
+    assert (
+        'response="1949323746fe6a43ef61f9606e7febea"'
+        in request.headers["Authorization"]
+    )
+
+    # No other requests are made.
+    response = httpx.Response(content=b"Hello, world!", status_code=200)
+    with pytest.raises(StopIteration):
+        flow.send(response)

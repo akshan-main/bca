@@ -1,0 +1,811 @@
+## examples/pydantic_ai_examples/evals/custom_evaluators.py
+
+from pydantic_evals.evaluators import (
+    Evaluator,
+    EvaluatorContext,
+    EvaluatorOutput,
+)
+
+## pydantic_ai_slim/pydantic_ai/_a2a.py
+
+from typing import Any, Generic, TypeVar
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py
+
+from pydantic_ai.providers import Provider
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+class _GeminiSafetyRating(TypedDict):
+    """See <https://ai.google.dev/gemini-api/docs/safety-settings#safety-filters>."""
+
+    category: Literal[
+        'HARM_CATEGORY_HARASSMENT',
+        'HARM_CATEGORY_HATE_SPEECH',
+        'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+        'HARM_CATEGORY_DANGEROUS_CONTENT',
+        'HARM_CATEGORY_CIVIC_INTEGRITY',
+    ]
+    probability: Literal['NEGLIGIBLE', 'LOW', 'MEDIUM', 'HIGH']
+    blocked: NotRequired[bool]
+
+## pydantic_ai_slim/pydantic_ai/providers/azure.py
+
+class AzureProvider(Provider[AsyncOpenAI]):
+    """Provider for Azure OpenAI API.
+
+    See <https://azure.microsoft.com/en-us/products/ai-foundry> for more information.
+    """
+
+    @property
+    def name(self) -> str:
+        return 'azure'
+
+    @property
+    def base_url(self) -> str:
+        assert self._base_url is not None
+        return self._base_url
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        return self._client
+
+    def model_profile(self, model_name: str) -> ModelProfile | None:
+        model_name = model_name.lower()
+
+        prefix_to_profile = {
+            'llama': meta_model_profile,
+            'meta-': meta_model_profile,
+            'deepseek': deepseek_model_profile,
+            'mistralai-': mistral_model_profile,
+            'mistral': mistral_model_profile,
+            'cohere-': cohere_model_profile,
+            'grok': grok_model_profile,
+        }
+
+        for prefix, profile_func in prefix_to_profile.items():
+            if model_name.startswith(prefix):
+                if prefix.endswith('-'):
+                    model_name = model_name[len(prefix) :]
+
+                profile = profile_func(model_name)
+
+                # As AzureProvider is always used with OpenAIChatModel, which used to unconditionally use OpenAIJsonSchemaTransformer,
+                # we need to maintain that behavior unless json_schema_transformer is set explicitly
+                return OpenAIModelProfile(json_schema_transformer=OpenAIJsonSchemaTransformer).update(profile)
+
+        # OpenAI models are unprefixed
+        return openai_model_profile(model_name)
+
+    @overload
+    def __init__(self, *, openai_client: AsyncAzureOpenAI) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        *,
+        azure_endpoint: str | None = None,
+        api_version: str | None = None,
+        api_key: str | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        *,
+        azure_endpoint: str | None = None,
+        api_version: str | None = None,
+        api_key: str | None = None,
+        openai_client: AsyncAzureOpenAI | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        """Create a new Azure provider.
+
+        Args:
+            azure_endpoint: The Azure endpoint to use for authentication, if not provided, the `AZURE_OPENAI_ENDPOINT`
+                environment variable will be used if available.
+            api_version: The API version to use for authentication, if not provided, the `OPENAI_API_VERSION`
+                environment variable will be used if available.
+            api_key: The API key to use for authentication, if not provided, the `AZURE_OPENAI_API_KEY` environment variable
+                will be used if available.
+            openai_client: An existing
+                [`AsyncAzureOpenAI`](https://github.com/openai/openai-python#microsoft-azure-openai)
+                client to use. If provided, `base_url`, `api_key`, and `http_client` must be `None`.
+            http_client: An existing `httpx.AsyncClient` to use for making HTTP requests.
+        """
+        if openai_client is not None:
+            assert azure_endpoint is None, 'Cannot provide both `openai_client` and `azure_endpoint`'
+            assert http_client is None, 'Cannot provide both `openai_client` and `http_client`'
+            assert api_key is None, 'Cannot provide both `openai_client` and `api_key`'
+            self._base_url = str(openai_client.base_url)
+            self._client = openai_client
+        else:
+            azure_endpoint = azure_endpoint or os.getenv('AZURE_OPENAI_ENDPOINT')
+            if not azure_endpoint:
+                raise UserError(
+                    'Must provide one of the `azure_endpoint` argument or the `AZURE_OPENAI_ENDPOINT` environment variable'
+                )
+
+            if not api_key and 'AZURE_OPENAI_API_KEY' not in os.environ:  # pragma: no cover
+                raise UserError(
+                    'Must provide one of the `api_key` argument or the `AZURE_OPENAI_API_KEY` environment variable'
+                )
+
+            if not api_version and 'OPENAI_API_VERSION' not in os.environ:  # pragma: no cover
+                raise UserError(
+                    'Must provide one of the `api_version` argument or the `OPENAI_API_VERSION` environment variable'
+                )
+
+            http_client = http_client or cached_async_http_client(provider='azure')
+            self._client = AsyncAzureOpenAI(
+                azure_endpoint=azure_endpoint,
+                api_key=api_key,
+                api_version=api_version,
+                http_client=http_client,
+            )
+            self._base_url = str(self._client.base_url)
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+class UsageBase:
+    input_tokens: Annotated[
+        int,
+        # `request_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('input_tokens', 'request_tokens')),
+    ] = 0
+    """Number of input/prompt tokens."""
+
+    cache_write_tokens: int = 0
+    """Number of tokens written to the cache."""
+    cache_read_tokens: int = 0
+    """Number of tokens read from the cache."""
+
+    output_tokens: Annotated[
+        int,
+        # `response_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('output_tokens', 'response_tokens')),
+    ] = 0
+    """Number of output/completion tokens."""
+
+    input_audio_tokens: int = 0
+    """Number of audio input tokens."""
+    cache_audio_read_tokens: int = 0
+    """Number of audio tokens read from the cache."""
+    output_audio_tokens: int = 0
+    """Number of audio output tokens."""
+
+    details: Annotated[
+        dict[str, int],
+        # `details` can not be `None` any longer, but we still want to support deserializing model responses stored in a DB before this was changed
+        BeforeValidator(lambda d: d or {}),
+    ] = dataclasses.field(default_factory=dict[str, int])
+    """Any extra details returned by the model."""
+
+    @property
+    @deprecated('`request_tokens` is deprecated, use `input_tokens` instead')
+    def request_tokens(self) -> int:
+        return self.input_tokens
+
+    @property
+    @deprecated('`response_tokens` is deprecated, use `output_tokens` instead')
+    def response_tokens(self) -> int:
+        return self.output_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Sum of `input_tokens + output_tokens`."""
+        return self.input_tokens + self.output_tokens
+
+    def opentelemetry_attributes(self) -> dict[str, int]:
+        """Get the token usage values as OpenTelemetry attributes."""
+        result: dict[str, int] = {}
+        if self.input_tokens:
+            result['gen_ai.usage.input_tokens'] = self.input_tokens
+        if self.output_tokens:
+            result['gen_ai.usage.output_tokens'] = self.output_tokens
+
+        details = self.details.copy()
+        if self.cache_write_tokens:
+            details['cache_write_tokens'] = self.cache_write_tokens
+        if self.cache_read_tokens:
+            details['cache_read_tokens'] = self.cache_read_tokens
+        if self.input_audio_tokens:
+            details['input_audio_tokens'] = self.input_audio_tokens
+        if self.cache_audio_read_tokens:
+            details['cache_audio_read_tokens'] = self.cache_audio_read_tokens
+        if self.output_audio_tokens:
+            details['output_audio_tokens'] = self.output_audio_tokens
+        if details:
+            prefix = 'gen_ai.usage.details.'
+            for key, value in details.items():
+                # Skipping check for value since spec implies all detail values are relevant
+                if value:
+                    result[prefix + key] = value
+        return result
+
+    def __repr__(self):
+        kv_pairs = (f'{f.name}={value!r}' for f in fields(self) if (value := getattr(self, f.name)))
+        return f'{self.__class__.__qualname__}({", ".join(kv_pairs)})'
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+## pydantic_evals/pydantic_evals/_utils.py
+
+class Unset:
+    """A singleton to represent an unset value.
+
+    Used to distinguish between explicitly set `None` values and values that were never set.
+
+    Copied from pydantic_ai/_utils.py.
+    """
+
+    pass
+
+## pydantic_evals/pydantic_evals/evaluators/common.py
+
+class HasMatchingSpan(Evaluator[object, object, object]):
+    """Check if the span tree contains a span that matches the specified query."""
+
+    query: SpanQuery
+    evaluation_name: str | None = field(default=None)
+
+    def evaluate(
+        self,
+        ctx: EvaluatorContext[object, object, object],
+    ) -> bool:
+        return ctx.span_tree.any(self.query)
+
+    def evaluate(
+        self,
+        ctx: EvaluatorContext[object, object, object],
+    ) -> bool:
+        return ctx.span_tree.any(self.query)
+
+## pydantic_evals/pydantic_evals/otel/span_tree.py
+
+class SpanTree:
+    """A container that builds a hierarchy of SpanNode objects from a list of finished spans.
+
+    You can then search or iterate the tree to make your assertions (using DFS for traversal).
+    """
+
+    roots: list[SpanNode] = field(default_factory=list[SpanNode])
+    nodes_by_id: dict[str, SpanNode] = field(default_factory=dict[str, SpanNode])
+
+    # -------------------------------------------------------------------------
+    # Construction
+    # -------------------------------------------------------------------------
+    def __post_init__(self):
+        self._rebuild_tree()
+
+    def add_spans(self, spans: list[SpanNode]) -> None:
+        """Add a list of spans to the tree, rebuilding the tree structure."""
+        for span in spans:
+            self.nodes_by_id[span.node_key] = span
+        self._rebuild_tree()
+
+    def add_readable_spans(self, readable_spans: list[ReadableSpan]):
+        self.add_spans([SpanNode.from_readable_span(span) for span in readable_spans])
+
+    def _rebuild_tree(self):
+        # Ensure spans are ordered by start_timestamp so that roots and children end up in the right order
+        nodes = list(self.nodes_by_id.values())
+        nodes.sort(key=lambda node: node.start_timestamp or datetime.min)
+        self.nodes_by_id = {node.node_key: node for node in nodes}
+
+        # Build the parent/child relationships
+        for node in self.nodes_by_id.values():
+            parent_node_key = node.parent_node_key
+            if parent_node_key is not None:
+                parent_node = self.nodes_by_id.get(parent_node_key)
+                if parent_node is not None:
+                    parent_node.add_child(node)
+
+        # Determine the roots
+        # A node is a "root" if its parent is None or if its parent's span_id is not in the current set of spans.
+        self.roots = []
+        for node in self.nodes_by_id.values():
+            parent_node_key = node.parent_node_key
+            if parent_node_key is None or parent_node_key not in self.nodes_by_id:
+                self.roots.append(node)
+
+    # -------------------------------------------------------------------------
+    # Node filtering and iteration
+    # -------------------------------------------------------------------------
+    def find(self, predicate: SpanQuery | SpanPredicate) -> list[SpanNode]:
+        """Find all nodes in the entire tree that match the predicate, scanning from each root in DFS order."""
+        return list(self._filter(predicate))
+
+    def first(self, predicate: SpanQuery | SpanPredicate) -> SpanNode | None:
+        """Find the first node that matches a predicate, scanning from each root in DFS order. Returns `None` if not found."""
+        return next(self._filter(predicate), None)
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+    def _filter(self, predicate: SpanQuery | SpanPredicate) -> Iterator[SpanNode]:
+        for node in self:
+            if node.matches(predicate):
+                yield node
+
+    def __iter__(self) -> Iterator[SpanNode]:
+        """Return an iterator over all nodes in the tree."""
+        return iter(self.nodes_by_id.values())
+
+    # -------------------------------------------------------------------------
+    # String representation
+    # -------------------------------------------------------------------------
+    def repr_xml(
+        self,
+        include_children: bool = True,
+        include_trace_id: bool = False,
+        include_span_id: bool = False,
+        include_start_timestamp: bool = False,
+        include_duration: bool = False,
+    ) -> str:
+        """Return an XML-like string representation of the tree, optionally including children, trace_id, span_id, duration, and timestamps."""
+        if not self.roots:
+            return '<SpanTree />'
+        repr_parts = [
+            '<SpanTree>',
+            *[
+                indent(
+                    root.repr_xml(
+                        include_children=include_children,
+                        include_trace_id=include_trace_id,
+                        include_span_id=include_span_id,
+                        include_start_timestamp=include_start_timestamp,
+                        include_duration=include_duration,
+                    ),
+                    '  ',
+                )
+                for root in self.roots
+            ],
+            '</SpanTree>',
+        ]
+        return '\n'.join(repr_parts)
+
+    def __str__(self):
+        return f'<SpanTree num_roots={len(self.roots)} total_spans={len(self.nodes_by_id)} />'
+
+    def __repr__(self):
+        return self.repr_xml()
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+## pydantic_graph/pydantic_graph/beta/decision.py
+
+class Decision(Generic[StateT, DepsT, HandledT]):
+    """Decision node for conditional branching in graph execution.
+
+    A Decision node evaluates conditions and routes execution to different
+    branches based on the input data type or custom matching logic.
+    """
+
+    id: NodeID
+    """Unique identifier for this decision node."""
+
+    branches: list[DecisionBranch[Any]]
+    """List of branches that can be taken from this decision."""
+
+    note: str | None
+    """Optional documentation note for this decision."""
+
+    def branch(self, branch: DecisionBranch[T]) -> Decision[StateT, DepsT, HandledT | T]:
+        """Add a new branch to this decision.
+
+        Args:
+            branch: The branch to add to this decision.
+
+        Returns:
+            A new Decision with the additional branch.
+        """
+        return Decision(id=self.id, branches=self.branches + [branch], note=self.note)
+
+    def _force_handled_contravariant(self, inputs: HandledT) -> Never:  # pragma: no cover
+        """Forces this type to be contravariant in the HandledT type variable.
+
+        This is an implementation detail of how we can type-check that all possible input types have
+        been exhaustively covered.
+
+        Args:
+            inputs: Input data of handled types.
+
+        Raises:
+            RuntimeError: Always, as this method should never be executed.
+        """
+        raise RuntimeError('This method should never be called, it is just defined for typing purposes.')
+
+    matches: Callable[[Any], bool] | None
+
+class DecisionBranchBuilder(Generic[StateT, DepsT, OutputT, SourceT, HandledT]):
+    """Builder for constructing decision branches with fluent API.
+
+    This builder provides methods to configure branches with destinations,
+    forks, and transformations in a type-safe manner.
+
+    Instances of this class should be created using [`GraphBuilder.match`][pydantic_graph.beta.graph_builder.GraphBuilder],
+    not created directly.
+    """
+
+    _decision: Decision[StateT, DepsT, HandledT]
+    """The parent decision node."""
+    _source: TypeOrTypeExpression[SourceT]
+    """The expected source type for this branch."""
+    _matches: Callable[[Any], bool] | None
+    """Optional matching predicate."""
+
+    _path_builder: PathBuilder[StateT, DepsT, OutputT]
+    """Builder for the execution path."""
+
+    def __init__(
+        self,
+        *,
+        decision: Decision[StateT, DepsT, HandledT],
+        source: TypeOrTypeExpression[SourceT],
+        matches: Callable[[Any], bool] | None,
+        path_builder: PathBuilder[StateT, DepsT, OutputT],
+    ):
+        # This manually-defined initializer is necessary due to https://github.com/python/mypy/issues/17623.
+        self._decision = decision
+        self._source = source
+        self._matches = matches
+        self._path_builder = path_builder
+
+    def to(
+        self,
+        destination: DestinationNode[StateT, DepsT, OutputT] | type[BaseNode[StateT, DepsT, Any]],
+        /,
+        *extra_destinations: DestinationNode[StateT, DepsT, OutputT] | type[BaseNode[StateT, DepsT, Any]],
+        fork_id: str | None = None,
+    ) -> DecisionBranch[SourceT]:
+        """Set the destination(s) for this branch.
+
+        Args:
+            destination: The primary destination node.
+            *extra_destinations: Additional destination nodes.
+            fork_id: Optional node ID to use for the resulting broadcast fork if multiple destinations are provided.
+
+        Returns:
+            A completed DecisionBranch with the specified destinations.
+        """
+        destination = get_origin(destination) or destination
+        extra_destinations = tuple(get_origin(d) or d for d in extra_destinations)
+        destinations = [(NodeStep(d) if inspect.isclass(d) else d) for d in (destination, *extra_destinations)]
+        return DecisionBranch(
+            source=self._source,
+            matches=self._matches,
+            path=self._path_builder.to(*destinations, fork_id=fork_id),
+            destinations=destinations,
+        )
+
+    def broadcast(
+        self, get_forks: Callable[[Self], Sequence[DecisionBranch[SourceT]]], /, *, fork_id: str | None = None
+    ) -> DecisionBranch[SourceT]:
+        """Broadcast this decision branch into multiple destinations.
+
+        Args:
+            get_forks: The callback that will return a sequence of decision branches to broadcast to.
+            fork_id: Optional node ID to use for the resulting broadcast fork.
+
+        Returns:
+            A completed DecisionBranch with the specified destinations.
+        """
+        fork_decision_branches = get_forks(self)
+        new_paths = [b.path for b in fork_decision_branches]
+        if not new_paths:
+            raise GraphBuildingError(f'The call to {get_forks} returned no branches, but must return at least one.')
+        path = self._path_builder.broadcast(new_paths, fork_id=fork_id)
+        destinations = [d for fdp in fork_decision_branches for d in fdp.destinations]
+        return DecisionBranch(source=self._source, matches=self._matches, path=path, destinations=destinations)
+
+    def transform(
+        self, func: TransformFunction[StateT, DepsT, OutputT, NewOutputT], /
+    ) -> DecisionBranchBuilder[StateT, DepsT, NewOutputT, SourceT, HandledT]:
+        """Apply a transformation to the branch's output.
+
+        Args:
+            func: Transformation function to apply.
+
+        Returns:
+            A new DecisionBranchBuilder where the provided transform is applied prior to generating the final output.
+        """
+        return DecisionBranchBuilder(
+            decision=self._decision,
+            source=self._source,
+            matches=self._matches,
+            path_builder=self._path_builder.transform(func),
+        )
+
+    def map(
+        self: DecisionBranchBuilder[StateT, DepsT, Iterable[T], SourceT, HandledT]
+        | DecisionBranchBuilder[StateT, DepsT, AsyncIterable[T], SourceT, HandledT],
+        *,
+        fork_id: str | None = None,
+        downstream_join_id: str | None = None,
+    ) -> DecisionBranchBuilder[StateT, DepsT, T, SourceT, HandledT]:
+        """Spread the branch's output.
+
+        To do this, the current output must be iterable, and any subsequent steps in the path being built for this
+        branch will be applied to each item of the current output in parallel.
+
+        Args:
+            fork_id: Optional ID for the fork, defaults to a generated value
+            downstream_join_id: Optional ID of a downstream join node which is involved when mapping empty iterables
+
+        Returns:
+            A new DecisionBranchBuilder where mapping is performed prior to generating the final output.
+        """
+        return DecisionBranchBuilder(
+            decision=self._decision,
+            source=self._source,
+            matches=self._matches,
+            path_builder=self._path_builder.map(fork_id=fork_id, downstream_join_id=downstream_join_id),
+        )
+
+    def label(self, label: str) -> DecisionBranchBuilder[StateT, DepsT, OutputT, SourceT, HandledT]:
+        """Apply a label to the branch at the current point in the path being built.
+
+        These labels are only used in generated mermaid diagrams.
+
+        Args:
+            label: The label to apply.
+
+        Returns:
+            A new DecisionBranchBuilder where the label has been applied at the end of the current path being built.
+        """
+        return DecisionBranchBuilder(
+            decision=self._decision,
+            source=self._source,
+            matches=self._matches,
+            path_builder=self._path_builder.label(label),
+        )
+
+## pydantic_graph/pydantic_graph/beta/graph_builder.py
+
+    def match(
+        self,
+        source: TypeOrTypeExpression[SourceT],
+        *,
+        matches: Callable[[Any], bool] | None = None,
+    ) -> DecisionBranchBuilder[StateT, DepsT, SourceT, SourceT, Never]:
+        """Create a decision branch matcher.
+
+        Args:
+            source: The type or type expression to match against
+            matches: Optional custom matching function
+
+        Returns:
+            A DecisionBranchBuilder for constructing the branch
+        """
+        # Note, the following node_id really is just a placeholder and shouldn't end up in the final graph
+        # This is why we don't expose a way for end users to override the value used here.
+        node_id = NodeID(generate_placeholder_node_id('match_decision'))
+        decision = Decision[StateT, DepsT, Never](id=node_id, branches=[], note=None)
+        new_path_builder = PathBuilder[StateT, DepsT, SourceT](working_items=[])
+        return DecisionBranchBuilder(decision=decision, source=source, matches=matches, path_builder=new_path_builder)
+
+## tests/conftest.py
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+## tests/graph/beta/test_graph_builder.py
+
+async def test_validation_node_with_no_outgoing_edges():
+    """Test that validation catches nodes with no outgoing edges."""
+    g = GraphBuilder(output_type=int)
+
+    @g.step
+    async def first_step(ctx: StepContext[None, None, None]) -> int:
+        return 42  # pragma: no cover
+
+    @g.step
+    async def dead_end_step(ctx: StepContext[None, None, int]) -> int:
+        return ctx.inputs  # pragma: no cover
+
+    # first_step connects to both dead_end_step and end_node
+    # But dead_end_step has no outgoing edges
+    g.add(
+        g.edge_from(g.start_node).to(first_step),
+        g.edge_from(first_step).to(dead_end_step, g.end_node),
+    )
+
+    with pytest.raises(GraphValidationError, match='The following nodes have no outgoing edges'):
+        g.build()
+
+## tests/graph/test_mermaid.py
+
+def test_edge_union():
+    """Test that a union of things annotated with an Edge doesn't raise a TypeError.
+
+    This is important because such unions may occur as a return type for a graph, and needs to be evaluated when
+    generating a mermaid diagram.
+    """
+    # This would raise an error on 3.10 if Edge was not hashable:
+    edges_union = Union[  # noqa: UP007
+        Annotated[End[None], Edge(label='first label')], Annotated[End[None], Edge(label='second label')]
+    ]
+    assert edges_union
+
+## tests/models/mock_openai.py
+
+    def create_mock(cls, completions: MockChatCompletion | Sequence[MockChatCompletion]) -> AsyncOpenAI:
+        return cast(AsyncOpenAI, cls(completions=completions))
+
+## tests/models/test_model_settings.py
+
+def test_none_settings_in_hierarchy():
+    """Test that None settings at any level don't break the merge hierarchy."""
+    captured_settings = None
+
+    def capture_settings(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+        nonlocal captured_settings
+        captured_settings = agent_info.model_settings
+        return ModelResponse(parts=[TextPart('captured')])
+
+    # Model with no settings
+    model = FunctionModel(capture_settings, settings=None)
+
+    # Agent with settings
+    agent_settings = ModelSettings(max_tokens=150, temperature=0.5)
+    agent = Agent(model=model, model_settings=agent_settings)
+
+    # Run with no additional settings
+    result = agent.run_sync('test', model_settings=None)
+    assert result.output == 'captured'
+
+    # Should have agent settings
+    assert captured_settings is not None
+    assert captured_settings['max_tokens'] == 150
+    assert captured_settings['temperature'] == 0.5
+
+## tests/models/test_openai.py
+
+def test_azure_400_malformed_error(allow_model_requests: None) -> None:
+    """Test a 400 error from Azure where body matches dict but error structure is wrong."""
+    mock_client = MockOpenAI.create_mock(
+        APIStatusError(
+            'Bad Request',
+            response=httpx.Response(status_code=400, request=httpx.Request('POST', 'https://example.com/v1')),
+            body={'something_else': 'foo'},  # No 'error' key
+        )
+    )
+    m = OpenAIChatModel('gpt-5-mini', provider=AzureProvider(openai_client=cast(AsyncAzureOpenAI, mock_client)))
+    agent = Agent(m)
+
+    with pytest.raises(ModelHTTPError) as exc_info:
+        agent.run_sync('hello')
+
+    assert exc_info.value.status_code == 400
+
+## tests/test_agent.py
+
+def test_result_pydantic_model_validation_error():
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        if len(messages) == 1:
+            args_json = '{"a": 1, "b": "foo"}'
+        else:
+            args_json = '{"a": 1, "b": "bar"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    class Bar(BaseModel):
+        a: int
+        b: str
+
+        @field_validator('b')
+        def check_b(cls, v: str) -> str:
+            if v == 'foo':
+                raise ValueError('must not be foo')
+            return v
+
+    agent = Agent(FunctionModel(return_model), output_type=Bar)
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, Bar)
+    assert result.output.model_dump() == snapshot({'a': 1, 'b': 'bar'})
+    messages_part_kinds = [(m.kind, [p.part_kind for p in m.parts]) for m in result.all_messages()]
+    assert messages_part_kinds == snapshot(
+        [
+            ('request', ['user-prompt']),
+            ('response', ['tool-call']),
+            ('request', ['retry-prompt']),
+            ('response', ['tool-call']),
+            ('request', ['tool-return']),
+        ]
+    )
+
+    user_retry = result.all_messages()[2]
+    assert isinstance(user_retry, ModelRequest)
+    retry_prompt = user_retry.parts[0]
+    assert isinstance(retry_prompt, RetryPromptPart)
+    assert retry_prompt.model_response() == snapshot("""\
+1 validation error:
+```json
+[
+  {
+    "type": "value_error",
+    "loc": [
+      "b"
+    ],
+    "msg": "Value error, must not be foo",
+    "input": "foo"
+  }
+]
+```
+
+Fix the errors and try again.""")
+
+## tests/test_json_body_serializer.py
+
+def cassette_dict_base():
+    """
+    A fixture providing a base cassette dictionary with:
+    - A request containing a multi-line JSON string in `body`.
+    - A response containing a multi-line JSON string in `body['string']`.
+    - Various headers to test filtering & lowercasing.
+    """
+    return {
+        'interactions': [
+            {
+                'request': {
+                    'headers': {
+                        'Content-Type': ['application/json'],
+                        'Authorization': ['some-token'],  # Should be filtered out
+                        'X-Test': ['some-token'],  # Should be filtered out
+                        'Other-Header': ['test-value'],  # Should remain, but become lowercase (other-header)
+                    },
+                    'body': '{"message": "line1\\nline2"}',  # multi-line JSON
+                },
+            },
+            {
+                'response': {
+                    'headers': {
+                        'Content-Type': ['application/json'],
+                        'Date': ['some-date-string'],  # Should be filtered out
+                    },
+                    'body': {'string': '{"response": "line3\\nline4"}'},
+                },
+            },
+        ]
+    }
+
+## tests/test_ui_web.py
+
+def test_agent_to_web_with_model_settings():
+    """Test to_web() accepts model_settings parameter."""
+    agent = Agent(TestModel())
+    settings = ModelSettings(temperature=0.5, max_tokens=100)
+
+    app = agent.to_web(model_settings=settings)
+    assert isinstance(app, Starlette)
+
+## tests/test_validation_context.py
+
+def test_agent_output_validator_with_validation_context():
+    """Test that the argument passed to the output validator is validated using the validation context."""
+
+    agent = Agent(
+        'test',
+        output_type=Value,
+        deps_type=Deps,
+        validation_context=lambda ctx: ctx.deps.increment,
+    )
+
+    @agent.output_validator
+    def identity(ctx: RunContext[Deps], v: Value) -> Value:
+        return v
+
+    result = agent.run_sync('', deps=Deps(increment=10))
+    assert result.output.x == snapshot(10)

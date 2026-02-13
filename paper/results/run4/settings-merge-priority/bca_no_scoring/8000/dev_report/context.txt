@@ -1,0 +1,828 @@
+## tests/test_agent.py
+
+class Person(BaseModel):
+    name: str
+
+T = TypeVar('T')
+
+class ResultGeneric(BaseModel, Generic[T]):
+    """A generic result class."""
+
+    value: T
+    success: bool
+
+class StringData(BaseModel):
+    text: str
+
+def test_result_list_of_models_with_stringified_response():
+    def return_list(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        # Simulate providers that return the nested payload as a JSON string under "response"
+        args_json = json.dumps(
+            {
+                'response': json.dumps(
+                    [
+                        {'name': 'John Doe'},
+                        {'name': 'Jane Smith'},
+                    ]
+                )
+            }
+        )
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_list), output_type=list[Person])
+
+    result = agent.run_sync('Hello')
+    assert result.output == snapshot(
+        [
+            Person(name='John Doe'),
+            Person(name='Jane Smith'),
+        ]
+    )
+
+class Foo(BaseModel):
+    a: int
+    b: str
+
+def test_result_pydantic_model():
+    def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        args_json = '{"a": 1, "b": "foo"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=Foo)
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, Foo)
+    assert result.output.model_dump() == {'a': 1, 'b': 'foo'}
+
+def test_result_pydantic_model_retry():
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        if len(messages) == 1:
+            args_json = '{"a": "wrong", "b": "foo"}'
+        else:
+            args_json = '{"a": 42, "b": "foo"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=Foo)
+
+    assert agent.name is None
+
+    result = agent.run_sync('Hello')
+    assert agent.name == 'agent'
+    assert isinstance(result.output, Foo)
+    assert result.output.model_dump() == {'a': 42, 'b': 'foo'}
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='final_result', args='{"a": "wrong", "b": "foo"}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=51, output_tokens=7),
+                model_name='function:return_model:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        tool_name='final_result',
+                        content=[
+                            ErrorDetails(
+                                type='int_parsing',
+                                loc=('a',),
+                                msg='Input should be a valid integer, unable to parse string as an integer',
+                                input='wrong',
+                            )
+                        ],
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='final_result', args='{"a": 42, "b": "foo"}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=89, output_tokens=14),
+                model_name='function:return_model:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.all_messages_json().startswith(b'[{"parts":[{"content":"Hello",')
+
+def test_result_pydantic_model_validation_error():
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        if len(messages) == 1:
+            args_json = '{"a": 1, "b": "foo"}'
+        else:
+            args_json = '{"a": 1, "b": "bar"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    class Bar(BaseModel):
+        a: int
+        b: str
+
+        @field_validator('b')
+        def check_b(cls, v: str) -> str:
+            if v == 'foo':
+                raise ValueError('must not be foo')
+            return v
+
+    agent = Agent(FunctionModel(return_model), output_type=Bar)
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, Bar)
+    assert result.output.model_dump() == snapshot({'a': 1, 'b': 'bar'})
+    messages_part_kinds = [(m.kind, [p.part_kind for p in m.parts]) for m in result.all_messages()]
+    assert messages_part_kinds == snapshot(
+        [
+            ('request', ['user-prompt']),
+            ('response', ['tool-call']),
+            ('request', ['retry-prompt']),
+            ('response', ['tool-call']),
+            ('request', ['tool-return']),
+        ]
+    )
+
+    user_retry = result.all_messages()[2]
+    assert isinstance(user_retry, ModelRequest)
+    retry_prompt = user_retry.parts[0]
+    assert isinstance(retry_prompt, RetryPromptPart)
+    assert retry_prompt.model_response() == snapshot("""\
+1 validation error:
+```json
+[
+  {
+    "type": "value_error",
+    "loc": [
+      "b"
+    ],
+    "msg": "Value error, must not be foo",
+    "input": "foo"
+  }
+]
+```
+
+Fix the errors and try again.""")
+
+def test_output_validator():
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        if len(messages) == 1:
+            args_json = '{"a": 41, "b": "foo"}'
+        else:
+            args_json = '{"a": 42, "b": "foo"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=Foo)
+
+    @agent.output_validator
+    def validate_output(ctx: RunContext[None], o: Foo) -> Foo:
+        assert ctx.tool_name == 'final_result'
+        if o.a == 42:
+            return o
+        else:
+            raise ModelRetry('"a" should be 42')
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, Foo)
+    assert result.output.model_dump() == {'a': 42, 'b': 'foo'}
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='final_result', args='{"a": 41, "b": "foo"}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=51, output_tokens=7),
+                model_name='function:return_model:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='"a" should be 42',
+                        tool_name='final_result',
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='final_result', args='{"a": 42, "b": "foo"}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=63, output_tokens=14),
+                model_name='function:return_model:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+def test_output_validator_retries():
+    """Test that ctx.retry and ctx.max_retries are correctly tracked in RunContext for output validators."""
+    retries_log: list[int] = []
+    max_retries_log: list[int] = []
+    target_retries = 3
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        # Always return the same value, let the validator control retries
+        args_json = '{"a": 1, "b": "foo"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=Foo, output_retries=target_retries)
+
+    @agent.output_validator
+    def validate_output(ctx: RunContext[None], o: Foo) -> Foo:
+        retries_log.append(ctx.retry)
+        max_retries_log.append(ctx.max_retries)
+        # Succeed on the last retry
+        if ctx.retry == target_retries:
+            return o
+        else:
+            raise ModelRetry(f'Retry {ctx.retry}')
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, Foo)
+
+    # Should have been called target_retries + 1 times (0, 1, 2, 3)
+    assert retries_log == [0, 1, 2, 3]
+    assert max_retries_log == [target_retries] * (target_retries + 1)
+
+def test_output_function_retries():
+    """Test that ctx.retry and ctx.max_retries are correctly tracked in RunContext for output functions."""
+    retries_log: list[int] = []
+    max_retries_log: list[int] = []
+    target_retries = 3
+
+    def get_weather(ctx: RunContext[None], text: str) -> str:
+        retries_log.append(ctx.retry)
+        max_retries_log.append(ctx.max_retries)
+        if ctx.retry == target_retries:
+            return f'Weather: {text}'
+        else:
+            raise ModelRetry(f'Retry {ctx.retry}')
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content='sunny')])
+
+    agent = Agent(FunctionModel(return_model), output_type=TextOutput(get_weather), output_retries=target_retries)
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'Weather: sunny'
+
+    # Should have been called target_retries + 1 times (0, 1, 2, 3)
+    assert retries_log == [0, 1, 2, 3]
+    assert max_retries_log == [target_retries] * (target_retries + 1)
+
+def test_tool_output_function_retries():
+    """Test that ctx.retry and ctx.max_retries are correctly tracked in RunContext for tool output functions."""
+    retries_log: list[int] = []
+    max_retries_log: list[int] = []
+    target_retries = 3
+
+    def get_weather(ctx: RunContext[None], city: str) -> str:
+        retries_log.append(ctx.retry)
+        max_retries_log.append(ctx.max_retries)
+        if ctx.retry == target_retries:
+            return f'Weather in {city}'
+        else:
+            raise ModelRetry(f'Retry {ctx.retry}')
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        args_json = '{"city": "Mexico City"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=get_weather, output_retries=target_retries)
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'Weather in Mexico City'
+
+    # Should have been called target_retries + 1 times (0, 1, 2, 3)
+    assert retries_log == [0, 1, 2, 3]
+    assert max_retries_log == [target_retries] * (target_retries + 1)
+
+def test_plain_response_then_tuple():
+    call_index = 0
+
+    def return_tuple(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal call_index
+
+        assert info.output_tools is not None
+        call_index += 1
+        if call_index == 1:
+            return ModelResponse(parts=[TextPart('hello')])
+        else:
+            args_json = '{"response": ["foo", "bar"]}'
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_tuple), output_type=ToolOutput(tuple[str, str]))
+
+    result = agent.run_sync('Hello')
+    assert result.output == ('foo', 'bar')
+    assert call_index == 2
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='hello')],
+                usage=RequestUsage(input_tokens=51, output_tokens=1),
+                model_name='function:return_tuple:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Please include your response in a tool call.',
+                        timestamp=IsNow(tz=timezone.utc),
+                        tool_call_id=IsStr(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name='final_result', args='{"response": ["foo", "bar"]}', tool_call_id=IsStr())
+                ],
+                usage=RequestUsage(input_tokens=68, output_tokens=8),
+                model_name='function:return_tuple:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result._output_tool_name == 'final_result'  # pyright: ignore[reportPrivateUsage]
+    assert result.all_messages(output_tool_return_content='foobar')[-1] == snapshot(
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='final_result', content='foobar', tool_call_id=IsStr(), timestamp=IsNow(tz=timezone.utc)
+                )
+            ],
+            timestamp=IsNow(tz=timezone.utc),
+            run_id=IsStr(),
+        )
+    )
+    assert result.all_messages()[-1] == snapshot(
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='final_result',
+                    content='Final result processed.',
+                    tool_call_id=IsStr(),
+                    timestamp=IsNow(tz=timezone.utc),
+                )
+            ],
+            timestamp=IsNow(tz=timezone.utc),
+            run_id=IsStr(),
+        )
+    )
+
+def test_output_tool_return_content_str_return():
+    agent = Agent('test')
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'success (no tool calls)'
+    assert result.response == snapshot(
+        ModelResponse(
+            parts=[TextPart(content='success (no tool calls)')],
+            usage=RequestUsage(input_tokens=51, output_tokens=4),
+            model_name='test',
+            timestamp=IsDatetime(),
+            run_id=IsStr(),
+        )
+    )
+
+    msg = re.escape('Cannot set output tool return content when the return type is `str`.')
+    with pytest.raises(ValueError, match=msg):
+        result.all_messages(output_tool_return_content='foobar')
+
+def test_output_tool_return_content_no_tool():
+    agent = Agent('test', output_type=int)
+
+    result = agent.run_sync('Hello')
+    assert result.output == 0
+    result._output_tool_name = 'wrong'  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(LookupError, match=re.escape("No tool call found with tool name 'wrong'.")):
+        result.all_messages(output_tool_return_content='foobar')
+
+def test_response_tuple():
+    m = TestModel()
+
+    agent = Agent(m, output_type=tuple[str, str])
+
+    result = agent.run_sync('Hello')
+    assert result.output == snapshot(('a', 'a'))
+
+    assert m.last_model_request_parameters is not None
+    assert m.last_model_request_parameters.output_mode == 'tool'
+    assert m.last_model_request_parameters.function_tools == snapshot([])
+    assert m.last_model_request_parameters.allow_text_output is False
+
+    assert m.last_model_request_parameters.output_tools is not None
+    assert len(m.last_model_request_parameters.output_tools) == 1
+    assert m.last_model_request_parameters.output_tools == snapshot(
+        [
+            ToolDefinition(
+                name='final_result',
+                description='The final response which ends this conversation',
+                parameters_json_schema={
+                    'properties': {
+                        'response': {
+                            'maxItems': 2,
+                            'minItems': 2,
+                            'prefixItems': [{'type': 'string'}, {'type': 'string'}],
+                            'type': 'array',
+                        }
+                    },
+                    'required': ['response'],
+                    'type': 'object',
+                },
+                outer_typed_dict_key='response',
+                kind='output',
+            )
+        ]
+    )
+
+def upcase(text: str) -> str:
+    return text.upper()
+
+def test_response_union_allow_str(input_union_callable: Callable[[], Any]):
+    try:
+        union = input_union_callable()
+    except TypeError:  # pragma: lax no cover
+        pytest.skip('Python version does not support `|` syntax for unions')
+
+    m = TestModel()
+    agent: Agent[None, str | Foo] = Agent(m, output_type=union)
+
+    got_tool_call_name = 'unset'
+
+    @agent.output_validator
+    def validate_output(ctx: RunContext[None], o: Any) -> Any:
+        nonlocal got_tool_call_name
+        got_tool_call_name = ctx.tool_name
+        return o
+
+    assert agent._output_schema.allows_text  # pyright: ignore[reportPrivateUsage]
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, str)
+    assert result.output.lower() == snapshot('success (no tool calls)')
+    assert got_tool_call_name == snapshot(None)
+
+    assert m.last_model_request_parameters is not None
+    assert m.last_model_request_parameters.function_tools == snapshot([])
+    assert m.last_model_request_parameters.allow_text_output is True
+
+    assert m.last_model_request_parameters.output_tools is not None
+    assert len(m.last_model_request_parameters.output_tools) == 1
+
+    assert m.last_model_request_parameters.output_tools == snapshot(
+        [
+            ToolDefinition(
+                name='final_result',
+                description='The final response which ends this conversation',
+                parameters_json_schema={
+                    'properties': {
+                        'a': {'type': 'integer'},
+                        'b': {'type': 'string'},
+                    },
+                    'required': ['a', 'b'],
+                    'title': 'Foo',
+                    'type': 'object',
+                },
+                kind='output',
+            )
+        ]
+    )
+
+def test_response_multiple_return_tools(create_module: Callable[[str], Any], union_code: str):
+    module_code = f'''
+from pydantic import BaseModel
+from typing import Union
+from typing_extensions import TypeAlias
+from pydantic_ai import ToolOutput
+
+class Foo(BaseModel):
+    a: int
+    b: str
+
+
+class Bar(BaseModel):
+    """This is a bar model."""
+
+    b: str
+
+{union_code}
+    '''
+
+    mod = create_module(module_code)
+
+    m = TestModel()
+    agent = Agent(m, output_type=mod.OutputType)
+    got_tool_call_name = 'unset'
+
+    @agent.output_validator
+    def validate_output(ctx: RunContext[None], o: Any) -> Any:
+        nonlocal got_tool_call_name
+        got_tool_call_name = ctx.tool_name
+        return o
+
+    result = agent.run_sync('Hello')
+    assert result.output == mod.Foo(a=0, b='a')
+    assert got_tool_call_name == snapshot('final_result_Foo')
+
+    assert m.last_model_request_parameters is not None
+    assert m.last_model_request_parameters.function_tools == snapshot([])
+    assert m.last_model_request_parameters.allow_text_output is False
+
+    assert m.last_model_request_parameters.output_tools is not None
+    assert len(m.last_model_request_parameters.output_tools) == 2
+
+    assert m.last_model_request_parameters.output_tools == snapshot(
+        [
+            ToolDefinition(
+                name='final_result_Foo',
+                description='Foo: The final response which ends this conversation',
+                parameters_json_schema={
+                    'properties': {
+                        'a': {'type': 'integer'},
+                        'b': {'type': 'string'},
+                    },
+                    'required': ['a', 'b'],
+                    'title': 'Foo',
+                    'type': 'object',
+                },
+                kind='output',
+            ),
+            ToolDefinition(
+                name='final_result_Bar',
+                description='This is a bar model.',
+                parameters_json_schema={
+                    'properties': {'b': {'type': 'string'}},
+                    'required': ['b'],
+                    'title': 'Bar',
+                    'type': 'object',
+                },
+                kind='output',
+            ),
+        ]
+    )
+
+    result = agent.run_sync('Hello', model=TestModel(seed=1))
+    assert result.output == mod.Bar(b='b')
+    assert got_tool_call_name == snapshot('final_result_Bar')
+
+def test_output_type_generic_class_name_sanitization():
+    """Test that generic class names with brackets are properly sanitized."""
+    # This will have a name like "ResultGeneric[StringData]" which needs sanitization
+    output_type = [ResultGeneric[StringData], ResultGeneric[int]]
+
+    m = TestModel()
+    agent = Agent(m, output_type=output_type)
+    agent.run_sync('Hello')
+
+    # The sanitizer should remove brackets from the generic type name
+    assert m.last_model_request_parameters is not None
+    assert m.last_model_request_parameters.output_tools is not None
+    assert len(m.last_model_request_parameters.output_tools) == 2
+
+    tool_names = [tool.name for tool in m.last_model_request_parameters.output_tools]
+    assert tool_names == snapshot(['final_result_ResultGenericStringData', 'final_result_ResultGenericint'])
+
+def test_output_type_with_two_descriptions():
+    class MyOutput(BaseModel):
+        """Description from docstring"""
+
+        valid: bool
+
+    m = TestModel()
+    agent = Agent(m, output_type=ToolOutput(MyOutput, description='Description from ToolOutput'))
+    result = agent.run_sync('Hello')
+    assert result.output == snapshot(MyOutput(valid=False))
+    assert m.last_model_request_parameters is not None
+    assert m.last_model_request_parameters.output_tools == snapshot(
+        [
+            ToolDefinition(
+                name='final_result',
+                description='Description from ToolOutput. Description from docstring',
+                parameters_json_schema={
+                    'properties': {'valid': {'type': 'boolean'}},
+                    'required': ['valid'],
+                    'title': 'MyOutput',
+                    'type': 'object',
+                },
+                kind='output',
+            )
+        ]
+    )
+
+def test_output_type_tool_output_union():
+    class Foo(BaseModel):
+        a: int
+        b: str
+
+    class Bar(BaseModel):
+        c: bool
+
+    m = TestModel()
+    marker: ToolOutput[Foo | Bar] = ToolOutput(Foo | Bar, strict=False)  # type: ignore
+    agent = Agent(m, output_type=marker)
+    result = agent.run_sync('Hello')
+    assert result.output == snapshot(Foo(a=0, b='a'))
+    assert m.last_model_request_parameters is not None
+    assert m.last_model_request_parameters.output_tools == snapshot(
+        [
+            ToolDefinition(
+                name='final_result',
+                description='The final response which ends this conversation',
+                parameters_json_schema={
+                    '$defs': {
+                        'Bar': {
+                            'properties': {'c': {'type': 'boolean'}},
+                            'required': ['c'],
+                            'title': 'Bar',
+                            'type': 'object',
+                        },
+                        'Foo': {
+                            'properties': {'a': {'type': 'integer'}, 'b': {'type': 'string'}},
+                            'required': ['a', 'b'],
+                            'title': 'Foo',
+                            'type': 'object',
+                        },
+                    },
+                    'properties': {'response': {'anyOf': [{'$ref': '#/$defs/Foo'}, {'$ref': '#/$defs/Bar'}]}},
+                    'required': ['response'],
+                    'type': 'object',
+                },
+                outer_typed_dict_key='response',
+                strict=False,
+                kind='output',
+            )
+        ]
+    )
+
+def test_output_type_multiple_text_output(output_type: OutputSpec[str]):
+    with pytest.raises(UserError, match='Only one `str` or `TextOutput` is allowed.'):
+        Agent('test', output_type=output_type)
+
+def test_output_type_text_output_invalid():
+    def int_func(x: int) -> str:
+        return str(int)  # pragma: no cover
+
+    with pytest.raises(UserError, match='TextOutput must take a function taking a single `str` argument'):
+        output_type: TextOutput[str] = TextOutput(int_func)  # type: ignore
+        Agent('test', output_type=output_type)
+
+def test_native_output_strict_mode():
+    class CityLocation(BaseModel):
+        city: str
+        country: str
+
+    agent = Agent(output_type=NativeOutput(CityLocation, strict=True))
+    output_schema = agent._output_schema  # pyright: ignore[reportPrivateUsage]
+    assert isinstance(output_schema, NativeOutputSchema)
+    assert output_schema.object_def is not None
+    assert output_schema.object_def.strict
+
+def test_dynamic_false_no_reevaluate():
+    """When dynamic is false (default), the system prompt is not reevaluated
+    i.e: SystemPromptPart(
+            content="A",       <--- Remains the same when `message_history` is passed.
+    )
+    """
+    agent = Agent('test', system_prompt='Foobar')
+
+    dynamic_value = 'A'
+
+    @agent.system_prompt
+    async def func() -> str:
+        return dynamic_value
+
+    res = agent.run_sync('Hello')
+
+    assert res.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(content='Foobar', timestamp=IsNow(tz=timezone.utc)),
+                    SystemPromptPart(content=dynamic_value, timestamp=IsNow(tz=timezone.utc)),
+                    UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc)),
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=53, output_tokens=4),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='response',
+            ),
+        ]
+    )
+
+    dynamic_value = 'B'
+
+    res_two = agent.run_sync('World', message_history=res.all_messages())
+
+    assert res_two.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(content='Foobar', timestamp=IsNow(tz=timezone.utc)),
+                    SystemPromptPart(
+                        content='A',  # Remains the same
+                        timestamp=IsNow(tz=timezone.utc),
+                    ),
+                    UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc)),
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=53, output_tokens=4),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='response',
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='World', timestamp=IsNow(tz=timezone.utc), part_kind='user-prompt')],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=54, output_tokens=8),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='response',
+            ),
+        ]
+    )
+
+    assert res_two.new_messages() == res_two.all_messages()[-2:]

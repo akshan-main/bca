@@ -1,0 +1,953 @@
+# pydantic_evals/pydantic_evals/dataset.py:230-230
+    cases: list[Case[InputsT, OutputT, MetadataT]]
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:305-305
+    cases: list[ReportCase[InputsT, OutputT, MetadataT]]
+
+# pydantic_evals/pydantic_evals/dataset.py:105-105
+    cases: list[_CaseModel[InputsT, OutputT, MetadataT]]
+
+# pydantic_evals/pydantic_evals/dataset.py:237-266
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        cases: Sequence[Case[InputsT, OutputT, MetadataT]],
+        evaluators: Sequence[Evaluator[InputsT, OutputT, MetadataT]] = (),
+        report_evaluators: Sequence[ReportEvaluator[InputsT, OutputT, MetadataT]] = (),
+    ):
+        """Initialize a new dataset with test cases and optional evaluators.
+
+        Args:
+            name: Optional name for the dataset.
+            cases: Sequence of test cases to include in the dataset.
+            evaluators: Optional sequence of evaluators to apply to all cases in the dataset.
+            report_evaluators: Optional sequence of report evaluators that run on the full evaluation report.
+        """
+        case_names = set[str]()
+        for case in cases:
+            if case.name is None:
+                continue
+            if case.name in case_names:
+                raise ValueError(f'Duplicate case name: {case.name!r}')
+            case_names.add(case.name)
+
+        super().__init__(
+            name=name,
+            cases=cases,
+            evaluators=list(evaluators),
+            report_evaluators=list(report_evaluators),
+        )
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:325-360
+    def case_groups(self) -> list[ReportCaseGroup[InputsT, OutputT, MetadataT]] | None:
+        """Group cases by source_case_name and compute per-group aggregates.
+
+        Returns None if no cases have source_case_name set (i.e., single-run experiment).
+        """
+        if not any(c.source_case_name for c in self.cases) and not any(f.source_case_name for f in self.failures):
+            return None
+
+        groups: dict[
+            str,
+            tuple[list[ReportCase[InputsT, OutputT, MetadataT]], list[ReportCaseFailure[InputsT, OutputT, MetadataT]]],
+        ] = {}
+        for case in self.cases:
+            key = case.source_case_name or case.name
+            groups.setdefault(key, ([], []))[0].append(case)
+        for failure in self.failures:
+            key = failure.source_case_name or failure.name
+            groups.setdefault(key, ([], []))[1].append(failure)
+
+        result: list[ReportCaseGroup[InputsT, OutputT, MetadataT]] = []
+        for group_name, (runs, failures) in groups.items():
+            first: ReportCase[InputsT, OutputT, MetadataT] | ReportCaseFailure[InputsT, OutputT, MetadataT] = (
+                runs[0] if runs else failures[0]
+            )
+            result.append(
+                ReportCaseGroup(
+                    name=group_name,
+                    inputs=first.inputs,
+                    metadata=first.metadata,
+                    expected_output=first.expected_output,
+                    runs=runs,
+                    failures=failures,
+                    summary=ReportCaseAggregate.average(list(runs)),
+                )
+            )
+        return result
+
+# pydantic_evals/pydantic_evals/generation.py:33-85
+async def generate_dataset(
+    *,
+    dataset_type: type[Dataset[InputsT, OutputT, MetadataT]],
+    path: Path | str | None = None,
+    custom_evaluator_types: Sequence[type[Evaluator[InputsT, OutputT, MetadataT]]] = (),
+    model: models.Model | models.KnownModelName = 'openai:gpt-5.2',
+    n_examples: int = 3,
+    extra_instructions: str | None = None,
+) -> Dataset[InputsT, OutputT, MetadataT]:
+    """Use an LLM to generate a dataset of test cases, each consisting of input, expected output, and metadata.
+
+    This function creates a properly structured dataset with the specified input, output, and metadata types.
+    It uses an LLM to attempt to generate realistic test cases that conform to the types' schemas.
+
+    Args:
+        path: Optional path to save the generated dataset. If provided, the dataset will be saved to this location.
+        dataset_type: The type of dataset to generate, with the desired input, output, and metadata types.
+        custom_evaluator_types: Optional sequence of custom evaluator classes to include in the schema.
+        model: The Pydantic AI model to use for generation. Defaults to 'openai:gpt-5.2'.
+        n_examples: Number of examples to generate. Defaults to 3.
+        extra_instructions: Optional additional instructions to provide to the LLM.
+
+    Returns:
+        A properly structured Dataset object with generated test cases.
+
+    Raises:
+        ValidationError: If the LLM's response cannot be parsed as a valid dataset.
+    """
+    output_schema = dataset_type.model_json_schema_with_evaluators(custom_evaluator_types)
+
+    # TODO: Use `output_type=StructuredDict(output_schema)` (and `from_dict` below) once https://github.com/pydantic/pydantic/issues/12145
+    # is fixed and `StructuredDict` no longer needs to use `InlineDefsJsonSchemaTransformer`.
+    agent = Agent(
+        model,
+        system_prompt=(
+            f'Generate an object that is in compliance with this JSON schema:\n{output_schema}\n\n'
+            f'Include {n_examples} example cases.'
+            ' You must not include any characters in your response before the opening { of the JSON object, or after the closing }.'
+        ),
+        output_type=str,
+        retries=1,
+    )
+
+    result = await agent.run(extra_instructions or 'Please generate the object.')
+    output = strip_markdown_fences(result.output)
+    try:
+        result = dataset_type.from_text(output, fmt='json', custom_evaluator_types=custom_evaluator_types)
+    except ValidationError as e:  # pragma: no cover
+        print(f'Raw response from model:\n{result.output}')
+        raise e
+    if path is not None:
+        result.to_file(path, custom_evaluator_types=custom_evaluator_types)  # pragma: no cover
+    return result
+
+# tests/test_usage_limits.py:3-3
+import operator
+
+# pydantic_evals/pydantic_evals/dataset.py:281-405
+    async def evaluate(
+        self,
+        task: Callable[[InputsT], Awaitable[OutputT]] | Callable[[InputsT], OutputT],
+        name: str | None = None,
+        max_concurrency: int | None = None,
+        progress: bool = True,
+        retry_task: RetryConfig | None = None,
+        retry_evaluators: RetryConfig | None = None,
+        *,
+        task_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        repeat: int = 1,
+    ) -> EvaluationReport[InputsT, OutputT, MetadataT]:
+        """Evaluates the test cases in the dataset using the given task.
+
+        This method runs the task on each case in the dataset, applies evaluators,
+        and collects results into a report. Cases are run concurrently, limited by `max_concurrency` if specified.
+
+        Args:
+            task: The task to evaluate. This should be a callable that takes the inputs of the case
+                and returns the output.
+            name: The name of the experiment being run, this is used to identify the experiment in the report.
+                If omitted, the task_name will be used; if that is not specified, the name of the task function is used.
+            max_concurrency: The maximum number of concurrent evaluations of the task to allow.
+                If None, all cases will be evaluated concurrently.
+            progress: Whether to show a progress bar for the evaluation. Defaults to `True`.
+            retry_task: Optional retry configuration for the task execution.
+            retry_evaluators: Optional retry configuration for evaluator execution.
+            task_name: Optional override to the name of the task being executed, otherwise the name of the task
+                function will be used.
+            metadata: Optional dict of experiment metadata.
+            repeat: Number of times to run each case. When > 1, each case is run multiple times and
+                results are grouped by the original case name for aggregation. Defaults to 1.
+
+        Returns:
+            A report containing the results of the evaluation.
+        """
+        if repeat < 1:
+            raise ValueError(f'repeat must be >= 1, got {repeat}')
+
+        task_name = task_name or get_unwrapped_function_name(task)
+        name = name or task_name
+
+        tasks_to_run = self._build_tasks_to_run(repeat)
+        total_tasks = len(tasks_to_run)
+        progress_bar = Progress() if progress else None
+
+        limiter = anyio.Semaphore(max_concurrency) if max_concurrency is not None else AsyncExitStack()
+
+        extra_attributes: dict[str, Any] = {'gen_ai.operation.name': 'experiment'}
+        if metadata is not None:
+            extra_attributes['metadata'] = metadata
+        if repeat > 1:
+            extra_attributes['logfire.experiment.repeat'] = repeat
+        with (
+            logfire_span(
+                'evaluate {name}',
+                name=name,
+                task_name=task_name,
+                dataset_name=self.name,
+                n_cases=len(self.cases),
+                **extra_attributes,
+            ) as eval_span,
+            progress_bar or nullcontext(),
+        ):
+            task_id = progress_bar.add_task(f'Evaluating {task_name}', total=total_tasks) if progress_bar else None
+
+            async def _handle_case(
+                case: Case[InputsT, OutputT, MetadataT],
+                report_case_name: str,
+                source_case_name: str | None,
+            ):
+                async with limiter:
+                    result = await _run_task_and_evaluators(
+                        task,
+                        case,
+                        report_case_name,
+                        self.evaluators,
+                        retry_task,
+                        retry_evaluators,
+                        source_case_name=source_case_name,
+                    )
+                    if progress_bar and task_id is not None:  # pragma: no branch
+                        progress_bar.update(task_id, advance=1)
+                    return result
+
+            if (context := eval_span.context) is None:  # pragma: no cover
+                trace_id = None
+                span_id = None
+            else:
+                trace_id = f'{context.trace_id:032x}'
+                span_id = f'{context.span_id:016x}'
+            cases_and_failures = await task_group_gather(
+                [
+                    lambda case=case, rn=report_name, scn=source_name: _handle_case(case, rn, scn)
+                    for case, report_name, source_name in tasks_to_run
+                ]
+            )
+            cases: list[ReportCase] = []
+            failures: list[ReportCaseFailure] = []
+            for item in cases_and_failures:
+                if isinstance(item, ReportCase):
+                    cases.append(item)
+                else:
+                    failures.append(item)
+            report = EvaluationReport(
+                name=name,
+                cases=cases,
+                failures=failures,
+                experiment_metadata=metadata,
+                span_id=span_id,
+                trace_id=trace_id,
+            )
+
+            # Run report evaluators
+            if self.report_evaluators:
+                report_ctx = ReportEvaluatorContext(
+                    name=name,
+                    report=report,
+                    experiment_metadata=metadata,
+                )
+                await _run_report_evaluators(self.report_evaluators, report_ctx)
+
+            _set_experiment_span_attributes(eval_span, report, metadata, len(self.cases), repeat)
+        return report
+
+# pydantic_graph/pydantic_graph/beta/step.py:90-112
+class StreamFunction(Protocol[StateT, DepsT, InputT, OutputT]):
+    """Protocol for stream functions that can be executed in the graph.
+
+    Stream functions are async callables that receive a step context and return an async iterator.
+
+    Type Parameters:
+        StateT: The type of the graph state
+        DepsT: The type of the dependencies
+        InputT: The type of the input data
+        OutputT: The type of the output data
+    """
+
+    def __call__(self, ctx: StepContext[StateT, DepsT, InputT]) -> AsyncIterator[OutputT]:
+        """Execute the stream function with the given context.
+
+        Args:
+            ctx: The step context containing state, dependencies, and inputs
+
+        Returns:
+            An async iterator yielding the streamed output
+        """
+        raise NotImplementedError
+        yield
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:20-20
+    type: Literal['tool_call']
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:15-15
+    type: Literal['text']
+
+# pydantic_graph/pydantic_graph/beta/step.py:66-87
+class StepFunction(Protocol[StateT, DepsT, InputT, OutputT]):
+    """Protocol for step functions that can be executed in the graph.
+
+    Step functions are async callables that receive a step context and return a result.
+
+    Type Parameters:
+        StateT: The type of the graph state
+        DepsT: The type of the dependencies
+        InputT: The type of the input data
+        OutputT: The type of the output data
+    """
+
+    def __call__(self, ctx: StepContext[StateT, DepsT, InputT]) -> Awaitable[OutputT]:
+        """Execute the step function with the given context.
+
+        Args:
+            ctx: The step context containing state, dependencies, and inputs
+
+        Returns:
+            An awaitable that resolves to the step's output
+        """
+        raise NotImplementedError
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:47-47
+    type: Literal['thinking']
+
+# pydantic_graph/pydantic_graph/beta/step.py:120-165
+class Step(Generic[StateT, DepsT, InputT, OutputT]):
+    """A step in the graph execution that wraps a step function.
+
+    Steps represent individual units of execution in the graph, encapsulating
+    a step function along with metadata like ID and label.
+
+    Type Parameters:
+        StateT: The type of the graph state
+        DepsT: The type of the dependencies
+        InputT: The type of the input data
+        OutputT: The type of the output data
+    """
+
+    id: NodeID
+    """Unique identifier for this step."""
+    _call: StepFunction[StateT, DepsT, InputT, OutputT]
+    """The step function to execute."""
+    label: str | None
+    """Optional human-readable label for this step."""
+
+    def __init__(self, *, id: NodeID, call: StepFunction[StateT, DepsT, InputT, OutputT], label: str | None = None):
+        self.id = id
+        self._call = call
+        self.label = label
+
+    @property
+    def call(self) -> StepFunction[StateT, DepsT, InputT, OutputT]:
+        """The step function to execute. This needs to be a property for proper variance inference."""
+        return self._call
+
+    @overload
+    def as_node(self, inputs: None = None) -> StepNode[StateT, DepsT]: ...
+
+    @overload
+    def as_node(self, inputs: InputT) -> StepNode[StateT, DepsT]: ...
+
+    def as_node(self, inputs: InputT | None = None) -> StepNode[StateT, DepsT]:
+        """Create a step node with bound inputs.
+
+        Args:
+            inputs: The input data to bind to this step, or None
+
+        Returns:
+            A [`StepNode`][pydantic_graph.beta.step.StepNode] with this step and the bound inputs
+        """
+        return StepNode(self, inputs)
+
+# pydantic_graph/pydantic_graph/beta/paths.py:32-57
+class TransformFunction(Protocol[StateT, DepsT, InputT, OutputT]):
+    """Protocol for step functions that can be executed in the graph.
+
+    Transform functions are sync callables that receive a step context and return
+    a result. This protocol enables serialization and deserialization of step
+    calls similar to how evaluators work.
+
+    This is very similar to a StepFunction, but must be sync instead of async.
+
+    Type Parameters:
+        StateT: The type of the graph state
+        DepsT: The type of the dependencies
+        InputT: The type of the input data
+        OutputT: The type of the output data
+    """
+
+    def __call__(self, ctx: StepContext[StateT, DepsT, InputT]) -> OutputT:
+        """Execute the step function with the given context.
+
+        Args:
+            ctx: The step context containing state, dependencies, and inputs
+
+        Returns:
+            An awaitable that resolves to the step's output
+        """
+        raise NotImplementedError
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:152-152
+    type: Annotated[str, Field(pattern=r'^tool-')]
+
+# pydantic_evals/pydantic_evals/dataset.py:407-455
+    def evaluate_sync(
+        self,
+        task: Callable[[InputsT], Awaitable[OutputT]] | Callable[[InputsT], OutputT],
+        name: str | None = None,
+        max_concurrency: int | None = None,
+        progress: bool = True,
+        retry_task: RetryConfig | None = None,
+        retry_evaluators: RetryConfig | None = None,
+        *,
+        task_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        repeat: int = 1,
+    ) -> EvaluationReport[InputsT, OutputT, MetadataT]:
+        """Evaluates the test cases in the dataset using the given task.
+
+        This is a synchronous wrapper around [`evaluate`][pydantic_evals.dataset.Dataset.evaluate] provided for convenience.
+
+        Args:
+            task: The task to evaluate. This should be a callable that takes the inputs of the case
+                and returns the output.
+            name: The name of the experiment being run, this is used to identify the experiment in the report.
+                If omitted, the task_name will be used; if that is not specified, the name of the task function is used.
+            max_concurrency: The maximum number of concurrent evaluations of the task to allow.
+                If None, all cases will be evaluated concurrently.
+            progress: Whether to show a progress bar for the evaluation. Defaults to `True`.
+            retry_task: Optional retry configuration for the task execution.
+            retry_evaluators: Optional retry configuration for evaluator execution.
+            task_name: Optional override to the name of the task being executed, otherwise the name of the task
+                function will be used.
+            metadata: Optional dict of experiment metadata.
+            repeat: Number of times to run each case. When > 1, each case is run multiple times and
+                results are grouped by the original case name for aggregation. Defaults to 1.
+
+        Returns:
+            A report containing the results of the evaluation.
+        """
+        return get_event_loop().run_until_complete(
+            self.evaluate(
+                task,
+                name=name,
+                max_concurrency=max_concurrency,
+                progress=progress,
+                retry_task=retry_task,
+                retry_evaluators=retry_evaluators,
+                task_name=task_name,
+                metadata=metadata,
+                repeat=repeat,
+            )
+        )
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:139-139
+    type: Annotated[str, Field(pattern=r'^tool-')]
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:192-192
+    type: Literal['dynamic-tool'] = 'dynamic-tool'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:90-90
+    type: Literal['tool-input-start'] = 'tool-input-start'
+
+# pydantic_evals/pydantic_evals/reporting/analyses.py:21-21
+    type: Literal['confusion_matrix'] = 'confusion_matrix'
+
+# pydantic_evals/pydantic_evals/reporting/analyses.py:52-52
+    type: Literal['precision_recall'] = 'precision_recall'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:78-78
+    type: Literal['file'] = 'file'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:128-128
+    type: Annotated[str, Field(pattern=r'^tool-')]
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:205-205
+    type: Literal['dynamic-tool'] = 'dynamic-tool'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:124-124
+    type: Literal['tool-input-available'] = 'tool-input-available'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:136-136
+    type: Literal['tool-input-error'] = 'tool-input-error'
+
+# pydantic_evals/pydantic_evals/reporting/analyses.py:62-62
+    type: Literal['scalar'] = 'scalar'
+
+# pydantic_evals/pydantic_evals/reporting/analyses.py:73-73
+    type: Literal['table'] = 'table'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:27-27
+    type: Literal['text'] = 'text'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:67-67
+    type: Literal['source-document'] = 'source-document'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:117-117
+    type: Annotated[str, Field(pattern=r'^tool-')]
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:170-170
+    type: Literal['dynamic-tool'] = 'dynamic-tool'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:181-181
+    type: Literal['dynamic-tool'] = 'dynamic-tool'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:113-113
+    type: Literal['tool-output-available'] = 'tool-output-available'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:42-42
+    type: Literal['reasoning'] = 'reasoning'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:57-57
+    type: Literal['source-url'] = 'source-url'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:149-149
+    type: Literal['tool-output-error'] = 'tool-output-error'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:184-184
+    type: Literal['source-document'] = 'source-document'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:203-203
+    type: Annotated[str, Field(pattern=r'^data-')]
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:28-28
+    type: Literal['tool_call_response']
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:41-41
+    type: Literal['text-delta'] = 'text-delta'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:66-66
+    type: Literal['reasoning-delta'] = 'reasoning-delta'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:174-174
+    type: Literal['source-url'] = 'source-url'
+
+# pydantic_ai_slim/pydantic_ai/models/groq.py:665-665
+    type: Literal['invalid_request_error']
+
+# pydantic_ai_slim/pydantic_ai/models/openrouter.py:258-258
+    type: Literal['reasoning.text', 'reasoning.summary', 'reasoning.encrypted']
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:108-108
+    type: Annotated[str, Field(pattern=r'^data-')]
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:33-33
+    type: Literal['text-start'] = 'text-start'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:50-50
+    type: Literal['text-end'] = 'text-end'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:58-58
+    type: Literal['reasoning-start'] = 'reasoning-start'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:75-75
+    type: Literal['reasoning-end'] = 'reasoning-end'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:105-105
+    type: Literal['tool-input-delta'] = 'tool-input-delta'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:195-195
+    type: Literal['file'] = 'file'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:224-224
+    type: Literal['start'] = 'start'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:232-232
+    type: Literal['finish'] = 'finish'
+
+# tests/evals/test_reports.py:173-233
+async def test_report_with_error(mock_evaluator: Evaluator[TaskInput, TaskOutput, TaskMetadata]):
+    """Test a report with error in one of the cases."""
+    # Create an evaluator output
+    error_output = EvaluationResult[bool](
+        name='error_evaluator',
+        value=False,  # No result
+        reason='Test error message',
+        source=mock_evaluator.as_spec(),
+    )
+
+    # Create a case
+    error_case = ReportCase(
+        name='error_case',
+        inputs={'query': 'What is 1/0?'},
+        output=None,
+        expected_output={'answer': 'Error'},
+        metadata={'difficulty': 'hard'},
+        metrics={},
+        attributes={'error': 'Division by zero'},
+        scores={},
+        labels={},
+        assertions={error_output.name: error_output},
+        task_duration=0.05,
+        total_duration=0.1,
+        trace_id='test-error-trace-id',
+        span_id='test-error-span-id',
+    )
+
+    # Create a report with the error case
+    report = EvaluationReport(
+        cases=[error_case],
+        name='error_report',
+    )
+
+    assert ReportCaseAdapter.dump_python(report.cases[0]) == snapshot(
+        {
+            'assertions': {
+                'error_evaluator': {
+                    'name': 'error_evaluator',
+                    'reason': 'Test error message',
+                    'source': {'arguments': None, 'name': 'MockEvaluator'},
+                    'value': False,
+                }
+            },
+            'attributes': {'error': 'Division by zero'},
+            'evaluator_failures': [],
+            'expected_output': {'answer': 'Error'},
+            'inputs': {'query': 'What is 1/0?'},
+            'labels': {},
+            'metadata': {'difficulty': 'hard'},
+            'metrics': {},
+            'name': 'error_case',
+            'output': None,
+            'scores': {},
+            'span_id': 'test-error-span-id',
+            'source_case_name': None,
+            'task_duration': 0.05,
+            'total_duration': 0.1,
+            'trace_id': 'test-error-trace-id',
+        }
+    )
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:41-41
+    type: Literal['binary']
+
+# pydantic_ai_slim/pydantic_ai/models/openrouter.py:278-278
+    type: Literal['reasoning.text']
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:83-83
+    type: Literal['error'] = 'error'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:159-159
+    type: Literal['tool-approval-request'] = 'tool-approval-request'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:254-254
+    type: Literal['done'] = 'done'
+
+# tests/models/test_model_names.py:121-121
+    type: list[str]
+
+# pydantic_evals/pydantic_evals/dataset.py:489-515
+    def add_evaluator(
+        self,
+        evaluator: Evaluator[InputsT, OutputT, MetadataT],
+        specific_case: str | None = None,
+    ) -> None:
+        """Adds an evaluator to the dataset or a specific case.
+
+        Args:
+            evaluator: The evaluator to add.
+            specific_case: If provided, the evaluator will only be added to the case with this name.
+                If None, the evaluator will be added to all cases in the dataset.
+
+        Raises:
+            ValueError: If `specific_case` is provided but no case with that name exists in the dataset.
+        """
+        if specific_case is None:
+            self.evaluators.append(evaluator)
+        else:
+            # If this is too slow, we could try to add a case lookup dict.
+            # Note that if we do that, we'd need to make the cases list private to prevent modification.
+            added = False
+            for case in self.cases:
+                if case.name == specific_case:
+                    case.evaluators.append(evaluator)
+                    added = True
+            if not added:
+                raise ValueError(f'Case {specific_case!r} not found in the dataset')
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:691-782
+    def run_stream_sync(
+        self,
+        user_prompt: str | Sequence[_messages.UserContent] | None = None,
+        *,
+        output_type: OutputSpec[RunOutputDataT] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: models.Model | models.KnownModelName | str | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+        usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool | BuiltinToolFunc[AgentDepsT]] | None = None,
+        event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+    ) -> result.StreamedRunResultSync[AgentDepsT, Any]:
+        """Run the agent with a user prompt in sync streaming mode.
+
+        This is a convenience method that wraps [`run_stream()`][pydantic_ai.agent.AbstractAgent.run_stream] with `loop.run_until_complete(...)`.
+        You therefore can't use this method inside async code or if there's an active event loop.
+
+        This method builds an internal agent graph (using system prompts, tools and output schemas) and then
+        runs the graph until the model produces output matching the `output_type`, for example text or structured data.
+        At this point, a streaming run result object is yielded from which you can stream the output as it comes in,
+        and -- once this output has completed streaming -- get the complete output, message history, and usage.
+
+        As this method will consider the first output matching the `output_type` to be the final output,
+        it will stop running the agent graph and will not execute any tool calls made by the model after this "final" output.
+        If you want to always run the agent graph to completion and stream events and output at the same time,
+        use [`agent.run()`][pydantic_ai.agent.AbstractAgent.run] with an `event_stream_handler` or [`agent.iter()`][pydantic_ai.agent.AbstractAgent.iter] instead.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+
+        def main():
+            response = agent.run_stream_sync('What is the capital of the UK?')
+            print(response.get_output())
+            #> The capital of the UK is London.
+        ```
+
+        Args:
+            user_prompt: User input to start/continue the conversation.
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has no
+                output validators since output validators would expect an argument that matches the agent's output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            metadata: Optional metadata to attach to this run. Accepts a dictionary or a callable taking
+                [`RunContext`][pydantic_ai.tools.RunContext]; merged with the agent's configured metadata.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            event_stream_handler: Optional handler for events from the model's streaming response and the agent's execution of tools to use for this run.
+                It will receive all the events up until the final result is found, which you can then read or stream from inside the context manager.
+                Note that it does _not_ receive any events after the final result is found.
+
+        Returns:
+            The result of the run.
+        """
+        if infer_name and self.name is None:
+            self._infer_name(inspect.currentframe())
+
+        async def _consume_stream():
+            async with self.run_stream(
+                user_prompt,
+                output_type=output_type,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                model=model,
+                deps=deps,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+                usage=usage,
+                metadata=metadata,
+                infer_name=infer_name,
+                toolsets=toolsets,
+                builtin_tools=builtin_tools,
+                event_stream_handler=event_stream_handler,
+            ) as stream_result:
+                yield stream_result
+
+        async_result = _utils.get_event_loop().run_until_complete(anext(_consume_stream()))
+        return result.StreamedRunResultSync(async_result)
+
+# pydantic_ai_slim/pydantic_ai/format_prompt.py:20-77
+def format_as_xml(
+    obj: Any,
+    root_tag: str | None = None,
+    item_tag: str = 'item',
+    none_str: str = 'null',
+    indent: str | None = '  ',
+    include_field_info: Literal['once'] | bool = False,
+) -> str:
+    """Format a Python object as XML.
+
+    This is useful since LLMs often find it easier to read semi-structured data (e.g. examples) as XML,
+    rather than JSON etc.
+
+    Supports: `str`, `bytes`, `bytearray`, `bool`, `int`, `float`, `Decimal`, `date`, `datetime`, `time`, `timedelta`,
+    `UUID`, `Enum`, `Mapping`, `Iterable`, `dataclass`, and `BaseModel`.
+
+    Args:
+        obj: Python Object to serialize to XML.
+        root_tag: Outer tag to wrap the XML in, use `None` to omit the outer tag.
+        item_tag: Tag to use for each item in an iterable (e.g. list), this is overridden by the class name
+            for dataclasses and Pydantic models.
+        none_str: String to use for `None` values.
+        indent: Indentation string to use for pretty printing.
+        include_field_info: Whether to include attributes like Pydantic `Field` attributes and dataclasses `field()`
+            `metadata` as XML attributes. In both cases the allowed `Field` attributes and `field()` metadata keys are
+            `title` and `description`. If a field is repeated in the data (e.g. in a list) by setting `once`
+            the attributes are included only in the first occurrence of an XML element relative to the same field.
+
+    Returns:
+        XML representation of the object.
+
+    Example:
+    ```python {title="format_as_xml_example.py" lint="skip"}
+    from pydantic_ai import format_as_xml
+
+    print(format_as_xml({'name': 'John', 'height': 6, 'weight': 200}, root_tag='user'))
+    '''
+    <user>
+      <name>John</name>
+      <height>6</height>
+      <weight>200</weight>
+    </user>
+    '''
+    ```
+    """
+    el = _ToXml(
+        data=obj,
+        item_tag=item_tag,
+        none_str=none_str,
+        include_field_info=include_field_info,
+    ).to_xml(root_tag)
+    if root_tag is None and el.text is None:
+        join = '' if indent is None else '\n'
+        return join.join(_rootless_xml_elements(el, indent))
+    else:
+        if indent is not None:
+            ElementTree.indent(el, space=indent)
+        return ElementTree.tostring(el, encoding='unicode')
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:36-36
+    type: Literal['image-url', 'audio-url', 'video-url', 'document-url']
+
+# pydantic_ai_slim/pydantic_ai/models/openrouter.py:264-264
+    type: Literal['reasoning.summary']
+
+# pydantic_ai_slim/pydantic_ai/models/openrouter.py:271-271
+    type: Literal['reasoning.encrypted']
+
+# pydantic_ai_slim/pydantic_ai/models/openrouter.py:356-356
+    type: Literal['file']
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:102-102
+    type: Literal['step-start'] = 'step-start'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:167-167
+    type: Literal['tool-output-denied'] = 'tool-output-denied'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:212-212
+    type: Literal['start-step'] = 'start-step'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:218-218
+    type: Literal['finish-step'] = 'finish-step'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:240-240
+    type: Literal['abort'] = 'abort'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:247-247
+    type: Literal['message-metadata'] = 'message-metadata'
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:97-179
+    def __init__(
+        self,
+        *,
+        tracer_provider: TracerProvider | None = None,
+        meter_provider: MeterProvider | None = None,
+        include_binary_content: bool = True,
+        include_content: bool = True,
+        version: Literal[1, 2, 3] = DEFAULT_INSTRUMENTATION_VERSION,
+        event_mode: Literal['attributes', 'logs'] = 'attributes',
+        logger_provider: LoggerProvider | None = None,
+    ):
+        """Create instrumentation options.
+
+        Args:
+            tracer_provider: The OpenTelemetry tracer provider to use.
+                If not provided, the global tracer provider is used.
+                Calling `logfire.configure()` sets the global tracer provider, so most users don't need this.
+            meter_provider: The OpenTelemetry meter provider to use.
+                If not provided, the global meter provider is used.
+                Calling `logfire.configure()` sets the global meter provider, so most users don't need this.
+            include_binary_content: Whether to include binary content in the instrumentation events.
+            include_content: Whether to include prompts, completions, and tool call arguments and responses
+                in the instrumentation events.
+            version: Version of the data format. This is unrelated to the Pydantic AI package version.
+                Version 1 is based on the legacy event-based OpenTelemetry GenAI spec
+                    and will be removed in a future release.
+                    The parameters `event_mode` and `logger_provider` are only relevant for version 1.
+                Version 2 uses the newer OpenTelemetry GenAI spec and stores messages in the following attributes:
+                    - `gen_ai.system_instructions` for instructions passed to the agent.
+                    - `gen_ai.input.messages` and `gen_ai.output.messages` on model request spans.
+                    - `pydantic_ai.all_messages` on agent run spans.
+            event_mode: The mode for emitting events in version 1.
+                If `'attributes'`, events are attached to the span as attributes.
+                If `'logs'`, events are emitted as OpenTelemetry log-based events.
+            logger_provider: The OpenTelemetry logger provider to use.
+                If not provided, the global logger provider is used.
+                Calling `logfire.configure()` sets the global logger provider, so most users don't need this.
+                This is only used if `event_mode='logs'` and `version=1`.
+        """
+        from pydantic_ai import __version__
+
+        tracer_provider = tracer_provider or get_tracer_provider()
+        meter_provider = meter_provider or get_meter_provider()
+        logger_provider = logger_provider or get_logger_provider()
+        scope_name = 'pydantic-ai'
+        self.tracer = tracer_provider.get_tracer(scope_name, __version__)
+        self.meter = meter_provider.get_meter(scope_name, __version__)
+        self.logger = logger_provider.get_logger(scope_name, __version__)
+        self.event_mode = event_mode
+        self.include_binary_content = include_binary_content
+        self.include_content = include_content
+
+        if event_mode == 'logs' and version != 1:
+            warnings.warn(
+                'event_mode is only relevant for version=1 which is deprecated and will be removed in a future release.',
+                stacklevel=2,
+            )
+            version = 1
+
+        self.version = version
+
+        # As specified in the OpenTelemetry GenAI metrics spec:
+        # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/#metric-gen_aiclienttokenusage
+        tokens_histogram_kwargs = dict(
+            name='gen_ai.client.token.usage',
+            unit='{token}',
+            description='Measures number of input and output tokens used',
+        )
+        try:
+            self.tokens_histogram = self.meter.create_histogram(
+                **tokens_histogram_kwargs,
+                explicit_bucket_boundaries_advisory=TOKEN_HISTOGRAM_BOUNDARIES,
+            )
+        except TypeError:  # pragma: lax no cover
+            # Older OTel/logfire versions don't support explicit_bucket_boundaries_advisory
+            self.tokens_histogram = self.meter.create_histogram(
+                **tokens_histogram_kwargs,  # pyright: ignore
+            )
+        self.cost_histogram = self.meter.create_histogram(
+            'operation.cost',
+            unit='{USD}',
+            description='Monetary cost',
+        )
+
+# pydantic_ai_slim/pydantic_ai/ui/_event_stream.py:92-98
+    def content_type(self) -> str:
+        """Get the content type for the event stream, compatible with the `Accept` header value.
+
+        By default, this returns the Server-Sent Events content type (`text/event-stream`).
+        If a subclass supports other types as well, it should consider `self.accept` in [`encode_event()`][pydantic_ai.ui.UIEventStream.encode_event] and return the resulting content type.
+        """
+        return SSE_CONTENT_TYPE

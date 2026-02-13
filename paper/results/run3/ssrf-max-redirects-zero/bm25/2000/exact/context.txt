@@ -1,0 +1,218 @@
+# tests/test_ssrf.py:484-501
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:50-50
+_MAX_REDIRECTS = 0
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:50-50
+_MAX_REDIRECTS = 0
+
+# tests/test_ssrf.py:432-459
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+# tests/models/test_gemini.py:1169-1201
+async def test_safety_settings_safe(
+    client_with_handler: ClientWithHandler, env: TestEnv, allow_model_requests: None
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        safety_settings = json.loads(request.content)['safetySettings']
+        assert safety_settings == [
+            {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+            {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+        ]
+
+        return httpx.Response(
+            200,
+            content=_gemini_response_ta.dump_json(
+                gemini_response(_content_model_response(ModelResponse(parts=[TextPart('world')]))),
+                by_alias=True,
+            ),
+            headers={'Content-Type': 'application/json'},
+        )
+
+    gemini_client = client_with_handler(handler)
+    m = GeminiModel('gemini-1.5-flash', provider=GoogleGLAProvider(http_client=gemini_client, api_key='mock'))
+    agent = Agent(m)
+
+    result = await agent.run(
+        'hello',
+        model_settings=GeminiModelSettings(
+            gemini_safety_settings=[
+                {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+                {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+            ]
+        ),
+    )
+    assert result.output == 'world'
+
+# tests/models/test_gemini.py:1125-1166
+async def test_safety_settings_unsafe(
+    client_with_handler: ClientWithHandler, env: TestEnv, allow_model_requests: None
+) -> None:
+    try:
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            safety_settings = json.loads(request.content)['safetySettings']
+            assert safety_settings == [
+                {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+                {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+            ]
+
+            return httpx.Response(
+                200,
+                content=_gemini_response_ta.dump_json(
+                    gemini_no_content_response(
+                        finish_reason='SAFETY',
+                        safety_ratings=[
+                            {'category': 'HARM_CATEGORY_HARASSMENT', 'probability': 'MEDIUM', 'blocked': True}
+                        ],
+                    ),
+                    by_alias=True,
+                ),
+                headers={'Content-Type': 'application/json'},
+            )
+
+        gemini_client = client_with_handler(handler)
+
+        m = GeminiModel('gemini-1.5-flash', provider=GoogleGLAProvider(http_client=gemini_client, api_key='mock'))
+        agent = Agent(m)
+
+        await agent.run(
+            'a request for something rude',
+            model_settings=GeminiModelSettings(
+                gemini_safety_settings=[
+                    {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+                    {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+                ]
+            ),
+        )
+    except UnexpectedModelBehavior as e:
+        assert repr(e) == "UnexpectedModelBehavior('Safety settings triggered')"
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:956-967
+class _GeminiSafetyRating(TypedDict):
+    """See <https://ai.google.dev/gemini-api/docs/safety-settings#safety-filters>."""
+
+    category: Literal[
+        'HARM_CATEGORY_HARASSMENT',
+        'HARM_CATEGORY_HATE_SPEECH',
+        'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+        'HARM_CATEGORY_DANGEROUS_CONTENT',
+        'HARM_CATEGORY_CIVIC_INTEGRITY',
+    ]
+    probability: Literal['NEGLIGIBLE', 'LOW', 'MEDIUM', 'HIGH']
+    blocked: NotRequired[bool]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:569-569
+    safetySettings: NotRequired[list[GeminiSafetySettings]]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:82-82
+    gemini_safety_settings: list[GeminiSafetySettings]
+
+# pydantic_ai_slim/pydantic_ai/models/google.py:166-166
+    google_safety_settings: list[SafetySettingDict]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:579-608
+class GeminiSafetySettings(TypedDict):
+    """Safety settings options for Gemini model request.
+
+    See [Gemini API docs](https://ai.google.dev/gemini-api/docs/safety-settings) for safety category and threshold descriptions.
+    For an example on how to use `GeminiSafetySettings`, see [here](../../agent.md#model-specific-settings).
+    """
+
+    category: Literal[
+        'HARM_CATEGORY_UNSPECIFIED',
+        'HARM_CATEGORY_HARASSMENT',
+        'HARM_CATEGORY_HATE_SPEECH',
+        'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+        'HARM_CATEGORY_DANGEROUS_CONTENT',
+        'HARM_CATEGORY_CIVIC_INTEGRITY',
+    ]
+    """
+    Safety settings category.
+    """
+
+    threshold: Literal[
+        'HARM_BLOCK_THRESHOLD_UNSPECIFIED',
+        'BLOCK_LOW_AND_ABOVE',
+        'BLOCK_MEDIUM_AND_ABOVE',
+        'BLOCK_ONLY_HIGH',
+        'BLOCK_NONE',
+        'OFF',
+    ]
+    """
+    Safety settings threshold.
+    """
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:586-593
+    category: Literal[
+        'HARM_CATEGORY_UNSPECIFIED',
+        'HARM_CATEGORY_HARASSMENT',
+        'HARM_CATEGORY_HATE_SPEECH',
+        'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+        'HARM_CATEGORY_DANGEROUS_CONTENT',
+        'HARM_CATEGORY_CIVIC_INTEGRITY',
+    ]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:598-605
+    threshold: Literal[
+        'HARM_BLOCK_THRESHOLD_UNSPECIFIED',
+        'BLOCK_LOW_AND_ABOVE',
+        'BLOCK_MEDIUM_AND_ABOVE',
+        'BLOCK_ONLY_HIGH',
+        'BLOCK_NONE',
+        'OFF',
+    ]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:875-875
+    safety_ratings: NotRequired[Annotated[list[_GeminiSafetyRating], pydantic.Field(alias='safetyRatings')]]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:974-974
+    safety_ratings: Annotated[list[_GeminiSafetyRating], pydantic.Field(alias='safetyRatings')]
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx

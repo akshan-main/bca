@@ -1,0 +1,452 @@
+## httpx/_content.py
+
+def encode_multipart_data(
+    data: RequestData, files: RequestFiles, boundary: bytes | None
+) -> tuple[dict[str, str], MultipartStream]:
+    multipart = MultipartStream(data=data, files=files, boundary=boundary)
+    headers = multipart.get_headers()
+    return headers, multipart
+
+def encode_json(json: Any) -> tuple[dict[str, str], ByteStream]:
+    body = json_dumps(
+        json, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    content_length = str(len(body))
+    content_type = "application/json"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+## httpx/_urlparse.py
+
+def PERCENT(string: str) -> str:
+    return "".join([f"%{byte:02X}" for byte in string.encode("utf-8")])
+
+## httpx/_utils.py
+
+def to_str(value: str | bytes, encoding: str = "utf-8") -> str:
+    return value if isinstance(value, str) else value.decode(encoding)
+
+def to_bytes_or_str(value: str, match_type_of: typing.AnyStr) -> typing.AnyStr:
+    return value if isinstance(match_type_of, str) else value.encode()
+
+class URLPattern:
+    """
+    A utility class currently used for making lookups against proxy keys...
+
+    # Wildcard matching...
+    >>> pattern = URLPattern("all://")
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    True
+
+    # Witch scheme matching...
+    >>> pattern = URLPattern("https://")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    False
+
+    # With domain matching...
+    >>> pattern = URLPattern("https://example.com")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    False
+    >>> pattern.matches(httpx.URL("https://other.com"))
+    False
+
+    # Wildcard scheme, with domain matching...
+    >>> pattern = URLPattern("all://example.com")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("https://other.com"))
+    False
+
+    # With port matching...
+    >>> pattern = URLPattern("https://example.com:1234")
+    >>> pattern.matches(httpx.URL("https://example.com:1234"))
+    True
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    False
+    """
+
+    def __init__(self, pattern: str) -> None:
+        from ._urls import URL
+
+        if pattern and ":" not in pattern:
+            raise ValueError(
+                f"Proxy keys should use proper URL forms rather "
+                f"than plain scheme strings. "
+                f'Instead of "{pattern}", use "{pattern}://"'
+            )
+
+        url = URL(pattern)
+        self.pattern = pattern
+        self.scheme = "" if url.scheme == "all" else url.scheme
+        self.host = "" if url.host == "*" else url.host
+        self.port = url.port
+        if not url.host or url.host == "*":
+            self.host_regex: typing.Pattern[str] | None = None
+        elif url.host.startswith("*."):
+            # *.example.com should match "www.example.com", but not "example.com"
+            domain = re.escape(url.host[2:])
+            self.host_regex = re.compile(f"^.+\\.{domain}$")
+        elif url.host.startswith("*"):
+            # *example.com should match "www.example.com" and "example.com"
+            domain = re.escape(url.host[1:])
+            self.host_regex = re.compile(f"^(.+\\.)?{domain}$")
+        else:
+            # example.com should match "example.com" but not "www.example.com"
+            domain = re.escape(url.host)
+            self.host_regex = re.compile(f"^{domain}$")
+
+    def matches(self, other: URL) -> bool:
+        if self.scheme and self.scheme != other.scheme:
+            return False
+        if (
+            self.host
+            and self.host_regex is not None
+            and not self.host_regex.match(other.host)
+        ):
+            return False
+        if self.port is not None and self.port != other.port:
+            return False
+        return True
+
+    @property
+    def priority(self) -> tuple[int, int, int]:
+        """
+        The priority allows URLPattern instances to be sortable, so that
+        we can match from most specific to least specific.
+        """
+        # URLs with a port should take priority over URLs without a port.
+        port_priority = 0 if self.port is not None else 1
+        # Longer hostnames should match first.
+        host_priority = -len(self.host)
+        # Longer schemes should match first.
+        scheme_priority = -len(self.scheme)
+        return (port_priority, host_priority, scheme_priority)
+
+    def __hash__(self) -> int:
+        return hash(self.pattern)
+
+    def __lt__(self, other: URLPattern) -> bool:
+        return self.priority < other.priority
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return isinstance(other, URLPattern) and self.pattern == other.pattern
+
+    def __hash__(self) -> int:
+        return hash(self.pattern)
+
+    def __lt__(self, other: URLPattern) -> bool:
+        return self.priority < other.priority
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return isinstance(other, URLPattern) and self.pattern == other.pattern
+
+## tests/client/test_async_client.py
+
+async def test_post(server):
+    url = server.url
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, content=b"Hello, world!")
+    assert response.status_code == 200
+
+async def test_post_json(server):
+    url = server.url
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json={"text": "Hello, world!"})
+    assert response.status_code == 200
+
+def hello_world(request):
+    return httpx.Response(200, text="Hello, world!")
+
+## tests/client/test_auth.py
+
+async def test_digest_auth_qop_auth_int_not_implemented() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="auth-int")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(NotImplementedError):
+            await client.get(url, auth=auth)
+
+async def test_digest_auth_qop_must_be_auth_or_auth_int() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="not-auth")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+## tests/client/test_client.py
+
+def test_post(server):
+    with httpx.Client() as client:
+        response = client.post(server.url, content=b"Hello, world!")
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+
+def test_post_json(server):
+    with httpx.Client() as client:
+        response = client.post(server.url, json={"text": "Hello, world!"})
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+
+## tests/client/test_redirects.py
+
+def test_redirect_301():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.post("https://example.org/redirect_301", follow_redirects=True)
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/"
+    assert len(response.history) == 1
+
+def test_invalid_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.RemoteProtocolError):
+        client.get("http://example.org/invalid_redirect", follow_redirects=True)
+
+def test_redirect_loop():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get("https://example.org/redirect_loop", follow_redirects=True)
+
+def test_cross_domain_redirect_with_auth():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_domain"
+    response = client.get(url, auth=("user", "pass"), follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert "authorization" not in response.json()["headers"]
+
+def test_cross_subdomain_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_subdomain"
+    response = client.get(url, follow_redirects=True)
+    assert response.url == "https://www.example.org/cross_subdomain"
+
+def test_redirect_custom_scheme():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.UnsupportedProtocol) as e:
+        client.post("https://example.org/redirect_custom_scheme", follow_redirects=True)
+    assert str(e.value) == "Scheme 'market' not supported."
+
+## tests/models/test_responses.py
+
+def streaming_body() -> typing.Iterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+async def async_streaming_body() -> typing.AsyncIterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+## tests/test_api.py
+
+def test_post(server):
+    response = httpx.post(server.url, content=b"Hello, world!")
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+
+## tests/test_content.py
+
+async def test_multipart_files_content():
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"Content-Type": "multipart/form-data; boundary=+++"}
+    request = httpx.Request(
+        method,
+        url,
+        files=files,
+        headers=headers,
+    )
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "138",
+        "Content-Type": "multipart/form-data; boundary=+++",
+    }
+    assert sync_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+    assert async_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+
+## tests/test_decoders.py
+
+def test_decoders_empty_cases(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    response = httpx.Response(content=b"", status_code=200, headers=headers)
+    assert response.read() == b""
+
+## tests/test_main.py
+
+def splitlines(output: str) -> typing.Iterable[str]:
+    return [line.strip() for line in output.splitlines()]
+
+## tests/test_multipart.py
+
+def test_multipart(value, output):
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    # Test with a single-value 'data' argument, and a plain file 'files' argument.
+    data = {"text": value}
+    files = {"file": io.BytesIO(b"<file content>")}
+    response = client.post("http://127.0.0.1:8000/", data=data, files=files)
+    boundary = response.request.headers["Content-Type"].split("boundary=")[-1]
+    boundary_bytes = boundary.encode("ascii")
+
+    assert response.status_code == 200
+    assert response.content == b"".join(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="text"\r\n',
+            b"\r\n",
+            b"abc\r\n",
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+
+def test_multipart_invalid_key(key):
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    data = {key: "abc"}
+    files = {"file": io.BytesIO(b"<file content>")}
+    with pytest.raises(TypeError) as e:
+        client.post(
+            "http://127.0.0.1:8000/",
+            data=data,
+            files=files,
+        )
+    assert "Invalid type for name" in str(e.value)
+    assert repr(key) in str(e.value)
+
+def test_multipart_invalid_value(value):
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    data = {"text": value}
+    files = {"file": io.BytesIO(b"<file content>")}
+    with pytest.raises(TypeError) as e:
+        client.post("http://127.0.0.1:8000/", data=data, files=files)
+    assert "Invalid type for value" in str(e.value)
+
+def test_multipart_file_tuple():
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    # Test with a list of values 'data' argument,
+    #     and a tuple style 'files' argument.
+    data = {"text": ["abc"]}
+    files = {"file": ("name.txt", io.BytesIO(b"<file content>"))}
+    response = client.post("http://127.0.0.1:8000/", data=data, files=files)
+    boundary = response.request.headers["Content-Type"].split("boundary=")[-1]
+    boundary_bytes = boundary.encode("ascii")
+
+    assert response.status_code == 200
+    assert response.content == b"".join(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="text"\r\n',
+            b"\r\n",
+            b"abc\r\n",
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="name.txt"\r\n',
+            b"Content-Type: text/plain\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+
+def test_multipart_encode(tmp_path: typing.Any) -> None:
+    path = str(tmp_path / "name.txt")
+    with open(path, "wb") as f:
+        f.write(b"<file content>")
+
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    data = {
+        "a": "1",
+        "b": b"C",
+        "c": ["11", "22", "33"],
+        "d": "",
+        "e": True,
+        "f": "",
+    }
+    with open(path, "rb") as input_file:
+        files = {"file": ("name.txt", input_file)}
+
+        request = httpx.Request("POST", url, headers=headers, data=data, files=files)
+        request.read()
+
+        assert request.headers == {
+            "Host": "www.example.com",
+            "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+            "Content-Length": str(len(request.content)),
+        }
+        assert request.content == (
+            '--BOUNDARY\r\nContent-Disposition: form-data; name="a"\r\n\r\n1\r\n'
+            '--BOUNDARY\r\nContent-Disposition: form-data; name="b"\r\n\r\nC\r\n'
+            '--BOUNDARY\r\nContent-Disposition: form-data; name="c"\r\n\r\n11\r\n'
+            '--BOUNDARY\r\nContent-Disposition: form-data; name="c"\r\n\r\n22\r\n'
+            '--BOUNDARY\r\nContent-Disposition: form-data; name="c"\r\n\r\n33\r\n'
+            '--BOUNDARY\r\nContent-Disposition: form-data; name="d"\r\n\r\n\r\n'
+            '--BOUNDARY\r\nContent-Disposition: form-data; name="e"\r\n\r\ntrue\r\n'
+            '--BOUNDARY\r\nContent-Disposition: form-data; name="f"\r\n\r\n\r\n'
+            '--BOUNDARY\r\nContent-Disposition: form-data; name="file";'
+            ' filename="name.txt"\r\n'
+            "Content-Type: text/plain\r\n\r\n<file content>\r\n"
+            "--BOUNDARY--\r\n"
+            "".encode("ascii")
+        )
+
+def test_multipart_rewinds_files():
+    with tempfile.TemporaryFile() as upload:
+        upload.write(b"Hello, world!")
+
+        transport = httpx.MockTransport(echo_request_content)
+        client = httpx.Client(transport=transport)
+
+        files = {"file": upload}
+        response = client.post("http://127.0.0.1:8000/", files=files)
+        assert response.status_code == 200
+        assert b"\r\nHello, world!\r\n" in response.content
+
+        # POSTing the same file instance a second time should have the same content.
+        files = {"file": upload}
+        response = client.post("http://127.0.0.1:8000/", files=files)
+        assert response.status_code == 200
+        assert b"\r\nHello, world!\r\n" in response.content
+
+## tests/test_utils.py
+
+def test_url_matches(pattern, url, expected):
+    pattern = URLPattern(pattern)
+    assert pattern.matches(httpx.URL(url)) == expected

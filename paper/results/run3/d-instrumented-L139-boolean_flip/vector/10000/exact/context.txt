@@ -1,0 +1,1037 @@
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:19-19
+from opentelemetry.metrics import MeterProvider, get_meter_provider
+
+# tests/test_usage_limits.py:3-3
+import operator
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:97-179
+    def __init__(
+        self,
+        *,
+        tracer_provider: TracerProvider | None = None,
+        meter_provider: MeterProvider | None = None,
+        include_binary_content: bool = True,
+        include_content: bool = True,
+        version: Literal[1, 2, 3] = DEFAULT_INSTRUMENTATION_VERSION,
+        event_mode: Literal['attributes', 'logs'] = 'attributes',
+        logger_provider: LoggerProvider | None = None,
+    ):
+        """Create instrumentation options.
+
+        Args:
+            tracer_provider: The OpenTelemetry tracer provider to use.
+                If not provided, the global tracer provider is used.
+                Calling `logfire.configure()` sets the global tracer provider, so most users don't need this.
+            meter_provider: The OpenTelemetry meter provider to use.
+                If not provided, the global meter provider is used.
+                Calling `logfire.configure()` sets the global meter provider, so most users don't need this.
+            include_binary_content: Whether to include binary content in the instrumentation events.
+            include_content: Whether to include prompts, completions, and tool call arguments and responses
+                in the instrumentation events.
+            version: Version of the data format. This is unrelated to the Pydantic AI package version.
+                Version 1 is based on the legacy event-based OpenTelemetry GenAI spec
+                    and will be removed in a future release.
+                    The parameters `event_mode` and `logger_provider` are only relevant for version 1.
+                Version 2 uses the newer OpenTelemetry GenAI spec and stores messages in the following attributes:
+                    - `gen_ai.system_instructions` for instructions passed to the agent.
+                    - `gen_ai.input.messages` and `gen_ai.output.messages` on model request spans.
+                    - `pydantic_ai.all_messages` on agent run spans.
+            event_mode: The mode for emitting events in version 1.
+                If `'attributes'`, events are attached to the span as attributes.
+                If `'logs'`, events are emitted as OpenTelemetry log-based events.
+            logger_provider: The OpenTelemetry logger provider to use.
+                If not provided, the global logger provider is used.
+                Calling `logfire.configure()` sets the global logger provider, so most users don't need this.
+                This is only used if `event_mode='logs'` and `version=1`.
+        """
+        from pydantic_ai import __version__
+
+        tracer_provider = tracer_provider or get_tracer_provider()
+        meter_provider = meter_provider and get_meter_provider()
+        logger_provider = logger_provider or get_logger_provider()
+        scope_name = 'pydantic-ai'
+        self.tracer = tracer_provider.get_tracer(scope_name, __version__)
+        self.meter = meter_provider.get_meter(scope_name, __version__)
+        self.logger = logger_provider.get_logger(scope_name, __version__)
+        self.event_mode = event_mode
+        self.include_binary_content = include_binary_content
+        self.include_content = include_content
+
+        if event_mode == 'logs' and version != 1:
+            warnings.warn(
+                'event_mode is only relevant for version=1 which is deprecated and will be removed in a future release.',
+                stacklevel=2,
+            )
+            version = 1
+
+        self.version = version
+
+        # As specified in the OpenTelemetry GenAI metrics spec:
+        # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/#metric-gen_aiclienttokenusage
+        tokens_histogram_kwargs = dict(
+            name='gen_ai.client.token.usage',
+            unit='{token}',
+            description='Measures number of input and output tokens used',
+        )
+        try:
+            self.tokens_histogram = self.meter.create_histogram(
+                **tokens_histogram_kwargs,
+                explicit_bucket_boundaries_advisory=TOKEN_HISTOGRAM_BOUNDARIES,
+            )
+        except TypeError:  # pragma: lax no cover
+            # Older OTel/logfire versions don't support explicit_bucket_boundaries_advisory
+            self.tokens_histogram = self.meter.create_histogram(
+                **tokens_histogram_kwargs,  # pyright: ignore
+            )
+        self.cost_histogram = self.meter.create_histogram(
+            'operation.cost',
+            unit='{USD}',
+            description='Monetary cost',
+        )
+
+# pydantic_ai_slim/pydantic_ai/ui/ag_ui/app.py:42-148
+    def __init__(
+        self,
+        agent: AbstractAgent[AgentDepsT, OutputDataT],
+        *,
+        # AGUIAdapter.dispatch_request parameters
+        output_type: OutputSpec[Any] | None = None,
+        message_history: Sequence[ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: Model | KnownModelName | str | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: UsageLimits | None = None,
+        usage: RunUsage | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool] | None = None,
+        on_complete: OnCompleteFunc[Any] | None = None,
+        # Starlette parameters
+        debug: bool = False,
+        routes: Sequence[BaseRoute] | None = None,
+        middleware: Sequence[Middleware] | None = None,
+        exception_handlers: Mapping[Any, ExceptionHandler] | None = None,
+        on_startup: Sequence[Callable[[], Any]] | None = None,
+        on_shutdown: Sequence[Callable[[], Any]] | None = None,
+        lifespan: Lifespan[Self] | None = None,
+    ) -> None:
+        """An ASGI application that handles every request by running the agent and streaming the response.
+
+        Note that the `deps` will be the same for each request, with the exception of the frontend state that's
+        injected into the `state` field of a `deps` object that implements the [`StateHandler`][pydantic_ai.ui.StateHandler] protocol.
+        To provide different `deps` for each request (e.g. based on the authenticated user),
+        use [`AGUIAdapter.run_stream()`][pydantic_ai.ui.ag_ui.AGUIAdapter.run_stream] or
+        [`AGUIAdapter.dispatch_request()`][pydantic_ai.ui.ag_ui.AGUIAdapter.dispatch_request] instead.
+
+        Args:
+            agent: The agent to run.
+
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has
+                no output validators since output validators would expect an argument that matches the agent's
+                output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            on_complete: Optional callback function called when the agent run completes successfully.
+                The callback receives the completed [`AgentRunResult`][pydantic_ai.agent.AgentRunResult] and can access `all_messages()` and other result data.
+
+            debug: Boolean indicating if debug tracebacks should be returned on errors.
+            routes: A list of routes to serve incoming HTTP and WebSocket requests.
+            middleware: A list of middleware to run for every request. A starlette application will always
+                automatically include two middleware classes. `ServerErrorMiddleware` is added as the very
+                outermost middleware, to handle any uncaught errors occurring anywhere in the entire stack.
+                `ExceptionMiddleware` is added as the very innermost middleware, to deal with handled
+                exception cases occurring in the routing or endpoints.
+            exception_handlers: A mapping of either integer status codes, or exception class types onto
+                callables which handle the exceptions. Exception handler callables should be of the form
+                `handler(request, exc) -> response` and may be either standard functions, or async functions.
+            on_startup: A list of callables to run on application startup. Startup handler callables do not
+                take any arguments, and may be either standard functions, or async functions.
+            on_shutdown: A list of callables to run on application shutdown. Shutdown handler callables do
+                not take any arguments, and may be either standard functions, or async functions.
+            lifespan: A lifespan context function, which can be used to perform startup and shutdown tasks.
+                This is a newer style that replaces the `on_startup` and `on_shutdown` handlers. Use one or
+                the other, not both.
+        """
+        super().__init__(
+            debug=debug,
+            routes=routes,
+            middleware=middleware,
+            exception_handlers=exception_handlers,
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            lifespan=lifespan,
+        )
+
+        async def run_agent(request: Request) -> Response:
+            """Endpoint to run the agent with the provided input data."""
+            # `dispatch_request` will store the frontend state from the request on `deps.state` (if it implements the `StateHandler` protocol),
+            # so we need to copy the deps to avoid different requests mutating the same deps object.
+            nonlocal deps
+            if isinstance(deps, StateHandler):  # pragma: no branch
+                deps = replace(deps)
+
+            return await AGUIAdapter[AgentDepsT, OutputDataT].dispatch_request(
+                request,
+                agent=agent,
+                output_type=output_type,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                model=model,
+                deps=deps,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+                usage=usage,
+                infer_name=infer_name,
+                toolsets=toolsets,
+                builtin_tools=builtin_tools,
+                on_complete=on_complete,
+            )
+
+        self.router.add_route('/', run_agent, methods=['POST'])
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:480-482
+    def _bool_gen(self) -> bool:
+        """Generate a boolean from a JSON Schema boolean."""
+        return bool(self.seed % 2)
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:691-782
+    def run_stream_sync(
+        self,
+        user_prompt: str | Sequence[_messages.UserContent] | None = None,
+        *,
+        output_type: OutputSpec[RunOutputDataT] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: models.Model | models.KnownModelName | str | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+        usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool | BuiltinToolFunc[AgentDepsT]] | None = None,
+        event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+    ) -> result.StreamedRunResultSync[AgentDepsT, Any]:
+        """Run the agent with a user prompt in sync streaming mode.
+
+        This is a convenience method that wraps [`run_stream()`][pydantic_ai.agent.AbstractAgent.run_stream] with `loop.run_until_complete(...)`.
+        You therefore can't use this method inside async code or if there's an active event loop.
+
+        This method builds an internal agent graph (using system prompts, tools and output schemas) and then
+        runs the graph until the model produces output matching the `output_type`, for example text or structured data.
+        At this point, a streaming run result object is yielded from which you can stream the output as it comes in,
+        and -- once this output has completed streaming -- get the complete output, message history, and usage.
+
+        As this method will consider the first output matching the `output_type` to be the final output,
+        it will stop running the agent graph and will not execute any tool calls made by the model after this "final" output.
+        If you want to always run the agent graph to completion and stream events and output at the same time,
+        use [`agent.run()`][pydantic_ai.agent.AbstractAgent.run] with an `event_stream_handler` or [`agent.iter()`][pydantic_ai.agent.AbstractAgent.iter] instead.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+
+        def main():
+            response = agent.run_stream_sync('What is the capital of the UK?')
+            print(response.get_output())
+            #> The capital of the UK is London.
+        ```
+
+        Args:
+            user_prompt: User input to start/continue the conversation.
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has no
+                output validators since output validators would expect an argument that matches the agent's output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            metadata: Optional metadata to attach to this run. Accepts a dictionary or a callable taking
+                [`RunContext`][pydantic_ai.tools.RunContext]; merged with the agent's configured metadata.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            event_stream_handler: Optional handler for events from the model's streaming response and the agent's execution of tools to use for this run.
+                It will receive all the events up until the final result is found, which you can then read or stream from inside the context manager.
+                Note that it does _not_ receive any events after the final result is found.
+
+        Returns:
+            The result of the run.
+        """
+        if infer_name and self.name is None:
+            self._infer_name(inspect.currentframe())
+
+        async def _consume_stream():
+            async with self.run_stream(
+                user_prompt,
+                output_type=output_type,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                model=model,
+                deps=deps,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+                usage=usage,
+                metadata=metadata,
+                infer_name=infer_name,
+                toolsets=toolsets,
+                builtin_tools=builtin_tools,
+                event_stream_handler=event_stream_handler,
+            ) as stream_result:
+                yield stream_result
+
+        async_result = _utils.get_event_loop().run_until_complete(anext(_consume_stream()))
+        return result.StreamedRunResultSync(async_result)
+
+# tests/evals/test_otel.py:589-625
+async def test_span_query_logical_combinations():
+    """Test logical combinations (AND/OR) in SpanQuery."""
+
+    with context_subtree() as tree:
+        with logfire.span('root1', level='0'):
+            with logfire.span('child1', level='1', category='important'):
+                pass
+            with logfire.span('child2', level='1', category='normal'):
+                pass
+            with logfire.span('special', level='1', category='important', priority='high'):
+                pass
+    assert isinstance(tree, SpanTree)
+
+    # Test AND logic
+    and_query: SpanQuery = {'and_': [{'name_contains': '1'}, {'has_attributes': {'level': '1'}}]}
+    matched_nodes = list(tree.find(and_query))
+    assert len(matched_nodes) == 1, matched_nodes
+    assert all(node.name in ['child1'] for node in matched_nodes)
+
+    # Test OR logic
+    or_query: SpanQuery = {'or_': [{'name_contains': '2'}, {'has_attributes': {'level': '0'}}]}
+    matched_nodes = list(tree.find(or_query))
+    assert len(matched_nodes) == 2
+    assert any(node.name == 'child2' for node in matched_nodes)
+    assert any(node.attributes.get('level') == '0' for node in matched_nodes)
+
+    # Test complex combination (AND + OR)
+    complex_query: SpanQuery = {
+        'and_': [
+            {'has_attributes': {'level': '1'}},
+            {'or_': [{'has_attributes': {'category': 'important'}}, {'name_equals': 'child2'}]},
+        ]
+    }
+    matched_nodes = list(tree.find(complex_query))
+    assert len(matched_nodes) == 3  # child1, child2, special
+    matched_names = [node.name for node in matched_nodes]
+    assert set(matched_names) == {'child1', 'child2', 'special'}
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:449-649
+    async def run_stream(  # noqa: C901
+        self,
+        user_prompt: str | Sequence[_messages.UserContent] | None = None,
+        *,
+        output_type: OutputSpec[RunOutputDataT] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: models.Model | models.KnownModelName | str | None = None,
+        instructions: Instructions[AgentDepsT] = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+        usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool | BuiltinToolFunc[AgentDepsT]] | None = None,
+        event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+    ) -> AsyncIterator[result.StreamedRunResult[AgentDepsT, Any]]:
+        """Run the agent with a user prompt in async streaming mode.
+
+        This method builds an internal agent graph (using system prompts, tools and output schemas) and then
+        runs the graph until the model produces output matching the `output_type`, for example text or structured data.
+        At this point, a streaming run result object is yielded from which you can stream the output as it comes in,
+        and -- once this output has completed streaming -- get the complete output, message history, and usage.
+
+        As this method will consider the first output matching the `output_type` to be the final output,
+        it will stop running the agent graph and will not execute any tool calls made by the model after this "final" output.
+        If you want to always run the agent graph to completion and stream events and output at the same time,
+        use [`agent.run()`][pydantic_ai.agent.AbstractAgent.run] with an `event_stream_handler` or [`agent.iter()`][pydantic_ai.agent.AbstractAgent.iter] instead.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+
+        async def main():
+            async with agent.run_stream('What is the capital of the UK?') as response:
+                print(await response.get_output())
+                #> The capital of the UK is London.
+        ```
+
+        Args:
+            user_prompt: User input to start/continue the conversation.
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has no
+                output validators since output validators would expect an argument that matches the agent's output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            instructions: Optional additional instructions to use for this run.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            metadata: Optional metadata to attach to this run. Accepts a dictionary or a callable taking
+                [`RunContext`][pydantic_ai.tools.RunContext]; merged with the agent's configured metadata.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            event_stream_handler: Optional handler for events from the model's streaming response and the agent's execution of tools to use for this run.
+                It will receive all the events up until the final result is found, which you can then read or stream from inside the context manager.
+                Note that it does _not_ receive any events after the final result is found.
+
+        Returns:
+            The result of the run.
+        """
+        if infer_name and self.name is None:
+            # f_back because `asynccontextmanager` adds one frame
+            if frame := inspect.currentframe():  # pragma: no branch
+                self._infer_name(frame.f_back)
+
+        event_stream_handler = event_stream_handler or self.event_stream_handler
+
+        yielded = False
+        async with self.iter(
+            user_prompt,
+            output_type=output_type,
+            message_history=message_history,
+            deferred_tool_results=deferred_tool_results,
+            model=model,
+            deps=deps,
+            instructions=instructions,
+            model_settings=model_settings,
+            usage_limits=usage_limits,
+            usage=usage,
+            metadata=metadata,
+            infer_name=False,
+            toolsets=toolsets,
+            builtin_tools=builtin_tools,
+        ) as agent_run:
+            first_node = agent_run.next_node  # start with the first node
+            assert isinstance(first_node, _agent_graph.UserPromptNode)  # the first node should be a user prompt node
+            node = first_node
+            while True:
+                graph_ctx = agent_run.ctx
+                if self.is_model_request_node(node):
+                    async with node.stream(graph_ctx) as stream:
+                        final_result_event = None
+
+                        async def stream_to_final(
+                            stream: AgentStream,
+                        ) -> AsyncIterator[_messages.ModelResponseStreamEvent]:
+                            nonlocal final_result_event
+                            async for event in stream:
+                                yield event
+                                if isinstance(event, _messages.FinalResultEvent):
+                                    final_result_event = event
+                                    break
+
+                        if event_stream_handler is not None:
+                            await event_stream_handler(
+                                _agent_graph.build_run_context(graph_ctx), stream_to_final(stream)
+                            )
+                        else:
+                            async for _ in stream_to_final(stream):
+                                pass
+
+                        if final_result_event is not None:
+                            final_result = FinalResult(
+                                None, final_result_event.tool_name, final_result_event.tool_call_id
+                            )
+                            if yielded:
+                                raise exceptions.AgentRunError('Agent run produced final results')  # pragma: no cover
+                            yielded = True
+
+                            messages = graph_ctx.state.message_history.copy()
+
+                            async def on_complete() -> None:
+                                """Called when the stream has completed.
+
+                                The model response will have been added to messages by now
+                                by `StreamedRunResult._marked_completed`.
+                                """
+                                nonlocal final_result
+                                final_result = FinalResult(
+                                    await stream.get_output(), final_result.tool_name, final_result.tool_call_id
+                                )
+
+                                # When we get here, the `ModelRequestNode` has completed streaming after the final result was found.
+                                # When running an agent with `agent.run`, we'd then move to `CallToolsNode` to execute the tool calls and
+                                # find the final result.
+                                # We also want to execute tool calls (in case `agent.end_strategy == 'exhaustive'`) here, but
+                                # we don't want to use run the `CallToolsNode` logic to determine the final output, as it would be
+                                # wasteful and could produce a different result (e.g. when text output is followed by tool calls).
+                                # So we call `process_tool_calls` directly and then end the run with the found final result.
+
+                                parts: list[_messages.ModelRequestPart] = []
+                                async for _event in _agent_graph.process_tool_calls(
+                                    tool_manager=graph_ctx.deps.tool_manager,
+                                    tool_calls=stream.response.tool_calls,
+                                    tool_call_results=None,
+                                    tool_call_metadata=None,
+                                    final_result=final_result,
+                                    ctx=graph_ctx,
+                                    output_parts=parts,
+                                ):
+                                    pass
+
+                                # To allow this message history to be used in a future run without dangling tool calls,
+                                # append a new ModelRequest using the tool returns and retries
+                                if parts:
+                                    messages.append(
+                                        _messages.ModelRequest(
+                                            parts, run_id=graph_ctx.state.run_id, timestamp=_utils.now_utc()
+                                        )
+                                    )
+
+                                await agent_run.next(_agent_graph.SetFinalResult(final_result))
+
+                            yield StreamedRunResult(
+                                messages,
+                                graph_ctx.deps.new_message_index,
+                                stream,
+                                on_complete,
+                            )
+                            break
+                elif self.is_call_tools_node(node) and event_stream_handler is not None:
+                    async with node.stream(agent_run.ctx) as stream:
+                        await event_stream_handler(_agent_graph.build_run_context(agent_run.ctx), stream)
+
+                next_node = await agent_run.next(node)
+                if isinstance(next_node, End) and agent_run.result is not None:
+                    # A final output could have been produced by the CallToolsNode rather than the ModelRequestNode,
+                    # if a tool function raised CallDeferred or ApprovalRequired.
+                    # In this case there's no response to stream, but we still let the user access the output etc as normal.
+                    yield StreamedRunResult(
+                        graph_ctx.state.message_history,
+                        graph_ctx.deps.new_message_index,
+                        run_result=agent_run.result,
+                    )
+                    yielded = True
+                    break
+                if not isinstance(next_node, _agent_graph.AgentNode):
+                    raise exceptions.AgentRunError(  # pragma: no cover
+                        'Should have produced a StreamedRunResult before getting here'
+                    )
+                node = cast(_agent_graph.AgentNode[Any, Any], next_node)
+
+        if not yielded:
+            raise exceptions.AgentRunError('Agent run finished without producing a final result')  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:1245-1352
+    def to_ag_ui(
+        self,
+        *,
+        # Agent.iter parameters
+        output_type: OutputSpec[OutputDataT] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: models.Model | models.KnownModelName | str | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: UsageLimits | None = None,
+        usage: RunUsage | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        # Starlette
+        debug: bool = False,
+        routes: Sequence[BaseRoute] | None = None,
+        middleware: Sequence[Middleware] | None = None,
+        exception_handlers: Mapping[Any, ExceptionHandler] | None = None,
+        on_startup: Sequence[Callable[[], Any]] | None = None,
+        on_shutdown: Sequence[Callable[[], Any]] | None = None,
+        lifespan: Lifespan[AGUIApp[AgentDepsT, OutputDataT]] | None = None,
+    ) -> AGUIApp[AgentDepsT, OutputDataT]:
+        """Returns an ASGI application that handles every AG-UI request by running the agent.
+
+        Note that the `deps` will be the same for each request, with the exception of the AG-UI state that's
+        injected into the `state` field of a `deps` object that implements the [`StateHandler`][pydantic_ai.ag_ui.StateHandler] protocol.
+        To provide different `deps` for each request (e.g. based on the authenticated user),
+        use [`pydantic_ai.ag_ui.run_ag_ui`][pydantic_ai.ag_ui.run_ag_ui] or
+        [`pydantic_ai.ag_ui.handle_ag_ui_request`][pydantic_ai.ag_ui.handle_ag_ui_request] instead.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+        app = agent.to_ag_ui()
+        ```
+
+        The `app` is an ASGI application that can be used with any ASGI server.
+
+        To run the application, you can use the following command:
+
+        ```bash
+        uvicorn app:app --host 0.0.0.0 --port 8000
+        ```
+
+        See [AG-UI docs](../ui/ag-ui.md) for more information.
+
+        Args:
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has
+                no output validators since output validators would expect an argument that matches the agent's
+                output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+
+            debug: Boolean indicating if debug tracebacks should be returned on errors.
+            routes: A list of routes to serve incoming HTTP and WebSocket requests.
+            middleware: A list of middleware to run for every request. A starlette application will always
+                automatically include two middleware classes. `ServerErrorMiddleware` is added as the very
+                outermost middleware, to handle any uncaught errors occurring anywhere in the entire stack.
+                `ExceptionMiddleware` is added as the very innermost middleware, to deal with handled
+                exception cases occurring in the routing or endpoints.
+            exception_handlers: A mapping of either integer status codes, or exception class types onto
+                callables which handle the exceptions. Exception handler callables should be of the form
+                `handler(request, exc) -> response` and may be either standard functions, or async functions.
+            on_startup: A list of callables to run on application startup. Startup handler callables do not
+                take any arguments, and may be either standard functions, or async functions.
+            on_shutdown: A list of callables to run on application shutdown. Shutdown handler callables do
+                not take any arguments, and may be either standard functions, or async functions.
+            lifespan: A lifespan context function, which can be used to perform startup and shutdown tasks.
+                This is a newer style that replaces the `on_startup` and `on_shutdown` handlers. Use one or
+                the other, not both.
+
+        Returns:
+            An ASGI application for running Pydantic AI agents with AG-UI protocol support.
+        """
+        from pydantic_ai.ui.ag_ui.app import AGUIApp
+
+        return AGUIApp(
+            agent=self,
+            # Agent.iter parameters
+            output_type=output_type,
+            message_history=message_history,
+            deferred_tool_results=deferred_tool_results,
+            model=model,
+            deps=deps,
+            model_settings=model_settings,
+            usage_limits=usage_limits,
+            usage=usage,
+            infer_name=infer_name,
+            toolsets=toolsets,
+            # Starlette
+            debug=debug,
+            routes=routes,
+            middleware=middleware,
+            exception_handlers=exception_handlers,
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            lifespan=lifespan,
+        )
+
+# pydantic_ai_slim/pydantic_ai/messages.py:1779-1802
+    def apply(
+        self, part: ModelResponsePart | ToolCallPartDelta
+    ) -> ToolCallPart | BuiltinToolCallPart | ToolCallPartDelta:
+        """Apply this delta to a part or delta, returning a new part or delta with the changes applied.
+
+        Args:
+            part: The existing model response part or delta to update.
+
+        Returns:
+            Either a new `ToolCallPart` or `BuiltinToolCallPart`, or an updated `ToolCallPartDelta`.
+
+        Raises:
+            ValueError: If `part` is neither a `ToolCallPart`, `BuiltinToolCallPart`, nor a `ToolCallPartDelta`.
+            UnexpectedModelBehavior: If applying JSON deltas to dict arguments or vice versa.
+        """
+        if isinstance(part, ToolCallPart | BuiltinToolCallPart):
+            return self._apply_to_part(part)
+
+        if isinstance(part, ToolCallPartDelta):
+            return self._apply_to_delta(part)
+
+        raise ValueError(  # pragma: no cover
+            f'Can only apply ToolCallPartDeltas to ToolCallParts, BuiltinToolCallParts, or ToolCallPartDeltas, not {part}'
+        )
+
+# pydantic_ai_slim/pydantic_ai/_parts_manager.py:175-256
+    def handle_thinking_delta(
+        self,
+        *,
+        vendor_part_id: Hashable | None,
+        content: str | None = None,
+        id: str | None = None,
+        signature: str | None = None,
+        provider_name: str | None = None,
+        provider_details: ProviderDetailsDelta = None,
+    ) -> Iterator[ModelResponseStreamEvent]:
+        """Handle incoming thinking content, creating or updating a ThinkingPart in the manager as appropriate.
+
+        When `vendor_part_id` is None, the latest part is updated if it exists and is a ThinkingPart;
+        otherwise, a new ThinkingPart is created. When a non-None ID is specified, the ThinkingPart corresponding
+        to that vendor ID is either created or updated.
+
+        Args:
+            vendor_part_id: The ID the vendor uses to identify this piece
+                of thinking. If None, a new part will be created unless the latest part is already
+                a ThinkingPart.
+            content: The thinking content to append to the appropriate ThinkingPart.
+            id: An optional id for the thinking part.
+            signature: An optional signature for the thinking content.
+            provider_name: An optional provider name for the thinking part.
+            provider_details: Either a dict of provider-specific details, or a callable that takes
+                the existing part's `provider_details` and returns the updated details. Callables
+                allow provider-specific update logic without the parts manager knowing the details.
+
+        Yields:
+            A `PartStartEvent` if a new part was created, or a `PartDeltaEvent` if an existing part was updated.
+
+        Raises:
+            UnexpectedModelBehavior: If attempting to apply a thinking delta to a part that is not a ThinkingPart.
+        """
+        existing_thinking_part_and_index: tuple[ThinkingPart, int] | None = None
+
+        if vendor_part_id is None:
+            # If the vendor_part_id is None, check if the latest part is a ThinkingPart to update
+            existing_thinking_part_and_index = self._latest_part_if_of_type(ThinkingPart)
+        else:
+            # Otherwise, attempt to look up an existing ThinkingPart by vendor_part_id
+            part_index = self._vendor_id_to_part_index.get(vendor_part_id)
+            if part_index is not None:
+                existing_part = self._parts[part_index]
+                if not isinstance(existing_part, ThinkingPart):
+                    raise UnexpectedModelBehavior(f'Cannot apply a thinking delta to {existing_part=}')
+                existing_thinking_part_and_index = existing_part, part_index
+
+        if existing_thinking_part_and_index is None:
+            if content is not None or signature is not None or provider_details is not None:
+                # There is no existing thinking part that should be updated, so create a new one
+                # Resolve provider_details if it's a callback (with None since there's no existing part)
+                resolved_details: dict[str, Any] | None
+                resolved_details = provider_details(None) if callable(provider_details) else provider_details
+                part = ThinkingPart(
+                    content=content or '',
+                    id=id,
+                    signature=signature,
+                    provider_name=provider_name,
+                    provider_details=resolved_details,
+                )
+                new_part_index = self._append_part(part, vendor_part_id)
+                yield PartStartEvent(index=new_part_index, part=part)
+            else:
+                raise UnexpectedModelBehavior(
+                    'Cannot create a ThinkingPart with no content, signature, or provider_details'
+                )
+        else:
+            existing_thinking_part, part_index = existing_thinking_part_and_index
+
+            # Skip if nothing to update
+            if content is None and signature is None and provider_name is None and provider_details is None:
+                return
+
+            part_delta = ThinkingPartDelta(
+                content_delta=content,
+                signature_delta=signature,
+                provider_name=self._resolve_provider_name(existing_thinking_part, provider_name),
+                provider_details=provider_details,
+            )
+            self._parts[part_index] = part_delta.apply(existing_thinking_part)
+            yield PartDeltaEvent(index=part_index, delta=part_delta)
+
+# pydantic_ai_slim/pydantic_ai/messages.py:553-566
+    def identifier(self) -> str:
+        """Identifier for the binary content, such as a unique ID.
+
+        This identifier can be provided to the model in a message to allow it to refer to this file in a tool call argument,
+        and the tool can look up the file in question by iterating over the message history and finding the matching `BinaryContent`.
+
+        This identifier is only automatically passed to the model when the `BinaryContent` is returned by a tool.
+        If you're passing the `BinaryContent` as a user message, it's up to you to include a separate text part with the identifier,
+        e.g. "This is file <identifier>:" preceding the `BinaryContent`.
+
+        It's also included in inline-text delimiters for providers that require inlining text documents, so the model can
+        distinguish multiple files.
+        """
+        return self._identifier or _multi_modal_content_identifier(self.data)
+
+# pydantic_ai_slim/pydantic_ai/tools.py:235-235
+A = TypeVar('A')
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:236-418
+    def __init__(
+        self,
+        model: models.Model | models.KnownModelName | str | None = None,
+        *,
+        output_type: OutputSpec[OutputDataT] = str,
+        instructions: Instructions[AgentDepsT] = None,
+        system_prompt: str | Sequence[str] = (),
+        deps_type: type[AgentDepsT] = NoneType,
+        name: str | None = None,
+        model_settings: ModelSettings | None = None,
+        retries: int = 1,
+        validation_context: Any | Callable[[RunContext[AgentDepsT]], Any] = None,
+        output_retries: int | None = None,
+        tools: Sequence[Tool[AgentDepsT] | ToolFuncEither[AgentDepsT, ...]] = (),
+        builtin_tools: Sequence[AbstractBuiltinTool | BuiltinToolFunc[AgentDepsT]] = (),
+        prepare_tools: ToolsPrepareFunc[AgentDepsT] | None = None,
+        prepare_output_tools: ToolsPrepareFunc[AgentDepsT] | None = None,
+        toolsets: Sequence[AbstractToolset[AgentDepsT] | ToolsetFunc[AgentDepsT]] | None = None,
+        defer_model_check: bool = False,
+        end_strategy: EndStrategy = 'early',
+        instrument: InstrumentationSettings | bool | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        history_processors: Sequence[HistoryProcessor[AgentDepsT]] | None = None,
+        event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+        tool_timeout: float | None = None,
+        max_concurrency: _concurrency.AnyConcurrencyLimit = None,
+        **_deprecated_kwargs: Any,
+    ):
+        """Create an agent.
+
+        Args:
+            model: The default model to use for this agent, if not provided,
+                you must provide the model when calling it. We allow `str` here since the actual list of allowed models changes frequently.
+            output_type: The type of the output data, used to validate the data returned by the model,
+                defaults to `str`.
+            instructions: Instructions to use for this agent, you can also register instructions via a function with
+                [`instructions`][pydantic_ai.agent.Agent.instructions] or pass additional, temporary, instructions when executing a run.
+            system_prompt: Static system prompts to use for this agent, you can also register system
+                prompts via a function with [`system_prompt`][pydantic_ai.agent.Agent.system_prompt].
+            deps_type: The type used for dependency injection, this parameter exists solely to allow you to fully
+                parameterize the agent, and therefore get the best out of static type checking.
+                If you're not using deps, but want type checking to pass, you can set `deps=None` to satisfy Pyright
+                or add a type hint `: Agent[None, <return type>]`.
+            name: The name of the agent, used for logging. If `None`, we try to infer the agent name from the call frame
+                when the agent is first run.
+            model_settings: Optional model request settings to use for this agent's runs, by default.
+            retries: The default number of retries to allow for tool calls and output validation, before raising an error.
+                For model request retries, see the [HTTP Request Retries](../retries.md) documentation.
+            validation_context: Pydantic [validation context](https://docs.pydantic.dev/latest/concepts/validators/#validation-context) used to validate tool arguments and outputs.
+            output_retries: The maximum number of retries to allow for output validation, defaults to `retries`.
+            tools: Tools to register with the agent, you can also register tools via the decorators
+                [`@agent.tool`][pydantic_ai.agent.Agent.tool] and [`@agent.tool_plain`][pydantic_ai.agent.Agent.tool_plain].
+            builtin_tools: The builtin tools that the agent will use. This depends on the model, as some models may not
+                support certain tools. If the model doesn't support the builtin tools, an error will be raised.
+            prepare_tools: Custom function to prepare the tool definition of all tools for each step, except output tools.
+                This is useful if you want to customize the definition of multiple tools or you want to register
+                a subset of tools for a given step. See [`ToolsPrepareFunc`][pydantic_ai.tools.ToolsPrepareFunc]
+            prepare_output_tools: Custom function to prepare the tool definition of all output tools for each step.
+                This is useful if you want to customize the definition of multiple output tools or you want to register
+                a subset of output tools for a given step. See [`ToolsPrepareFunc`][pydantic_ai.tools.ToolsPrepareFunc]
+            toolsets: Toolsets to register with the agent, including MCP servers and functions which take a run context
+                and return a toolset. See [`ToolsetFunc`][pydantic_ai.toolsets.ToolsetFunc] for more information.
+            defer_model_check: by default, if you provide a [named][pydantic_ai.models.KnownModelName] model,
+                it's evaluated to create a [`Model`][pydantic_ai.models.Model] instance immediately,
+                which checks for the necessary environment variables. Set this to `false`
+                to defer the evaluation until the first run. Useful if you want to
+                [override the model][pydantic_ai.agent.Agent.override] for testing.
+            end_strategy: Strategy for handling tool calls that are requested alongside a final result.
+                See [`EndStrategy`][pydantic_ai.agent.EndStrategy] for more information.
+            instrument: Set to True to automatically instrument with OpenTelemetry,
+                which will use Logfire if it's configured.
+                Set to an instance of [`InstrumentationSettings`][pydantic_ai.agent.InstrumentationSettings] to customize.
+                If this isn't set, then the last value set by
+                [`Agent.instrument_all()`][pydantic_ai.agent.Agent.instrument_all]
+                will be used, which defaults to False.
+                See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+            metadata: Optional metadata to store with each run.
+                Provide a dictionary of primitives, or a callable returning one
+                computed from the [`RunContext`][pydantic_ai.tools.RunContext] on each run.
+                Metadata is resolved when a run starts and recomputed after a successful run finishes so it
+                can reflect the final state.
+                Resolved metadata can be read after the run completes via
+                [`AgentRun.metadata`][pydantic_ai.agent.AgentRun],
+                [`AgentRunResult.metadata`][pydantic_ai.agent.AgentRunResult], and
+                [`StreamedRunResult.metadata`][pydantic_ai.result.StreamedRunResult],
+                and is attached to the agent run span when instrumentation is enabled.
+            history_processors: Optional list of callables to process the message history before sending it to the model.
+                Each processor takes a list of messages and returns a modified list of messages.
+                Processors can be sync or async and are applied in sequence.
+            event_stream_handler: Optional handler for events from the model's streaming response and the agent's execution of tools.
+            tool_timeout: Default timeout in seconds for tool execution. If a tool takes longer than this,
+                the tool is considered to have failed and a retry prompt is returned to the model (counting towards the retry limit).
+                Individual tools can override this with their own timeout. Defaults to None (no timeout).
+            max_concurrency: Optional limit on concurrent agent runs. Can be an integer for simple limiting,
+                a [`ConcurrencyLimit`][pydantic_ai.ConcurrencyLimit] for advanced configuration with backpressure,
+                a [`ConcurrencyLimiter`][pydantic_ai.ConcurrencyLimiter] for sharing limits across
+                multiple agents, or None (default) for no limiting. When the limit is reached, additional calls
+                to `run()` or `iter()` will wait until a slot becomes available.
+        """
+        if model is None or defer_model_check:
+            self._model = model
+        else:
+            self._model = models.infer_model(model)
+
+        self._name = name
+        self.end_strategy = end_strategy
+        self.model_settings = model_settings
+
+        self._output_type = output_type
+        self.instrument = instrument
+        self._metadata = metadata
+        self._deps_type = deps_type
+
+        if mcp_servers := _deprecated_kwargs.pop('mcp_servers', None):
+            if toolsets is not None:  # pragma: no cover
+                raise TypeError('`mcp_servers` and `toolsets` cannot be set at the same time.')
+            warnings.warn('`mcp_servers` is deprecated, use `toolsets` instead', DeprecationWarning)
+            toolsets = mcp_servers
+
+        _utils.validate_empty_kwargs(_deprecated_kwargs)
+
+        self._output_schema = _output.OutputSchema[OutputDataT].build(output_type)
+        self._output_validators = []
+
+        self._instructions = self._normalize_instructions(instructions)
+
+        self._system_prompts = (system_prompt,) if isinstance(system_prompt, str) else tuple(system_prompt)
+        self._system_prompt_functions = []
+        self._system_prompt_dynamic_functions = {}
+
+        self._max_result_retries = output_retries if output_retries is not None else retries
+        self._max_tool_retries = retries
+        self._tool_timeout = tool_timeout
+
+        self._validation_context = validation_context
+
+        self._builtin_tools = builtin_tools
+
+        self._prepare_tools = prepare_tools
+        self._prepare_output_tools = prepare_output_tools
+
+        self._output_toolset = self._output_schema.toolset
+        if self._output_toolset:
+            self._output_toolset.max_retries = self._max_result_retries
+
+        self._function_toolset = _AgentFunctionToolset(
+            tools,
+            max_retries=self._max_tool_retries,
+            timeout=self._tool_timeout,
+            output_schema=self._output_schema,
+        )
+        self._dynamic_toolsets = [
+            DynamicToolset[AgentDepsT](toolset_func=toolset)
+            for toolset in toolsets or []
+            if not isinstance(toolset, AbstractToolset)
+        ]
+        self._user_toolsets = [toolset for toolset in toolsets or [] if isinstance(toolset, AbstractToolset)]
+
+        self.history_processors = history_processors or []
+
+        self._event_stream_handler = event_stream_handler
+
+        self._concurrency_limiter = _concurrency.normalize_to_limiter(max_concurrency)
+
+        self._override_name: ContextVar[_utils.Option[str]] = ContextVar('_override_name', default=None)
+        self._override_deps: ContextVar[_utils.Option[AgentDepsT]] = ContextVar('_override_deps', default=None)
+        self._override_model: ContextVar[_utils.Option[models.Model]] = ContextVar('_override_model', default=None)
+        self._override_toolsets: ContextVar[_utils.Option[Sequence[AbstractToolset[AgentDepsT]]]] = ContextVar(
+            '_override_toolsets', default=None
+        )
+        self._override_tools: ContextVar[
+            _utils.Option[Sequence[Tool[AgentDepsT] | ToolFuncEither[AgentDepsT, ...]]]
+        ] = ContextVar('_override_tools', default=None)
+        self._override_instructions: ContextVar[
+            _utils.Option[list[str | _system_prompt.SystemPromptFunc[AgentDepsT]]]
+        ] = ContextVar('_override_instructions', default=None)
+        self._override_metadata: ContextVar[_utils.Option[AgentMetadata[AgentDepsT]]] = ContextVar(
+            '_override_metadata', default=None
+        )
+
+        self._enter_lock = Lock()
+        self._entered_count = 0
+        self._exit_stack = None
+
+# pydantic_ai_slim/pydantic_ai/messages.py:228-241
+    def identifier(self) -> str:
+        """The identifier of the file, such as a unique ID.
+
+        This identifier can be provided to the model in a message to allow it to refer to this file in a tool call argument,
+        and the tool can look up the file in question by iterating over the message history and finding the matching `FileUrl`.
+
+        This identifier is only automatically passed to the model when the `FileUrl` is returned by a tool.
+        If you're passing the `FileUrl` as a user message, it's up to you to include a separate text part with the identifier,
+        e.g. "This is file <identifier>:" preceding the `FileUrl`.
+
+        It's also included in inline-text delimiters for providers that require inlining text documents, so the model can
+        distinguish multiple files.
+        """
+        return self._identifier or _multi_modal_content_identifier(self.url)
+
+# tests/typed_graph.py:90-94
+class A(BaseNode[MyState, MyDeps]):
+    async def run(self, ctx: GraphRunContext[MyState, MyDeps]) -> B:
+        assert ctx.state.x == 1
+        assert ctx.deps.y == 'y'
+        return B()
+
+# examples/pydantic_ai_examples/ag_ui/api/agentic_generative_ui.py:92-119
+async def update_plan_step(
+    index: int, description: str | None = None, status: StepStatus | None = None
+) -> StateDeltaEvent:
+    """Update the plan with new steps or changes.
+
+    Args:
+        index: The index of the step to update.
+        description: The new description for the step.
+        status: The new status for the step.
+
+    Returns:
+        StateDeltaEvent containing the changes made to the plan.
+    """
+    changes: list[JSONPatchOp] = []
+    if description is not None:
+        changes.append(
+            JSONPatchOp(
+                op='replace', path=f'/steps/{index}/description', value=description
+            )
+        )
+    if status is not None:
+        changes.append(
+            JSONPatchOp(op='replace', path=f'/steps/{index}/status', value=status)
+        )
+    return StateDeltaEvent(
+        type=EventType.STATE_DELTA,
+        delta=changes,
+    )
+
+# pydantic_graph/pydantic_graph/beta/paths.py:141-150
+    def last_fork(self) -> BroadcastMarker | MapMarker | None:
+        """Get the most recent fork or map marker in this path.
+
+        Returns:
+            The last BroadcastMarker or MapMarker in the path, or None if no forks exist
+        """
+        for item in reversed(self.items):
+            if isinstance(item, BroadcastMarker | MapMarker):
+                return item
+        return None
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:431-436
+    def model(self, value: models.Model | models.KnownModelName | str | None) -> None:
+        """Set the default model configured for this agent.
+
+        We allow `str` here since the actual list of allowed models changes frequently.
+        """
+        self._model = value

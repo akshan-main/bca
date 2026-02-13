@@ -1,0 +1,423 @@
+# pydantic_ai_slim/pydantic_ai/concurrency.py:276-295
+def normalize_to_limiter(
+    limit: AnyConcurrencyLimit,
+    *,
+    name: str | None = None,
+) -> AbstractConcurrencyLimiter | None:
+    """Normalize a concurrency limit configuration to an AbstractConcurrencyLimiter.
+
+    Args:
+        limit: The concurrency limit configuration.
+        name: Optional name for the limiter if one is created.
+
+    Returns:
+        An AbstractConcurrencyLimiter if limit is not None, otherwise None.
+    """
+    if limit is None:
+        return None
+    elif isinstance(limit, AbstractConcurrencyLimiter):
+        return limit
+    else:
+        return ConcurrencyLimiter.from_limit(limit, name=name)
+
+# pydantic_evals/pydantic_evals/reporting/render_numbers.py:24-51
+def default_render_number(value: float | int) -> str:
+    """The default logic for formatting numerical values in an Evaluation report.
+
+    * If the value is an integer, format it as an integer.
+    * If the value is a float, include at least one decimal place and at least 3 significant figures.
+    """
+    # If it's an int, just return its string representation.
+    if isinstance(value, int):
+        return f'{value:,d}'
+
+    abs_val = abs(value)
+
+    # Special case for zero:
+    if abs_val == 0:
+        return f'{value:,.{VALUE_SIG_FIGS}f}'
+
+    if abs_val >= 1:
+        # Count the digits in the integer part.
+        digits = math.floor(math.log10(abs_val)) + 1
+        # Number of decimals: at least one, and enough to reach 4 significant figures.
+        decimals = max(1, VALUE_SIG_FIGS - digits)
+    else:
+        # For numbers between 0 and 1, determine the exponent.
+        # For example: 0.1 -> log10(0.1) = -1, so we want -(-1) + 3 = 4 decimals.
+        exponent = math.floor(math.log10(abs_val))
+        decimals = -exponent + VALUE_SIG_FIGS - 1  # because the first nonzero digit is in the 10^exponent place.
+
+    return f'{value:,.{decimals}f}'
+
+# tests/models/test_bedrock.py:1899-1937
+async def test_bedrock_cache_write_and_read(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    """Integration test covering all cache settings using a recorded cassette.
+
+    This test enables all 3 cache settings plus 2 manual CachePoints (5 total),
+    which triggers the _limit_cache_points logic to strip the oldest one (limit is 4).
+    """
+    model = BedrockConverseModel('us.anthropic.claude-sonnet-4-5-20250929-v1:0', provider=bedrock_provider)
+    agent = Agent(
+        model,
+        system_prompt='YOU MUST RESPONSE ONLY WITH SINGLE NUMBER\n' * 50,  # More tokens to activate a cache
+        model_settings=BedrockModelSettings(
+            bedrock_cache_instructions=True,  # 1 cache point
+            bedrock_cache_tool_definitions=True,  # 1 cache point
+            bedrock_cache_messages=True,  # 1 cache point (on last user message)
+        ),
+    )
+
+    @agent.tool_plain
+    def catalog_lookup() -> str:  # pragma: no cover - exercised via agent call
+        return 'catalog-ok'
+
+    @agent.tool_plain
+    def diagnostics() -> str:  # pragma: no cover - exercised via agent call
+        return 'diagnostics-ok'
+
+    long_context = 'Newer response with something except single number\n' * 10
+    document = BinaryContent(data=b'You are a great mathematician', media_type='text/plain')
+    # 2 CachePoints, more that maximum allowed, so will be stripped.
+    run_args = [long_context, CachePoint(), document, CachePoint(), 'What is 10 + 11?']
+
+    first = await agent.run(run_args)
+    assert first.output == snapshot('21')
+    first_usage = first.usage()
+    assert first_usage == snapshot(RunUsage(input_tokens=1324, cache_write_tokens=1322, output_tokens=5, requests=1))
+
+    second = await agent.run(run_args)
+    assert second.output == snapshot('21')
+    second_usage = second.usage()
+    assert second_usage == snapshot(RunUsage(input_tokens=1324, output_tokens=5, cache_read_tokens=1322, requests=1))
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:86-101
+def is_model_like(type_: Any) -> bool:
+    """Check if something is a pydantic model, dataclass or typedict.
+
+    These should all generate a JSON Schema with `{"type": "object"}` and therefore be usable directly as
+    function parameters.
+    """
+    return (
+        isinstance(type_, type)
+        and not isinstance(type_, GenericAlias)
+        and (
+            issubclass(type_, BaseModel)
+            or is_dataclass(type_)  # pyright: ignore[reportUnknownArgumentType]
+            or is_typeddict(type_)  # pyright: ignore[reportUnknownArgumentType]
+            or getattr(type_, '__is_model_like__', False)  # pyright: ignore[reportUnknownArgumentType]
+        )
+    )
+
+# pydantic_evals/pydantic_evals/evaluators/evaluator.py:165-181
+    def evaluate(
+        self, ctx: EvaluatorContext[InputsT, OutputT, MetadataT]
+    ) -> EvaluatorOutput | Awaitable[EvaluatorOutput]:  # pragma: no cover
+        """Evaluate the task output in the given context.
+
+        This is the main evaluation method that subclasses must implement. It can be either synchronous
+        or asynchronous, returning either an EvaluatorOutput directly or an Awaitable[EvaluatorOutput].
+
+        Args:
+            ctx: The context containing the inputs, outputs, and metadata for evaluation.
+
+        Returns:
+            The evaluation result, which can be a scalar value, an EvaluationReason, or a mapping
+            of evaluation names to either of those. Can be returned either synchronously or as an
+            awaitable for asynchronous evaluation.
+        """
+        raise NotImplementedError('You must implement `evaluate`.')
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:58-76
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        limiter: int | ConcurrencyLimit | AbstractConcurrencyLimiter,
+    ):
+        """Initialize the ConcurrencyLimitedModel.
+
+        Args:
+            wrapped: The model to wrap, either a Model instance or a known model name.
+            limiter: The concurrency limit configuration. Can be:
+                - An `int`: Simple limit on concurrent operations (unlimited queue).
+                - A `ConcurrencyLimit`: Full configuration with optional backpressure.
+                - An `AbstractConcurrencyLimiter`: A pre-created limiter for sharing across models.
+        """
+        super().__init__(wrapped)
+        if isinstance(limiter, AbstractConcurrencyLimiter):
+            self._limiter = limiter
+        else:
+            self._limiter = ConcurrencyLimiter.from_limit(limiter)
+
+# pydantic_evals/pydantic_evals/reporting/render_numbers.py:54-59
+def default_render_percentage(value: float) -> str:
+    """The default logic for formatting percentages in an Evaluation report.
+
+    * Include at least one decimal place and at least 3 significant figures.
+    """
+    return f'{value:,.{VALUE_SIG_FIGS - 2}%}'
+
+# pydantic_graph/pydantic_graph/beta/paths.py:130-159
+class Path:
+    """A sequence of path items defining data flow through the graph.
+
+    Paths represent the route that data takes through the graph, including
+    transformations, forks, and routing decisions.
+    """
+
+    items: list[PathItem]
+    """The sequence of path items that define this path."""
+
+    @property
+    def last_fork(self) -> BroadcastMarker | MapMarker | None:
+        """Get the most recent fork or map marker in this path.
+
+        Returns:
+            The last BroadcastMarker or MapMarker in the path, or None if no forks exist
+        """
+        for item in reversed(self.items):
+            if isinstance(item, BroadcastMarker | MapMarker):
+                return item
+        return None
+
+    @property
+    def next_path(self) -> Path:
+        """Create a new path with the first item removed.
+
+        Returns:
+            A new Path with all items except the first one
+        """
+        return Path(self.items[1:])
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:1245-1352
+    def to_ag_ui(
+        self,
+        *,
+        # Agent.iter parameters
+        output_type: OutputSpec[OutputDataT] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: models.Model | models.KnownModelName | str | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: UsageLimits | None = None,
+        usage: RunUsage | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        # Starlette
+        debug: bool = False,
+        routes: Sequence[BaseRoute] | None = None,
+        middleware: Sequence[Middleware] | None = None,
+        exception_handlers: Mapping[Any, ExceptionHandler] | None = None,
+        on_startup: Sequence[Callable[[], Any]] | None = None,
+        on_shutdown: Sequence[Callable[[], Any]] | None = None,
+        lifespan: Lifespan[AGUIApp[AgentDepsT, OutputDataT]] | None = None,
+    ) -> AGUIApp[AgentDepsT, OutputDataT]:
+        """Returns an ASGI application that handles every AG-UI request by running the agent.
+
+        Note that the `deps` will be the same for each request, with the exception of the AG-UI state that's
+        injected into the `state` field of a `deps` object that implements the [`StateHandler`][pydantic_ai.ag_ui.StateHandler] protocol.
+        To provide different `deps` for each request (e.g. based on the authenticated user),
+        use [`pydantic_ai.ag_ui.run_ag_ui`][pydantic_ai.ag_ui.run_ag_ui] or
+        [`pydantic_ai.ag_ui.handle_ag_ui_request`][pydantic_ai.ag_ui.handle_ag_ui_request] instead.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+        app = agent.to_ag_ui()
+        ```
+
+        The `app` is an ASGI application that can be used with any ASGI server.
+
+        To run the application, you can use the following command:
+
+        ```bash
+        uvicorn app:app --host 0.0.0.0 --port 8000
+        ```
+
+        See [AG-UI docs](../ui/ag-ui.md) for more information.
+
+        Args:
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has
+                no output validators since output validators would expect an argument that matches the agent's
+                output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+
+            debug: Boolean indicating if debug tracebacks should be returned on errors.
+            routes: A list of routes to serve incoming HTTP and WebSocket requests.
+            middleware: A list of middleware to run for every request. A starlette application will always
+                automatically include two middleware classes. `ServerErrorMiddleware` is added as the very
+                outermost middleware, to handle any uncaught errors occurring anywhere in the entire stack.
+                `ExceptionMiddleware` is added as the very innermost middleware, to deal with handled
+                exception cases occurring in the routing or endpoints.
+            exception_handlers: A mapping of either integer status codes, or exception class types onto
+                callables which handle the exceptions. Exception handler callables should be of the form
+                `handler(request, exc) -> response` and may be either standard functions, or async functions.
+            on_startup: A list of callables to run on application startup. Startup handler callables do not
+                take any arguments, and may be either standard functions, or async functions.
+            on_shutdown: A list of callables to run on application shutdown. Shutdown handler callables do
+                not take any arguments, and may be either standard functions, or async functions.
+            lifespan: A lifespan context function, which can be used to perform startup and shutdown tasks.
+                This is a newer style that replaces the `on_startup` and `on_shutdown` handlers. Use one or
+                the other, not both.
+
+        Returns:
+            An ASGI application for running Pydantic AI agents with AG-UI protocol support.
+        """
+        from pydantic_ai.ui.ag_ui.app import AGUIApp
+
+        return AGUIApp(
+            agent=self,
+            # Agent.iter parameters
+            output_type=output_type,
+            message_history=message_history,
+            deferred_tool_results=deferred_tool_results,
+            model=model,
+            deps=deps,
+            model_settings=model_settings,
+            usage_limits=usage_limits,
+            usage=usage,
+            infer_name=infer_name,
+            toolsets=toolsets,
+            # Starlette
+            debug=debug,
+            routes=routes,
+            middleware=middleware,
+            exception_handlers=exception_handlers,
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            lifespan=lifespan,
+        )
+
+# pydantic_ai_slim/pydantic_ai/ui/ag_ui/app.py:42-148
+    def __init__(
+        self,
+        agent: AbstractAgent[AgentDepsT, OutputDataT],
+        *,
+        # AGUIAdapter.dispatch_request parameters
+        output_type: OutputSpec[Any] | None = None,
+        message_history: Sequence[ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: Model | KnownModelName | str | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: UsageLimits | None = None,
+        usage: RunUsage | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool] | None = None,
+        on_complete: OnCompleteFunc[Any] | None = None,
+        # Starlette parameters
+        debug: bool = False,
+        routes: Sequence[BaseRoute] | None = None,
+        middleware: Sequence[Middleware] | None = None,
+        exception_handlers: Mapping[Any, ExceptionHandler] | None = None,
+        on_startup: Sequence[Callable[[], Any]] | None = None,
+        on_shutdown: Sequence[Callable[[], Any]] | None = None,
+        lifespan: Lifespan[Self] | None = None,
+    ) -> None:
+        """An ASGI application that handles every request by running the agent and streaming the response.
+
+        Note that the `deps` will be the same for each request, with the exception of the frontend state that's
+        injected into the `state` field of a `deps` object that implements the [`StateHandler`][pydantic_ai.ui.StateHandler] protocol.
+        To provide different `deps` for each request (e.g. based on the authenticated user),
+        use [`AGUIAdapter.run_stream()`][pydantic_ai.ui.ag_ui.AGUIAdapter.run_stream] or
+        [`AGUIAdapter.dispatch_request()`][pydantic_ai.ui.ag_ui.AGUIAdapter.dispatch_request] instead.
+
+        Args:
+            agent: The agent to run.
+
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has
+                no output validators since output validators would expect an argument that matches the agent's
+                output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            on_complete: Optional callback function called when the agent run completes successfully.
+                The callback receives the completed [`AgentRunResult`][pydantic_ai.agent.AgentRunResult] and can access `all_messages()` and other result data.
+
+            debug: Boolean indicating if debug tracebacks should be returned on errors.
+            routes: A list of routes to serve incoming HTTP and WebSocket requests.
+            middleware: A list of middleware to run for every request. A starlette application will always
+                automatically include two middleware classes. `ServerErrorMiddleware` is added as the very
+                outermost middleware, to handle any uncaught errors occurring anywhere in the entire stack.
+                `ExceptionMiddleware` is added as the very innermost middleware, to deal with handled
+                exception cases occurring in the routing or endpoints.
+            exception_handlers: A mapping of either integer status codes, or exception class types onto
+                callables which handle the exceptions. Exception handler callables should be of the form
+                `handler(request, exc) -> response` and may be either standard functions, or async functions.
+            on_startup: A list of callables to run on application startup. Startup handler callables do not
+                take any arguments, and may be either standard functions, or async functions.
+            on_shutdown: A list of callables to run on application shutdown. Shutdown handler callables do
+                not take any arguments, and may be either standard functions, or async functions.
+            lifespan: A lifespan context function, which can be used to perform startup and shutdown tasks.
+                This is a newer style that replaces the `on_startup` and `on_shutdown` handlers. Use one or
+                the other, not both.
+        """
+        super().__init__(
+            debug=debug,
+            routes=routes,
+            middleware=middleware,
+            exception_handlers=exception_handlers,
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            lifespan=lifespan,
+        )
+
+        async def run_agent(request: Request) -> Response:
+            """Endpoint to run the agent with the provided input data."""
+            # `dispatch_request` will store the frontend state from the request on `deps.state` (if it implements the `StateHandler` protocol),
+            # so we need to copy the deps to avoid different requests mutating the same deps object.
+            nonlocal deps
+            if isinstance(deps, StateHandler):  # pragma: no branch
+                deps = replace(deps)
+
+            return await AGUIAdapter[AgentDepsT, OutputDataT].dispatch_request(
+                request,
+                agent=agent,
+                output_type=output_type,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                model=model,
+                deps=deps,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+                usage=usage,
+                infer_name=infer_name,
+                toolsets=toolsets,
+                builtin_tools=builtin_tools,
+                on_complete=on_complete,
+            )
+
+        self.router.add_route('/', run_agent, methods=['POST'])
+
+# pydantic_ai_slim/pydantic_ai/toolsets/abstract.py:76-83
+    def id(self) -> str | None:
+        """An ID for the toolset that is unique among all toolsets registered with the same agent.
+
+        If you're implementing a concrete implementation that users can instantiate more than once, you should let them optionally pass a custom ID to the constructor and return that here.
+
+        A toolset needs to have an ID in order to be used in a durable execution environment like Temporal, in which case the ID will be used to identify the toolset's activities within the workflow.
+        """
+        raise NotImplementedError()
+
+# pydantic_ai_slim/pydantic_ai/exceptions.py:230-231
+class IncompleteToolCall(UnexpectedModelBehavior):
+    """Error raised when a model stops due to token limit while emitting a tool call."""

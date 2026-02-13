@@ -1,0 +1,1060 @@
+## pydantic_ai_slim/pydantic_ai/ui/_web/app.py
+
+def create_web_app(
+    agent: Agent[AgentDepsT, OutputDataT],
+    models: ModelsParam = None,
+    builtin_tools: Sequence[AbstractBuiltinTool] | None = None,
+    deps: AgentDepsT = None,
+    model_settings: ModelSettings | None = None,
+    instructions: str | None = None,
+    html_source: str | Path | None = None,
+) -> Starlette:
+    """Create a Starlette app that serves a web chat UI for the given agent.
+
+    By default, the UI is fetched from a CDN and cached locally. The html_source
+    parameter allows overriding this for enterprise environments, offline usage,
+    or custom UI builds.
+
+    Args:
+        agent: The Pydantic AI agent to serve
+        models: Models to make available in the UI. Can be:
+            - A sequence of model names/instances (e.g., `['openai:gpt-5', 'anthropic:claude-sonnet-4-5']`)
+            - A dict mapping display labels to model names/instances
+                (e.g., `{'GPT 5': 'openai:gpt-5', 'Claude': 'anthropic:claude-sonnet-4-5'}`)
+            If not provided, the UI will have no model options.
+        builtin_tools: Optional list of additional builtin tools to make available in the UI.
+            Tools already configured on the agent are always included but won't appear as options.
+        deps: Optional dependencies to use for all requests.
+        model_settings: Optional settings to use for all model requests.
+        instructions: Optional extra instructions to pass to each agent run.
+        html_source: Path or URL for the chat UI HTML. Can be:
+            - None (default): Fetches from CDN and caches locally
+            - A Path instance: Reads from the local file
+            - A URL string (http:// or https://): Fetches from the URL
+            - A file path string: Reads from the local file
+
+    Returns:
+        A configured Starlette application ready to be served
+    """
+    api_app = create_api_app(
+        agent=agent,
+        models=models,
+        builtin_tools=builtin_tools,
+        deps=deps,
+        model_settings=model_settings,
+        instructions=instructions,
+    )
+
+    routes = [Mount('/api', app=api_app)]
+    app = Starlette(routes=routes)
+
+    async def index(request: Request) -> Response:
+        """Serve the chat UI from filesystem cache or CDN."""
+        content = await _get_ui_html(html_source)
+
+        return HTMLResponse(
+            content=content,
+            headers={
+                'Cache-Control': 'public, max-age=3600',
+            },
+        )
+
+    app.router.add_route('/', index, methods=['GET'])
+    app.router.add_route('/{id}', index, methods=['GET'])
+
+    return app
+
+## tests/models/test_anthropic.py
+
+async def test_anthropic_prompted_output_multiple(allow_model_requests: None, anthropic_api_key: str):
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+
+    class CityLocation(BaseModel):
+        city: str
+        country: str
+
+    class CountryLanguage(BaseModel):
+        country: str
+        language: str
+
+    agent = Agent(m, output_type=PromptedOutput([CityLocation, CountryLanguage]))
+
+    result = await agent.run('What is the largest city in Mexico?')
+    assert result.output == snapshot(CityLocation(city='Mexico City', country='Mexico'))
+
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='What is the largest city in Mexico?',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content='{"result": {"kind": "CityLocation", "data": {"city": "Mexico City", "country": "Mexico"}}}'
+                    )
+                ],
+                usage=RequestUsage(
+                    input_tokens=265,
+                    output_tokens=31,
+                    details={
+                        'cache_creation_input_tokens': 0,
+                        'cache_read_input_tokens': 0,
+                        'input_tokens': 265,
+                        'output_tokens': 31,
+                    },
+                ),
+                model_name='claude-sonnet-4-5-20250929',
+                timestamp=IsDatetime(),
+                provider_name='anthropic',
+                provider_url='https://api.anthropic.com',
+                provider_details={'finish_reason': 'end_turn'},
+                provider_response_id='msg_01N2PwwVQo2aBtt6UFhMDtEX',
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_model_retry(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    model = BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+    agent = Agent(
+        model=model, instructions='You are a helpful chatbot.', model_settings={'temperature': 0.0}, retries=2
+    )
+
+    @agent.tool_plain
+    async def get_capital(country: str) -> str:
+        """Get the capital of a country.
+
+        Args:
+            country: The country name.
+        """
+        raise ModelRetry('The country is not supported.')
+
+    result = await agent.run('What is the capital of France?')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='What is the capital of France?',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                instructions='You are a helpful chatbot.',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content='<thinking> To determine the capital of France, I can use the provided tool that returns the capital of a given country. Since the country in question is France, I will use the tool with the country parameter set to "France". </thinking>\n'
+                    ),
+                    ToolCallPart(
+                        tool_name='get_capital',
+                        args={'country': 'France'},
+                        tool_call_id=IsStr(),
+                    ),
+                ],
+                usage=RequestUsage(input_tokens=426, output_tokens=66),
+                model_name='us.amazon.nova-micro-v1:0',
+                timestamp=IsDatetime(),
+                provider_name='bedrock',
+                provider_url='https://bedrock-runtime.us-east-1.amazonaws.com',
+                provider_details={'finish_reason': 'tool_use'},
+                finish_reason='tool_call',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='The country is not supported.',
+                        tool_name='get_capital',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                instructions='You are a helpful chatbot.',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content="""\
+<thinking> It appears that there was an error in retrieving the capital of France as the tool indicated that the country is not supported. Since the tool is not able to provide the requested information, I will respond to the User with the information I have access to. </thinking> \n\
+
+The capital of France is Paris. If you need any further information, feel free to ask!\
+"""
+                    )
+                ],
+                usage=RequestUsage(input_tokens=531, output_tokens=76),
+                model_name='us.amazon.nova-micro-v1:0',
+                timestamp=IsDatetime(),
+                provider_name='bedrock',
+                provider_url='https://bedrock-runtime.us-east-1.amazonaws.com',
+                provider_details={'finish_reason': 'end_turn'},
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_gemini.py
+
+async def test_gemini_model_thinking_part(allow_model_requests: None, gemini_api_key: str):
+    model = GeminiModel('gemini-2.5-flash', provider=GoogleGLAProvider(api_key=gemini_api_key))
+    agent = Agent(model)
+
+    result = await agent.run(
+        'What is 2+2?',
+        model_settings=GeminiModelSettings(
+            gemini_thinking_config={'thinking_budget': 1024, 'include_thoughts': True},
+        ),
+    )
+
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='What is 2+2?',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content="""\
+**Calculating the Simple**
+
+Okay, here we go. Someone's asking a pretty straightforward arithmetic question. It's really just a simple calculation. Nothing fancy, just plug in the numbers and get the result.  No need to overthink it. It's a quick win, a chance to flex some basic math muscles before getting into anything more complex. Just a matter of applying the right operation and moving on.
+"""
+                    ),
+                    TextPart(content='2 + 2 = 4'),
+                ],
+                usage=RequestUsage(
+                    input_tokens=8, output_tokens=24, details={'thoughts_tokens': 16, 'text_prompt_tokens': 8}
+                ),
+                model_name='gemini-2.5-flash',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='google-gla',
+                provider_url='https://generativelanguage.googleapis.com/v1beta/models/',
+                provider_details={'finish_reason': 'STOP'},
+                provider_response_id='lghYaaSmK7eomtkP_KDT6A0',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_huggingface.py
+
+async def test_hf_model_thinking_part_iter(allow_model_requests: None, huggingface_api_key: str):
+    m = HuggingFaceModel(
+        'Qwen/Qwen3-235B-A22B', provider=HuggingFaceProvider(provider_name='nebius', api_key=huggingface_api_key)
+    )
+    agent = Agent(m)
+
+    result: AgentRunResult | None = None
+    async for event in agent.run_stream_events(user_prompt='How do I cross the street?'):
+        if isinstance(event, AgentRunResultEvent):
+            result = event.result
+
+    assert result is not None
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='How do I cross the street?',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ThinkingPart(content=IsStr()),
+                    TextPart(content=IsStr()),
+                ],
+                model_name='Qwen/Qwen3-235B-A22B',
+                timestamp=IsDatetime(),
+                provider_name='huggingface',
+                provider_details={
+                    'finish_reason': 'stop',
+                    'timestamp': datetime(2025, 7, 23, 19, 58, 41, tzinfo=timezone.utc),
+                },
+                provider_response_id='chatcmpl-357f347a3f5d4897b36a128fb4e4cf7b',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_model_test.py
+
+def test_custom_output_args_model():
+    class Foo(BaseModel):
+        foo: str
+        bar: int
+
+    agent = Agent(output_type=Foo)
+    result = agent.run_sync('x', model=TestModel(custom_output_args={'foo': 'a', 'bar': 1}))
+    assert result.output == Foo(foo='a', bar=1)
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='x',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args={'foo': 'a', 'bar': 1},
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=51, output_tokens=6),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_openai.py
+
+async def test_openai_auto_mode_reasoning_field_different_provider_uses_tags(allow_model_requests: None):
+    """Test that auto mode falls back to tags when provider_name doesn't match."""
+    # This test verifies behavior by checking that when thinking comes from a different provider, auto mode falls back to tags.
+    c1 = completion_message(ChatCompletionMessage.model_construct(content='response2', role='assistant'))
+    m = OpenAIChatModel(
+        'foobar',
+        provider=OpenAIProvider(openai_client=MockOpenAI.create_mock(c1)),
+        profile=OpenAIModelProfile(
+            openai_chat_thinking_field='reasoning_content',
+            openai_chat_send_back_thinking_parts='auto',
+        ),
+    )
+
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='question')]),
+        ModelResponse(
+            parts=[
+                ThinkingPart(
+                    content='reasoning from different provider',
+                    id='reasoning_content',
+                    provider_name='different-provider',
+                ),
+            ]
+        ),
+    ]
+
+    settings = ModelSettings()
+    params = ModelRequestParameters()
+    await m.request(messages=messages, model_settings=settings, model_request_parameters=params)
+
+    mapped = m._map_model_response(messages[1])  # type: ignore[reportPrivateUsage]
+    assert mapped == snapshot(
+        {
+            'role': 'assistant',
+            'content': """<think>
+reasoning from different provider
+</think>""",
+        }
+    )
+
+## tests/models/test_xai.py
+
+async def test_xai_builtin_tool_without_tool_call_id(allow_model_requests: None):
+    """Test that BuiltinToolCallPart without tool_call_id returns None."""
+    # Create a response for the call
+    response = create_response(content='Done')
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m, builtin_tools=[CodeExecutionTool()])
+
+    # Manually construct message history with BuiltinToolCallPart that has empty tool_call_id
+    # This directly tests the case when tool_call_id is empty
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Run code')]),
+        ModelResponse(
+            parts=[
+                BuiltinToolCallPart(
+                    tool_name='code_execution',
+                    args={},
+                    tool_call_id='',  # Empty - should be skipped
+                    provider_name='xai',
+                ),
+                TextPart(content='Code ran'),
+            ],
+            model_name=XAI_NON_REASONING_MODEL,
+        ),
+    ]
+
+    result = await agent.run('What happened?', message_history=message_history)
+
+    # Verify kwargs - the builtin tool call with empty id is skipped
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'Run code'}], 'role': 'ROLE_USER'},
+                    # BuiltinToolCallPart with empty tool_call_id is skipped
+                    {'content': [{'text': 'Code ran'}], 'role': 'ROLE_ASSISTANT'},
+                    {'content': [{'text': 'What happened?'}], 'role': 'ROLE_USER'},
+                ],
+                'tools': [{'code_execution': {}}],
+                'tool_choice': 'auto',
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+        ]
+    )
+
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(parts=[UserPromptPart(content='Run code', timestamp=IsDatetime())]),
+            ModelResponse(
+                parts=[
+                    BuiltinToolCallPart(tool_name='code_execution', args={}, tool_call_id='', provider_name='xai'),
+                    TextPart(content='Code ran'),
+                ],
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='What happened?', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Done')],
+                usage=RequestUsage(),
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_url='https://api.x.ai/v1',
+                provider_name='xai',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_streaming.py
+
+async def test_get_output_after_stream_output():
+    """Verify that we don't get duplicate messages in history when using tool output and `get_output` is called after `stream_output`."""
+    m = TestModel()
+
+    agent = Agent(m, output_type=bool)
+
+    async with agent.run_stream('Hello') as result:
+        outputs: list[bool] = []
+        async for o in result.stream_output():
+            outputs.append(o)
+        o = await result.get_output()
+        outputs.append(o)
+
+    assert outputs == snapshot([False, False, False])
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Hello',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args={'response': False},
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=51),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_ui_web.py
+
+def test_agent_to_web():
+    """Test the Agent.to_web() method."""
+    agent = Agent('test')
+    app = agent.to_web()
+
+    assert isinstance(app, Starlette)
+
+def test_agent_to_web_with_model_instances():
+    """Test to_web() accepts model instances, not just strings."""
+    agent = Agent(TestModel())
+    model_instance = TestModel()
+
+    # List with instances
+    app = agent.to_web(models=[model_instance, 'test'])
+    assert isinstance(app, Starlette)
+
+    # Dict with instances
+    app = agent.to_web(models={'Custom': model_instance, 'Test': 'test'})
+    assert isinstance(app, Starlette)
+
+async def test_model_instance_preserved_in_dispatch(monkeypatch: pytest.MonkeyPatch):
+    """Test that model instances are preserved and used in dispatch, not reconstructed from string."""
+    model_instance = TestModel(custom_output_text='Custom output')
+    agent: Agent[None, str] = Agent()
+    app = create_web_app(agent, models=[model_instance])
+
+    # Mock dispatch_request to capture the model parameter
+    mock_dispatch = AsyncMock(return_value=Response(content=b'', status_code=200))
+    monkeypatch.setattr(VercelAIAdapter, 'dispatch_request', mock_dispatch)
+
+    with TestClient(app) as client:
+        client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:test',
+                'builtinTools': [],
+            },
+        )
+
+    # Verify dispatch_request was called with the original model instance
+    mock_dispatch.assert_called_once()
+    call_kwargs = mock_dispatch.call_args.kwargs
+    assert call_kwargs['model'] is model_instance, 'Model instance should be preserved, not reconstructed from string'
+
+def test_agent_to_web_with_deps():
+    """Test to_web() accepts deps parameter."""
+
+    @dataclass
+    class MyDeps:
+        api_key: str
+
+    agent: Agent[MyDeps, str] = Agent(TestModel(), deps_type=MyDeps)
+    deps = MyDeps(api_key='test-key')
+
+    app = agent.to_web(deps=deps)
+    assert isinstance(app, Starlette)
+
+def test_agent_to_web_with_model_settings():
+    """Test to_web() accepts model_settings parameter."""
+    agent = Agent(TestModel())
+    settings = ModelSettings(temperature=0.5, max_tokens=100)
+
+    app = agent.to_web(model_settings=settings)
+    assert isinstance(app, Starlette)
+
+def test_chat_app_health_endpoint():
+    """Test the /api/health endpoint."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.get('/api/health')
+        assert response.status_code == 200
+        assert response.json() == {'ok': True}
+
+def test_chat_app_configure_endpoint():
+    """Test the /api/configure endpoint with explicit models and tools."""
+
+    agent = Agent('test')
+    app = create_web_app(
+        agent,
+        models=['test'],
+        builtin_tools=[WebSearchTool()],
+    )
+
+    with TestClient(app) as client:
+        response = client.get('/api/configure')
+        assert response.status_code == 200
+        assert response.json() == snapshot(
+            {
+                'models': [
+                    {'id': 'test:test', 'name': 'Test', 'builtinTools': ['web_search']},
+                    {'id': 'test', 'name': 'Test', 'builtinTools': ['web_search']},
+                ],
+                'builtinTools': [{'id': 'web_search', 'name': 'Web Search'}],
+            }
+        )
+
+def test_chat_app_configure_endpoint_empty():
+    """Test the /api/configure endpoint with no models or tools."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.get('/api/configure')
+        assert response.status_code == 200
+        assert response.json() == snapshot(
+            {'models': [{'id': 'test:test', 'name': 'Test', 'builtinTools': []}], 'builtinTools': []}
+        )
+
+def test_chat_app_configure_preserves_chat_vs_responses(monkeypatch: pytest.MonkeyPatch):
+    """Test that openai-chat: and openai-responses: models are kept as separate entries."""
+    monkeypatch.setenv('OPENAI_API_KEY', 'test-key')
+
+    agent = Agent('test')
+    app = create_web_app(
+        agent,
+        models=['openai-chat:gpt-4o', 'openai-responses:gpt-4o'],
+    )
+
+    with TestClient(app) as client:
+        response = client.get('/api/configure')
+        assert response.status_code == 200
+        data = response.json()
+        model_ids = [m['id'] for m in data['models']]
+        assert 'openai-chat:gpt-4o' in model_ids
+        assert 'openai-responses:gpt-4o' in model_ids
+        assert len([m for m in model_ids if 'gpt-4o' in m]) == 2
+
+def test_chat_app_index_endpoint():
+    """Test that the index endpoint serves HTML with proper caching headers."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.get('/')
+        assert response.status_code == 200
+        assert response.headers['content-type'] == 'text/html; charset=utf-8'
+        assert 'cache-control' in response.headers
+        assert response.headers['cache-control'] == 'public, max-age=3600'
+        assert len(response.content) > 0
+
+async def test_get_ui_html_cdn_fetch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html fetches from CDN when filesystem cache misses."""
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: tmp_path)
+
+    test_content = b'<html>Test UI</html>'
+
+    class MockResponse:
+        content = test_content
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class MockAsyncClient:
+        async def __aenter__(self) -> MockAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> MockResponse:
+            return MockResponse()
+
+    monkeypatch.setattr(app_module.httpx, 'AsyncClient', MockAsyncClient)
+
+    result = await _get_ui_html()
+
+    assert result == test_content
+    cache_file: Path = tmp_path / f'{app_module.CHAT_UI_VERSION}.html'
+    assert cache_file.exists()
+    assert cache_file.read_bytes() == test_content
+
+async def test_get_ui_html_filesystem_cache_hit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html returns cached content from filesystem."""
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: tmp_path)
+
+    test_content = b'<html>Cached UI</html>'
+    cache_file = tmp_path / f'{app_module.CHAT_UI_VERSION}.html'
+    cache_file.write_bytes(test_content)
+
+    result = await _get_ui_html()
+
+    assert result == test_content
+
+def test_chat_app_index_caching():
+    """Test that the UI HTML is cached after first fetch."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response1 = client.get('/')
+        response2 = client.get('/')
+
+        assert response1.content == response2.content
+        assert response1.status_code == 200
+        assert response2.status_code == 200
+
+async def test_post_chat_endpoint():
+    """Test the POST /api/chat endpoint."""
+    agent = Agent(TestModel(custom_output_text='Hello from test!'))
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-message-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:test',
+                'builtinTools': [],
+            },
+        )
+
+        assert response.status_code == 200
+
+def test_chat_app_options_endpoint():
+    """Test the OPTIONS /api/chat endpoint (CORS preflight)."""
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app) as client:
+        response = client.options('/api/chat')
+        assert response.status_code == 200
+
+def test_mcp_server_tool_label():
+    """Test MCPServerTool.label property."""
+    tool = MCPServerTool(id='test-server', url='https://example.com')
+    assert tool.label == 'MCP: test-server'
+
+def test_model_profile():
+    """Test Model.profile cached property."""
+    model = TestModel()
+    assert model.profile is not None
+
+def test_supported_builtin_tools(profile_name: str):
+    """Test profile.supported_builtin_tools returns proper tool types."""
+    if profile_name == 'base':
+        profile: ModelProfile = ModelProfile()
+    elif profile_name == 'openai':
+        profile = OpenAIModelProfile()
+    elif profile_name == 'google':
+        profile = GoogleModelProfile()
+    else:
+        profile = GroqModelProfile()
+
+    result = profile.supported_builtin_tools
+    assert isinstance(result, frozenset)
+    assert all(issubclass(t, AbstractBuiltinTool) for t in result)
+
+def test_post_chat_invalid_model():
+    """Test POST /api/chat returns 400 when model is not in allowed list."""
+    agent = Agent(TestModel(custom_output_text='Hello'))
+    # Use 'test' as the allowed model, then send a different model in the request
+    app = create_web_app(agent, models=['test'])
+
+    with TestClient(app) as client:
+        response = client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:different_model',
+                'builtinTools': [],
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json() == snapshot({'error': 'Model "test:different_model" is not in the allowed models list'})
+
+def test_post_chat_invalid_builtin_tool():
+    """Test POST /api/chat returns 400 when builtin tool is not in allowed list."""
+    agent = Agent(TestModel(custom_output_text='Hello'))
+    app = create_web_app(agent, builtin_tools=[WebSearchTool()])
+
+    with TestClient(app) as client:
+        response = client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:test',
+                'builtinTools': ['code_execution'],  # Not in allowed list
+            },
+        )
+
+        assert response.status_code == 400
+        assert response.json() == snapshot(
+            {'error': "Builtin tool(s) ['code_execution'] not in the allowed tools list"}
+        )
+
+def test_model_label_openrouter():
+    """Test Model.label handles OpenRouter-style names with /."""
+    model = TestModel(model_name='meta-llama/llama-3-70b')
+    assert model.label == snapshot('Llama 3 70b')
+
+def test_agent_to_web_with_instructions():
+    """Test to_web() accepts instructions parameter."""
+    agent = Agent(TestModel())
+    app = agent.to_web(instructions='Always respond in Spanish')
+    assert isinstance(app, Starlette)
+
+async def test_instructions_passed_to_dispatch(monkeypatch: pytest.MonkeyPatch):
+    """Test that instructions from create_web_app are passed to dispatch_request."""
+    agent = Agent(TestModel(custom_output_text='Hello'))
+    app = create_web_app(agent, instructions='Always respond in Spanish')
+
+    # Mock dispatch_request to capture the instructions parameter
+    mock_dispatch = AsyncMock(return_value=Response(content=b'', status_code=200))
+    monkeypatch.setattr(VercelAIAdapter, 'dispatch_request', mock_dispatch)
+
+    with TestClient(app) as client:
+        client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:test',
+                'builtinTools': [],
+            },
+        )
+
+    # Verify dispatch_request was called with instructions
+    mock_dispatch.assert_called_once()
+    call_kwargs = mock_dispatch.call_args.kwargs
+    assert call_kwargs['instructions'] == 'Always respond in Spanish'
+
+async def test_get_ui_html_custom_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html fetches from custom URL when provided."""
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: tmp_path)
+
+    test_content = b'<html>Custom CDN UI</html>'
+    captured_url: list[str] = []
+
+    class MockResponse:
+        content = test_content
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class MockAsyncClient:
+        async def __aenter__(self) -> MockAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> MockResponse:
+            captured_url.append(url)
+            return MockResponse()
+
+    monkeypatch.setattr(app_module.httpx, 'AsyncClient', MockAsyncClient)
+
+    # URL is used directly, no version templating
+    custom_url = 'https://my-internal-cdn.example.com/ui/index.html'
+    result = await _get_ui_html(html_source=custom_url)
+
+    assert result == test_content
+    assert len(captured_url) == 1
+    assert captured_url[0] == custom_url
+
+async def test_get_ui_html_custom_url_caching(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that custom URLs are cached to filesystem and not re-fetched."""
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: tmp_path)
+
+    test_content = b'<html>Cached Custom UI</html>'
+    fetch_count = 0
+
+    class MockResponse:
+        content = test_content
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class MockAsyncClient:
+        async def __aenter__(self) -> MockAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> MockResponse:
+            nonlocal fetch_count
+            fetch_count += 1
+            return MockResponse()
+
+    monkeypatch.setattr(app_module.httpx, 'AsyncClient', MockAsyncClient)
+
+    custom_url = 'https://my-internal-cdn.example.com/ui/cached.html'
+
+    # First call should fetch from URL
+    result1 = await _get_ui_html(html_source=custom_url)
+    assert result1 == test_content
+    assert fetch_count == 1
+
+    # Verify cache file was created
+    url_hash = hashlib.sha256(custom_url.encode()).hexdigest()[:16]
+    cache_file = tmp_path / f'url_{url_hash}.html'
+    assert cache_file.exists()
+    assert cache_file.read_bytes() == test_content
+
+    # Second call should use cache, not fetch again
+    result2 = await _get_ui_html(html_source=custom_url)
+    assert result2 == test_content
+    assert fetch_count == 1  # Still 1, not 2
+
+def test_agent_to_web_with_html_source():
+    """Test that Agent.to_web() accepts html_source parameter."""
+    agent = Agent('test')
+    app = agent.to_web(html_source='https://custom-cdn.example.com/ui/index.html')
+
+    assert isinstance(app, Starlette)
+
+async def test_get_ui_html_local_file_path_string(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html supports local file paths as strings."""
+    # Create a test HTML file
+    test_html = b'<html><body>Local UI Content</body></html>'
+    local_file = tmp_path / 'custom-ui.html'
+    local_file.write_bytes(test_html)
+
+    result = await app_module._get_ui_html(html_source=str(local_file))  # pyright: ignore[reportPrivateUsage]
+
+    assert result == test_html
+
+async def test_get_ui_html_local_file_path_instance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html supports Path instances."""
+    # Create a test HTML file
+    test_html = b'<html><body>Path Instance UI</body></html>'
+    local_file = tmp_path / 'path-ui.html'
+    local_file.write_bytes(test_html)
+
+    result = await app_module._get_ui_html(html_source=local_file)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == test_html
+
+async def test_get_ui_html_local_file_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html raises FileNotFoundError for missing local file paths."""
+    # Try to use a non-existent local file path
+    nonexistent_path = str(tmp_path / 'nonexistent-ui.html')
+
+    with pytest.raises(FileNotFoundError, match='Local UI file not found'):
+        await app_module._get_ui_html(html_source=nonexistent_path)  # pyright: ignore[reportPrivateUsage]
+
+async def test_get_ui_html_source_instance_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html raises FileNotFoundError for missing Path instances."""
+    # Try to use a non-existent Path instance
+    nonexistent_path = tmp_path / 'nonexistent-ui.html'
+
+    with pytest.raises(FileNotFoundError, match='Local UI file not found'):
+        await app_module._get_ui_html(html_source=nonexistent_path)  # pyright: ignore[reportPrivateUsage]
+
+def test_chat_app_index_file_not_found(tmp_path: Path):
+    """Test that index endpoint raises FileNotFoundError for non-existent html_source file."""
+    agent = Agent('test')
+    nonexistent_file = tmp_path / 'nonexistent-ui.html'
+    app = create_web_app(agent, html_source=str(nonexistent_file))
+
+    with TestClient(app, raise_server_exceptions=True) as client:
+        with pytest.raises(FileNotFoundError, match='Local UI file not found'):
+            client.get('/')
+
+def test_chat_app_index_http_error(monkeypatch: pytest.MonkeyPatch):
+    """Test that index endpoint raises HTTPStatusError when CDN fetch fails."""
+
+    class MockResponse:
+        status_code = 500
+
+    class MockAsyncClient:
+        async def __aenter__(self) -> MockAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> None:
+            response = MockResponse()
+            raise httpx.HTTPStatusError('Server error', request=None, response=response)  # type: ignore
+
+    monkeypatch.setattr(app_module.httpx, 'AsyncClient', MockAsyncClient)
+    # Use a fresh temp dir so there's no cached file
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: Path('/tmp/nonexistent-cache-dir-for-test'))
+
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app, raise_server_exceptions=True) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            client.get('/')

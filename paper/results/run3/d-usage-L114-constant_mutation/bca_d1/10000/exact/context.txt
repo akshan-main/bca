@@ -1,0 +1,920 @@
+## docs/.hooks/algolia.py
+
+from typing_extensions import TypedDict
+
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/direct.py
+
+from .models import StreamedResponse, instrumented as instrumented_models
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/embeddings/google.py
+
+def _map_usage(
+    response: EmbedContentResponse,
+    provider: str,
+    provider_url: str,
+    model: str,
+) -> RequestUsage:
+    """Map Google embedding response to RequestUsage.
+
+    Note: The Gemini API (google-gla) doesn't return token usage information.
+    Vertex AI (google-vertex) returns token_count in embedding statistics.
+    """
+    total_tokens = 0
+    if response.embeddings:  # pragma: no branch
+        for emb in response.embeddings:
+            if emb.statistics and emb.statistics.token_count:
+                total_tokens += int(emb.statistics.token_count)  # pragma: lax no cover -- requires vertexai
+
+    return RequestUsage(input_tokens=total_tokens)
+
+## pydantic_ai_slim/pydantic_ai/embeddings/openai.py
+
+def _map_usage(
+    usage: Usage | None,
+    provider: str,
+    provider_url: str,
+    model: str,
+) -> RequestUsage:
+    # OpenAI SDK types say CreateEmbeddingResponse.usage will always be set, in reality some OpenAI-compatible APIs omit it.
+    if usage is None:
+        return RequestUsage()
+
+    usage_data = usage.model_dump(exclude_none=True)
+    details = {k: v for k, v in usage_data.items() if k not in {'prompt_tokens', 'total_tokens'} if isinstance(v, int)}
+    response_data = dict(model=model, usage=usage_data)
+
+    return RequestUsage.extract(
+        response_data,
+        provider=provider,
+        provider_url=provider_url,
+        provider_fallback='openai',
+        api_flavor='embeddings',
+        details=details,
+    )
+
+## pydantic_ai_slim/pydantic_ai/embeddings/voyageai.py
+
+def _map_usage(total_tokens: int) -> RequestUsage:
+    return RequestUsage(input_tokens=total_tokens)
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far. This will not be the final usage until the stream is exhausted."""
+        return self._usage
+
+## pydantic_ai_slim/pydantic_ai/models/cohere.py
+
+def _map_usage(response: V2ChatResponse) -> usage.RequestUsage:
+    u = response.usage
+    if u is None:
+        return usage.RequestUsage()
+    else:
+        details: dict[str, int] = {}
+        if u.billed_units is not None:
+            if u.billed_units.input_tokens:  # pragma: no branch
+                details['input_tokens'] = int(u.billed_units.input_tokens)
+            if u.billed_units.output_tokens:
+                details['output_tokens'] = int(u.billed_units.output_tokens)
+            if u.billed_units.search_units:  # pragma: no cover
+                details['search_units'] = int(u.billed_units.search_units)
+            if u.billed_units.classifications:  # pragma: no cover
+                details['classifications'] = int(u.billed_units.classifications)
+
+        request_tokens = int(u.tokens.input_tokens) if u.tokens and u.tokens.input_tokens else 0
+        response_tokens = int(u.tokens.output_tokens) if u.tokens and u.tokens.output_tokens else 0
+        return usage.RequestUsage(
+            input_tokens=request_tokens,
+            output_tokens=response_tokens,
+            details=details,
+        )
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+    def _process_response(self, response: _GeminiResponse) -> ModelResponse:
+        vendor_details: dict[str, Any] | None = None
+
+        if len(response['candidates']) != 1:
+            raise UnexpectedModelBehavior('Expected exactly one candidate in Gemini response')  # pragma: no cover
+        if 'content' not in response['candidates'][0]:
+            if response['candidates'][0].get('finish_reason') == 'SAFETY':
+                raise UnexpectedModelBehavior('Safety settings triggered', str(response))
+            else:
+                raise UnexpectedModelBehavior(  # pragma: no cover
+                    'Content field missing from Gemini response', str(response)
+                )
+        parts = response['candidates'][0]['content']['parts']
+        vendor_id = response.get('vendor_id', None)
+        finish_reason = response['candidates'][0].get('finish_reason')
+        if finish_reason:
+            vendor_details = {'finish_reason': finish_reason}
+        usage = _metadata_as_usage(response)
+        return _process_response_from_parts(
+            parts,
+            response.get('model_version', self._model_name),
+            usage,
+            vendor_id=vendor_id,
+            vendor_details=vendor_details,
+            provider_name=self._provider.name,
+            provider_url=self.base_url,
+        )
+
+    async def _get_gemini_responses(self) -> AsyncIterator[_GeminiResponse]:
+        # This method exists to ensure we only yield completed items, so we don't need to worry about
+        # partial gemini responses, which would make everything more complicated
+
+        gemini_responses: list[_GeminiResponse] = []
+        current_gemini_response_index = 0
+        # Right now, there are some circumstances where we will have information that could be yielded sooner than it is
+        # But changing that would make things a lot more complicated.
+        async for chunk in self._stream:
+            self._content.extend(chunk)
+
+            gemini_responses = _gemini_streamed_response_ta.validate_json(
+                _ensure_decodeable(self._content),
+                experimental_allow_partial='trailing-strings',
+            )
+
+            # The idea: yield only up to the latest response, which might still be partial.
+            # Note that if the latest response is complete, we could yield it immediately, but there's not a good
+            # allow_partial API to determine if the last item in the list is complete.
+            responses_to_yield = gemini_responses[:-1]
+            for r in responses_to_yield[current_gemini_response_index:]:
+                current_gemini_response_index += 1
+                yield r
+
+        # Now yield the final response, which should be complete
+        if gemini_responses:  # pragma: no branch
+            r = gemini_responses[-1]
+            self._usage = _metadata_as_usage(r)
+            yield r
+
+class _GeminiUsageMetaData(TypedDict, total=False):
+    """See <https://ai.google.dev/api/generate-content#UsageMetadata>.
+
+    The docs suggest all fields are required, but some are actually not required, so we assume they are all optional.
+    """
+
+    prompt_token_count: Annotated[int, pydantic.Field(alias='promptTokenCount')]
+    candidates_token_count: NotRequired[Annotated[int, pydantic.Field(alias='candidatesTokenCount')]]
+    total_token_count: Annotated[int, pydantic.Field(alias='totalTokenCount')]
+    cached_content_token_count: NotRequired[Annotated[int, pydantic.Field(alias='cachedContentTokenCount')]]
+    thoughts_token_count: NotRequired[Annotated[int, pydantic.Field(alias='thoughtsTokenCount')]]
+    tool_use_prompt_token_count: NotRequired[Annotated[int, pydantic.Field(alias='toolUsePromptTokenCount')]]
+    prompt_tokens_details: NotRequired[
+        Annotated[list[_GeminiModalityTokenCount], pydantic.Field(alias='promptTokensDetails')]
+    ]
+    cache_tokens_details: NotRequired[
+        Annotated[list[_GeminiModalityTokenCount], pydantic.Field(alias='cacheTokensDetails')]
+    ]
+    candidates_tokens_details: NotRequired[
+        Annotated[list[_GeminiModalityTokenCount], pydantic.Field(alias='candidatesTokensDetails')]
+    ]
+    tool_use_prompt_tokens_details: NotRequired[
+        Annotated[list[_GeminiModalityTokenCount], pydantic.Field(alias='toolUsePromptTokensDetails')]
+    ]
+
+def _metadata_as_usage(response: _GeminiResponse) -> usage.RequestUsage:
+    metadata = response.get('usage_metadata')
+    if metadata is None:
+        return usage.RequestUsage()
+    details: dict[str, int] = {}
+    if cached_content_token_count := metadata.get('cached_content_token_count', 0):
+        details['cached_content_tokens'] = cached_content_token_count
+
+    if thoughts_token_count := metadata.get('thoughts_token_count', 0):
+        details['thoughts_tokens'] = thoughts_token_count
+
+    if tool_use_prompt_token_count := metadata.get('tool_use_prompt_token_count', 0):
+        details['tool_use_prompt_tokens'] = tool_use_prompt_token_count
+
+    input_audio_tokens = 0
+    output_audio_tokens = 0
+    cache_audio_read_tokens = 0
+    for key, metadata_details in metadata.items():
+        if key.endswith('_details') and metadata_details:
+            metadata_details = cast(list[_GeminiModalityTokenCount], metadata_details)
+            suffix = key.removesuffix('_details')
+            for detail in metadata_details:
+                modality = detail['modality']
+                details[f'{modality.lower()}_{suffix}'] = value = detail.get('token_count', 0)
+                if value and modality == 'AUDIO':
+                    if key == 'prompt_tokens_details':
+                        input_audio_tokens = value
+                    elif key == 'candidates_tokens_details':
+                        output_audio_tokens = value
+                    elif key == 'cache_tokens_details':  # pragma: no branch
+                        cache_audio_read_tokens = value
+
+    return usage.RequestUsage(
+        input_tokens=metadata.get('prompt_token_count', 0),
+        output_tokens=metadata.get('candidates_token_count', 0) + thoughts_token_count,
+        cache_read_tokens=cached_content_token_count,
+        input_audio_tokens=input_audio_tokens,
+        output_audio_tokens=output_audio_tokens,
+        cache_audio_read_tokens=cache_audio_read_tokens,
+        details=details,
+    )
+
+## pydantic_ai_slim/pydantic_ai/models/google.py
+
+    def _process_response(self, response: GenerateContentResponse) -> ModelResponse:
+        candidate = response.candidates[0] if response.candidates else None
+
+        vendor_id = response.response_id
+        finish_reason: FinishReason | None = None
+        vendor_details: dict[str, Any] = {}
+
+        raw_finish_reason = candidate.finish_reason if candidate else None
+        if raw_finish_reason and candidate:  # pragma: no branch
+            vendor_details = {'finish_reason': raw_finish_reason.value}
+            # Add safety ratings to provider details
+            if candidate.safety_ratings:
+                vendor_details['safety_ratings'] = [r.model_dump(by_alias=True) for r in candidate.safety_ratings]
+            finish_reason = _FINISH_REASON_MAP.get(raw_finish_reason)
+
+        if response.create_time is not None:  # pragma: no branch
+            vendor_details['timestamp'] = response.create_time
+
+        if candidate is None or candidate.content is None or candidate.content.parts is None:
+            parts = []
+        else:
+            parts = candidate.content.parts or []
+
+        usage = _metadata_as_usage(response, provider=self._provider.name, provider_url=self._provider.base_url)
+        grounding_metadata = candidate.grounding_metadata if candidate else None
+        url_context_metadata = candidate.url_context_metadata if candidate else None
+
+        return _process_response_from_parts(
+            parts,
+            grounding_metadata,
+            response.model_version or self._model_name,
+            self._provider.name,
+            self._provider.base_url,
+            usage,
+            vendor_id=vendor_id,
+            vendor_details=vendor_details or None,
+            finish_reason=finish_reason,
+            url_context_metadata=url_context_metadata,
+        )
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._initial_run_ctx_usage + self._raw_stream_response.usage()
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._streamed_run_result.usage()
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def usage(self) -> _usage.RunUsage:
+        """Get usage statistics for the run so far, including token usage, model requests, and so on."""
+        return self._graph_run.state.usage
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+class UsageBase:
+    input_tokens: Annotated[
+        int,
+        # `request_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('input_tokens', 'request_tokens')),
+    ] = 0
+    """Number of input/prompt tokens."""
+
+    cache_write_tokens: int = 0
+    """Number of tokens written to the cache."""
+    cache_read_tokens: int = 0
+    """Number of tokens read from the cache."""
+
+    output_tokens: Annotated[
+        int,
+        # `response_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('output_tokens', 'response_tokens')),
+    ] = 0
+    """Number of output/completion tokens."""
+
+    input_audio_tokens: int = 0
+    """Number of audio input tokens."""
+    cache_audio_read_tokens: int = 0
+    """Number of audio tokens read from the cache."""
+    output_audio_tokens: int = 0
+    """Number of audio output tokens."""
+
+    details: Annotated[
+        dict[str, int],
+        # `details` can not be `None` any longer, but we still want to support deserializing model responses stored in a DB before this was changed
+        BeforeValidator(lambda d: d or {}),
+    ] = dataclasses.field(default_factory=dict[str, int])
+    """Any extra details returned by the model."""
+
+    @property
+    @deprecated('`request_tokens` is deprecated, use `input_tokens` instead')
+    def request_tokens(self) -> int:
+        return self.input_tokens
+
+    @property
+    @deprecated('`response_tokens` is deprecated, use `output_tokens` instead')
+    def response_tokens(self) -> int:
+        return self.output_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Sum of `input_tokens + output_tokens`."""
+        return self.input_tokens + self.output_tokens
+
+    def opentelemetry_attributes(self) -> dict[str, int]:
+        """Get the token usage values as OpenTelemetry attributes."""
+        result: dict[str, int] = {}
+        if self.input_tokens:
+            result['gen_ai.usage.input_tokens'] = self.input_tokens
+        if self.output_tokens:
+            result['gen_ai.usage.output_tokens'] = self.output_tokens
+
+        details = self.details.copy()
+        if self.cache_write_tokens:
+            details['cache_write_tokens'] = self.cache_write_tokens
+        if self.cache_read_tokens:
+            details['cache_read_tokens'] = self.cache_read_tokens
+        if self.input_audio_tokens:
+            details['input_audio_tokens'] = self.input_audio_tokens
+        if self.cache_audio_read_tokens:
+            details['cache_audio_read_tokens'] = self.cache_audio_read_tokens
+        if self.output_audio_tokens:
+            details['output_audio_tokens'] = self.output_audio_tokens
+        if details:
+            prefix = 'gen_ai.usage.details.'
+            for key, value in details.items():
+                # Skipping check for value since spec implies all detail values are relevant
+                if value:
+                    result[prefix + key] = value
+        return result
+
+    def __repr__(self):
+        kv_pairs = (f'{f.name}={value!r}' for f in fields(self) if (value := getattr(self, f.name)))
+        return f'{self.__class__.__qualname__}({", ".join(kv_pairs)})'
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+    def request_tokens(self) -> int:
+        return self.input_tokens
+
+    def response_tokens(self) -> int:
+        return self.output_tokens
+
+    def total_tokens(self) -> int:
+        """Sum of `input_tokens + output_tokens`."""
+        return self.input_tokens + self.output_tokens
+
+    def opentelemetry_attributes(self) -> dict[str, int]:
+        """Get the token usage values as OpenTelemetry attributes."""
+        result: dict[str, int] = {}
+        if self.input_tokens:
+            result['gen_ai.usage.input_tokens'] = self.input_tokens
+        if self.output_tokens:
+            result['gen_ai.usage.output_tokens'] = self.output_tokens
+
+        details = self.details.copy()
+        if self.cache_write_tokens:
+            details['cache_write_tokens'] = self.cache_write_tokens
+        if self.cache_read_tokens:
+            details['cache_read_tokens'] = self.cache_read_tokens
+        if self.input_audio_tokens:
+            details['input_audio_tokens'] = self.input_audio_tokens
+        if self.cache_audio_read_tokens:
+            details['cache_audio_read_tokens'] = self.cache_audio_read_tokens
+        if self.output_audio_tokens:
+            details['output_audio_tokens'] = self.output_audio_tokens
+        if details:
+            prefix = 'gen_ai.usage.details.'
+            for key, value in details.items():
+                # Skipping check for value since spec implies all detail values are relevant
+                if value:
+                    result[prefix + key] = value
+        return result
+
+    def __repr__(self):
+        kv_pairs = (f'{f.name}={value!r}' for f in fields(self) if (value := getattr(self, f.name)))
+        return f'{self.__class__.__qualname__}({", ".join(kv_pairs)})'
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+class RequestUsage(UsageBase):
+    """LLM usage associated with a single request.
+
+    This is an implementation of `genai_prices.types.AbstractUsage` so it can be used to calculate the price of the
+    request using [genai-prices](https://github.com/pydantic/genai-prices).
+    """
+
+    @property
+    def requests(self):
+        return 0
+
+    def incr(self, incr_usage: RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        return _incr_usage_tokens(self, incr_usage)
+
+    def __add__(self, other: RequestUsage) -> RequestUsage:
+        """Add two RequestUsages together.
+
+        This is provided so it's trivial to sum usage information from multiple parts of a response.
+
+        **WARNING:** this CANNOT be used to sum multiple requests without breaking some pricing calculations.
+        """
+        new_usage = copy(self)
+        new_usage.incr(other)
+        return new_usage
+
+    @classmethod
+    def extract(
+        cls,
+        data: Any,
+        *,
+        provider: str,
+        provider_url: str,
+        provider_fallback: str,
+        api_flavor: str = 'default',
+        details: dict[str, Any] | None = None,
+    ) -> RequestUsage:
+        """Extract usage information from the response data using genai-prices.
+
+        Args:
+            data: The response data from the model API.
+            provider: The actual provider ID
+            provider_url: The provider base_url
+            provider_fallback: The fallback provider ID to use if the actual provider is not found in genai-prices.
+                For example, an OpenAI model should set this to "openai" in case it has an obscure provider ID.
+            api_flavor: The API flavor to use when extracting usage information,
+                e.g. 'chat' or 'responses' for OpenAI.
+            details: Becomes the `details` field on the returned `RequestUsage` for convenience.
+        """
+        details = details or {}
+        for provider_id, provider_api_url in [(None, provider_url), (provider, None), (provider_fallback, None)]:
+            try:
+                provider_obj = get_snapshot().find_provider(None, provider_id, provider_api_url)
+                _model_ref, extracted_usage = provider_obj.extract_usage(data, api_flavor=api_flavor)
+                return cls(**{k: v for k, v in extracted_usage.__dict__.items() if v is not None}, details=details)
+            except Exception:
+                pass
+        return cls(details=details)
+
+    def incr(self, incr_usage: RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        return _incr_usage_tokens(self, incr_usage)
+
+    def extract(
+        cls,
+        data: Any,
+        *,
+        provider: str,
+        provider_url: str,
+        provider_fallback: str,
+        api_flavor: str = 'default',
+        details: dict[str, Any] | None = None,
+    ) -> RequestUsage:
+        """Extract usage information from the response data using genai-prices.
+
+        Args:
+            data: The response data from the model API.
+            provider: The actual provider ID
+            provider_url: The provider base_url
+            provider_fallback: The fallback provider ID to use if the actual provider is not found in genai-prices.
+                For example, an OpenAI model should set this to "openai" in case it has an obscure provider ID.
+            api_flavor: The API flavor to use when extracting usage information,
+                e.g. 'chat' or 'responses' for OpenAI.
+            details: Becomes the `details` field on the returned `RequestUsage` for convenience.
+        """
+        details = details or {}
+        for provider_id, provider_api_url in [(None, provider_url), (provider, None), (provider_fallback, None)]:
+            try:
+                provider_obj = get_snapshot().find_provider(None, provider_id, provider_api_url)
+                _model_ref, extracted_usage = provider_obj.extract_usage(data, api_flavor=api_flavor)
+                return cls(**{k: v for k, v in extracted_usage.__dict__.items() if v is not None}, details=details)
+            except Exception:
+                pass
+        return cls(details=details)
+
+class RunUsage(UsageBase):
+    """LLM usage associated with an agent run.
+
+    Responsibility for calculating request usage is on the model; Pydantic AI simply sums the usage information across requests.
+    """
+
+    requests: int = 0
+    """Number of requests made to the LLM API."""
+
+    tool_calls: int = 0
+    """Number of successful tool calls executed during the run."""
+
+    input_tokens: int = 0
+    """Total number of input/prompt tokens."""
+
+    cache_write_tokens: int = 0
+    """Total number of tokens written to the cache."""
+
+    cache_read_tokens: int = 0
+    """Total number of tokens read from the cache."""
+
+    input_audio_tokens: int = 0
+    """Total number of audio input tokens."""
+
+    cache_audio_read_tokens: int = 0
+    """Total number of audio tokens read from the cache."""
+
+    output_tokens: int = 0
+    """Total number of output/completion tokens."""
+
+    details: dict[str, int] = dataclasses.field(default_factory=dict[str, int])
+    """Any extra details returned by the model."""
+
+    def incr(self, incr_usage: RunUsage | RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        if isinstance(incr_usage, RunUsage):
+            self.requests += incr_usage.requests
+            self.tool_calls += incr_usage.tool_calls
+        return _incr_usage_tokens(self, incr_usage)
+
+    def __add__(self, other: RunUsage | RequestUsage) -> RunUsage:
+        """Add two RunUsages together.
+
+        This is provided so it's trivial to sum usage information from multiple runs.
+        """
+        new_usage = copy(self)
+        new_usage.incr(other)
+        return new_usage
+
+    def incr(self, incr_usage: RunUsage | RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        if isinstance(incr_usage, RunUsage):
+            self.requests += incr_usage.requests
+            self.tool_calls += incr_usage.tool_calls
+        return _incr_usage_tokens(self, incr_usage)
+
+def _incr_usage_tokens(slf: RunUsage | RequestUsage, incr_usage: RunUsage | RequestUsage) -> None:
+    """Increment the usage in place.
+
+    Args:
+        slf: The usage to increment.
+        incr_usage: The usage to increment by.
+    """
+    slf.input_tokens += incr_usage.input_tokens
+    slf.cache_write_tokens += incr_usage.cache_write_tokens
+    slf.cache_read_tokens += incr_usage.cache_read_tokens
+    slf.input_audio_tokens += incr_usage.input_audio_tokens
+    slf.cache_audio_read_tokens += incr_usage.cache_audio_read_tokens
+    slf.output_tokens += incr_usage.output_tokens
+
+    for key, value in incr_usage.details.items():
+        # Note: value can be None at runtime from model responses despite the type annotation
+        if isinstance(value, (int, float)):
+            slf.details[key] = slf.details.get(key, 0) + value
+
+class Usage(RunUsage):
+    """Deprecated alias for `RunUsage`."""
+
+## tests/models/test_cohere.py
+
+async def test_request_simple_usage(allow_model_requests: None):
+    c = completion_message(
+        AssistantMessageResponse(
+            content=[TextAssistantMessageResponseContentItem(text='world')],
+            role='assistant',
+        ),
+        usage=cohere.Usage(
+            tokens=cohere.UsageTokens(input_tokens=1, output_tokens=1),
+            billed_units=cohere.UsageBilledUnits(input_tokens=1, output_tokens=1),
+        ),
+    )
+    mock_client = MockAsyncClientV2.create_mock(c)
+    m = CohereModel('command-r7b-12-2024', provider=CohereProvider(cohere_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Hello')
+    assert result.output == 'world'
+    assert result.usage() == snapshot(
+        RunUsage(
+            requests=1,
+            input_tokens=1,
+            output_tokens=1,
+            details={
+                'input_tokens': 1,
+                'output_tokens': 1,
+            },
+        )
+    )
+
+async def test_request_tool_call(allow_model_requests: None):
+    responses = [
+        completion_message(
+            AssistantMessageResponse(
+                content=None,
+                role='assistant',
+                tool_calls=[
+                    ToolCallV2(
+                        id='1',
+                        function=ToolCallV2Function(arguments='{"loc_name": "San Fransisco"}', name='get_location'),
+                        type='function',
+                    )
+                ],
+            ),
+            usage=cohere.Usage(),
+        ),
+        completion_message(
+            AssistantMessageResponse(
+                content=None,
+                role='assistant',
+                tool_calls=[
+                    ToolCallV2(
+                        id='2',
+                        function=ToolCallV2Function(arguments='{"loc_name": "London"}', name='get_location'),
+                        type='function',
+                    )
+                ],
+            ),
+            usage=cohere.Usage(
+                tokens=cohere.UsageTokens(input_tokens=5, output_tokens=3),
+                billed_units=cohere.UsageBilledUnits(input_tokens=4, output_tokens=2),
+            ),
+        ),
+        completion_message(
+            AssistantMessageResponse(
+                content=[TextAssistantMessageResponseContentItem(text='final response')],
+                role='assistant',
+            )
+        ),
+    ]
+    mock_client = MockAsyncClientV2.create_mock(responses)
+    m = CohereModel('command-r7b-12-2024', provider=CohereProvider(cohere_client=mock_client))
+    agent = Agent(m, system_prompt='this is the system prompt')
+
+    @agent.tool_plain
+    async def get_location(loc_name: str) -> str:
+        if loc_name == 'London':
+            return json.dumps({'lat': 51, 'lng': 0})
+        else:
+            raise ModelRetry('Wrong location, please try again')
+
+    result = await agent.run('Hello')
+    assert result.output == 'final response'
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(content='this is the system prompt', timestamp=IsNow(tz=timezone.utc)),
+                    UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc)),
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='get_location',
+                        args='{"loc_name": "San Fransisco"}',
+                        tool_call_id='1',
+                    )
+                ],
+                model_name='command-r7b-12-2024',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='cohere',
+                provider_url='https://api.cohere.com',
+                provider_details={'finish_reason': 'COMPLETE'},
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Wrong location, please try again',
+                        tool_name='get_location',
+                        tool_call_id='1',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='get_location',
+                        args='{"loc_name": "London"}',
+                        tool_call_id='2',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=5, output_tokens=3, details={'input_tokens': 4, 'output_tokens': 2}),
+                model_name='command-r7b-12-2024',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='cohere',
+                provider_url='https://api.cohere.com',
+                provider_details={'finish_reason': 'COMPLETE'},
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='get_location',
+                        content='{"lat": 51, "lng": 0}',
+                        tool_call_id='2',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='final response')],
+                model_name='command-r7b-12-2024',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='cohere',
+                provider_url='https://api.cohere.com',
+                provider_details={'finish_reason': 'COMPLETE'},
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.usage() == snapshot(
+        RunUsage(
+            requests=3,
+            input_tokens=5,
+            output_tokens=3,
+            details={'input_tokens': 4, 'output_tokens': 2},
+            tool_calls=1,
+        )
+    )
+
+## tests/models/test_gemini.py
+
+def gemini_response(content: _GeminiContent, finish_reason: Literal['STOP'] | None = 'STOP') -> _GeminiResponse:
+    candidate = _GeminiCandidates(content=content, index=0, safety_ratings=[])
+    if finish_reason:  # pragma: no branch
+        candidate['finish_reason'] = finish_reason
+    return _GeminiResponse(candidates=[candidate], usage_metadata=example_usage(), model_version='gemini-1.5-flash-123')
+
+def example_usage() -> _GeminiUsageMetaData:
+    return _GeminiUsageMetaData(prompt_token_count=1, candidates_token_count=2, total_token_count=3)
+
+async def test_stream_text_no_data(get_gemini_client: GetGeminiClient):
+    responses = [_GeminiResponse(candidates=[], usage_metadata=example_usage())]
+    json_data = _gemini_streamed_response_ta.dump_json(responses, by_alias=True)
+    stream = AsyncByteStreamList([json_data[:100], json_data[100:200], json_data[200:]])
+    gemini_client = get_gemini_client(stream)
+    m = GeminiModel('gemini-1.5-flash', provider=GoogleGLAProvider(http_client=gemini_client))
+    agent = Agent(m)
+    with pytest.raises(UnexpectedModelBehavior, match='Streamed response ended without con'):
+        async with agent.run_stream('Hello'):
+            pass
+
+def gemini_no_content_response(
+    safety_ratings: list[_GeminiSafetyRating], finish_reason: Literal['SAFETY'] | None = 'SAFETY'
+) -> _GeminiResponse:
+    candidate = _GeminiCandidates(safety_ratings=safety_ratings)
+    if finish_reason:  # pragma: no branch
+        candidate['finish_reason'] = finish_reason
+    return _GeminiResponse(candidates=[candidate], usage_metadata=example_usage())
+
+def test_map_usage():
+    response = gemini_response(_content_model_response(ModelResponse(parts=[TextPart('Hello world')])))
+    assert 'usage_metadata' in response
+    response['usage_metadata']['cached_content_token_count'] = 9100
+    response['usage_metadata']['prompt_tokens_details'] = [
+        _GeminiModalityTokenCount(modality='AUDIO', token_count=9200)
+    ]
+    response['usage_metadata']['cache_tokens_details'] = [
+        _GeminiModalityTokenCount(modality='AUDIO', token_count=9300),
+    ]
+    response['usage_metadata']['candidates_tokens_details'] = [
+        _GeminiModalityTokenCount(modality='AUDIO', token_count=9400)
+    ]
+    response['usage_metadata']['thoughts_token_count'] = 9500
+    response['usage_metadata']['tool_use_prompt_token_count'] = 9600
+
+    assert _metadata_as_usage(response) == snapshot(
+        RequestUsage(
+            input_tokens=1,
+            cache_read_tokens=9100,
+            output_tokens=9502,
+            input_audio_tokens=9200,
+            cache_audio_read_tokens=9300,
+            output_audio_tokens=9400,
+            details={
+                'cached_content_tokens': 9100,
+                'audio_prompt_tokens': 9200,
+                'audio_cache_tokens': 9300,
+                'audio_candidates_tokens': 9400,
+                'thoughts_tokens': 9500,
+                'tool_use_prompt_tokens': 9600,
+            },
+        )
+    )
+
+def test_map_empty_usage():
+    response = gemini_response(_content_model_response(ModelResponse(parts=[TextPart('Hello world')])))
+    assert 'usage_metadata' in response
+    del response['usage_metadata']
+
+    assert _metadata_as_usage(response) == RequestUsage()
+
+## tests/models/test_google.py
+
+def test_map_usage():
+    assert (
+        _metadata_as_usage(
+            GenerateContentResponse(),
+            # Test the 'google' provider fallback
+            provider='',
+            provider_url='',
+        )
+        == RequestUsage()
+    )
+
+    response = GenerateContentResponse(
+        usage_metadata=GenerateContentResponseUsageMetadata(
+            prompt_token_count=1,
+            candidates_token_count=2,
+            cached_content_token_count=9100,
+            thoughts_token_count=9500,
+            prompt_tokens_details=[ModalityTokenCount(modality=MediaModality.AUDIO, token_count=9200)],
+            cache_tokens_details=[ModalityTokenCount(modality=MediaModality.AUDIO, token_count=9300)],
+            candidates_tokens_details=[ModalityTokenCount(modality=MediaModality.AUDIO, token_count=9400)],
+        )
+    )
+    assert _metadata_as_usage(response, provider='', provider_url='') == snapshot(
+        RequestUsage(
+            input_tokens=1,
+            cache_read_tokens=9100,
+            output_tokens=9502,
+            input_audio_tokens=9200,
+            cache_audio_read_tokens=9300,
+            output_audio_tokens=9400,
+            details={
+                'cached_content_tokens': 9100,
+                'thoughts_tokens': 9500,
+                'audio_prompt_tokens': 9200,
+                'audio_cache_tokens': 9300,
+                'audio_candidates_tokens': 9400,
+            },
+        )
+    )

@@ -1,0 +1,886 @@
+## pydantic_ai_slim/pydantic_ai/_run_context.py
+
+    usage: RunUsage
+
+## pydantic_ai_slim/pydantic_ai/direct.py
+
+from .models import StreamedResponse, instrumented as instrumented_models
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py
+
+_MAX_INPUT_TOKENS: dict[str, int] = {
+    'amazon.titan-embed-text-v1': 8192,
+    'amazon.titan-embed-text-v2:0': 8192,
+    'cohere.embed-english-v3': 512,
+    'cohere.embed-multilingual-v3': 512,
+    'cohere.embed-v4:0': 128000,
+    'amazon.nova-2-multimodal-embeddings-v1:0': 8192,
+}
+
+## pydantic_ai_slim/pydantic_ai/embeddings/cohere.py
+
+_MAX_INPUT_TOKENS: dict[CohereEmbeddingModelName, int] = {
+    'embed-v4.0': 128000,
+    'embed-english-v3.0': 512,
+    'embed-english-light-v3.0': 512,
+    'embed-multilingual-v3.0': 512,
+    'embed-multilingual-light-v3.0': 512,
+}
+
+## pydantic_ai_slim/pydantic_ai/embeddings/voyageai.py
+
+def _map_usage(total_tokens: int) -> RequestUsage:
+    return RequestUsage(input_tokens=total_tokens)
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far. This will not be the final usage until the stream is exhausted."""
+        return self._usage
+
+## pydantic_ai_slim/pydantic_ai/models/openai.py
+
+    openai_continuous_usage_stats: bool
+
+## pydantic_ai_slim/pydantic_ai/models/xai.py
+
+    def _process_response(self, response: chat_types.Response) -> ModelResponse:
+        """Convert xAI SDK response to pydantic_ai ModelResponse.
+
+        Processes response.proto.outputs to extract (in order):
+        - ThinkingPart: For reasoning/thinking content
+        - TextPart: For text content
+        - ToolCallPart: For client-side tool calls
+        - BuiltinToolCallPart + BuiltinToolReturnPart: For server-side (builtin) tool calls
+        """
+        parts: list[ModelResponsePart] = []
+        outputs = response.proto.outputs
+
+        for output in outputs:
+            message = output.message
+
+            # Add reasoning/thinking content if present
+            if message.reasoning_content or message.encrypted_content:
+                signature = message.encrypted_content or None
+                parts.append(
+                    ThinkingPart(
+                        content=message.reasoning_content or '',
+                        signature=signature,
+                        provider_name=self.system if signature else None,
+                    )
+                )
+
+            # Add text content from assistant messages
+            if message.content and message.role == chat_types.chat_pb2.MessageRole.ROLE_ASSISTANT:
+                part_provider_details: dict[str, Any] | None = None
+                if output.logprobs and output.logprobs.content:
+                    part_provider_details = {'logprobs': _map_logprobs(output.logprobs)}
+                parts.append(TextPart(content=message.content, provider_details=part_provider_details))
+
+            # Process tool calls in this output
+            for tool_call in message.tool_calls:
+                tool_result_content = _get_tool_result_content(message.content)
+                _, part = _create_tool_call_part(
+                    tool_call,
+                    tool_result_content,
+                    self.system,
+                    message_role=message.role,
+                )
+                parts.append(part)
+
+        # Convert usage with detailed token information
+        usage = _extract_usage(response, self._model_name, self._provider.name, self._provider.base_url)
+
+        # Map finish reason.
+        #
+        # The xAI SDK exposes `response.finish_reason` as a *string* for the overall response, but in
+        # multi-output responses (e.g. server-side tools) it can reflect an intermediate TOOL_CALLS
+        # output rather than the final STOP output. We derive the finish reason from the final output
+        # when available.
+        if outputs:
+            last_reason = outputs[-1].finish_reason
+            finish_reason = _FINISH_REASON_PROTO_MAP.get(last_reason, 'stop')
+        else:  # pragma: no cover
+            finish_reason = _FINISH_REASON_MAP.get(response.finish_reason, 'stop')
+
+        return ModelResponse(
+            parts=parts,
+            usage=usage,
+            model_name=self._model_name,
+            timestamp=response.created,
+            provider_name=self.system,
+            provider_url=self._provider.base_url,
+            provider_response_id=response.id,
+            finish_reason=finish_reason,
+        )
+
+class XaiStreamedResponse(StreamedResponse):
+    """Implementation of `StreamedResponse` for xAI SDK."""
+
+    _model_name: str
+    _response: _utils.PeekableAsyncStream[tuple[chat_types.Response, chat_types.Chunk]]
+    _timestamp: datetime
+    _provider: Provider[AsyncClient]
+
+    @property
+    def system(self) -> str:
+        """The model provider system name."""
+        return self._provider.name
+
+    @property
+    def provider_url(self) -> str:
+        """Get the provider base URL."""
+        return self._provider.base_url
+
+    def _update_response_state(self, response: chat_types.Response) -> None:
+        """Update response state including usage, response ID, and finish reason."""
+        # Update usage (SDK Response always provides a usage object)
+        self._usage = _extract_usage(response, self._model_name, self._provider.name, self._provider.base_url)
+
+        # Set provider response ID (only set once)
+        if response.id and self.provider_response_id is None:
+            self.provider_response_id = response.id
+
+        # Handle finish reason (SDK Response always provides a finish_reason)
+        self.finish_reason = _FINISH_REASON_MAP.get(response.finish_reason, 'stop')
+
+    def _collect_reasoning_events(
+        self,
+        *,
+        response: chat_types.Response,
+        prev_reasoning_content: str,
+        prev_encrypted_content: str,
+    ) -> tuple[str, str, list[ModelResponseStreamEvent]]:
+        """Collect thinking/reasoning events and return updated previous values.
+
+        Note: xAI exposes reasoning via the accumulated Response object (not the per-chunk delta), so we compute
+        deltas ourselves to avoid re-emitting the entire accumulated content on every chunk.
+        """
+        events: list[ModelResponseStreamEvent] = []
+
+        if response.reasoning_content and response.reasoning_content != prev_reasoning_content:
+            if response.reasoning_content.startswith(prev_reasoning_content):
+                reasoning_delta = response.reasoning_content[len(prev_reasoning_content) :]
+            else:
+                reasoning_delta = response.reasoning_content
+            prev_reasoning_content = response.reasoning_content
+            if reasoning_delta:  # pragma: no branch
+                events.extend(
+                    self._parts_manager.handle_thinking_delta(
+                        vendor_part_id='reasoning',
+                        content=reasoning_delta,
+                        # Only set provider_name when we have an encrypted signature to send back.
+                        provider_name=self.system if response.encrypted_content else None,
+                    )
+                )
+
+        if response.encrypted_content and response.encrypted_content != prev_encrypted_content:
+            prev_encrypted_content = response.encrypted_content
+            events.extend(
+                self._parts_manager.handle_thinking_delta(
+                    vendor_part_id='reasoning',
+                    signature=response.encrypted_content,
+                    provider_name=self.system,
+                )
+            )
+
+        return prev_reasoning_content, prev_encrypted_content, events
+
+    def _handle_server_side_tool_call(
+        self,
+        *,
+        tool_call: chat_pb2.ToolCall,
+        delta: chat_pb2.Delta,
+        seen_tool_call_ids: set[str],
+        seen_tool_return_ids: set[str],
+        last_tool_return_content: dict[str, dict[str, Any] | str | None],
+    ) -> Iterator[ModelResponseStreamEvent]:
+        """Handle a single server-side tool call delta, yielding stream events."""
+        builtin_tool_name = _get_builtin_tool_name(tool_call)
+
+        if delta.role == chat_pb2.MessageRole.ROLE_ASSISTANT:
+            # Emit the call part once per tool_call_id.
+            if tool_call.id in seen_tool_call_ids:
+                return
+            seen_tool_call_ids.add(tool_call.id)
+
+            if builtin_tool_name.startswith(MCPServerTool.kind):
+                parsed_args = _build_mcp_tool_call_args(tool_call)
+            else:
+                parsed_args = _parse_tool_args(tool_call.function.arguments)
+            call_part = BuiltinToolCallPart(
+                tool_name=builtin_tool_name, args=parsed_args, tool_call_id=tool_call.id, provider_name=self.system
+            )
+            yield self._parts_manager.handle_part(vendor_part_id=tool_call.id, part=call_part)
+            return
+
+        if delta.role == chat_pb2.MessageRole.ROLE_TOOL:
+            # Emit the return part once per tool_call_id.
+            return_vendor_id = f'{tool_call.id}_return'
+            tool_result_content = _get_tool_result_content(delta.content)
+            if return_vendor_id in seen_tool_return_ids and tool_result_content == last_tool_return_content.get(
+                return_vendor_id
+            ):
+                return
+            seen_tool_return_ids.add(return_vendor_id)
+            last_tool_return_content[return_vendor_id] = tool_result_content
+            return_part = BuiltinToolReturnPart(
+                tool_name=builtin_tool_name,
+                content=tool_result_content,
+                tool_call_id=tool_call.id,
+                provider_name=self.system,
+            )
+            yield self._parts_manager.handle_part(vendor_part_id=return_vendor_id, part=return_part)
+
+    async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        """Iterate over streaming events from xAI SDK."""
+        # Local state to avoid re-emmiting duplicate events.
+        prev_reasoning_content = ''
+        prev_encrypted_content = ''
+        seen_tool_call_ids: set[str] = set()
+        seen_tool_return_ids: set[str] = set()
+        last_tool_return_content: dict[str, dict[str, Any] | str | None] = {}
+        # Track previous tool call args to compute deltas (like we do for reasoning content).
+        prev_tool_call_args: dict[str, str] = {}
+
+        async for response, chunk in self._response:
+            self._update_response_state(response)
+
+            prev_reasoning_content, prev_encrypted_content, reasoning_events = self._collect_reasoning_events(
+                response=response,
+                prev_reasoning_content=prev_reasoning_content,
+                prev_encrypted_content=prev_encrypted_content,
+            )
+            for event in reasoning_events:
+                yield event
+
+            # Handle text content (property filters for ROLE_ASSISTANT)
+            if chunk.content:
+                for event in self._parts_manager.handle_text_delta(
+                    vendor_part_id='content',
+                    content=chunk.content,
+                ):
+                    yield event
+
+            # Handle tool calls/tool results from *this chunk*.
+            #
+            # Important: xAI SDK `Response` is an accumulated view; `response.tool_calls` includes tool calls from
+            # previous chunks. Iterating over it would re-emit tool calls repeatedly. Instead, we read tool calls
+            # from the chunk's deltas which represent what changed in this frame.
+            for output_chunk in chunk.proto.outputs:
+                delta = output_chunk.delta
+                if not delta.tool_calls:
+                    continue
+                for tool_call in delta.tool_calls:
+                    if not tool_call.function.name:
+                        continue
+
+                    if tool_call.type != chat_pb2.ToolCallType.TOOL_CALL_TYPE_CLIENT_SIDE_TOOL:
+                        for event in self._handle_server_side_tool_call(
+                            tool_call=tool_call,
+                            delta=delta,
+                            seen_tool_call_ids=seen_tool_call_ids,
+                            seen_tool_return_ids=seen_tool_return_ids,
+                            last_tool_return_content=last_tool_return_content,
+                        ):
+                            yield event
+                    else:
+                        # Client-side tools: emit args as deltas so UI adapters receive PartDeltaEvents
+                        # (not repeated PartStartEvents). Use accumulated args from response.tool_calls
+                        # and compute the delta like we do for reasoning content.
+                        accumulated = next((tc for tc in response.tool_calls if tc.id == tool_call.id), None)
+                        accumulated_args = (
+                            accumulated.function.arguments
+                            if accumulated is not None and accumulated.function.arguments
+                            else tool_call.function.arguments
+                        )
+                        prev_args = prev_tool_call_args.get(tool_call.id, '')
+                        is_new_tool_call = tool_call.id not in prev_tool_call_args
+                        args_changed = accumulated_args != prev_args
+
+                        if is_new_tool_call or args_changed:
+                            # Compute delta: if accumulated starts with prev, extract the new portion.
+                            if accumulated_args.startswith(prev_args):
+                                args_delta = accumulated_args[len(prev_args) :] or None
+                            else:
+                                args_delta = accumulated_args or None
+                            prev_tool_call_args[tool_call.id] = accumulated_args
+                            maybe_event = self._parts_manager.handle_tool_call_delta(
+                                vendor_part_id=tool_call.id,
+                                # Only pass tool_name on the first call; it would be appended otherwise.
+                                tool_name=tool_call.function.name if is_new_tool_call else None,
+                                args=args_delta,
+                                tool_call_id=tool_call.id,
+                            )
+                            if maybe_event is not None:  # pragma: no branch
+                                yield maybe_event
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name of the response."""
+        return self._model_name
+
+    @property
+    def provider_name(self) -> str:
+        """The model provider."""
+        return self.system
+
+    @property
+    def timestamp(self) -> datetime:
+        """Get the timestamp of the response."""
+        return self._timestamp
+
+    def _update_response_state(self, response: chat_types.Response) -> None:
+        """Update response state including usage, response ID, and finish reason."""
+        # Update usage (SDK Response always provides a usage object)
+        self._usage = _extract_usage(response, self._model_name, self._provider.name, self._provider.base_url)
+
+        # Set provider response ID (only set once)
+        if response.id and self.provider_response_id is None:
+            self.provider_response_id = response.id
+
+        # Handle finish reason (SDK Response always provides a finish_reason)
+        self.finish_reason = _FINISH_REASON_MAP.get(response.finish_reason, 'stop')
+
+def _map_server_side_tools_used_to_name(server_side_tool: usage_pb2.ServerSideTool) -> str:
+    """Map xAI SDK ServerSideTool enum from usage.server_side_tools_used to a tool name.
+
+    Args:
+        server_side_tool: The ServerSideTool enum value from usage.server_side_tools_used.
+
+    Returns:
+        The tool name (e.g., 'web_search', 'code_execution').
+    """
+    mapping = {
+        usage_pb2.SERVER_SIDE_TOOL_WEB_SEARCH: WebSearchTool.kind,
+        usage_pb2.SERVER_SIDE_TOOL_CODE_EXECUTION: CodeExecutionTool.kind,
+        usage_pb2.SERVER_SIDE_TOOL_MCP: MCPServerTool.kind,
+        usage_pb2.SERVER_SIDE_TOOL_X_SEARCH: 'x_search',
+        usage_pb2.SERVER_SIDE_TOOL_COLLECTIONS_SEARCH: 'collections_search',
+        usage_pb2.SERVER_SIDE_TOOL_VIEW_IMAGE: 'view_image',
+        usage_pb2.SERVER_SIDE_TOOL_VIEW_X_VIDEO: 'view_x_video',
+    }
+    return mapping.get(server_side_tool, 'unknown')
+
+def _extract_usage(
+    response: chat_types.Response,
+    model: str,
+    provider: str,
+    provider_url: str,
+) -> RequestUsage:
+    """Extract usage information from xAI SDK response.
+
+    Extracts token counts and additional usage details including:
+    - reasoning_tokens: Tokens used for model reasoning/thinking
+    - cache_read_tokens: Tokens read from prompt cache
+    - server_side_tools_used: Count of server-side (built-in) tools executed
+    """
+    usage_obj = response.usage
+
+    # Build usage data dict with all integer fields for genai-prices extraction
+    usage_data: dict[str, int] = {
+        'prompt_tokens': usage_obj.prompt_tokens or 0,
+        'completion_tokens': usage_obj.completion_tokens or 0,
+    }
+
+    # Add reasoning tokens if available (optional attribute)
+    if usage_obj.reasoning_tokens:
+        usage_data['reasoning_tokens'] = usage_obj.reasoning_tokens
+
+    # Add cached prompt tokens if available (optional attribute)
+    if usage_obj.cached_prompt_text_tokens:
+        usage_data['cache_read_tokens'] = usage_obj.cached_prompt_text_tokens
+
+    # Aggregate server-side tools used by PydanticAI builtin tool name
+    if usage_obj.server_side_tools_used:
+        tool_counts: dict[str, int] = defaultdict(int)
+        for server_side_tool in usage_obj.server_side_tools_used:
+            tool_name = _map_server_side_tools_used_to_name(server_side_tool)
+            tool_counts[tool_name] += 1
+        # Add each tool as a separate details entry (server_side_tools must be flattened to comply with details being dict[str, int])
+        for tool_name, count in tool_counts.items():
+            usage_data[f'server_side_tools_{tool_name}'] = count
+
+    # Build details from non-standard fields
+    details = {k: v for k, v in usage_data.items() if k not in {'prompt_tokens', 'completion_tokens'}}
+
+    extracted = RequestUsage.extract(
+        dict(model=model, usage=usage_data),
+        provider=provider,
+        provider_url=provider_url,
+        provider_fallback='x_ai',  # Pricing file is defined as x_ai.yml
+        details=details or None,
+    )
+
+    # Ensure token counts are set even if genai-prices extraction failed
+    if extracted.input_tokens == 0 and usage_data['prompt_tokens']:
+        extracted.input_tokens = usage_data['prompt_tokens']
+    if extracted.output_tokens == 0 and usage_data['completion_tokens']:
+        extracted.output_tokens = usage_data['completion_tokens']
+
+    return extracted
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._initial_run_ctx_usage + self._raw_stream_response.usage()
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def usage(self) -> _usage.RunUsage:
+        """Get usage statistics for the run so far, including token usage, model requests, and so on."""
+        return self._graph_run.state.usage
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+class UsageBase:
+    input_tokens: Annotated[
+        int,
+        # `request_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('input_tokens', 'request_tokens')),
+    ] = 0
+    """Number of input/prompt tokens."""
+
+    cache_write_tokens: int = 0
+    """Number of tokens written to the cache."""
+    cache_read_tokens: int = 0
+    """Number of tokens read from the cache."""
+
+    output_tokens: Annotated[
+        int,
+        # `response_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('output_tokens', 'response_tokens')),
+    ] = 0
+    """Number of output/completion tokens."""
+
+    input_audio_tokens: int = 0
+    """Number of audio input tokens."""
+    cache_audio_read_tokens: int = 0
+    """Number of audio tokens read from the cache."""
+    output_audio_tokens: int = 0
+    """Number of audio output tokens."""
+
+    details: Annotated[
+        dict[str, int],
+        # `details` can not be `None` any longer, but we still want to support deserializing model responses stored in a DB before this was changed
+        BeforeValidator(lambda d: d or {}),
+    ] = dataclasses.field(default_factory=dict[str, int])
+    """Any extra details returned by the model."""
+
+    @property
+    @deprecated('`request_tokens` is deprecated, use `input_tokens` instead')
+    def request_tokens(self) -> int:
+        return self.input_tokens
+
+    @property
+    @deprecated('`response_tokens` is deprecated, use `output_tokens` instead')
+    def response_tokens(self) -> int:
+        return self.output_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        """Sum of `input_tokens + output_tokens`."""
+        return self.input_tokens + self.output_tokens
+
+    def opentelemetry_attributes(self) -> dict[str, int]:
+        """Get the token usage values as OpenTelemetry attributes."""
+        result: dict[str, int] = {}
+        if self.input_tokens:
+            result['gen_ai.usage.input_tokens'] = self.input_tokens
+        if self.output_tokens:
+            result['gen_ai.usage.output_tokens'] = self.output_tokens
+
+        details = self.details.copy()
+        if self.cache_write_tokens:
+            details['cache_write_tokens'] = self.cache_write_tokens
+        if self.cache_read_tokens:
+            details['cache_read_tokens'] = self.cache_read_tokens
+        if self.input_audio_tokens:
+            details['input_audio_tokens'] = self.input_audio_tokens
+        if self.cache_audio_read_tokens:
+            details['cache_audio_read_tokens'] = self.cache_audio_read_tokens
+        if self.output_audio_tokens:
+            details['output_audio_tokens'] = self.output_audio_tokens
+        if details:
+            prefix = 'gen_ai.usage.details.'
+            for key, value in details.items():
+                # Skipping check for value since spec implies all detail values are relevant
+                if value:
+                    result[prefix + key] = value
+        return result
+
+    def __repr__(self):
+        kv_pairs = (f'{f.name}={value!r}' for f in fields(self) if (value := getattr(self, f.name)))
+        return f'{self.__class__.__qualname__}({", ".join(kv_pairs)})'
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+    input_tokens: Annotated[
+        int,
+        # `request_tokens` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        Field(validation_alias=AliasChoices('input_tokens', 'request_tokens')),
+    ] = 0
+
+    input_audio_tokens: int = 0
+
+    def total_tokens(self) -> int:
+        """Sum of `input_tokens + output_tokens`."""
+        return self.input_tokens + self.output_tokens
+
+class RequestUsage(UsageBase):
+    """LLM usage associated with a single request.
+
+    This is an implementation of `genai_prices.types.AbstractUsage` so it can be used to calculate the price of the
+    request using [genai-prices](https://github.com/pydantic/genai-prices).
+    """
+
+    @property
+    def requests(self):
+        return 1
+
+    def incr(self, incr_usage: RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        return _incr_usage_tokens(self, incr_usage)
+
+    def __add__(self, other: RequestUsage) -> RequestUsage:
+        """Add two RequestUsages together.
+
+        This is provided so it's trivial to sum usage information from multiple parts of a response.
+
+        **WARNING:** this CANNOT be used to sum multiple requests without breaking some pricing calculations.
+        """
+        new_usage = copy(self)
+        new_usage.incr(other)
+        return new_usage
+
+    @classmethod
+    def extract(
+        cls,
+        data: Any,
+        *,
+        provider: str,
+        provider_url: str,
+        provider_fallback: str,
+        api_flavor: str = 'default',
+        details: dict[str, Any] | None = None,
+    ) -> RequestUsage:
+        """Extract usage information from the response data using genai-prices.
+
+        Args:
+            data: The response data from the model API.
+            provider: The actual provider ID
+            provider_url: The provider base_url
+            provider_fallback: The fallback provider ID to use if the actual provider is not found in genai-prices.
+                For example, an OpenAI model should set this to "openai" in case it has an obscure provider ID.
+            api_flavor: The API flavor to use when extracting usage information,
+                e.g. 'chat' or 'responses' for OpenAI.
+            details: Becomes the `details` field on the returned `RequestUsage` for convenience.
+        """
+        details = details or {}
+        for provider_id, provider_api_url in [(None, provider_url), (provider, None), (provider_fallback, None)]:
+            try:
+                provider_obj = get_snapshot().find_provider(None, provider_id, provider_api_url)
+                _model_ref, extracted_usage = provider_obj.extract_usage(data, api_flavor=api_flavor)
+                return cls(**{k: v for k, v in extracted_usage.__dict__.items() if v is not None}, details=details)
+            except Exception:
+                pass
+        return cls(details=details)
+
+    def extract(
+        cls,
+        data: Any,
+        *,
+        provider: str,
+        provider_url: str,
+        provider_fallback: str,
+        api_flavor: str = 'default',
+        details: dict[str, Any] | None = None,
+    ) -> RequestUsage:
+        """Extract usage information from the response data using genai-prices.
+
+        Args:
+            data: The response data from the model API.
+            provider: The actual provider ID
+            provider_url: The provider base_url
+            provider_fallback: The fallback provider ID to use if the actual provider is not found in genai-prices.
+                For example, an OpenAI model should set this to "openai" in case it has an obscure provider ID.
+            api_flavor: The API flavor to use when extracting usage information,
+                e.g. 'chat' or 'responses' for OpenAI.
+            details: Becomes the `details` field on the returned `RequestUsage` for convenience.
+        """
+        details = details or {}
+        for provider_id, provider_api_url in [(None, provider_url), (provider, None), (provider_fallback, None)]:
+            try:
+                provider_obj = get_snapshot().find_provider(None, provider_id, provider_api_url)
+                _model_ref, extracted_usage = provider_obj.extract_usage(data, api_flavor=api_flavor)
+                return cls(**{k: v for k, v in extracted_usage.__dict__.items() if v is not None}, details=details)
+            except Exception:
+                pass
+        return cls(details=details)
+
+    input_tokens: int = 0
+
+    input_audio_tokens: int = 0
+
+    output_tokens: int = 0
+
+    def __add__(self, other: RunUsage | RequestUsage) -> RunUsage:
+        """Add two RunUsages together.
+
+        This is provided so it's trivial to sum usage information from multiple runs.
+        """
+        new_usage = copy(self)
+        new_usage.incr(other)
+        return new_usage
+
+class UsageLimits:
+    """Limits on model usage.
+
+    The request count is tracked by pydantic_ai, and the request limit is checked before each request to the model.
+    Token counts are provided in responses from the model, and the token limits are checked after each response.
+
+    Each of the limits can be set to `None` to disable that limit.
+    """
+
+    request_limit: int | None = 50
+    """The maximum number of requests allowed to the model."""
+    tool_calls_limit: int | None = None
+    """The maximum number of successful tool calls allowed to be executed."""
+    input_tokens_limit: int | None = None
+    """The maximum number of input/prompt tokens allowed."""
+    output_tokens_limit: int | None = None
+    """The maximum number of output/response tokens allowed."""
+    total_tokens_limit: int | None = None
+    """The maximum number of tokens allowed in requests and responses combined."""
+    count_tokens_before_request: bool = False
+    """If True, perform a token counting pass before sending the request to the model,
+    to enforce `request_tokens_limit` ahead of time.
+
+    This may incur additional overhead (from calling the model's `count_tokens` API before making the actual request) and is disabled by default.
+
+    Supported by:
+
+    - Anthropic
+    - Google
+    - Bedrock Converse
+
+    Support for OpenAI is in development: https://github.com/pydantic/pydantic-ai/issues/3430
+    """
+
+    @property
+    @deprecated('`request_tokens_limit` is deprecated, use `input_tokens_limit` instead')
+    def request_tokens_limit(self) -> int | None:
+        return self.input_tokens_limit
+
+    @property
+    @deprecated('`response_tokens_limit` is deprecated, use `output_tokens_limit` instead')
+    def response_tokens_limit(self) -> int | None:
+        return self.output_tokens_limit
+
+    @overload
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+    ) -> None:
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit
+        self.output_tokens_limit = output_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    @overload
+    @deprecated(
+        'Use `input_tokens_limit` instead of `request_tokens_limit` and `output_tokens_limit` and `total_tokens_limit`'
+    )
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+    ) -> None:
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = request_tokens_limit
+        self.output_tokens_limit = response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+        # deprecated:
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+    ):
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit if input_tokens_limit is not None else request_tokens_limit
+        self.output_tokens_limit = output_tokens_limit if output_tokens_limit is not None else response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    def has_token_limits(self) -> bool:
+        """Returns `True` if this instance places any limits on token counts.
+
+        If this returns `False`, the `check_tokens` method will never raise an error.
+
+        This is useful because if we have token limits, we need to check them after receiving each streamed message.
+        If there are no limits, we can skip that processing in the streaming response iterator.
+        """
+        return any(
+            limit is not None for limit in (self.input_tokens_limit, self.output_tokens_limit, self.total_tokens_limit)
+        )
+
+    def check_before_request(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next request would exceed any of the limits."""
+        request_limit = self.request_limit
+        if request_limit is not None and usage.requests >= request_limit:
+            raise UsageLimitExceeded(f'The next request would exceed the request_limit of {request_limit}')
+
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(
+                f'The next request would exceed the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(  # pragma: lax no cover
+                f'The next request would exceed the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})'
+            )
+
+    def check_tokens(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the usage exceeds any of the token limits."""
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})')
+
+        output_tokens = usage.output_tokens
+        if self.output_tokens_limit is not None and output_tokens > self.output_tokens_limit:
+            raise UsageLimitExceeded(
+                f'Exceeded the output_tokens_limit of {self.output_tokens_limit} ({output_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})')
+
+    def check_before_tool_call(self, projected_usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next tool call(s) would exceed the tool call limit."""
+        tool_calls_limit = self.tool_calls_limit
+        tool_calls = projected_usage.tool_calls
+        if tool_calls_limit is not None and tool_calls > tool_calls_limit:
+            raise UsageLimitExceeded(
+                f'The next tool call(s) would exceed the tool_calls_limit of {tool_calls_limit} ({tool_calls=}).'
+            )
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    input_tokens_limit: int | None = None
+
+## tests/models/test_openai.py
+
+def chunk_with_usage(
+    delta: list[ChoiceDelta],
+    finish_reason: FinishReason | None = None,
+    completion_tokens: int = 1,
+    prompt_tokens: int = 2,
+    total_tokens: int = 3,
+) -> chat.ChatCompletionChunk:
+    """Create a chunk with configurable usage stats for testing continuous_usage_stats."""
+    return chat.ChatCompletionChunk(
+        id='123',
+        choices=[
+            ChunkChoice(index=index, delta=delta, finish_reason=finish_reason) for index, delta in enumerate(delta)
+        ],
+        created=1704067200,  # 2024-01-01
+        model='gpt-4o-123',
+        object='chat.completion.chunk',
+        usage=CompletionUsage(
+            completion_tokens=completion_tokens, prompt_tokens=prompt_tokens, total_tokens=total_tokens
+        ),
+    )
+
+async def test_stream_with_continuous_usage_stats(allow_model_requests: None):
+    """Test that continuous_usage_stats replaces usage instead of accumulating.
+
+    When continuous_usage_stats=True, each chunk contains cumulative usage, not incremental.
+    The final usage should equal the last chunk's usage, not the sum of all chunks.
+    We verify that usage is correctly updated at each step via stream_responses.
+    """
+    # Simulate cumulative usage: each chunk has higher tokens (cumulative, not incremental)
+    stream = [
+        chunk_with_usage(
+            [ChoiceDelta(content='hello ', role='assistant')],
+            completion_tokens=5,
+            prompt_tokens=10,
+            total_tokens=15,
+        ),
+        chunk_with_usage([ChoiceDelta(content='world')], completion_tokens=10, prompt_tokens=10, total_tokens=20),
+        chunk_with_usage([ChoiceDelta(content='!')], completion_tokens=15, prompt_tokens=10, total_tokens=25),
+        chunk_with_usage([], finish_reason='stop', completion_tokens=15, prompt_tokens=10, total_tokens=25),
+    ]
+    mock_client = MockOpenAI.create_mock_stream(stream)
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(openai_client=mock_client))
+    agent = Agent(m)
+
+    settings = cast(OpenAIChatModelSettings, {'openai_continuous_usage_stats': True})
+    async with agent.run_stream('', model_settings=settings) as result:
+        # Verify usage is updated at each step via stream_responses
+        usage_at_each_step: list[RequestUsage] = []
+        async for response, _ in result.stream_responses(debounce_by=None):
+            usage_at_each_step.append(response.usage)
+
+        # Each step should have the cumulative usage from that chunk (not accumulated)
+        # The stream emits responses for each content chunk plus final
+        assert usage_at_each_step == snapshot(
+            [
+                RequestUsage(input_tokens=10, output_tokens=5),
+                RequestUsage(input_tokens=10, output_tokens=10),
+                RequestUsage(input_tokens=10, output_tokens=15),
+                RequestUsage(input_tokens=10, output_tokens=15),
+                RequestUsage(input_tokens=10, output_tokens=15),
+            ]
+        )
+
+    # Final usage should be from the last chunk (15 output tokens)
+    # NOT the sum of all chunks (5+10+15+15 = 45 output tokens)
+    assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=10, output_tokens=15))
+
+## tests/test_mcp.py
+
+def agent(model: Model, mcp_server: MCPServerStdio) -> Agent:
+    return Agent(model, toolsets=[mcp_server])

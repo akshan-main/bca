@@ -1,0 +1,185 @@
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    async def _handle_tool_calls(
+        self,
+        ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]],
+        tool_calls: list[_messages.ToolCallPart],
+    ) -> AsyncIterator[_messages.HandleResponseEvent]:
+        run_context = build_run_context(ctx)
+
+        # This will raise errors for any tool name conflicts
+        ctx.deps.tool_manager = await ctx.deps.tool_manager.for_run_step(run_context)
+
+        output_parts: list[_messages.ModelRequestPart] = []
+        output_final_result: deque[result.FinalResult[NodeRunEndT]] = deque(maxlen=1)
+
+        async for event in process_tool_calls(
+            tool_manager=ctx.deps.tool_manager,
+            tool_calls=tool_calls,
+            tool_call_results=self.tool_call_results,
+            tool_call_metadata=self.tool_call_metadata,
+            final_result=None,
+            ctx=ctx,
+            output_parts=output_parts,
+            output_final_result=output_final_result,
+        ):
+            yield event
+
+        if output_final_result:
+            final_result = output_final_result[0]
+            self._next_node = self._handle_final_result(ctx, final_result, output_parts)
+        else:
+            # Add user prompt if provided, after all tool return parts
+            if self.user_prompt is not None:
+                output_parts.append(_messages.UserPromptPart(self.user_prompt))
+
+            instructions = await ctx.deps.get_instructions(run_context)
+            self._next_node = ModelRequestNode[DepsT, NodeRunEndT](
+                _messages.ModelRequest(parts=output_parts, instructions=instructions)
+            )
+
+async def _call_tools(  # noqa: C901
+    tool_manager: ToolManager[DepsT],
+    tool_calls: list[_messages.ToolCallPart],
+    tool_call_results: dict[str, DeferredToolResult],
+    tool_call_metadata: dict[str, dict[str, Any]] | None,
+    tracer: Tracer,
+    usage: _usage.RunUsage,
+    usage_limits: _usage.UsageLimits,
+    output_parts: list[_messages.ModelRequestPart],
+    output_deferred_calls: dict[Literal['external', 'unapproved'], list[_messages.ToolCallPart]],
+    output_deferred_metadata: dict[str, dict[str, Any]],
+) -> AsyncIterator[_messages.HandleResponseEvent]:
+    tool_parts_by_index: dict[int, _messages.ModelRequestPart] = {}
+    user_parts_by_index: dict[int, _messages.UserPromptPart] = {}
+    deferred_calls_by_index: dict[int, Literal['external', 'unapproved']] = {}
+    deferred_metadata_by_index: dict[int, dict[str, Any] | None] = {}
+
+    if usage_limits.tool_calls_limit is not None:
+        projected_usage = deepcopy(usage)
+        projected_usage.tool_calls += len(tool_calls)
+        usage_limits.check_before_tool_call(projected_usage)
+
+    for call in tool_calls:
+        yield _messages.FunctionToolCallEvent(call)
+
+    with tracer.start_as_current_span(
+        'running tools',
+        attributes={
+            'tools': [call.tool_name for call in tool_calls],
+            'logfire.msg': f'running {len(tool_calls)} tool{"" if len(tool_calls) == 1 else "s"}',
+        },
+    ):
+
+        async def handle_call_or_result(
+            coro_or_task: Awaitable[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ]
+            | Task[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ],
+            index: int,
+        ) -> _messages.HandleResponseEvent | None:
+            try:
+                tool_part, tool_user_content = (
+                    (await coro_or_task) if inspect.isawaitable(coro_or_task) else coro_or_task.result()
+                )
+            except exceptions.CallDeferred as e:
+                deferred_calls_by_index[index] = 'external'
+                deferred_metadata_by_index[index] = e.metadata
+            except exceptions.ApprovalRequired as e:
+                deferred_calls_by_index[index] = 'unapproved'
+                deferred_metadata_by_index[index] = e.metadata
+            else:
+                tool_parts_by_index[index] = tool_part
+                if tool_user_content:
+                    user_parts_by_index[index] = _messages.UserPromptPart(content=tool_user_content)
+
+                return _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
+
+        parallel_execution_mode = tool_manager.get_parallel_execution_mode(tool_calls)
+        if parallel_execution_mode == 'sequential':
+            for index, call in enumerate(tool_calls):
+                if event := await handle_call_or_result(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    index,
+                ):
+                    yield event
+
+        else:
+            tasks = [
+                asyncio.create_task(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    name=call.tool_name,
+                )
+                for call in tool_calls
+            ]
+            try:
+                if parallel_execution_mode == 'parallel_ordered_events':
+                    # Wait for all tasks to complete before yielding any events
+                    await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+                    for index, task in enumerate(tasks):
+                        if event := await handle_call_or_result(coro_or_task=task, index=index):
+                            yield event
+                else:
+                    pending: set[
+                        asyncio.Task[
+                            tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, _messages.UserPromptPart | None]
+                        ]
+                    ] = set(tasks)  # pyright: ignore[reportAssignmentType]
+                    while pending:
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            index = tasks.index(task)  # pyright: ignore[reportArgumentType]
+                            if event := await handle_call_or_result(coro_or_task=task, index=index):  # pyright: ignore[reportArgumentType]
+                                yield event
+
+            except asyncio.CancelledError as e:
+                for task in tasks:
+                    task.cancel(msg=e.args[0] if len(e.args) != 0 else None)
+
+                raise
+
+    # We append the results at the end, rather than as they are received, to retain a consistent ordering
+    # This is mostly just to simplify testing
+    output_parts.extend([tool_parts_by_index[k] for k in sorted(tool_parts_by_index)])
+    output_parts.extend([user_parts_by_index[k] for k in sorted(user_parts_by_index)])
+
+    _populate_deferred_calls(
+        tool_calls, deferred_calls_by_index, deferred_metadata_by_index, output_deferred_calls, output_deferred_metadata
+    )
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    def tool_calls(self) -> list[ToolCallPart]:
+        """Get the tool calls in the response."""
+        return [part for part in self.parts if isinstance(part, ToolCallPart)]
+
+## pydantic_ai_slim/pydantic_ai/output.py
+
+    def tool_calls(self) -> list[ToolCallPart]:
+        return self.calls
+
+## tests/test_usage_limits.py
+
+async def test_failed_tool_calls_not_counted() -> None:
+    """Test that failed tool calls (raising ModelRetry) are not counted in usage or against limits."""
+    test_agent = Agent(TestModel())
+
+    call_count = 0
+
+    @test_agent.tool_plain
+    async def flaky_tool(x: str) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ModelRetry('Temporary failure, please retry')
+        return f'{x}-success'
+
+    result = await test_agent.run('test', usage_limits=UsageLimits(tool_calls_limit=1))
+    assert call_count == 2
+    assert result.usage() == snapshot(RunUsage(requests=3, input_tokens=176, output_tokens=29, tool_calls=1))

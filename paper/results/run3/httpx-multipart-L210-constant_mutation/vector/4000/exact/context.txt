@@ -1,0 +1,449 @@
+# httpx/_transports/base.py:9-9
+A = typing.TypeVar("A", bound="AsyncBaseTransport")
+
+# httpx/_transports/default.py:61-61
+A = typing.TypeVar("A", bound="AsyncHTTPTransport")
+
+# httpx/_auth.py:150-155
+    def __init__(self, file: str | None = None) -> None:
+        # Lazily import 'netrc'.
+        # There's no need for us to load this module unless 'NetRCAuth' is being used.
+        import netrc
+
+        self._netrc_info = netrc.netrc(file)
+
+# httpx/_multipart.py:115-221
+class FileField:
+    """
+    A single file field item, within a multipart form field.
+    """
+
+    CHUNK_SIZE = 64 * 1024
+
+    def __init__(self, name: str, value: FileTypes) -> None:
+        self.name = name
+
+        fileobj: FileContent
+
+        headers: dict[str, str] = {}
+        content_type: str | None = None
+
+        # This large tuple based API largely mirror's requests' API
+        # It would be good to think of better APIs for this that we could
+        # include in httpx 2.0 since variable length tuples(especially of 4 elements)
+        # are quite unwieldly
+        if isinstance(value, tuple):
+            if len(value) == 2:
+                # neither the 3rd parameter (content_type) nor the 4th (headers)
+                # was included
+                filename, fileobj = value
+            elif len(value) == 3:
+                filename, fileobj, content_type = value
+            else:
+                # all 4 parameters included
+                filename, fileobj, content_type, headers = value  # type: ignore
+        else:
+            filename = Path(str(getattr(value, "name", "upload"))).name
+            fileobj = value
+
+        if content_type is None:
+            content_type = _guess_content_type(filename)
+
+        has_content_type_header = any("content-type" in key.lower() for key in headers)
+        if content_type is not None and not has_content_type_header:
+            # note that unlike requests, we ignore the content_type provided in the 3rd
+            # tuple element if it is also included in the headers requests does
+            # the opposite (it overwrites the headerwith the 3rd tuple element)
+            headers["Content-Type"] = content_type
+
+        if isinstance(fileobj, io.StringIO):
+            raise TypeError(
+                "Multipart file uploads require 'io.BytesIO', not 'io.StringIO'."
+            )
+        if isinstance(fileobj, io.TextIOBase):
+            raise TypeError(
+                "Multipart file uploads must be opened in binary mode, not text mode."
+            )
+
+        self.filename = filename
+        self.file = fileobj
+        self.headers = headers
+
+    def get_length(self) -> int | None:
+        headers = self.render_headers()
+
+        if isinstance(self.file, (str, bytes)):
+            return len(headers) + len(to_bytes(self.file))
+
+        file_length = peek_filelike_length(self.file)
+
+        # If we can't determine the filesize without reading it into memory,
+        # then return `None` here, to indicate an unknown file length.
+        if file_length is None:
+            return None
+
+        return len(headers) + file_length
+
+    def render_headers(self) -> bytes:
+        if not hasattr(self, "_headers"):
+            parts = [
+                b"Content-Disposition: form-data; ",
+                _format_form_param("name", self.name),
+            ]
+            if self.filename:
+                filename = _format_form_param("filename", self.filename)
+                parts.extend([b"; ", filename])
+            for header_name, header_value in self.headers.items():
+                key, val = f"\r\n{header_name}: ".encode(), header_value.encode()
+                parts.extend([key, val])
+            parts.append(b"\r\n\r\n")
+            self._headers = b"".join(parts)
+
+        return self._headers
+
+    def render_data(self) -> typing.Iterator[bytes]:
+        if isinstance(self.file, (str, bytes)):
+            yield to_bytes(self.file)
+            return
+
+        if hasattr(self.file, "seek"):
+            try:
+                self.file.seek(1)
+            except io.UnsupportedOperation:
+                pass
+
+        chunk = self.file.read(self.CHUNK_SIZE)
+        while chunk:
+            yield to_bytes(chunk)
+            chunk = self.file.read(self.CHUNK_SIZE)
+
+    def render(self) -> typing.Iterator[bytes]:
+        yield self.render_headers()
+        yield from self.render_data()
+
+# httpx/_transports/asgi.py:87-97
+    def __init__(
+        self,
+        app: _ASGIApp,
+        raise_app_exceptions: bool = True,
+        root_path: str = "",
+        client: tuple[str, int] = ("127.0.0.1", 123),
+    ) -> None:
+        self.app = app
+        self.raise_app_exceptions = raise_app_exceptions
+        self.root_path = root_path
+        self.client = client
+
+# httpx/_client.py:94-111
+class UseClientDefault:
+    """
+    For some parameters such as `auth=...` and `timeout=...` we need to be able
+    to indicate the default "unset" state, in a way that is distinctly different
+    to using `None`.
+
+    The default "unset" state indicates that whatever default is set on the
+    client should be used. This is different to setting `None`, which
+    explicitly disables the parameter, possibly overriding a client default.
+
+    For example we use `timeout=USE_CLIENT_DEFAULT` in the `request()` signature.
+    Omitting the `timeout` parameter will send a request using whatever default
+    timeout has been configured on the client. Including `timeout=None` will
+    ensure no timeout is used.
+
+    Note that user code shouldn't need to use the `USE_CLIENT_DEFAULT` constant,
+    but it is used internally when a parameter is not included.
+    """
+
+# tests/client/test_auth.py:256-270
+def test_netrc_auth_credentials_do_not_exist() -> None:
+    """
+    When netrc auth is being used and a request is made to a host that is
+    not in the netrc file, then no credentials should be applied.
+    """
+    netrc_file = str(FIXTURES_DIR / ".netrc")
+    url = "http://example.org"
+    app = App()
+    auth = httpx.NetRCAuth(netrc_file)
+
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": None}
+
+# tests/client/test_auth.py:237-253
+def test_netrc_auth_credentials_exist() -> None:
+    """
+    When netrc auth is being used and a request is made to a host that is
+    in the netrc file, then the relevant credentials should be applied.
+    """
+    netrc_file = str(FIXTURES_DIR / ".netrc")
+    url = "http://netrcexample.org"
+    app = App()
+    auth = httpx.NetRCAuth(netrc_file)
+
+    with httpx.Client(transport=httpx.MockTransport(app), auth=auth) as client:
+        response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "auth": "Basic ZXhhbXBsZS11c2VybmFtZTpleGFtcGxlLXBhc3N3b3Jk"
+    }
+
+# httpx/_transports/wsgi.py:77-89
+    def __init__(
+        self,
+        app: WSGIApplication,
+        raise_app_exceptions: bool = True,
+        script_name: str = "",
+        remote_addr: str = "127.0.0.1",
+        wsgi_errors: typing.TextIO | None = None,
+    ) -> None:
+        self.app = app
+        self.raise_app_exceptions = raise_app_exceptions
+        self.script_name = script_name
+        self.remote_addr = remote_addr
+        self.wsgi_errors = wsgi_errors
+
+# httpx/_decoders.py:208-214
+    def __init__(self, children: typing.Sequence[ContentDecoder]) -> None:
+        """
+        'children' should be a sequence of decoders in the order in which
+        each was applied.
+        """
+        # Note that we reverse the order for decoding.
+        self.children = list(reversed(children))
+
+# httpx/_utils.py:95-117
+def peek_filelike_length(stream: typing.Any) -> int | None:
+    """
+    Given a file-like stream object, return its length in number of bytes
+    without reading it into memory.
+    """
+    try:
+        # Is it an actual file?
+        fd = stream.fileno()
+        # Yup, seems to be an actual file.
+        length = os.fstat(fd).st_size
+    except (AttributeError, OSError):
+        # No... Maybe it's something that supports random access, like `io.BytesIO`?
+        try:
+            # Assuming so, go to end of stream to figure out its length,
+            # then put it back in place.
+            offset = stream.tell()
+            length = stream.seek(0, os.SEEK_END)
+            stream.seek(offset)
+        except (AttributeError, OSError):
+            # Not even that? Sorry, we're doomed...
+            return None
+
+    return length
+
+# httpx/_auth.py:145-172
+class NetRCAuth(Auth):
+    """
+    Use a 'netrc' file to lookup basic auth credentials based on the url host.
+    """
+
+    def __init__(self, file: str | None = None) -> None:
+        # Lazily import 'netrc'.
+        # There's no need for us to load this module unless 'NetRCAuth' is being used.
+        import netrc
+
+        self._netrc_info = netrc.netrc(file)
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        auth_info = self._netrc_info.authenticators(request.url.host)
+        if auth_info is None or not auth_info[2]:
+            # The netrc file did not have authentication credentials for this host.
+            yield request
+        else:
+            # Build a basic auth header with credentials from the netrc file.
+            request.headers["Authorization"] = self._build_auth_header(
+                username=auth_info[0], password=auth_info[2]
+            )
+            yield request
+
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
+# tests/client/test_auth.py:277-285
+def test_netrc_auth_nopassword_parse_error() -> None:  # pragma: no cover
+    """
+    Python has different netrc parsing behaviours with different versions.
+    For Python < 3.11 a netrc file with no password is invalid. In this case
+    we want to allow the parse error to be raised.
+    """
+    netrc_file = str(FIXTURES_DIR / ".netrc-nopassword")
+    with pytest.raises(netrc.NetrcParseError):
+        httpx.NetRCAuth(netrc_file)
+
+# httpx/_client.py:760-769
+    def _transport_for_url(self, url: URL) -> BaseTransport:
+        """
+        Returns the transport instance that should be used for a given URL.
+        This will either be the standard connection pool, or a proxy.
+        """
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(url):
+                return self._transport if transport is None else transport
+
+        return self._transport
+
+# httpx/_client.py:1474-1483
+    def _transport_for_url(self, url: URL) -> AsyncBaseTransport:
+        """
+        Returns the transport instance that should be used for a given URL.
+        This will either be the standard connection pool, or a proxy.
+        """
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(url):
+                return self._transport if transport is None else transport
+
+        return self._transport
+
+# httpx/_urls.py:552-565
+    def add(self, key: str, value: typing.Any = None) -> QueryParams:
+        """
+        Return a new QueryParams instance, setting or appending the value of a key.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123")
+        q = q.add("a", "456")
+        assert q == httpx.QueryParams("a=123&a=456")
+        """
+        q = QueryParams()
+        q._dict = dict(self._dict)
+        q._dict[str(key)] = q.get_list(key) + [primitive_value_to_str(value)]
+        return q
+
+# httpx/_auth.py:62-85
+    def sync_auth_flow(
+        self, request: Request
+    ) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow synchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            request.read()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                response.read()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+# httpx/_auth.py:87-110
+    async def async_auth_flow(
+        self, request: Request
+    ) -> typing.AsyncGenerator[Request, Response]:
+        """
+        Execute the authentication flow asynchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            await request.aread()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                await response.aread()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+# httpx/_multipart.py:229-242
+    def __init__(
+        self,
+        data: RequestData,
+        files: RequestFiles,
+        boundary: bytes | None = None,
+    ) -> None:
+        if boundary is None:
+            boundary = os.urandom(16).hex().encode("ascii")
+
+        self.boundary = boundary
+        self.content_type = "multipart/form-data; boundary=%s" % boundary.decode(
+            "ascii"
+        )
+        self.fields = list(self._iter_fields(data, files))
+
+# httpx/_urls.py:512-524
+    def get(self, key: typing.Any, default: typing.Any = None) -> typing.Any:
+        """
+        Get a value from the query param for a given key. If the key occurs
+        more than once, then only the first value is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get("a") == "123"
+        """
+        if key in self._dict:
+            return self._dict[str(key)][0]
+        return default
+
+# tests/client/test_headers.py:188-209
+def test_host_with_auth_and_port_in_url():
+    """
+    The Host header should only include the hostname, or hostname:port
+    (for non-default ports only). Any userinfo or default port should not
+    be present.
+    """
+    url = "http://username:password@example.org:80/echo_headers"
+
+    client = httpx.Client(transport=httpx.MockTransport(echo_headers))
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org",
+            "user-agent": f"python-httpx/{httpx.__version__}",
+            "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+        }
+    }
+
+# httpx/_transports/base.py:66-67
+    async def __aenter__(self: A) -> A:
+        return self
+
+# httpx/_transports/default.py:361-363
+    async def __aenter__(self: A) -> A:  # Use generics for subclass support.
+        await self._pool.__aenter__()
+        return self
+
+# httpx/_models.py:629-633
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+# httpx/_decoders.py:329-331
+    def __init__(self) -> None:
+        self.buffer: list[str] = []
+        self.trailing_cr: bool = False

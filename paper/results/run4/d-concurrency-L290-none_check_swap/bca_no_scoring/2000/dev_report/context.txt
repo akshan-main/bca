@@ -1,0 +1,203 @@
+## tests/test_concurrency.py
+
+class AsyncBarrier:
+    """A simple asyncio.Barrier-like implementation compatible with Python 3.10 using anyio."""
+
+    def __init__(self, parties: int):
+        self._parties = parties
+        self._count = 0
+        self._lock = anyio.Lock()
+        self._event = anyio.Event()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            self._count += 1
+            if self._count >= self._parties:
+                self._event.set()
+        await self._event.wait()
+
+class TestGetConcurrencyContext:
+    """Tests for the get_concurrency_context helper."""
+
+    async def test_returns_context_when_provided(self):
+        """Test that get_concurrency_context returns a working context."""
+        limiter = ConcurrencyLimiter(max_running=1)
+        async with get_concurrency_context(limiter, 'test'):
+            pass  # Should acquire and release
+
+    async def test_returns_null_context_when_none(self):
+        """Test that get_concurrency_context returns a no-op context when None."""
+        async with get_concurrency_context(None, 'test'):
+            pass  # Should be a no-op
+
+class TestAgentConcurrency:
+    """Tests for agent-level concurrency limiting."""
+
+    async def test_agent_concurrency_limit(self):
+        """Test that agent respects max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=2)
+        running = 0
+        max_running = 0
+        lock = anyio.Lock()
+
+        @agent.tool_plain
+        async def slow_tool() -> str:
+            nonlocal running, max_running
+            async with lock:
+                running += 1
+                max_running = max(max_running, running)
+            await anyio.sleep(0.1)
+            async with lock:
+                running -= 1
+            return 'done'
+
+        results: list[Any] = []
+
+        async def run_agent():
+            result = await agent.run('call slow_tool', model=TestModel(call_tools=['slow_tool']))
+            results.append(result)
+
+        async with anyio.create_task_group() as tg:
+            for _ in range(5):
+                tg.start_soon(run_agent)
+
+        assert max_running <= 2
+        assert len(results) == 5
+
+    async def test_agent_concurrency_backpressure(self):
+        """Test that agent raises when queue exceeds max_queued."""
+        agent = Agent(TestModel(), max_concurrency=ConcurrencyLimit(max_running=1, max_queued=1))
+        hold = anyio.Event()
+
+        @agent.tool_plain
+        async def hold_tool() -> str:
+            await hold.wait()
+            return 'done'
+
+        async def run_agent():
+            await agent.run('x', model=TestModel(call_tools=['hold_tool']))
+
+        async with anyio.create_task_group() as tg:
+            # Start 2 runs (1 running + 1 queued = at limit)
+            tg.start_soon(run_agent)
+            tg.start_soon(run_agent)
+            await anyio.sleep(0.05)
+
+            # Third should raise
+            with pytest.raises(ConcurrencyLimitExceeded):
+                await agent.run('x', model=TestModel(call_tools=['hold_tool']))
+
+            hold.set()
+
+    async def test_agent_no_limit_by_default(self):
+        """Test that agents have no concurrency limit by default."""
+        agent = Agent(TestModel())
+        assert agent._concurrency_limiter is None
+
+    async def test_agent_with_int_concurrency(self):
+        """Test that agent accepts int for max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=5)
+        assert agent._concurrency_limiter is not None
+        assert agent._concurrency_limiter.max_running == 5
+        assert agent._concurrency_limiter._max_queued is None
+
+    async def test_agent_with_limiter_concurrency(self):
+        """Test that agent accepts ConcurrencyLimit for max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=ConcurrencyLimit(max_running=5, max_queued=10))
+        assert agent._concurrency_limiter is not None
+        assert agent._concurrency_limiter.max_running == 5
+        assert agent._concurrency_limiter._max_queued == 10
+
+    async def test_agent_with_int_concurrency(self):
+        """Test that agent accepts int for max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=5)
+        assert agent._concurrency_limiter is not None
+        assert agent._concurrency_limiter.max_running == 5
+        assert agent._concurrency_limiter._max_queued is None
+
+class TestAgentWithSharedLimiter:
+    """Tests for agent with shared ConcurrencyLimiter."""
+
+    async def test_agent_with_shared_limiter(self):
+        """Test that agents can share a ConcurrencyLimiter."""
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        agent1 = Agent(TestModel(), max_concurrency=shared_limiter)
+        agent2 = Agent(TestModel(), max_concurrency=shared_limiter)
+
+        # Both agents should share the same limiter
+        assert agent1._concurrency_limiter is agent2._concurrency_limiter
+
+class TestConcurrencyLimiterWithTracer:
+    """Tests for ConcurrencyLimiter with custom tracer."""
+
+    async def test_custom_tracer_is_stored(self):
+        """Test that custom tracer is stored and returned by _get_tracer."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter(max_running=5, tracer=custom_tracer)
+
+        # Verify the tracer is stored and returned
+        assert limiter._get_tracer() is custom_tracer
+
+    async def test_from_limit_with_tracer(self):
+        """Test that from_limit passes tracer to the created limiter."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter.from_limit(5, tracer=custom_tracer)
+        assert limiter._get_tracer() is custom_tracer
+
+class TestConcurrencyLimitedModelMethods:
+    """Tests for ConcurrencyLimitedModel count_tokens and request_stream methods."""
+
+    async def test_count_tokens(self):
+        """Test that count_tokens delegates to wrapped model with concurrency limiting."""
+        from unittest.mock import AsyncMock
+
+        from pydantic_ai.models import ModelRequestParameters
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+        from pydantic_ai.usage import RequestUsage
+
+        base_model = TestModel()
+        # Mock count_tokens to return a value
+        base_model.count_tokens = AsyncMock(return_value=RequestUsage())
+        model = ConcurrencyLimitedModel(base_model, limiter=5)
+
+        # count_tokens should delegate to wrapped model
+        usage = await model.count_tokens([], None, ModelRequestParameters())
+        assert usage is not None
+        base_model.count_tokens.assert_called_once()
+
+    async def test_request_stream(self):
+        """Test that request_stream is called with concurrency limiting."""
+        from pydantic_ai.models import ModelRequestParameters
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        base_model = TestModel()
+        model = ConcurrencyLimitedModel(base_model, limiter=5)
+
+        # request_stream should work
+        async with model.request_stream([], None, ModelRequestParameters()) as stream:
+            # Consume the stream
+            async for _ in stream:
+                pass
+
+    async def test_count_tokens(self):
+        """Test that count_tokens delegates to wrapped model with concurrency limiting."""
+        from unittest.mock import AsyncMock
+
+        from pydantic_ai.models import ModelRequestParameters
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+        from pydantic_ai.usage import RequestUsage
+
+        base_model = TestModel()
+        # Mock count_tokens to return a value
+        base_model.count_tokens = AsyncMock(return_value=RequestUsage())
+        model = ConcurrencyLimitedModel(base_model, limiter=5)
+
+        # count_tokens should delegate to wrapped model
+        usage = await model.count_tokens([], None, ModelRequestParameters())
+        assert usage is not None
+        base_model.count_tokens.assert_called_once()

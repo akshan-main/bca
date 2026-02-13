@@ -1,0 +1,1024 @@
+## pydantic_ai_slim/pydantic_ai/__init__.py
+
+from .concurrency import (
+    AbstractConcurrencyLimiter,
+    AnyConcurrencyLimit,
+    ConcurrencyLimit,
+    ConcurrencyLimiter,
+)
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+from abc import ABC, abstractmethod
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+class Unset:
+    """A singleton to represent an unset value."""
+
+    pass
+
+## pydantic_ai_slim/pydantic_ai/ag_ui.py
+
+from .models import KnownModelName, Model
+
+## pydantic_ai_slim/pydantic_ai/concurrency.py
+
+class AbstractConcurrencyLimiter(ABC):
+    """Abstract base class for concurrency limiters.
+
+    Subclass this to create custom concurrency limiters
+    (e.g., Redis-backed distributed limiters).
+
+    Example:
+    ```python
+    from pydantic_ai.concurrency import AbstractConcurrencyLimiter
+
+
+    class RedisConcurrencyLimiter(AbstractConcurrencyLimiter):
+        def __init__(self, redis_client, key: str, max_running: int):
+            self._redis = redis_client
+            self._key = key
+            self._max_running = max_running
+
+        async def acquire(self, source: str) -> None:
+            # Implement Redis-based distributed locking
+            ...
+
+        def release(self) -> None:
+            # Release the Redis lock
+            ...
+    ```
+    """
+
+    @abstractmethod
+    async def acquire(self, source: str) -> None:
+        """Acquire a slot, waiting if necessary.
+
+        Args:
+            source: Identifier for observability (e.g., 'model:gpt-4o').
+        """
+        ...
+
+    @abstractmethod
+    def release(self) -> None:
+        """Release a slot."""
+        ...
+
+    async def acquire(self, source: str) -> None:
+        """Acquire a slot, waiting if necessary.
+
+        Args:
+            source: Identifier for observability (e.g., 'model:gpt-4o').
+        """
+        ...
+
+    def release(self) -> None:
+        """Release a slot."""
+        ...
+
+class ConcurrencyLimiter(AbstractConcurrencyLimiter):
+    """A concurrency limiter that tracks waiting operations for observability.
+
+    This class wraps an anyio.CapacityLimiter and tracks the number of waiting operations.
+    When an operation has to wait to acquire a slot, a span is created for
+    observability purposes.
+    """
+
+    def __init__(
+        self,
+        max_running: int,
+        *,
+        max_queued: int | None = None,
+        name: str | None = None,
+        tracer: Tracer | None = None,
+    ):
+        """Initialize the ConcurrencyLimiter.
+
+        Args:
+            max_running: Maximum number of concurrent operations.
+            max_queued: Maximum queue depth before raising ConcurrencyLimitExceeded.
+            name: Optional name for this limiter, used for observability when sharing
+                a limiter across multiple models or agents.
+            tracer: OpenTelemetry tracer for span creation.
+        """
+        self._limiter = anyio.CapacityLimiter(max_running)
+        self._max_queued = max_queued
+        self._name = name
+        self._tracer = tracer
+        # Lock and counter to atomically check and track waiting tasks for max_queued enforcement
+        self._queue_lock = anyio.Lock()
+        self._waiting_count = 0
+
+    @classmethod
+    def from_limit(
+        cls,
+        limit: int | ConcurrencyLimit,
+        *,
+        name: str | None = None,
+        tracer: Tracer | None = None,
+    ) -> Self:
+        """Create a ConcurrencyLimiter from a ConcurrencyLimit configuration.
+
+        Args:
+            limit: Either an int for simple limiting or a ConcurrencyLimit for full config.
+            name: Optional name for this limiter, used for observability.
+            tracer: OpenTelemetry tracer for span creation.
+
+        Returns:
+            A configured ConcurrencyLimiter.
+        """
+        if isinstance(limit, int):
+            return cls(max_running=limit, name=name, tracer=tracer)
+        else:
+            return cls(
+                max_running=limit.max_running,
+                max_queued=limit.max_queued,
+                name=name,
+                tracer=tracer,
+            )
+
+    @property
+    def name(self) -> str | None:
+        """Name of the limiter for observability."""
+        return self._name
+
+    @property
+    def waiting_count(self) -> int:
+        """Number of operations currently waiting to acquire a slot."""
+        return self._waiting_count
+
+    @property
+    def running_count(self) -> int:
+        """Number of operations currently running."""
+        return self._limiter.statistics().borrowed_tokens
+
+    @property
+    def available_count(self) -> int:
+        """Number of slots available."""
+        return int(self._limiter.available_tokens)
+
+    @property
+    def max_running(self) -> int:
+        """Maximum concurrent operations allowed."""
+        return int(self._limiter.total_tokens)
+
+    def _get_tracer(self) -> Tracer:
+        """Get the tracer, falling back to global tracer if not set."""
+        if self._tracer is not None:
+            return self._tracer
+        return get_tracer('pydantic-ai')
+
+    async def acquire(self, source: str) -> None:
+        """Acquire a slot, creating a span if waiting is required.
+
+        Args:
+            source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+        """
+        from .exceptions import ConcurrencyLimitExceeded
+
+        # Try to acquire immediately without blocking
+        try:
+            self._limiter.acquire_nowait()
+            return
+        except anyio.WouldBlock:
+            pass
+
+        # We need to wait - atomically check queue limits and register ourselves as waiting
+        # This prevents a race condition where multiple tasks could pass the check before
+        # any of them actually start waiting on the limiter
+        async with self._queue_lock:
+            if self._max_queued is None and self._waiting_count >= self._max_queued:
+                # Use limiter name if set, otherwise use source for error messages
+                display_name = self._name or source
+                raise ConcurrencyLimitExceeded(
+                    f'Concurrency queue depth ({self._waiting_count + 1}) exceeds max_queued ({self._max_queued})'
+                    + (f' for {display_name}' if display_name else '')
+                )
+            # Register ourselves as waiting before releasing the lock
+            self._waiting_count += 1
+
+        # Now we're registered as waiting, proceed to wait on the limiter
+        # Use try/finally to ensure we decrement the counter even on cancellation
+        try:
+            # Create a span for observability while waiting
+            tracer = self._get_tracer()
+            display_name = self._name or source
+            attributes: dict[str, str | int] = {
+                'source': source,
+                'waiting_count': self._waiting_count,
+                'max_running': int(self._limiter.total_tokens),
+            }
+            if self._name is not None:
+                attributes['limiter_name'] = self._name
+            if self._max_queued is not None:
+                attributes['max_queued'] = self._max_queued
+
+            # Span name uses limiter name if set, otherwise source
+            span_name = f'waiting for {display_name} concurrency'
+            with tracer.start_as_current_span(span_name, attributes=attributes):
+                await self._limiter.acquire()
+        finally:
+            # We're no longer waiting (either we acquired or we were cancelled)
+            self._waiting_count -= 1
+
+    def release(self) -> None:
+        """Release a slot."""
+        self._limiter.release()
+
+    def from_limit(
+        cls,
+        limit: int | ConcurrencyLimit,
+        *,
+        name: str | None = None,
+        tracer: Tracer | None = None,
+    ) -> Self:
+        """Create a ConcurrencyLimiter from a ConcurrencyLimit configuration.
+
+        Args:
+            limit: Either an int for simple limiting or a ConcurrencyLimit for full config.
+            name: Optional name for this limiter, used for observability.
+            tracer: OpenTelemetry tracer for span creation.
+
+        Returns:
+            A configured ConcurrencyLimiter.
+        """
+        if isinstance(limit, int):
+            return cls(max_running=limit, name=name, tracer=tracer)
+        else:
+            return cls(
+                max_running=limit.max_running,
+                max_queued=limit.max_queued,
+                name=name,
+                tracer=tracer,
+            )
+
+async def _limiter_context(limiter: AbstractConcurrencyLimiter, source: str) -> AsyncIterator[None]:
+    """Context manager that acquires and releases a limiter with the given source."""
+    await limiter.acquire(source)
+    try:
+        yield
+    finally:
+        limiter.release()
+
+def get_concurrency_context(
+    limiter: AbstractConcurrencyLimiter | None,
+    source: str = 'unnamed',
+) -> AbstractAsyncContextManager[None]:
+    """Get an async context manager for the concurrency limiter.
+
+    If limiter is None, returns a no-op context manager.
+
+    Args:
+        limiter: The AbstractConcurrencyLimiter or None.
+        source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+
+    Returns:
+        An async context manager.
+    """
+    if limiter is None:
+        return _null_context()
+    return _limiter_context(limiter, source)
+
+def normalize_to_limiter(
+    limit: AnyConcurrencyLimit,
+    *,
+    name: str | None = None,
+) -> AbstractConcurrencyLimiter | None:
+    """Normalize a concurrency limit configuration to an AbstractConcurrencyLimiter.
+
+    Args:
+        limit: The concurrency limit configuration.
+        name: Optional name for the limiter if one is created.
+
+    Returns:
+        An AbstractConcurrencyLimiter if limit is not None, otherwise None.
+    """
+    if limit is None:
+        return None
+    elif isinstance(limit, AbstractConcurrencyLimiter):
+        return limit
+    else:
+        return ConcurrencyLimiter.from_limit(limit, name=name)
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_model.py
+
+from pydantic_ai.models.wrapper import WrapperModel
+
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+    def id(self, value: str | None):
+        self._id = value
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class FileUrl(ABC):
+    """Abstract base class for any URL-based file."""
+
+    url: str
+    """The URL of the file."""
+
+    _: KW_ONLY
+
+    force_download: ForceDownloadMode = False
+    """Controls whether the file is downloaded and how SSRF protection is applied:
+
+    * If `False`, the URL is sent directly to providers that support it. For providers that don't,
+      the file is downloaded with SSRF protection (blocks private IPs and cloud metadata).
+    * If `True`, the file is always downloaded with SSRF protection (blocks private IPs and cloud metadata).
+    * If `'allow-local'`, the file is always downloaded, allowing private IPs but still blocking cloud metadata.
+    """
+
+    vendor_metadata: dict[str, Any] | None = None
+    """Vendor-specific metadata for the file.
+
+    Supported by:
+    - `GoogleModel`: `VideoUrl.vendor_metadata` is used as `video_metadata`: https://ai.google.dev/gemini-api/docs/video-understanding#customize-video-processing
+    - `OpenAIChatModel`, `OpenAIResponsesModel`: `ImageUrl.vendor_metadata['detail']` is used as `detail` setting for images
+    - `XaiModel`: `ImageUrl.vendor_metadata['detail']` is used as `detail` setting for images
+    """
+
+    _media_type: Annotated[str | None, pydantic.Field(alias='media_type', default=None, exclude=True)] = field(
+        compare=False, default=None
+    )
+
+    _identifier: Annotated[str | None, pydantic.Field(alias='identifier', default=None, exclude=True)] = field(
+        compare=False, default=None
+    )
+
+    # `pydantic_dataclass` replaces `__init__` so this method is never used.
+    # The signature is kept so that pyright/IDE hints recognize the `media_type` and `identifier` aliases.
+    def __init__(
+        self,
+        url: str,
+        *,
+        media_type: str | None = None,
+        identifier: str | None = None,
+        force_download: ForceDownloadMode = False,
+        vendor_metadata: dict[str, Any] | None = None,
+        # Required for inline-snapshot which expects all dataclass `__init__` methods to take all field names as kwargs.
+        _media_type: str | None = None,
+        _identifier: str | None = None,
+    ) -> None: ...  # pragma: no cover
+
+    @pydantic.computed_field
+    @property
+    def media_type(self) -> str:
+        """Return the media type of the file, based on the URL or the provided `media_type`."""
+        return self._media_type or self._infer_media_type()
+
+    @pydantic.computed_field
+    @property
+    def identifier(self) -> str:
+        """The identifier of the file, such as a unique ID.
+
+        This identifier can be provided to the model in a message to allow it to refer to this file in a tool call argument,
+        and the tool can look up the file in question by iterating over the message history and finding the matching `FileUrl`.
+
+        This identifier is only automatically passed to the model when the `FileUrl` is returned by a tool.
+        If you're passing the `FileUrl` as a user message, it's up to you to include a separate text part with the identifier,
+        e.g. "This is file <identifier>:" preceding the `FileUrl`.
+
+        It's also included in inline-text delimiters for providers that require inlining text documents, so the model can
+        distinguish multiple files.
+        """
+        return self._identifier or _multi_modal_content_identifier(self.url)
+
+    @abstractmethod
+    def _infer_media_type(self) -> str:
+        """Infer the media type of the file based on the URL."""
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def format(self) -> str:
+        """The file format."""
+        raise NotImplementedError
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    def format(self) -> str:
+        """The file format."""
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/models/concurrency.py
+
+class ConcurrencyLimitedModel(WrapperModel):
+    """A model wrapper that limits concurrent requests to the underlying model.
+
+    This wrapper applies concurrency limiting at the model level, ensuring that
+    the number of concurrent requests to the model does not exceed the configured
+    limit. This is useful for:
+
+    - Respecting API rate limits
+    - Managing resource usage
+    - Sharing a concurrency pool across multiple models
+
+    Example usage:
+    ```python
+    from pydantic_ai import Agent
+    from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+    # Limit to 5 concurrent requests
+    model = ConcurrencyLimitedModel('openai:gpt-4o', limiter=5)
+    agent = Agent(model)
+
+    # Or share a limiter across multiple models
+    from pydantic_ai import ConcurrencyLimiter  # noqa E402
+
+    shared_limiter = ConcurrencyLimiter(max_running=10, name='openai-pool')
+    model1 = ConcurrencyLimitedModel('openai:gpt-4o', limiter=shared_limiter)
+    model2 = ConcurrencyLimitedModel('openai:gpt-4o-mini', limiter=shared_limiter)
+    ```
+    """
+
+    _limiter: AbstractConcurrencyLimiter
+
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        limiter: int | ConcurrencyLimit | AbstractConcurrencyLimiter,
+    ):
+        """Initialize the ConcurrencyLimitedModel.
+
+        Args:
+            wrapped: The model to wrap, either a Model instance or a known model name.
+            limiter: The concurrency limit configuration. Can be:
+                - An `int`: Simple limit on concurrent operations (unlimited queue).
+                - A `ConcurrencyLimit`: Full configuration with optional backpressure.
+                - An `AbstractConcurrencyLimiter`: A pre-created limiter for sharing across models.
+        """
+        super().__init__(wrapped)
+        if isinstance(limiter, AbstractConcurrencyLimiter):
+            self._limiter = limiter
+        else:
+            self._limiter = ConcurrencyLimiter.from_limit(limiter)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        """Make a request to the model with concurrency limiting."""
+        async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+            return await self.wrapped.request(messages, model_settings, model_request_parameters)
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> RequestUsage:
+        """Count tokens with concurrency limiting."""
+        async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+            return await self.wrapped.count_tokens(messages, model_settings, model_request_parameters)
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        """Make a streaming request to the model with concurrency limiting."""
+        async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+            async with self.wrapped.request_stream(
+                messages, model_settings, model_request_parameters, run_context
+            ) as response_stream:
+                yield response_stream
+
+def limit_model_concurrency(
+    model: Model | KnownModelName,
+    limiter: AnyConcurrencyLimit,
+) -> Model:
+    """Wrap a model with concurrency limiting.
+
+    This is a convenience function to wrap a model with concurrency limiting.
+    If the limiter is None, the model is returned unchanged.
+
+    Args:
+        model: The model to wrap.
+        limiter: The concurrency limit configuration.
+
+    Returns:
+        The wrapped model with concurrency limiting, or the original model if limiter is None.
+
+    Example:
+    ```python
+    from pydantic_ai.models.concurrency import limit_model_concurrency
+
+    model = limit_model_concurrency('openai:gpt-4o', limiter=5)
+    ```
+    """
+    normalized_limiter = normalize_to_limiter(limiter)
+    if normalized_limiter is None:
+        from . import infer_model
+
+        return infer_model(model) if isinstance(model, str) else model
+    return ConcurrencyLimitedModel(model, normalized_limiter)
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class TestModel(Model):
+    """A model specifically for testing purposes.
+
+    This will (by default) call all tools in the agent, then return a tool response if possible,
+    otherwise a plain response.
+
+    How useful this model is will vary significantly.
+
+    Apart from `__init__` derived by the `dataclass` decorator, all methods are private or match those
+    of the base class.
+    """
+
+    # NOTE: Avoid test discovery by pytest.
+    __test__ = False
+
+    call_tools: list[str] | Literal['all'] = 'all'
+    """List of tools to call. If `'all'`, all tools will be called."""
+    custom_output_text: str | None = None
+    """If set, this text is returned as the final output."""
+    custom_output_args: Any | None = None
+    """If set, these args will be passed to the output tool."""
+    seed: int = 0
+    """Seed for generating random data."""
+    last_model_request_parameters: ModelRequestParameters | None = field(default=None, init=False)
+    """The last ModelRequestParameters passed to the model in a request.
+
+    The ModelRequestParameters contains information about the function and output tools available during request handling.
+
+    This is set when a request is made, so will reflect the function tools from the last step of the last run.
+    """
+    _model_name: str = field(default='test', repr=False)
+    _system: str = field(default='test', repr=False)
+
+    def __init__(
+        self,
+        *,
+        call_tools: list[str] | Literal['all'] = 'all',
+        custom_output_text: str | None = None,
+        custom_output_args: Any | None = None,
+        seed: int = 0,
+        model_name: str = 'test',
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize TestModel with optional settings and profile."""
+        self.call_tools = call_tools
+        self.custom_output_text = custom_output_text
+        self.custom_output_args = custom_output_args
+        self.seed = seed
+        self.last_model_request_parameters = None
+        self._model_name = model_name
+        self._system = 'test'
+        super().__init__(settings=settings, profile=profile)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        model_response.usage = _estimate_usage([*messages, model_response])
+        return model_response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        yield TestStreamedResponse(
+            model_request_parameters=model_request_parameters,
+            _model_name=self._model_name,
+            _structured_response=model_response,
+            _messages=messages,
+            _provider_name=self._system,
+        )
+
+    @property
+    def model_name(self) -> str:
+        """The model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The model provider."""
+        return self._system
+
+    @classmethod
+    def supported_builtin_tools(cls) -> frozenset[type[AbstractBuiltinTool]]:
+        """TestModel supports all builtin tools for testing flexibility."""
+        return SUPPORTED_BUILTIN_TOOLS
+
+    def gen_tool_args(self, tool_def: ToolDefinition) -> Any:
+        return _JsonSchemaTestData(tool_def.parameters_json_schema, self.seed).generate()
+
+    def _get_tool_calls(self, model_request_parameters: ModelRequestParameters) -> list[tuple[str, ToolDefinition]]:
+        if self.call_tools == 'all':
+            return [(r.name, r) for r in model_request_parameters.function_tools]
+        else:
+            function_tools_lookup = {t.name: t for t in model_request_parameters.function_tools}
+            tools_to_call = (function_tools_lookup[name] for name in self.call_tools)
+            return [(r.name, r) for r in tools_to_call]
+
+    def _get_output(self, model_request_parameters: ModelRequestParameters) -> _WrappedTextOutput | _WrappedToolOutput:
+        if self.custom_output_text is not None:
+            assert model_request_parameters.output_mode != 'tool', (
+                'Plain response not allowed, but `custom_output_text` is set.'
+            )
+            assert self.custom_output_args is None, 'Cannot set both `custom_output_text` and `custom_output_args`.'
+            return _WrappedTextOutput(self.custom_output_text)
+        elif self.custom_output_args is not None:
+            assert model_request_parameters.output_tools is not None, (
+                'No output tools provided, but `custom_output_args` is set.'
+            )
+            output_tool = model_request_parameters.output_tools[0]
+
+            if k := output_tool.outer_typed_dict_key:
+                return _WrappedToolOutput({k: self.custom_output_args})
+            else:
+                return _WrappedToolOutput(self.custom_output_args)
+        elif model_request_parameters.allow_text_output:
+            return _WrappedTextOutput(None)
+        elif model_request_parameters.output_tools:
+            return _WrappedToolOutput(None)
+        else:
+            return _WrappedTextOutput(None)
+
+    def _request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        if model_request_parameters.builtin_tools:
+            raise UserError('TestModel does not support built-in tools')
+
+        tool_calls = self._get_tool_calls(model_request_parameters)
+        output_wrapper = self._get_output(model_request_parameters)
+        output_tools = model_request_parameters.output_tools
+
+        # if there are tools, the first thing we want to do is call all of them
+        if tool_calls and not any(isinstance(m, ModelResponse) for m in messages):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(name, self.gen_tool_args(args), tool_call_id=f'pyd_ai_tool_call_id__{name}')
+                    for name, args in tool_calls
+                ],
+                model_name=self._model_name,
+            )
+
+        if messages:  # pragma: no branch
+            last_message = messages[-1]
+            assert isinstance(last_message, ModelRequest), 'Expected last message to be a `ModelRequest`.'
+
+            # check if there are any retry prompts, if so retry them
+            new_retry_names = {p.tool_name for p in last_message.parts if isinstance(p, RetryPromptPart)}
+            if new_retry_names:
+                # Handle retries for both function tools and output tools
+                # Check function tools first
+                retry_parts: list[ModelResponsePart] = [
+                    ToolCallPart(name, self.gen_tool_args(args)) for name, args in tool_calls if name in new_retry_names
+                ]
+                # Check output tools
+                if output_tools:
+                    retry_parts.extend(
+                        [
+                            ToolCallPart(
+                                tool.name,
+                                output_wrapper.value
+                                if isinstance(output_wrapper, _WrappedToolOutput) and output_wrapper.value is not None
+                                else self.gen_tool_args(tool),
+                                tool_call_id=f'pyd_ai_tool_call_id__{tool.name}',
+                            )
+                            for tool in output_tools
+                            if tool.name in new_retry_names
+                        ]
+                    )
+                return ModelResponse(parts=retry_parts, model_name=self._model_name)
+
+        if isinstance(output_wrapper, _WrappedTextOutput):
+            if (response_text := output_wrapper.value) is None:
+                # build up details of tool responses
+                output: dict[str, Any] = {}
+                for message in messages:
+                    if isinstance(message, ModelRequest):
+                        for part in message.parts:
+                            if isinstance(part, ToolReturnPart):
+                                output[part.tool_name] = part.content
+                if output:
+                    return ModelResponse(
+                        parts=[TextPart(pydantic_core.to_json(output).decode())], model_name=self._model_name
+                    )
+                else:
+                    return ModelResponse(parts=[TextPart('success (no tool calls)')], model_name=self._model_name)
+            else:
+                return ModelResponse(parts=[TextPart(response_text)], model_name=self._model_name)
+        else:
+            assert output_tools, 'No output tools provided'
+            custom_output_args = output_wrapper.value
+            output_tool = output_tools[self.seed % len(output_tools)]
+            if custom_output_args is not None:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            custom_output_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+            else:
+                response_args = self.gen_tool_args(output_tool)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            response_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+
+## pydantic_evals/pydantic_evals/reporting/__init__.py
+
+class _ValueRenderer:
+    value_formatter: str | Callable[[Any], str] = '{}'
+    diff_checker: Callable[[Any, Any], bool] | None = lambda x, y: x != y
+    diff_formatter: Callable[[Any, Any], str | None] | None = None
+    diff_style: str = 'magenta'
+
+    @staticmethod
+    def from_config(config: RenderValueConfig) -> _ValueRenderer:
+        return _ValueRenderer(
+            value_formatter=config.get('value_formatter', '{}'),
+            diff_checker=config.get('diff_checker', lambda x, y: x != y),
+            diff_formatter=config.get('diff_formatter'),
+            diff_style=config.get('diff_style', 'magenta'),
+        )
+
+    def render_value(self, name: str | None, v: Any) -> str:
+        result = self._get_value_str(v)
+        if name:
+            result = f'{name}: {result}'
+        return result
+
+    def render_diff(self, name: str | None, old: Any | None, new: Any | None) -> str:
+        old_str = self._get_value_str(old) or MISSING_VALUE_STR
+        new_str = self._get_value_str(new) or MISSING_VALUE_STR
+        if old_str == new_str:
+            result = old_str
+        else:
+            result = f'{old_str} → {new_str}'
+
+            has_diff = self.diff_checker and self.diff_checker(old, new)
+            if has_diff:  # pragma: no branch
+                # If there is a diff, make the name bold and compute the diff_str
+                name = name and f'[bold]{name}[/]'
+                diff_str = self.diff_formatter and self.diff_formatter(old, new)
+                if diff_str:  # pragma: no cover
+                    result += f' ({diff_str})'
+                result = f'[{self.diff_style}]{result}[/]'
+
+        # Add the name
+        if name:
+            result = f'{name}: {result}'
+
+        return result
+
+    def _get_value_str(self, value: Any) -> str:
+        if value is None:
+            return MISSING_VALUE_STR
+        if isinstance(self.value_formatter, str):
+            return self.value_formatter.format(value)
+        else:
+            return self.value_formatter(value)
+
+    def render_value(self, name: str | None, v: Any) -> str:
+        result = self._get_value_str(v)
+        if name:
+            result = f'{name}: {result}'
+        return result
+
+    def _get_value_str(self, value: Any) -> str:
+        if value is None:
+            return MISSING_VALUE_STR
+        if isinstance(self.value_formatter, str):
+            return self.value_formatter.format(value)
+        else:
+            return self.value_formatter(value)
+
+    def render_value(self, name: str | None, v: float | int) -> str:
+        result = self._get_value_str(v)
+        if name:
+            result = f'{name}: {result}'
+        return result
+
+    def _get_value_str(self, value: float | int | None) -> str:
+        if value is None:
+            return MISSING_VALUE_STR
+        if isinstance(self.value_formatter, str):
+            return self.value_formatter.format(value)
+        else:
+            return self.value_formatter(value)
+
+## pydantic_graph/pydantic_graph/beta/graph.py
+
+    def value(self) -> OutputT:
+        return self._value
+
+## pydantic_graph/pydantic_graph/beta/util.py
+
+class Some(Generic[T]):
+    """Container for explicitly present values in Maybe type pattern.
+
+    This class represents a value that is definitely present, as opposed to None.
+    It's part of the Maybe pattern, similar to Option/Maybe in functional programming,
+    allowing distinction between "no value" (None) and "value is None" (Some(None)).
+    """
+
+    value: T
+    """The wrapped value."""
+
+## tests/test_concurrency.py
+
+class TestAgentWithSharedLimiter:
+    """Tests for agent with shared ConcurrencyLimiter."""
+
+    async def test_agent_with_shared_limiter(self):
+        """Test that agents can share a ConcurrencyLimiter."""
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        agent1 = Agent(TestModel(), max_concurrency=shared_limiter)
+        agent2 = Agent(TestModel(), max_concurrency=shared_limiter)
+
+        # Both agents should share the same limiter
+        assert agent1._concurrency_limiter is agent2._concurrency_limiter
+
+    async def test_agent_with_shared_limiter(self):
+        """Test that agents can share a ConcurrencyLimiter."""
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        agent1 = Agent(TestModel(), max_concurrency=shared_limiter)
+        agent2 = Agent(TestModel(), max_concurrency=shared_limiter)
+
+        # Both agents should share the same limiter
+        assert agent1._concurrency_limiter is agent2._concurrency_limiter
+
+class TestConcurrencyLimiterName:
+    """Tests for ConcurrencyLimiter name parameter."""
+
+    async def test_limiter_with_name(self):
+        """Test that limiter name is properly set and accessible."""
+        limiter = ConcurrencyLimiter(max_running=5, name='my-limiter')
+        assert limiter.name == 'my-limiter'
+
+    async def test_limiter_without_name(self):
+        """Test that limiter name is None by default."""
+        limiter = ConcurrencyLimiter(max_running=5)
+        assert limiter.name is None
+
+    async def test_from_limit_with_name(self):
+        """Test creating limiter from limit with name."""
+        limiter = ConcurrencyLimiter.from_limit(5, name='my-limit')
+        assert limiter.name == 'my-limit'
+        assert limiter.max_running == 5
+
+    @pytest.mark.skipif(not logfire_installed, reason='logfire not installed')
+    async def test_named_limiter_waiting_adds_limiter_name_attribute(self, capfire: CaptureLogfire):
+        """Test that waiting with a named limiter adds limiter_name to span attributes."""
+        limiter = ConcurrencyLimiter(max_running=1, name='test-pool')
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test-source'):
+                await hold.wait()
+
+        # Start a waiter - this will trigger the span with limiter_name attribute
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test-source'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            # Start holder to occupy the slot
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span was created with the correct attributes
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for test-pool concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'test-source'
+        assert attrs['limiter_name'] == 'test-pool'
+        assert attrs['max_running'] == 1
+        assert 'waiting_count' in attrs
+
+    @pytest.mark.skipif(not logfire_installed, reason='logfire not installed')
+    async def test_unnamed_limiter_waiting_uses_source_in_span_name(self, capfire: CaptureLogfire):
+        """Test that waiting without a limiter name uses source for span name."""
+        limiter = ConcurrencyLimiter(max_running=1)  # No name
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span uses source in name when limiter has no name
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for model:gpt-4 concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'model:gpt-4'
+        assert 'limiter_name' not in attrs  # Should not be present when name is None
+        assert attrs['max_running'] == 1
+
+    @pytest.mark.skipif(not logfire_installed, reason='logfire not installed')
+    async def test_limiter_with_max_queued_includes_attribute_in_span(self, capfire: CaptureLogfire):
+        """Test that max_queued is included in span attributes when set."""
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=5, name='queued-pool')
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify max_queued is in span attributes
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        attrs = spans[0]['attributes']
+        assert attrs['max_queued'] == 5
+
+class TestConcurrencyLimiterWithTracer:
+    """Tests for ConcurrencyLimiter with custom tracer."""
+
+    async def test_custom_tracer_is_stored(self):
+        """Test that custom tracer is stored and returned by _get_tracer."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter(max_running=5, tracer=custom_tracer)
+
+        # Verify the tracer is stored and returned
+        assert limiter._get_tracer() is custom_tracer
+
+    async def test_from_limit_with_tracer(self):
+        """Test that from_limit passes tracer to the created limiter."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter.from_limit(5, tracer=custom_tracer)
+        assert limiter._get_tracer() is custom_tracer

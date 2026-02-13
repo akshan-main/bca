@@ -1,0 +1,853 @@
+## httpx/_content.py
+
+class ByteStream(AsyncByteStream, SyncByteStream):
+    def __init__(self, stream: bytes) -> None:
+        self._stream = stream
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self._stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield self._stream
+
+class IteratorByteStream(SyncByteStream):
+    CHUNK_SIZE = 65_536
+
+    def __init__(self, stream: Iterable[bytes]) -> None:
+        self._stream = stream
+        self._is_stream_consumed = False
+        self._is_generator = inspect.isgenerator(stream)
+
+    def __iter__(self) -> Iterator[bytes]:
+        if self._is_stream_consumed and self._is_generator:
+            raise StreamConsumed()
+
+        self._is_stream_consumed = True
+        if hasattr(self._stream, "read"):
+            # File-like interfaces should use 'read' directly.
+            chunk = self._stream.read(self.CHUNK_SIZE)
+            while chunk:
+                yield chunk
+                chunk = self._stream.read(self.CHUNK_SIZE)
+        else:
+            # Otherwise iterate.
+            for part in self._stream:
+                yield part
+
+class AsyncIteratorByteStream(AsyncByteStream):
+    CHUNK_SIZE = 65_536
+
+    def __init__(self, stream: AsyncIterable[bytes]) -> None:
+        self._stream = stream
+        self._is_stream_consumed = False
+        self._is_generator = inspect.isasyncgen(stream)
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        if self._is_stream_consumed and self._is_generator:
+            raise StreamConsumed()
+
+        self._is_stream_consumed = True
+        if hasattr(self._stream, "aread"):
+            # File-like interfaces should use 'aread' directly.
+            chunk = await self._stream.aread(self.CHUNK_SIZE)
+            while chunk:
+                yield chunk
+                chunk = await self._stream.aread(self.CHUNK_SIZE)
+        else:
+            # Otherwise iterate.
+            async for part in self._stream:
+                yield part
+
+class UnattachedStream(AsyncByteStream, SyncByteStream):
+    """
+    If a request or response is serialized using pickle, then it is no longer
+    attached to a stream for I/O purposes. Any stream operations should result
+    in `httpx.StreamClosed`.
+    """
+
+    def __iter__(self) -> Iterator[bytes]:
+        raise StreamClosed()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        raise StreamClosed()
+        yield b""  # pragma: no cover
+
+def encode_urlencoded_data(
+    data: RequestData,
+) -> tuple[dict[str, str], ByteStream]:
+    plain_data = []
+    for key, value in data.items():
+        if isinstance(value, (list, tuple)):
+            plain_data.extend([(key, primitive_value_to_str(item)) for item in value])
+        else:
+            plain_data.append((key, primitive_value_to_str(value)))
+    body = urlencode(plain_data, doseq=True).encode("utf-8")
+    content_length = str(len(body))
+    content_type = "application/x-www-form-urlencoded"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+def encode_multipart_data(
+    data: RequestData, files: RequestFiles, boundary: bytes | None
+) -> tuple[dict[str, str], MultipartStream]:
+    multipart = MultipartStream(data=data, files=files, boundary=boundary)
+    headers = multipart.get_headers()
+    return headers, multipart
+
+def encode_text(text: str) -> tuple[dict[str, str], ByteStream]:
+    body = text.encode("utf-8")
+    content_length = str(len(body))
+    content_type = "text/plain; charset=utf-8"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+def encode_json(json: Any) -> tuple[dict[str, str], ByteStream]:
+    body = json_dumps(
+        json, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    content_length = str(len(body))
+    content_type = "application/json"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+def encode_response(
+    content: ResponseContent | None = None,
+    text: str | None = None,
+    html: str | None = None,
+    json: Any | None = None,
+) -> tuple[dict[str, str], SyncByteStream | AsyncByteStream]:
+    """
+    Handles encoding the given `content`, returning a two-tuple of
+    (<headers>, <stream>).
+    """
+    if content is not None:
+        return encode_content(content)
+    elif text is not None:
+        return encode_text(text)
+    elif html is not None:
+        return encode_html(html)
+    elif json is not None:
+        return encode_json(json)
+
+    return {}, ByteStream(b"")
+
+## httpx/_models.py
+
+def _parse_content_type_charset(content_type: str) -> str | None:
+    # We used to use `cgi.parse_header()` here, but `cgi` became a dead battery.
+    # See: https://peps.python.org/pep-0594/#cgi
+    msg = email.message.Message()
+    msg["content-type"] = content_type
+    return msg.get_content_charset(failobj=None)
+
+def _obfuscate_sensitive_headers(
+    items: typing.Iterable[tuple[typing.AnyStr, typing.AnyStr]],
+) -> typing.Iterator[tuple[typing.AnyStr, typing.AnyStr]]:
+    for k, v in items:
+        if to_str(k.lower()) in SENSITIVE_HEADERS:
+            v = to_bytes_or_str("[secure]", match_type_of=v)
+        yield k, v
+
+    def keys(self) -> typing.KeysView[str]:
+        return {key.decode(self.encoding): None for _, key, value in self._list}.keys()
+
+    def values(self) -> typing.ValuesView[str]:
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.values()
+
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return `(key, value)` items of headers. Concatenate headers
+        into a single comma separated value when a key occurs multiple times.
+        """
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.items()
+
+    def update(self, headers: HeaderTypes | None = None) -> None:  # type: ignore
+        headers = Headers(headers)
+        for key in headers.keys():
+            if key in self:
+                self.pop(key)
+        self._list.extend(headers._list)
+
+    def copy(self) -> Headers:
+        return Headers(self, encoding=self.encoding)
+
+    def __init__(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        stream: SyncByteStream | AsyncByteStream | None = None,
+        extensions: RequestExtensions | None = None,
+    ) -> None:
+        self.method = method.upper()
+        self.url = URL(url) if params is None else URL(url, params=params)
+        self.headers = Headers(headers)
+        self.extensions = {} if extensions is None else dict(extensions)
+
+        if cookies:
+            Cookies(cookies).set_cookie_header(self)
+
+        if stream is None:
+            content_type: str | None = self.headers.get("content-type")
+            headers, stream = encode_request(
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                boundary=get_multipart_boundary_from_content_type(
+                    content_type=content_type.encode(self.headers.encoding)
+                    if content_type
+                    else None
+                ),
+            )
+            self._prepare(headers)
+            self.stream = stream
+            # Load the request body, except for streaming content.
+            if isinstance(stream, ByteStream):
+                self.read()
+        else:
+            # There's an important distinction between `Request(content=...)`,
+            # and `Request(stream=...)`.
+            #
+            # Using `content=...` implies automatically populated `Host` and content
+            # headers, of either `Content-Length: ...` or `Transfer-Encoding: chunked`.
+            #
+            # Using `stream=...` will not automatically include *any*
+            # auto-populated headers.
+            #
+            # As an end-user you don't really need `stream=...`. It's only
+            # useful when:
+            #
+            # * Preserving the request stream when copying requests, eg for redirects.
+            # * Creating request instances on the *server-side* of the transport API.
+            self.stream = stream
+
+    def read(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.Iterable)
+            self._content = b"".join(self.stream)
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.AsyncIterable)
+            self._content = b"".join([part async for part in self.stream])
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    def iter_bytes(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
+        """
+        A byte-iterator over the decoded response content.
+        This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+        """
+        if hasattr(self, "_content"):
+            chunk_size = len(self._content) if chunk_size is None else chunk_size
+            for i in range(0, len(self._content), max(chunk_size, 1)):
+                yield self._content[i : i + chunk_size]
+        else:
+            decoder = self._get_content_decoder()
+            chunker = ByteChunker(chunk_size=chunk_size)
+            with request_context(request=self._request):
+                for raw_bytes in self.iter_raw():
+                    decoded = decoder.decode(raw_bytes)
+                    for chunk in chunker.decode(decoded):
+                        yield chunk
+                decoded = decoder.flush()
+                for chunk in chunker.decode(decoded):
+                    yield chunk  # pragma: no cover
+                for chunk in chunker.flush():
+                    yield chunk
+
+    def iter_text(self, chunk_size: int | None = None) -> typing.Iterator[str]:
+        """
+        A str-iterator over the decoded response content
+        that handles both gzip, deflate, etc but also detects the content's
+        string encoding.
+        """
+        decoder = TextDecoder(encoding=self.encoding or "utf-8")
+        chunker = TextChunker(chunk_size=chunk_size)
+        with request_context(request=self._request):
+            for byte_content in self.iter_bytes():
+                text_content = decoder.decode(byte_content)
+                for chunk in chunker.decode(text_content):
+                    yield chunk
+            text_content = decoder.flush()
+            for chunk in chunker.decode(text_content):
+                yield chunk  # pragma: no cover
+            for chunk in chunker.flush():
+                yield chunk
+
+    def iter_lines(self) -> typing.Iterator[str]:
+        decoder = LineDecoder()
+        with request_context(request=self._request):
+            for text in self.iter_text():
+                for line in decoder.decode(text):
+                    yield line
+            for line in decoder.flush():
+                yield line
+
+    def iter_raw(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
+        """
+        A byte-iterator over the raw response content.
+        """
+        if self.is_stream_consumed:
+            raise StreamConsumed()
+        if self.is_closed:
+            raise StreamClosed()
+        if not isinstance(self.stream, SyncByteStream):
+            raise RuntimeError("Attempted to call a sync iterator on an async stream.")
+
+        self.is_stream_consumed = True
+        self._num_bytes_downloaded = 0
+        chunker = ByteChunker(chunk_size=chunk_size)
+
+        with request_context(request=self._request):
+            for raw_stream_bytes in self.stream:
+                self._num_bytes_downloaded += len(raw_stream_bytes)
+                for chunk in chunker.decode(raw_stream_bytes):
+                    yield chunk
+
+        for chunk in chunker.flush():
+            yield chunk
+
+        self.close()
+
+    async def aiter_bytes(
+        self, chunk_size: int | None = None
+    ) -> typing.AsyncIterator[bytes]:
+        """
+        A byte-iterator over the decoded response content.
+        This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+        """
+        if hasattr(self, "_content"):
+            chunk_size = len(self._content) if chunk_size is None else chunk_size
+            for i in range(0, len(self._content), max(chunk_size, 1)):
+                yield self._content[i : i + chunk_size]
+        else:
+            decoder = self._get_content_decoder()
+            chunker = ByteChunker(chunk_size=chunk_size)
+            with request_context(request=self._request):
+                async for raw_bytes in self.aiter_raw():
+                    decoded = decoder.decode(raw_bytes)
+                    for chunk in chunker.decode(decoded):
+                        yield chunk
+                decoded = decoder.flush()
+                for chunk in chunker.decode(decoded):
+                    yield chunk  # pragma: no cover
+                for chunk in chunker.flush():
+                    yield chunk
+
+    async def aiter_text(
+        self, chunk_size: int | None = None
+    ) -> typing.AsyncIterator[str]:
+        """
+        A str-iterator over the decoded response content
+        that handles both gzip, deflate, etc but also detects the content's
+        string encoding.
+        """
+        decoder = TextDecoder(encoding=self.encoding or "utf-8")
+        chunker = TextChunker(chunk_size=chunk_size)
+        with request_context(request=self._request):
+            async for byte_content in self.aiter_bytes():
+                text_content = decoder.decode(byte_content)
+                for chunk in chunker.decode(text_content):
+                    yield chunk
+            text_content = decoder.flush()
+            for chunk in chunker.decode(text_content):
+                yield chunk  # pragma: no cover
+            for chunk in chunker.flush():
+                yield chunk
+
+    async def aiter_raw(
+        self, chunk_size: int | None = None
+    ) -> typing.AsyncIterator[bytes]:
+        """
+        A byte-iterator over the raw response content.
+        """
+        if self.is_stream_consumed:
+            raise StreamConsumed()
+        if self.is_closed:
+            raise StreamClosed()
+        if not isinstance(self.stream, AsyncByteStream):
+            raise RuntimeError("Attempted to call an async iterator on a sync stream.")
+
+        self.is_stream_consumed = True
+        self._num_bytes_downloaded = 0
+        chunker = ByteChunker(chunk_size=chunk_size)
+
+        with request_context(request=self._request):
+            async for raw_stream_bytes in self.stream:
+                self._num_bytes_downloaded += len(raw_stream_bytes)
+                for chunk in chunker.decode(raw_stream_bytes):
+                    yield chunk
+
+        for chunk in chunker.flush():
+            yield chunk
+
+        await self.aclose()
+
+    def extract_cookies(self, response: Response) -> None:
+        """
+        Loads any cookies based on the response `Set-Cookie` headers.
+        """
+        urllib_response = self._CookieCompatResponse(response)
+        urllib_request = self._CookieCompatRequest(response.request)
+
+        self.jar.extract_cookies(urllib_response, urllib_request)  # type: ignore
+
+    def set(self, name: str, value: str, domain: str = "", path: str = "/") -> None:
+        """
+        Set a cookie value by name. May optionally include domain and path.
+        """
+        kwargs = {
+            "version": 0,
+            "name": name,
+            "value": value,
+            "port": None,
+            "port_specified": False,
+            "domain": domain,
+            "domain_specified": bool(domain),
+            "domain_initial_dot": domain.startswith("."),
+            "path": path,
+            "path_specified": bool(path),
+            "secure": False,
+            "expires": None,
+            "discard": True,
+            "comment": None,
+            "comment_url": None,
+            "rest": {"HttpOnly": None},
+            "rfc2109": False,
+        }
+        cookie = Cookie(**kwargs)  # type: ignore
+        self.jar.set_cookie(cookie)
+
+    class _CookieCompatRequest(urllib.request.Request):
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
+
+        def __init__(self, request: Request) -> None:
+            super().__init__(
+                url=str(request.url),
+                headers=dict(request.headers),
+                method=request.method,
+            )
+            self.request = request
+
+        def add_unredirected_header(self, key: str, value: str) -> None:
+            super().add_unredirected_header(key, value)
+            self.request.headers[key] = value
+
+    class _CookieCompatResponse:
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
+
+        def __init__(self, response: Response) -> None:
+            self.response = response
+
+        def info(self) -> email.message.Message:
+            info = email.message.Message()
+            for key, value in self.response.headers.multi_items():
+                # Note that setting `info[key]` here is an "append" operation,
+                # not a "replace" operation.
+                # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
+                info[key] = value
+            return info
+
+## tests/test_content.py
+
+async def test_empty_content():
+    request = httpx.Request(method, url)
+    assert isinstance(request.stream, httpx.SyncByteStream)
+    assert isinstance(request.stream, httpx.AsyncByteStream)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "0"}
+    assert sync_content == b""
+    assert async_content == b""
+
+async def test_bytes_content():
+    request = httpx.Request(method, url, content=b"Hello, world!")
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+    assert sync_content == b"Hello, world!"
+    assert async_content == b"Hello, world!"
+
+    # Support 'data' for compat with requests.
+    with pytest.warns(DeprecationWarning):
+        request = httpx.Request(method, url, data=b"Hello, world!")  # type: ignore
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+    assert sync_content == b"Hello, world!"
+    assert async_content == b"Hello, world!"
+
+async def test_bytesio_content():
+    request = httpx.Request(method, url, content=io.BytesIO(b"Hello, world!"))
+    assert isinstance(request.stream, typing.Iterable)
+    assert not isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+    assert content == b"Hello, world!"
+
+async def test_iterator_content():
+    def hello_world() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    request = httpx.Request(method, url, content=hello_world())
+    assert isinstance(request.stream, typing.Iterable)
+    assert not isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        list(request.stream)
+
+    # Support 'data' for compat with requests.
+    with pytest.warns(DeprecationWarning):
+        request = httpx.Request(method, url, data=hello_world())  # type: ignore
+    assert isinstance(request.stream, typing.Iterable)
+    assert not isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+async def test_aiterator_content():
+    async def hello_world() -> typing.AsyncIterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    request = httpx.Request(method, url, content=hello_world())
+    assert not isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        [part async for part in request.stream]
+
+    # Support 'data' for compat with requests.
+    with pytest.warns(DeprecationWarning):
+        request = httpx.Request(method, url, data=hello_world())  # type: ignore
+    assert not isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+async def test_json_content():
+    request = httpx.Request(method, url, json={"Hello": "world!"})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "18",
+        "Content-Type": "application/json",
+    }
+    assert sync_content == b'{"Hello":"world!"}'
+    assert async_content == b'{"Hello":"world!"}'
+
+async def test_urlencoded_content():
+    request = httpx.Request(method, url, data={"Hello": "world!"})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "14",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"Hello=world%21"
+    assert async_content == b"Hello=world%21"
+
+async def test_urlencoded_boolean():
+    request = httpx.Request(method, url, data={"example": True})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "12",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"example=true"
+    assert async_content == b"example=true"
+
+async def test_urlencoded_none():
+    request = httpx.Request(method, url, data={"example": None})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "8",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"example="
+    assert async_content == b"example="
+
+async def test_urlencoded_list():
+    request = httpx.Request(method, url, data={"example": ["a", 1, True]})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "32",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    assert sync_content == b"example=a&example=1&example=true"
+    assert async_content == b"example=a&example=1&example=true"
+
+async def test_multipart_files_content():
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"Content-Type": "multipart/form-data; boundary=+++"}
+    request = httpx.Request(
+        method,
+        url,
+        files=files,
+        headers=headers,
+    )
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "138",
+        "Content-Type": "multipart/form-data; boundary=+++",
+    }
+    assert sync_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+    assert async_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+
+async def test_multipart_data_and_files_content():
+    data = {"message": "Hello, world!"}
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"Content-Type": "multipart/form-data; boundary=+++"}
+    request = httpx.Request(method, url, data=data, files=files, headers=headers)
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "210",
+        "Content-Type": "multipart/form-data; boundary=+++",
+    }
+    assert sync_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="message"\r\n',
+            b"\r\n",
+            b"Hello, world!\r\n",
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+    assert async_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="message"\r\n',
+            b"\r\n",
+            b"Hello, world!\r\n",
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+
+async def test_empty_request():
+    request = httpx.Request(method, url, data={}, files={})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "0"}
+    assert sync_content == b""
+    assert async_content == b""
+
+async def test_response_empty_content():
+    response = httpx.Response(200)
+    assert isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(response.stream))
+    async_content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {}
+    assert sync_content == b""
+    assert async_content == b""
+
+async def test_response_bytes_content():
+    response = httpx.Response(200, content=b"Hello, world!")
+    assert isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(response.stream))
+    async_content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {"Content-Length": "13"}
+    assert sync_content == b"Hello, world!"
+    assert async_content == b"Hello, world!"
+
+async def test_response_iterator_content():
+    def hello_world() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    response = httpx.Response(200, content=hello_world())
+    assert isinstance(response.stream, typing.Iterable)
+    assert not isinstance(response.stream, typing.AsyncIterable)
+
+    content = b"".join(list(response.stream))
+
+    assert response.headers == {"Transfer-Encoding": "chunked"}
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        list(response.stream)
+
+async def test_response_aiterator_content():
+    async def hello_world() -> typing.AsyncIterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    response = httpx.Response(200, content=hello_world())
+    assert not isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {"Transfer-Encoding": "chunked"}
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        [part async for part in response.stream]
+
+def test_response_invalid_argument():
+    with pytest.raises(TypeError):
+        httpx.Response(200, content=123)  # type: ignore

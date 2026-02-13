@@ -1,0 +1,187 @@
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+def _clean_message_history(messages: list[_messages.ModelMessage]) -> list[_messages.ModelMessage]:
+    """Clean the message history by merging consecutive messages of the same type."""
+    clean_messages: list[_messages.ModelMessage] = []
+    for message in messages:
+        last_message = clean_messages[-1] if len(clean_messages) > 0 else None
+
+        if isinstance(message, _messages.ModelRequest):
+            if (
+                last_message
+                and isinstance(last_message, _messages.ModelRequest)
+                # Requests can only be merged if they have the same instructions
+                and (
+                    not last_message.instructions
+                    or not message.instructions
+                    or last_message.instructions == message.instructions
+                )
+            ):
+                parts = [*last_message.parts, *message.parts]
+                parts.sort(
+                    # Tool return parts always need to be at the start
+                    key=lambda x: 0 if isinstance(x, _messages.ToolReturnPart | _messages.RetryPromptPart) else 1
+                )
+                merged_message = _messages.ModelRequest(
+                    parts=parts,
+                    instructions=last_message.instructions or message.instructions,
+                    timestamp=message.timestamp or last_message.timestamp,
+                )
+                clean_messages[-1] = merged_message
+            else:
+                clean_messages.append(message)
+        elif isinstance(message, _messages.ModelResponse):  # pragma: no branch
+            if (
+                last_message
+                and isinstance(last_message, _messages.ModelResponse)
+                # Responses can only be merged if they didn't really come from an API
+                and last_message.provider_response_id is None
+                and last_message.provider_name is None
+                and last_message.model_name is None
+                and message.provider_response_id is None
+                and message.provider_name is None
+                and message.model_name is None
+            ):
+                merged_message = replace(last_message, parts=[*last_message.parts, *message.parts])
+                clean_messages[-1] = merged_message
+            else:
+                clean_messages.append(message)
+    return clean_messages
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_mcp_server.py
+
+class TemporalMCPServer(TemporalMCPToolset[AgentDepsT]):
+    def __init__(
+        self,
+        server: MCPServer,
+        *,
+        activity_name_prefix: str,
+        activity_config: ActivityConfig,
+        tool_activity_config: dict[str, ActivityConfig | Literal[False]],
+        deps_type: type[AgentDepsT],
+        run_context_type: type[TemporalRunContext[AgentDepsT]] = TemporalRunContext[AgentDepsT],
+    ):
+        super().__init__(
+            server,
+            activity_name_prefix=activity_name_prefix,
+            activity_config=activity_config,
+            tool_activity_config=tool_activity_config,
+            deps_type=deps_type,
+            run_context_type=run_context_type,
+        )
+
+    def tool_for_tool_def(self, tool_def: ToolDefinition) -> ToolsetTool[AgentDepsT]:
+        assert isinstance(self.wrapped, MCPServer)
+        return self.wrapped.tool_for_tool_def(tool_def)
+
+## tests/evals/test_report_evaluators.py
+
+def test_report_evaluator_build_serialization_arguments_excludes_defaults():
+    """ConfusionMatrixEvaluator with all defaults returns empty dict."""
+    evaluator = ConfusionMatrixEvaluator()
+    args = evaluator.build_serialization_arguments()
+    assert args == {}
+
+## tests/models/test_anthropic.py
+
+def test_cache_control_unsupported_param_type():
+    """Test that cache control raises error for unsupported param types."""
+    from unittest.mock import MagicMock
+
+    from pydantic_ai.exceptions import UserError
+    from pydantic_ai.models.anthropic import AnthropicModel
+
+    # Create a mock model instance
+    mock_client = MagicMock()
+    mock_client.__class__.__name__ = 'AsyncAnthropic'
+    mock_client.base_url = 'https://api.anthropic.com'
+    m = AnthropicModel('claude-haiku-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+
+    # Create a list with an unsupported param type (thinking)
+    params: list[dict[str, Any]] = [{'type': 'thinking', 'source': {'data': 'test'}}]
+
+    with pytest.raises(UserError, match='Cache control not supported for param type: thinking'):
+        m._add_cache_control_to_last_param(params)  # type: ignore[arg-type]  # Testing internal method
+
+## tests/models/test_google.py
+
+async def test_google_image_generation_auto_size_raises_error(google_provider: GoogleProvider) -> None:
+    """Test that 'auto' size raises an error for Google since it doesn't support intelligent size selection."""
+    model = GoogleModel('gemini-3-pro-image-preview', provider=google_provider)
+    params = ModelRequestParameters(builtin_tools=[ImageGenerationTool(size='auto')])
+
+    with pytest.raises(UserError, match='Google image generation only supports `size` values'):
+        model._get_tools(params)  # pyright: ignore[reportPrivateUsage]
+
+## tests/test_embeddings.py
+
+def test_infer_model_error():
+    with pytest.raises(ValueError, match='You must provide a provider prefix when specifying an embedding model name'):
+        infer_embedding_model('nonexistent')
+
+## tests/test_history_processor.py
+
+async def test_callable_class_history_processor_with_ctx_no_op(
+    function_model: FunctionModel, received_messages: list[ModelMessage]
+):
+    class NoOpHistoryProcessorWithCtx:
+        def __call__(self, _: RunContext, messages: list[ModelMessage]) -> list[ModelMessage]:
+            return messages
+
+    agent = Agent(function_model, history_processors=[NoOpHistoryProcessorWithCtx()])
+
+    message_history = [
+        ModelRequest(parts=[UserPromptPart(content='Previous question')]),
+        ModelResponse(parts=[TextPart(content='Previous answer')]),
+    ]
+
+    with capture_run_messages() as captured_messages:
+        result = await agent.run('New question', message_history=message_history)
+
+    assert received_messages == snapshot(
+        [
+            ModelRequest(parts=[UserPromptPart(content='Previous question', timestamp=IsDatetime())]),
+            ModelResponse(parts=[TextPart(content='Previous answer')], timestamp=IsDatetime()),
+            ModelRequest(
+                parts=[UserPromptPart(content='New question', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert captured_messages == result.all_messages()
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(parts=[UserPromptPart(content='Previous question', timestamp=IsDatetime())]),
+            ModelResponse(parts=[TextPart(content='Previous answer')], timestamp=IsDatetime()),
+            ModelRequest(
+                parts=[UserPromptPart(content='New question', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Provider response')],
+                usage=RequestUsage(input_tokens=54, output_tokens=4),
+                model_name='function:capture_model_function:capture_model_stream_function',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.new_messages() == result.all_messages()[-2:]
+
+## tests/test_temporal.py
+
+def test_temporal_run_context_preserves_run_id():
+    ctx = RunContext(
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        run_id='run-123',
+    )
+
+    serialized = TemporalRunContext.serialize_run_context(ctx)
+    assert serialized['run_id'] == 'run-123'
+
+    reconstructed = TemporalRunContext.deserialize_run_context(serialized, deps=None)
+    assert reconstructed.run_id == 'run-123'

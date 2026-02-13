@@ -1,0 +1,428 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+def is_cloud_metadata_ip(ip_str: str) -> bool:
+    """Check if an IP address is a cloud metadata endpoint.
+
+    These are always blocked for security reasons, even with allow_local=True.
+    """
+    return ip_str in _CLOUD_METADATA_IPS
+
+def is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address is in a private/internal range.
+
+    Handles both IPv4 and IPv6 addresses, including IPv4-mapped IPv6 addresses.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:192.168.1.1)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        return any(ip in network for network in _PRIVATE_NETWORKS)
+    except ValueError:
+        # Invalid IP address, treat as potentially dangerous
+        return True
+
+def build_url_with_ip(resolved: ResolvedUrl) -> str:
+    """Build a URL using a resolved IP address instead of the hostname.
+
+    For IPv6 addresses, wraps them in brackets as required by URL syntax.
+    """
+    scheme = 'https' if resolved.is_https else 'http'
+    default_port = 443 if resolved.is_https else 80
+
+    # IPv6 addresses need brackets in URLs
+    try:
+        ip_obj = ipaddress.ip_address(resolved.resolved_ip)
+        if isinstance(ip_obj, ipaddress.IPv6Address):
+            host_part = f'[{resolved.resolved_ip}]'
+        else:
+            host_part = resolved.resolved_ip
+    except ValueError:
+        host_part = resolved.resolved_ip
+
+    # Only include port if non-default
+    if resolved.port != default_port:
+        host_part = f'{host_part}:{resolved.port}'
+
+    return urlunparse((scheme, host_part, resolved.path, '', '', ''))
+
+async def validate_and_resolve_url(url: str, allow_local: bool) -> ResolvedUrl:
+    """Validate URL and resolve hostname to IP addresses.
+
+    Performs protocol validation, DNS resolution, and IP validation.
+
+    Args:
+        url: The URL to validate.
+        allow_local: Whether to allow private/internal IP addresses.
+
+    Returns:
+        ResolvedUrl with all the information needed to make the request.
+
+    Raises:
+        ValueError: If the URL fails validation.
+    """
+    hostname, path, port, is_https = extract_host_and_port(url)
+
+    # Check if hostname is already an IP address
+    try:
+        # Handle IPv6 addresses in brackets
+        ip_str = hostname.strip('[]')
+        ipaddress.ip_address(ip_str)
+        ips = [ip_str]
+    except ValueError:
+        # It's a hostname, resolve it
+        ips = await resolve_hostname(hostname)
+
+    # Validate all resolved IPs
+    for ip in ips:
+        # Cloud metadata IPs are always blocked
+        if is_cloud_metadata_ip(ip):
+            raise ValueError(f'Access to cloud metadata service ({ip}) is blocked for security reasons.')
+
+        # Private IPs are blocked unless allow_local is True
+        if allow_local and is_private_ip(ip):
+            raise ValueError(
+                f'Access to private/internal IP address ({ip}) is blocked. '
+                f'Use force_download="allow-local" to allow local network access.'
+            )
+
+    # Use the first resolved IP
+    return ResolvedUrl(
+        resolved_ip=ips[0],
+        hostname=hostname,
+        port=port,
+        is_https=is_https,
+        path=path,
+    )
+
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+## pydantic_ai_slim/pydantic_ai/builtin_tools.py
+
+    blocked_domains: list[str] | None = None
+
+    blocked_domains: list[str] | None = None
+
+## pydantic_graph/pydantic_graph/beta/node_types.py
+
+def is_source(node: AnyNode) -> TypeGuard[AnySourceNode]:
+    """Check if a node can serve as a source in the graph.
+
+    Source nodes are capable of producing output data and can be the starting
+    point for data flow in graph execution paths.
+
+    Args:
+        node: The node to check
+
+    Returns:
+        True if the node can serve as a source, False otherwise
+    """
+    return isinstance(node, StartNode | Step | Join)
+
+## tests/conftest.py
+
+class TestEnv:
+    __test__ = False
+
+    def __init__(self):
+        self.envars: dict[str, str | None] = {}
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+    def reset(self) -> None:
+        for name, value in self.envars.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value  # pragma: lax no cover
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+## tests/graph/beta/test_node_and_step.py
+
+def test_is_source_type_guard():
+    """Test is_source type guard function."""
+
+    # Test with StartNode
+    start = StartNode[int]()
+    assert is_source(start)
+
+    # Test with Step
+    async def my_step(ctx: StepContext[Any, Any, Any]):
+        return 42  # pragma: no cover
+
+    step = Step[None, None, None, int](id=NodeID('test'), call=my_step)
+    assert is_source(step)
+
+    # Test with EndNode (should be False)
+    end = EndNode[int]()
+    assert not is_source(end)
+
+## tests/models/test_anthropic.py
+
+async def test_anthropic_web_fetch_tool_domain_filtering():
+    """Test that blocked_domains work and are mutually exclusive with allowed_domains."""
+    from pydantic_ai.models.anthropic import AnthropicModel
+    from pydantic_ai.providers.anthropic import AnthropicProvider
+
+    # Create a model instance
+    m = AnthropicModel('claude-sonnet-4-0', provider=AnthropicProvider(api_key='test-key'))
+
+    # Test with blocked_domains
+    web_fetch_tool = WebFetchTool(blocked_domains=['private.example.com', 'internal.example.com'])
+
+    model_request_parameters = ModelRequestParameters(
+        function_tools=[],
+        builtin_tools=[web_fetch_tool],
+        output_tools=[],
+    )
+
+    # Get tools from model
+    tools, _, _ = m._add_builtin_tools([], model_request_parameters)  # pyright: ignore[reportPrivateUsage]
+
+    # Find the web_fetch tool
+    web_fetch_tool_param = next((t for t in tools if t.get('name') == 'web_fetch'), None)
+    assert web_fetch_tool_param is not None
+
+    # Verify blocked_domains is passed correctly
+    assert web_fetch_tool_param.get('blocked_domains') == ['private.example.com', 'internal.example.com']
+    assert web_fetch_tool_param.get('allowed_domains') is None
+
+async def test_anthropic_container_setting_false_ignores_history(allow_model_requests: None):
+    """Test that anthropic_container=False ignores container_id from history."""
+    c = completion_message([BetaTextBlock(text='world', type='text')], BetaUsage(input_tokens=5, output_tokens=10))
+    mock_client = MockAnthropic.create_mock(c)
+    m = AnthropicModel('claude-haiku-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+    agent = Agent(m)
+
+    # Create a message history with a container_id
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='hello')]),
+        ModelResponse(
+            parts=[TextPart(content='world')],
+            provider_name='anthropic',
+            provider_details={'container_id': 'container_should_be_ignored'},
+        ),
+    ]
+
+    # Run with anthropic_container=False to force fresh container
+    await agent.run(
+        'follow up', message_history=history, model_settings=AnthropicModelSettings(anthropic_container=False)
+    )
+
+    completion_kwargs = get_mock_chat_completion_kwargs(mock_client)[0]
+    # When anthropic_container=False, container should be OMIT (filtered out before sending to API)
+    from anthropic import omit as OMIT
+
+    assert completion_kwargs.get('container') is OMIT
+
+## tests/models/test_openai.py
+
+async def test_openai_gpt_5_2_temperature_allowed_by_default(allow_model_requests: None):
+    """GPT-5.2 allows temperature by default (reasoning_effort defaults to 'none')."""
+    c = completion_message(ChatCompletionMessage(content='Paris.', role='assistant'))
+    mock_client = MockOpenAI.create_mock(c)
+    m = OpenAIChatModel('gpt-5.2', provider=OpenAIProvider(openai_client=mock_client))
+    agent = Agent(m)
+
+    # No warning should be raised when using temperature without reasoning enabled
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        await agent.run('What is the capital of France?', model_settings=ModelSettings(temperature=0.5))
+        # Check no UserWarning about sampling params was raised
+        sampling_warnings = [x for x in w if 'Sampling parameters' in str(x.message)]
+        assert len(sampling_warnings) == 0
+
+    # Verify temperature was passed to the API
+    assert get_mock_chat_completion_kwargs(mock_client)[0]['temperature'] == 0.5
+
+## tests/test_agent.py
+
+def test_model_requests_blocked(env: TestEnv):
+    try:
+        env.set('GEMINI_API_KEY', 'foobar')
+        agent = Agent('google-gla:gemini-3-flash-preview', output_type=tuple[str, str], defer_model_check=True)
+
+        with pytest.raises(RuntimeError, match='Model requests are not allowed, since ALLOW_MODEL_REQUESTS is False'):
+            agent.run_sync('Hello')
+    except ImportError:  # pragma: lax no cover
+        pytest.skip('google-genai not installed')
+
+## tests/test_ssrf.py
+
+class TestIsCloudMetadataIp
+    """Tests for is_cloud_metadata_ip function."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def test_cloud_metadata_ips_detected(self, ip: str) -> None:
+        assert is_cloud_metadata_ip(ip) is True
+
+    def test_non_metadata_ips(self, ip: str) -> None:
+        assert is_cloud_metadata_ip(ip) is False
+
+    async def test_private_ip_allowed_with_allow_local(self) -> None:
+        """Test that private IPs are allowed with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('192.168.1.1', 0))]
+            resolved = await validate_and_resolve_url('http://internal.local/path', allow_local=True)
+            assert resolved.resolved_ip == '192.168.1.1'
+
+    async def test_cloud_metadata_always_blocked(self) -> None:
+        """Test that cloud metadata IPs are always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('169.254.169.254', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.google.internal/path', allow_local=True)
+
+    async def test_alibaba_cloud_metadata_always_blocked(self) -> None:
+        """Test that Alibaba Cloud metadata IP is always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.100.100.200', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.aliyun.internal/path', allow_local=True)
+
+    async def test_6to4_address_blocked(self) -> None:
+        """Test that 6to4 addresses (which can embed private IPv4) are blocked."""
+        # 2002:c0a8:0101::1 embeds 192.168.1.1
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://[2002:c0a8:0101::1]/path', allow_local=False)
+
+## tests/test_usage_limits.py
+
+async def test_output_tool_allowed_at_limit() -> None:
+    """Test that output tools can be called even when at the tool_calls_limit."""
+
+    class MyOutput(BaseModel):
+        result: str
+
+    def call_output_after_regular(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('regular_tool', {'x': 'test'}, 'call_1'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+        else:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('final_result', {'result': 'success'}, 'call_2'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+            )
+
+    test_agent = Agent(FunctionModel(call_output_after_regular), output_type=ToolOutput(MyOutput))
+
+    @test_agent.tool_plain
+    async def regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    result = await test_agent.run('test', usage_limits=UsageLimits(tool_calls_limit=1))
+
+    assert result.output.result == 'success'
+    assert result.usage() == snapshot(RunUsage(requests=2, input_tokens=20, output_tokens=10, tool_calls=1))

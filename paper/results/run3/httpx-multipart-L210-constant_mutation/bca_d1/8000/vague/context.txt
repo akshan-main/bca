@@ -1,0 +1,922 @@
+## httpx/_auth.py
+
+class Auth:
+    """
+    Base class for all authentication schemes.
+
+    To implement a custom authentication scheme, subclass `Auth` and override
+    the `.auth_flow()` method.
+
+    If the authentication scheme does I/O such as disk access or network calls, or uses
+    synchronization primitives such as locks, you should override `.sync_auth_flow()`
+    and/or `.async_auth_flow()` instead of `.auth_flow()` to provide specialized
+    implementations that will be used by `Client` and `AsyncClient` respectively.
+    """
+
+    requires_request_body = False
+    requires_response_body = False
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow.
+
+        To dispatch a request, `yield` it:
+
+        ```
+        yield request
+        ```
+
+        The client will `.send()` the response back into the flow generator. You can
+        access it like so:
+
+        ```
+        response = yield request
+        ```
+
+        A `return` (or reaching the end of the generator) will result in the
+        client returning the last response obtained from the server.
+
+        You can dispatch as many requests as is necessary.
+        """
+        yield request
+
+    def sync_auth_flow(
+        self, request: Request
+    ) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow synchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            request.read()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                response.read()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+    async def async_auth_flow(
+        self, request: Request
+    ) -> typing.AsyncGenerator[Request, Response]:
+        """
+        Execute the authentication flow asynchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            await request.aread()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                await response.aread()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+## httpx/_client.py
+
+from ._types import (
+    AsyncByteStream,
+    AuthTypes,
+    CertTypes,
+    CookieTypes,
+    HeaderTypes,
+    ProxyTypes,
+    QueryParamTypes,
+    RequestContent,
+    RequestData,
+    RequestExtensions,
+    RequestFiles,
+    SyncByteStream,
+    TimeoutTypes,
+)
+
+from ._types import (
+    AsyncByteStream,
+    AuthTypes,
+    CertTypes,
+    CookieTypes,
+    HeaderTypes,
+    ProxyTypes,
+    QueryParamTypes,
+    RequestContent,
+    RequestData,
+    RequestExtensions,
+    RequestFiles,
+    SyncByteStream,
+    TimeoutTypes,
+)
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+class UseClientDefault:
+    """
+    For some parameters such as `auth=...` and `timeout=...` we need to be able
+    to indicate the default "unset" state, in a way that is distinctly different
+    to using `None`.
+
+    The default "unset" state indicates that whatever default is set on the
+    client should be used. This is different to setting `None`, which
+    explicitly disables the parameter, possibly overriding a client default.
+
+    For example we use `timeout=USE_CLIENT_DEFAULT` in the `request()` signature.
+    Omitting the `timeout` parameter will send a request using whatever default
+    timeout has been configured on the client. Including `timeout=None` will
+    ensure no timeout is used.
+
+    Note that user code shouldn't need to use the `USE_CLIENT_DEFAULT` constant,
+    but it is used internally when a parameter is not included.
+    """
+
+USE_CLIENT_DEFAULT = UseClientDefault()
+
+class BoundSyncStream(SyncByteStream):
+    """
+    A byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: SyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        for chunk in self._stream:
+            yield chunk
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+class BoundAsyncStream(AsyncByteStream):
+    """
+    An async byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: AsyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    def _build_request_auth(
+        self,
+        request: Request,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+    ) -> Auth:
+        auth = (
+            self._auth if isinstance(auth, UseClientDefault) else self._build_auth(auth)
+        )
+
+        if auth is not None:
+            return auth
+
+        username, password = request.url.username, request.url.password
+        if username or password:
+            return BasicAuth(username=username, password=password)
+
+        return Auth()
+
+    def _set_timeout(self, request: Request) -> None:
+        if "timeout" not in request.extensions:
+            timeout = (
+                self.timeout
+                if isinstance(self.timeout, UseClientDefault)
+                else Timeout(self.timeout)
+            )
+            request.extensions = dict(**request.extensions, timeout=timeout.as_dict())
+
+    def _init_transport(
+        self,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+        transport: BaseTransport | None = None,
+    ) -> BaseTransport:
+        if transport is not None:
+            return transport
+
+        return HTTPTransport(
+            verify=verify,
+            cert=cert,
+            trust_env=trust_env,
+            http1=http1,
+            http2=http2,
+            limits=limits,
+        )
+
+    def _init_proxy_transport(
+        self,
+        proxy: Proxy,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+    ) -> BaseTransport:
+        return HTTPTransport(
+            verify=verify,
+            cert=cert,
+            trust_env=trust_env,
+            http1=http1,
+            http2=http2,
+            limits=limits,
+            proxy=proxy,
+        )
+
+    def _transport_for_url(self, url: URL) -> BaseTransport:
+        """
+        Returns the transport instance that should be used for a given URL.
+        This will either be the standard connection pool, or a proxy.
+        """
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(url):
+                return self._transport if transport is None else transport
+
+        return self._transport
+
+    def request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Build and send a request.
+
+        Equivalent to:
+
+        ```python
+        request = client.build_request(...)
+        response = client.send(request, ...)
+        ```
+
+        See `Client.build_request()`, `Client.send()` and
+        [Merging of configuration][0] for how the various parameters
+        are merged with client-level configuration.
+
+        [0]: /advanced/clients/#merging-of-configuration
+        """
+        if cookies is not None:
+            message = (
+                "Setting per-request cookies=<...> is being deprecated, because "
+                "the expected behaviour on cookie persistence is ambiguous. Set "
+                "cookies directly on the client instance instead."
+            )
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        return self.send(request, auth=auth, follow_redirects=follow_redirects)
+
+    def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `Client.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                response.read()
+
+            return response
+
+        except BaseException as exc:
+            response.close()
+            raise exc
+
+    def _init_transport(
+        self,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+        transport: AsyncBaseTransport | None = None,
+    ) -> AsyncBaseTransport:
+        if transport is not None:
+            return transport
+
+        return AsyncHTTPTransport(
+            verify=verify,
+            cert=cert,
+            trust_env=trust_env,
+            http1=http1,
+            http2=http2,
+            limits=limits,
+        )
+
+    def _init_proxy_transport(
+        self,
+        proxy: Proxy,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+    ) -> AsyncBaseTransport:
+        return AsyncHTTPTransport(
+            verify=verify,
+            cert=cert,
+            trust_env=trust_env,
+            http1=http1,
+            http2=http2,
+            limits=limits,
+            proxy=proxy,
+        )
+
+    async def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `AsyncClient.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = await self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                await response.aread()
+
+            return response
+
+        except BaseException as exc:
+            await response.aclose()
+            raise exc
+
+## httpx/_config.py
+
+def create_ssl_context(
+    verify: ssl.SSLContext | str | bool = True,
+    cert: CertTypes | None = None,
+    trust_env: bool = True,
+) -> ssl.SSLContext:
+    import ssl
+    import warnings
+
+    import certifi
+
+    if verify is True:
+        if trust_env and os.environ.get("SSL_CERT_FILE"):  # pragma: nocover
+            ctx = ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
+        elif trust_env and os.environ.get("SSL_CERT_DIR"):  # pragma: nocover
+            ctx = ssl.create_default_context(capath=os.environ["SSL_CERT_DIR"])
+        else:
+            # Default case...
+            ctx = ssl.create_default_context(cafile=certifi.where())
+    elif verify is False:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    elif isinstance(verify, str):  # pragma: nocover
+        message = (
+            "`verify=<str>` is deprecated. "
+            "Use `verify=ssl.create_default_context(cafile=...)` "
+            "or `verify=ssl.create_default_context(capath=...)` instead."
+        )
+        warnings.warn(message, DeprecationWarning)
+        if os.path.isdir(verify):
+            return ssl.create_default_context(capath=verify)
+        return ssl.create_default_context(cafile=verify)
+    else:
+        ctx = verify
+
+    if cert:  # pragma: nocover
+        message = (
+            "`cert=...` is deprecated. Use `verify=<ssl_context>` instead,"
+            "with `.load_cert_chain()` to configure the certificate chain."
+        )
+        warnings.warn(message, DeprecationWarning)
+        if isinstance(cert, str):
+            ctx.load_cert_chain(cert)
+        else:
+            ctx.load_cert_chain(*cert)
+
+    return ctx
+
+class Limits:
+    """
+    Configuration for limits to various client behaviors.
+
+    **Parameters:**
+
+    * **max_connections** - The maximum number of concurrent connections that may be
+            established.
+    * **max_keepalive_connections** - Allow the connection pool to maintain
+            keep-alive connections below this point. Should be less than or equal
+            to `max_connections`.
+    * **keepalive_expiry** - Time limit on idle keep-alive connections in seconds.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_connections: int | None = None,
+        max_keepalive_connections: int | None = None,
+        keepalive_expiry: float | None = 5.0,
+    ) -> None:
+        self.max_connections = max_connections
+        self.max_keepalive_connections = max_keepalive_connections
+        self.keepalive_expiry = keepalive_expiry
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return (
+            isinstance(other, self.__class__)
+            and self.max_connections == other.max_connections
+            and self.max_keepalive_connections == other.max_keepalive_connections
+            and self.keepalive_expiry == other.keepalive_expiry
+        )
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+        return (
+            f"{class_name}(max_connections={self.max_connections}, "
+            f"max_keepalive_connections={self.max_keepalive_connections}, "
+            f"keepalive_expiry={self.keepalive_expiry})"
+        )
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+        return (
+            f"{class_name}(max_connections={self.max_connections}, "
+            f"max_keepalive_connections={self.max_keepalive_connections}, "
+            f"keepalive_expiry={self.keepalive_expiry})"
+        )
+
+DEFAULT_TIMEOUT_CONFIG = Timeout(timeout=5.0)
+
+DEFAULT_LIMITS = Limits(max_connections=100, max_keepalive_connections=20)
+
+DEFAULT_MAX_REDIRECTS = 20
+
+## httpx/_models.py
+
+class Request
+    ...  # (skeleton: full source omitted for budget)
+
+    def read(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.Iterable)
+            self._content = b"".join(self.stream)
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.AsyncIterable)
+            self._content = b"".join([part async for part in self.stream])
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+## httpx/_transports/default.py
+
+    def __init__(
+        self,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+        proxy: ProxyTypes | None = None,
+        uds: str | None = None,
+        local_address: str | None = None,
+        retries: int = 0,
+        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+    ) -> None:
+        import httpcore
+
+        proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
+        ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
+
+        if proxy is None:
+            self._pool = httpcore.ConnectionPool(
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                uds=uds,
+                local_address=local_address,
+                retries=retries,
+                socket_options=socket_options,
+            )
+        elif proxy.url.scheme in ("http", "https"):
+            self._pool = httpcore.HTTPProxy(
+                proxy_url=httpcore.URL(
+                    scheme=proxy.url.raw_scheme,
+                    host=proxy.url.raw_host,
+                    port=proxy.url.port,
+                    target=proxy.url.raw_path,
+                ),
+                proxy_auth=proxy.raw_auth,
+                proxy_headers=proxy.headers.raw,
+                ssl_context=ssl_context,
+                proxy_ssl_context=proxy.ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                socket_options=socket_options,
+            )
+        elif proxy.url.scheme in ("socks5", "socks5h"):
+            try:
+                import socksio  # noqa
+            except ImportError:  # pragma: no cover
+                raise ImportError(
+                    "Using SOCKS proxy, but the 'socksio' package is not installed. "
+                    "Make sure to install httpx using `pip install httpx[socks]`."
+                ) from None
+
+            self._pool = httpcore.SOCKSProxy(
+                proxy_url=httpcore.URL(
+                    scheme=proxy.url.raw_scheme,
+                    host=proxy.url.raw_host,
+                    port=proxy.url.port,
+                    target=proxy.url.raw_path,
+                ),
+                proxy_auth=proxy.raw_auth,
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+            )
+        else:  # pragma: no cover
+            raise ValueError(
+                "Proxy protocol must be either 'http', 'https', 'socks5', or 'socks5h',"
+                f" but got {proxy.url.scheme!r}."
+            )
+
+    def __init__(
+        self,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+        proxy: ProxyTypes | None = None,
+        uds: str | None = None,
+        local_address: str | None = None,
+        retries: int = 0,
+        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+    ) -> None:
+        import httpcore
+
+        proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
+        ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
+
+        if proxy is None:
+            self._pool = httpcore.AsyncConnectionPool(
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                uds=uds,
+                local_address=local_address,
+                retries=retries,
+                socket_options=socket_options,
+            )
+        elif proxy.url.scheme in ("http", "https"):
+            self._pool = httpcore.AsyncHTTPProxy(
+                proxy_url=httpcore.URL(
+                    scheme=proxy.url.raw_scheme,
+                    host=proxy.url.raw_host,
+                    port=proxy.url.port,
+                    target=proxy.url.raw_path,
+                ),
+                proxy_auth=proxy.raw_auth,
+                proxy_headers=proxy.headers.raw,
+                proxy_ssl_context=proxy.ssl_context,
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                socket_options=socket_options,
+            )
+        elif proxy.url.scheme in ("socks5", "socks5h"):
+            try:
+                import socksio  # noqa
+            except ImportError:  # pragma: no cover
+                raise ImportError(
+                    "Using SOCKS proxy, but the 'socksio' package is not installed. "
+                    "Make sure to install httpx using `pip install httpx[socks]`."
+                ) from None
+
+            self._pool = httpcore.AsyncSOCKSProxy(
+                proxy_url=httpcore.URL(
+                    scheme=proxy.url.raw_scheme,
+                    host=proxy.url.raw_host,
+                    port=proxy.url.port,
+                    target=proxy.url.raw_path,
+                ),
+                proxy_auth=proxy.raw_auth,
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+            )
+        else:  # pragma: no cover
+            raise ValueError(
+                "Proxy protocol must be either 'http', 'https', 'socks5', or 'socks5h',"
+                f" but got {proxy.url.scheme!r}."
+            )
+
+## tests/client/test_auth.py
+
+class SyncOrAsyncAuth(httpx.Auth):
+    """
+    A mock authentication scheme that uses a different implementation for the
+    sync and async cases.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._async_lock = anyio.Lock()
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.AsyncGenerator[httpx.Request, httpx.Response]:
+        async with self._async_lock:
+            request.headers["Authorization"] = "async-auth"
+        yield request
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._async_lock = anyio.Lock()
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.AsyncGenerator[httpx.Request, httpx.Response]:
+        async with self._async_lock:
+            request.headers["Authorization"] = "async-auth"
+        yield request
+
+async def test_digest_auth_reuses_challenge() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response_1 = await client.get(url, auth=auth)
+        response_2 = await client.get(url, auth=auth)
+
+        assert response_1.status_code == 200
+        assert response_2.status_code == 200
+
+        assert len(response_1.history) == 1
+        assert len(response_2.history) == 0
+
+async def test_async_auth() -> None:
+    """
+    Test that we can use an auth implementation specific to the async case, to
+    support cases that require performing I/O or using concurrency primitives (such
+    as checking a disk-based cache or fetching a token from a remote auth server).
+    """
+    url = "https://example.org/"
+    auth = SyncOrAsyncAuth()
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "async-auth"}
+
+def test_sync_auth() -> None:
+    """
+    Test that we can use an auth implementation specific to the sync case.
+    """
+    url = "https://example.org/"
+    auth = SyncOrAsyncAuth()
+    app = App()
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "sync-auth"}
+
+## tests/client/test_headers.py
+
+def test_host_with_non_default_port_in_url():
+    """
+    If the URL includes a non-default port, then it should be included in
+    the Host header.
+    """
+    url = "http://username:password@example.org:123/echo_headers"
+
+    client = httpx.Client(transport=httpx.MockTransport(echo_headers))
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org:123",
+            "user-agent": f"python-httpx/{httpx.__version__}",
+            "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+        }
+    }
+
+## tests/test_config.py
+
+def test_limits_repr():
+    limits = httpx.Limits(max_connections=100)
+    expected = (
+        "Limits(max_connections=100, max_keepalive_connections=None,"
+        " keepalive_expiry=5.0)"
+    )
+    assert repr(limits) == expected
+
+def test_limits_eq():
+    limits = httpx.Limits(max_connections=100)
+    assert limits == httpx.Limits(max_connections=100)
+
+def test_timeout_from_one_value_and_default():
+    timeout = httpx.Timeout(5.0, pool=60.0)
+    assert timeout == httpx.Timeout(timeout=(5.0, 5.0, 5.0, 60.0))
+
+def test_timeout_missing_default():
+    with pytest.raises(ValueError):
+        httpx.Timeout(pool=60.0)

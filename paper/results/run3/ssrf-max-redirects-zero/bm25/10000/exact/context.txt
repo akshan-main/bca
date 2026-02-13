@@ -1,0 +1,1341 @@
+# tests/test_ssrf.py:484-501
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:50-50
+_MAX_REDIRECTS = 0
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:50-50
+_MAX_REDIRECTS = 0
+
+# tests/test_ssrf.py:432-459
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+# tests/models/test_gemini.py:1169-1201
+async def test_safety_settings_safe(
+    client_with_handler: ClientWithHandler, env: TestEnv, allow_model_requests: None
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        safety_settings = json.loads(request.content)['safetySettings']
+        assert safety_settings == [
+            {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+            {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+        ]
+
+        return httpx.Response(
+            200,
+            content=_gemini_response_ta.dump_json(
+                gemini_response(_content_model_response(ModelResponse(parts=[TextPart('world')]))),
+                by_alias=True,
+            ),
+            headers={'Content-Type': 'application/json'},
+        )
+
+    gemini_client = client_with_handler(handler)
+    m = GeminiModel('gemini-1.5-flash', provider=GoogleGLAProvider(http_client=gemini_client, api_key='mock'))
+    agent = Agent(m)
+
+    result = await agent.run(
+        'hello',
+        model_settings=GeminiModelSettings(
+            gemini_safety_settings=[
+                {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+                {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+            ]
+        ),
+    )
+    assert result.output == 'world'
+
+# tests/models/test_gemini.py:1125-1166
+async def test_safety_settings_unsafe(
+    client_with_handler: ClientWithHandler, env: TestEnv, allow_model_requests: None
+) -> None:
+    try:
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            safety_settings = json.loads(request.content)['safetySettings']
+            assert safety_settings == [
+                {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+                {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+            ]
+
+            return httpx.Response(
+                200,
+                content=_gemini_response_ta.dump_json(
+                    gemini_no_content_response(
+                        finish_reason='SAFETY',
+                        safety_ratings=[
+                            {'category': 'HARM_CATEGORY_HARASSMENT', 'probability': 'MEDIUM', 'blocked': True}
+                        ],
+                    ),
+                    by_alias=True,
+                ),
+                headers={'Content-Type': 'application/json'},
+            )
+
+        gemini_client = client_with_handler(handler)
+
+        m = GeminiModel('gemini-1.5-flash', provider=GoogleGLAProvider(http_client=gemini_client, api_key='mock'))
+        agent = Agent(m)
+
+        await agent.run(
+            'a request for something rude',
+            model_settings=GeminiModelSettings(
+                gemini_safety_settings=[
+                    {'category': 'HARM_CATEGORY_CIVIC_INTEGRITY', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+                    {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'threshold': 'BLOCK_LOW_AND_ABOVE'},
+                ]
+            ),
+        )
+    except UnexpectedModelBehavior as e:
+        assert repr(e) == "UnexpectedModelBehavior('Safety settings triggered')"
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:956-967
+class _GeminiSafetyRating(TypedDict):
+    """See <https://ai.google.dev/gemini-api/docs/safety-settings#safety-filters>."""
+
+    category: Literal[
+        'HARM_CATEGORY_HARASSMENT',
+        'HARM_CATEGORY_HATE_SPEECH',
+        'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+        'HARM_CATEGORY_DANGEROUS_CONTENT',
+        'HARM_CATEGORY_CIVIC_INTEGRITY',
+    ]
+    probability: Literal['NEGLIGIBLE', 'LOW', 'MEDIUM', 'HIGH']
+    blocked: NotRequired[bool]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:569-569
+    safetySettings: NotRequired[list[GeminiSafetySettings]]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:82-82
+    gemini_safety_settings: list[GeminiSafetySettings]
+
+# pydantic_ai_slim/pydantic_ai/models/google.py:166-166
+    google_safety_settings: list[SafetySettingDict]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:579-608
+class GeminiSafetySettings(TypedDict):
+    """Safety settings options for Gemini model request.
+
+    See [Gemini API docs](https://ai.google.dev/gemini-api/docs/safety-settings) for safety category and threshold descriptions.
+    For an example on how to use `GeminiSafetySettings`, see [here](../../agent.md#model-specific-settings).
+    """
+
+    category: Literal[
+        'HARM_CATEGORY_UNSPECIFIED',
+        'HARM_CATEGORY_HARASSMENT',
+        'HARM_CATEGORY_HATE_SPEECH',
+        'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+        'HARM_CATEGORY_DANGEROUS_CONTENT',
+        'HARM_CATEGORY_CIVIC_INTEGRITY',
+    ]
+    """
+    Safety settings category.
+    """
+
+    threshold: Literal[
+        'HARM_BLOCK_THRESHOLD_UNSPECIFIED',
+        'BLOCK_LOW_AND_ABOVE',
+        'BLOCK_MEDIUM_AND_ABOVE',
+        'BLOCK_ONLY_HIGH',
+        'BLOCK_NONE',
+        'OFF',
+    ]
+    """
+    Safety settings threshold.
+    """
+
+# tests/models/test_google.py:1023-1110
+async def test_google_model_safety_settings(allow_model_requests: None, google_provider: GoogleProvider):
+    m = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    settings = GoogleModelSettings(
+        google_safety_settings=[
+            {
+                'category': HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                'threshold': HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+            }
+        ]
+    )
+    agent = Agent(m, instructions='You hate the world!', model_settings=settings)
+
+    with pytest.raises(
+        ContentFilterError,
+        match="Content filter triggered. Finish reason: 'SAFETY'",
+    ) as exc_info:
+        await agent.run('Tell me a joke about a Brazilians.')
+
+    assert exc_info.value.body is not None
+    body_json = json.loads(exc_info.value.body)
+
+    assert body_json == snapshot(
+        [
+            {
+                'parts': [],
+                'usage': {
+                    'input_tokens': 14,
+                    'cache_write_tokens': 0,
+                    'cache_read_tokens': 0,
+                    'output_tokens': 0,
+                    'input_audio_tokens': 0,
+                    'cache_audio_read_tokens': 0,
+                    'output_audio_tokens': 0,
+                    'details': {'text_prompt_tokens': 14},
+                },
+                'model_name': 'gemini-1.5-flash',
+                'timestamp': IsStr(),
+                'kind': 'response',
+                'provider_name': 'google-gla',
+                'provider_url': 'https://generativelanguage.googleapis.com/',
+                'provider_details': {
+                    'finish_reason': 'SAFETY',
+                    'safety_ratings': [
+                        {
+                            'blocked': True,
+                            'category': 'HARM_CATEGORY_HATE_SPEECH',
+                            'overwrittenThreshold': None,
+                            'probability': 'LOW',
+                            'probabilityScore': None,
+                            'severity': None,
+                            'severityScore': None,
+                        },
+                        {
+                            'blocked': None,
+                            'category': 'HARM_CATEGORY_DANGEROUS_CONTENT',
+                            'overwrittenThreshold': None,
+                            'probability': 'NEGLIGIBLE',
+                            'probabilityScore': None,
+                            'severity': None,
+                            'severityScore': None,
+                        },
+                        {
+                            'blocked': None,
+                            'category': 'HARM_CATEGORY_HARASSMENT',
+                            'overwrittenThreshold': None,
+                            'probability': 'NEGLIGIBLE',
+                            'probabilityScore': None,
+                            'severity': None,
+                            'severityScore': None,
+                        },
+                        {
+                            'blocked': None,
+                            'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+                            'overwrittenThreshold': None,
+                            'probability': 'NEGLIGIBLE',
+                            'probabilityScore': None,
+                            'severity': None,
+                            'severityScore': None,
+                        },
+                    ],
+                },
+                'provider_response_id': IsStr(),
+                'finish_reason': 'content_filter',
+                'run_id': IsStr(),
+                'metadata': None,
+            }
+        ]
+    )
+
+# tests/test_ssrf.py:605-624
+    async def test_http_no_sni_extension(self) -> None:
+        """Test that sni_hostname extension is not set for HTTP requests."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('http://example.com/file.txt')
+
+            call_args = mock_client.get.call_args
+            assert call_args[1]['extensions'] == {}
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:586-593
+    category: Literal[
+        'HARM_CATEGORY_UNSPECIFIED',
+        'HARM_CATEGORY_HARASSMENT',
+        'HARM_CATEGORY_HATE_SPEECH',
+        'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+        'HARM_CATEGORY_DANGEROUS_CONTENT',
+        'HARM_CATEGORY_CIVIC_INTEGRITY',
+    ]
+
+# tests/models/test_google.py:4837-4857
+async def test_http_video_url_downloads_on_google_gla(mocker: MockerFixture):
+    """HTTP VideoUrls are downloaded on google-gla with video_metadata preserved."""
+    model = GoogleModel('gemini-1.5-flash', provider=GoogleProvider(api_key='test-key'))
+
+    mock_download = mocker.patch(
+        'pydantic_ai.models.google.download_item',
+        return_value={'data': b'fake video data', 'data_type': 'video/mp4'},
+    )
+
+    video = VideoUrl(
+        url='https://example.com/video.mp4',
+        vendor_metadata={'start_offset': '10s', 'end_offset': '20s'},
+    )
+    content = await model._map_user_prompt(UserPromptPart(content=[video]))  # pyright: ignore[reportPrivateUsage]
+
+    mock_download.assert_called_once()
+    assert len(content) == 1
+    assert 'inline_data' in content[0]
+    assert 'file_data' not in content[0]
+    # video_metadata is preserved even when video is downloaded
+    assert content[0].get('video_metadata') == {'start_offset': '10s', 'end_offset': '20s'}
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:598-605
+    threshold: Literal[
+        'HARM_BLOCK_THRESHOLD_UNSPECIFIED',
+        'BLOCK_LOW_AND_ABOVE',
+        'BLOCK_MEDIUM_AND_ABOVE',
+        'BLOCK_ONLY_HIGH',
+        'BLOCK_NONE',
+        'OFF',
+    ]
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:297-368
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+# tests/test_ssrf.py:402-672
+class TestSafeDownload:
+    """Tests for safe_download function."""
+
+    async def test_successful_download(self) -> None:
+        """Test successful download of a public URL."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+        mock_response.content = b'test content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'test content'
+
+            # Verify the request was made to the resolved IP with Host header and SNI
+            mock_client.get.assert_called_once()
+            call_args = mock_client.get.call_args
+            assert '93.184.215.14' in call_args[0][0]
+            assert call_args[1]['headers']['Host'] == 'example.com'
+            assert call_args[1]['extensions'] == {'sni_hostname': 'example.com'}
+
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+    async def test_redirect_to_private_ip_blocked(self) -> None:
+        """Test that redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'http://internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com (public), second for internal.local (private)
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_relative_redirect_resolved(self) -> None:
+        """Test that relative redirect URLs are resolved correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '/new-path/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/old-path/file.txt')
+            assert response.content == b'final content'
+
+            # Check that the second request was to the correct path
+            second_call = mock_client.get.call_args_list[1]
+            assert '/new-path/file.txt' in second_call[0][0]
+
+    async def test_missing_location_header(self) -> None:
+        """Test that redirect without Location header raises error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Redirect response missing Location header'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_protocol_relative_redirect(self) -> None:
+        """Test that protocol-relative redirects are handled correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+            # Verify second request was to cdn.example.com with https
+            second_call = mock_client.get.call_args_list[1]
+            assert second_call[1]['headers']['Host'] == 'cdn.example.com'
+
+    async def test_protocol_relative_redirect_to_private_blocked(self) -> None:
+        """Test that protocol-relative redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_http_no_sni_extension(self) -> None:
+        """Test that sni_hostname extension is not set for HTTP requests."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('http://example.com/file.txt')
+
+            call_args = mock_client.get.call_args
+            assert call_args[1]['extensions'] == {}
+
+    async def test_protocol_validation(self) -> None:
+        """Test that non-http(s) protocols are rejected."""
+        with pytest.raises(ValueError, match='URL protocol "file" is not allowed'):
+            await safe_download('file:///etc/passwd')
+
+        with pytest.raises(ValueError, match='URL protocol "ftp" is not allowed'):
+            await safe_download('ftp://ftp.example.com/file.txt')
+
+    async def test_timeout_parameter(self) -> None:
+        """Test that timeout parameter is passed to client."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('https://example.com/file.txt', timeout=60)
+
+            mock_client_fn.assert_called_once_with(timeout=60)
+
+    async def test_default_timeout(self) -> None:
+        """Test that default timeout is used."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('https://example.com/file.txt')
+
+            mock_client_fn.assert_called_once_with(timeout=_DEFAULT_TIMEOUT)
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:956-967
+class _GeminiSafetyRating(TypedDict):
+    """See <https://ai.google.dev/gemini-api/docs/safety-settings#safety-filters>."""
+
+    category: Literal[
+        'HARM_CATEGORY_HARASSMENT',
+        'HARM_CATEGORY_HATE_SPEECH',
+        'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+        'HARM_CATEGORY_DANGEROUS_CONTENT',
+        'HARM_CATEGORY_CIVIC_INTEGRITY',
+    ]
+    probability: Literal['NEGLIGIBLE', 'LOW', 'MEDIUM', 'HIGH']
+    blocked: NotRequired[bool]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:875-875
+    safety_ratings: NotRequired[Annotated[list[_GeminiSafetyRating], pydantic.Field(alias='safetyRatings')]]
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:974-974
+    safety_ratings: Annotated[list[_GeminiSafetyRating], pydantic.Field(alias='safetyRatings')]
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:297-368
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+# tests/models/xai_proto_cassettes.py:299-300
+    def from_path(cls, path: Path) -> XaiProtoCassetteClient:
+        return cls(cassette=XaiProtoCassette.load(path))
+
+# tests/test_ssrf.py:461-482
+    async def test_redirect_to_private_ip_blocked(self) -> None:
+        """Test that redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'http://internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com (public), second for internal.local (private)
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+# pydantic_ai_slim/pydantic_ai/models/wrapper.py:83-85
+    def settings(self) -> ModelSettings | None:
+        """Get the settings from the wrapped model."""
+        return self.wrapped.settings
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# .github/set_docs_main_preview_url.py:6-6
+import httpx
+
+# tests/test_ssrf.py:626-632
+    async def test_protocol_validation(self) -> None:
+        """Test that non-http(s) protocols are rejected."""
+        with pytest.raises(ValueError, match='URL protocol "file" is not allowed'):
+            await safe_download('file:///etc/passwd')
+
+        with pytest.raises(ValueError, match='URL protocol "ftp" is not allowed'):
+            await safe_download('ftp://ftp.example.com/file.txt')
+
+# tests/models/test_google.py:5448-5501
+async def test_google_stream_safety_filter(
+    allow_model_requests: None, google_provider: GoogleProvider, mocker: MockerFixture
+):
+    """Test that safety ratings are captured in the exception body when streaming."""
+    model_name = 'gemini-2.5-flash'
+    model = GoogleModel(model_name, provider=google_provider)
+
+    safety_rating = mocker.Mock(category='HARM_CATEGORY_HATE_SPEECH', probability='HIGH', blocked=True)
+
+    safety_rating.model_dump.return_value = {
+        'category': 'HARM_CATEGORY_HATE_SPEECH',
+        'probability': 'HIGH',
+        'blocked': True,
+    }
+
+    candidate = mocker.Mock(
+        finish_reason=GoogleFinishReason.SAFETY,
+        content=None,
+        safety_ratings=[safety_rating],
+        grounding_metadata=None,
+        url_context_metadata=None,
+    )
+
+    chunk = mocker.Mock(
+        candidates=[candidate],
+        model_version=model_name,
+        usage_metadata=None,
+        create_time=datetime.datetime.now(),
+        response_id='resp_123',
+    )
+    chunk.model_dump_json.return_value = '{"mock": "json"}'
+
+    async def stream_iterator():
+        yield chunk
+
+    mocker.patch.object(model.client.aio.models, 'generate_content_stream', return_value=stream_iterator())
+
+    agent = Agent(model=model)
+
+    with pytest.raises(ContentFilterError) as exc_info:
+        async with agent.run_stream('bad content'):
+            pass
+
+    # Verify exception message
+    assert 'Content filter triggered' in str(exc_info.value)
+
+    # Verify safety ratings are present in the body (serialized ModelResponse)
+    assert exc_info.value.body is not None
+    body_json = json.loads(exc_info.value.body)
+
+    # body_json is a list of messages, check the first one
+    response_msg = body_json[0]
+    assert response_msg['provider_details']['finish_reason'] == 'SAFETY'
+    assert response_msg['provider_details']['safety_ratings'][0]['category'] == 'HARM_CATEGORY_HATE_SPEECH'
+
+# tests/test_ssrf.py:550-581
+    async def test_protocol_relative_redirect(self) -> None:
+        """Test that protocol-relative redirects are handled correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+            # Verify second request was to cdn.example.com with https
+            second_call = mock_client.get.call_args_list[1]
+            assert second_call[1]['headers']['Host'] == 'cdn.example.com'
+
+# tests/evals/test_dataset.py:912-954
+async def test_from_text():
+    """Test creating a dataset from text."""
+    dataset_dict = {
+        'name': 'my dataset',
+        'cases': [
+            {
+                'name': '1',
+                'inputs': {'query': 'What is the capital of Germany?'},
+                'expected_output': {'answer': 'Berlin', 'confidence': 0.9},
+                'metadata': {'difficulty': 'hard', 'category': 'geography'},
+            },
+            {
+                'name': '2',
+                'inputs': {'query': 'What is the capital of Germany?'},
+                'expected_output': {'answer': 'Berlin', 'confidence': 0.9},
+                'metadata': {'difficulty': 'hard', 'category': 'geography'},
+                'evaluators': [{'LLMJudge': 'my rubric'}],
+            },
+        ],
+        'evaluators': [{'LLMJudge': 'my rubric'}],
+    }
+
+    loaded_dataset = Dataset[TaskInput, TaskOutput, TaskMetadata].from_text(json.dumps(dataset_dict))
+    assert loaded_dataset.name == 'my dataset'
+    assert loaded_dataset.cases == snapshot(
+        [
+            Case(
+                name='1',
+                inputs=TaskInput(query='What is the capital of Germany?'),
+                metadata=TaskMetadata(difficulty='hard', category='geography'),
+                expected_output=TaskOutput(answer='Berlin', confidence=0.9),
+                evaluators=(),
+            ),
+            Case(
+                name='2',
+                inputs=TaskInput(query='What is the capital of Germany?'),
+                metadata=TaskMetadata(difficulty='hard', category='geography'),
+                expected_output=TaskOutput(answer='Berlin', confidence=0.9),
+                evaluators=(LLMJudge(rubric='my rubric'),),
+            ),
+        ]
+    )
+    assert loaded_dataset.evaluators == snapshot([LLMJudge(rubric='my rubric')])
+
+# tests/models/test_google.py:5504-5514
+def test_google_provider_sets_http_options_timeout(google_provider: GoogleProvider):
+    """Test that GoogleProvider sets HttpOptions.timeout to prevent requests hanging indefinitely.
+
+    The google-genai SDK's HttpOptions.timeout defaults to None, which causes the SDK to
+    explicitly pass timeout=None to httpx, overriding any timeout configured on the httpx
+    client. This would cause requests to hang indefinitely.
+
+    See https://github.com/pydantic/pydantic-ai/issues/4031
+    """
+    http_options = google_provider._client._api_client._http_options  # pyright: ignore[reportPrivateUsage]
+    assert http_options.timeout == DEFAULT_HTTP_TIMEOUT * 1000
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:1001-1001
+    http_client: httpx.AsyncClient | None
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:967-967
+    blocked: NotRequired[bool]
+
+# pydantic_ai_slim/pydantic_ai/ui/_adapter.py:8-8
+from http import HTTPStatus
+
+# pydantic_ai_slim/pydantic_ai/ui/_adapter.py:8-8
+from http import HTTPStatus
+
+# tests/test_tenacity.py:8-8
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:959-965
+    category: Literal[
+        'HARM_CATEGORY_HARASSMENT',
+        'HARM_CATEGORY_HATE_SPEECH',
+        'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+        'HARM_CATEGORY_DANGEROUS_CONTENT',
+        'HARM_CATEGORY_CIVIC_INTEGRITY',
+    ]
+
+# pydantic_ai_slim/pydantic_ai/ui/ag_ui/_adapter.py:111-115
+    def toolset(self) -> AbstractToolset[AgentDepsT] | None:
+        """Toolset representing frontend tools from the AG-UI run input."""
+        if self.run_input.tools:
+            return _AGUIFrontendToolset[AgentDepsT](self.run_input.tools)
+        return None
+
+# tests/providers/test_google_vertex.py:34-43
+def http_client():
+    async def handler(request: httpx.Request):
+        if (
+            request.url.path
+            == '/v1/projects/my-project-id/locations/us-central1/publishers/google/models/gemini-1.0-pro:generateContent'
+        ):
+            return httpx.Response(200, json={'content': 'success'})
+        raise NotImplementedError(f'Unexpected request: {request.url!r}')  # pragma: no cover
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler=handler))
+
+# tests/providers/test_google_vertex.py:34-43
+def http_client():
+    async def handler(request: httpx.Request):
+        if (
+            request.url.path
+            == '/v1/projects/my-project-id/locations/us-central1/publishers/google/models/gemini-1.0-pro:generateContent'
+        ):
+            return httpx.Response(200, json={'content': 'success'})
+        raise NotImplementedError(f'Unexpected request: {request.url!r}')  # pragma: no cover
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler=handler))
+
+# tests/providers/test_google_vertex.py:34-43
+def http_client():
+    async def handler(request: httpx.Request):
+        if (
+            request.url.path
+            == '/v1/projects/my-project-id/locations/us-central1/publishers/google/models/gemini-1.0-pro:generateContent'
+        ):
+            return httpx.Response(200, json={'content': 'success'})
+        raise NotImplementedError(f'Unexpected request: {request.url!r}')  # pragma: no cover
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler=handler))
+
+# tests/providers/test_google_vertex.py:34-43
+def http_client():
+    async def handler(request: httpx.Request):
+        if (
+            request.url.path
+            == '/v1/projects/my-project-id/locations/us-central1/publishers/google/models/gemini-1.0-pro:generateContent'
+        ):
+            return httpx.Response(200, json={'content': 'success'})
+        raise NotImplementedError(f'Unexpected request: {request.url!r}')  # pragma: no cover
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler=handler))
+
+# pydantic_ai_slim/pydantic_ai/embeddings/wrapper.py:63-65
+    def settings(self) -> EmbeddingSettings | None:
+        """Get the settings from the wrapped embedding model."""
+        return self.wrapped.settings
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:150-153
+class Unset:
+    """A singleton to represent an unset value."""
+
+    pass
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:21-21
+from httpx import USE_CLIENT_DEFAULT, Response as HTTPResponse
+
+# tests/test_examples.py:283-286
+def http_request(url: str, **kwargs: Any) -> httpx.Response:
+    # sys.stdout.write(f'GET {args=} {kwargs=}\n')
+    request = httpx.Request('GET', url, **kwargs)
+    return httpx.Response(status_code=202, content='', request=request)
+
+# examples/pydantic_ai_examples/slack_lead_qualifier/app.py:4-4
+from fastapi import FastAPI, HTTPException, status
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:67-67
+    is_https: bool
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:35-48
+from .exceptions import (
+    AgentRunError,
+    ApprovalRequired,
+    CallDeferred,
+    ConcurrencyLimitExceeded,
+    FallbackExceptionGroup,
+    IncompleteToolCall,
+    ModelAPIError,
+    ModelHTTPError,
+    ModelRetry,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+    UserError,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:35-48
+from .exceptions import (
+    AgentRunError,
+    ApprovalRequired,
+    CallDeferred,
+    ConcurrencyLimitExceeded,
+    FallbackExceptionGroup,
+    IncompleteToolCall,
+    ModelAPIError,
+    ModelHTTPError,
+    ModelRetry,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+    UserError,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:35-48
+from .exceptions import (
+    AgentRunError,
+    ApprovalRequired,
+    CallDeferred,
+    ConcurrencyLimitExceeded,
+    FallbackExceptionGroup,
+    IncompleteToolCall,
+    ModelAPIError,
+    ModelHTTPError,
+    ModelRetry,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+    UserError,
+)

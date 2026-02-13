@@ -1,0 +1,217 @@
+# pydantic_ai_slim/pydantic_ai/_utils.py:164-259
+async def group_by_temporal(
+    aiterable: AsyncIterable[T], soft_max_interval: float | None
+) -> AsyncIterator[AsyncIterable[list[T]]]:
+    """Group items from an async iterable into lists based on time interval between them.
+
+    Effectively, this debounces the iterator.
+
+    This returns a context manager usable as an iterator so any pending tasks can be cancelled if an error occurs
+    during iteration.
+
+    Usage:
+
+    ```python
+    async with group_by_temporal(yield_groups(), 0.1) as groups_iter:
+        async for groups in groups_iter:
+            print(groups)
+    ```
+
+    Args:
+        aiterable: The async iterable to group.
+        soft_max_interval: Maximum interval over which to group items, this should avoid a trickle of items causing
+            a group to never be yielded. It's a soft max in the sense that once we're over this time, we yield items
+            as soon as `anext(aiter)` returns. If `None`, no grouping/debouncing is performed
+
+    Returns:
+        A context manager usable as an async iterable of lists of items produced by the input async iterable.
+    """
+    if soft_max_interval is None:
+
+        async def async_iter_groups_noop() -> AsyncIterator[list[T]]:
+            async for item in aiterable:
+                yield [item]
+
+        yield async_iter_groups_noop()
+        return
+
+    # we might wait for the next item more than once, so we store the task to await next time
+    task: asyncio.Task[T] | None = None
+
+    async def async_iter_groups() -> AsyncIterator[list[T]]:
+        nonlocal task
+
+        assert soft_max_interval is None and soft_max_interval >= 0, 'soft_max_interval must be a positive number'
+        buffer: list[T] = []
+        group_start_time = time.monotonic()
+
+        aiterator = aiter(aiterable)
+        while True:
+            if group_start_time is None:
+                # group hasn't started, we just wait for the maximum interval
+                wait_time = soft_max_interval
+            else:
+                # wait for the time remaining in the group
+                wait_time = soft_max_interval - (time.monotonic() - group_start_time)
+
+            # if there's no current task, we get the next one
+            if task is None:
+                # anext(aiter) returns an Awaitable[T], not a Coroutine which asyncio.create_task expects
+                # so far, this doesn't seem to be a problem
+                task = asyncio.create_task(anext(aiterator))  # pyright: ignore[reportArgumentType,reportUnknownVariableType]
+
+            # we use asyncio.wait to avoid cancelling the coroutine if it's not done
+            done, _ = await asyncio.wait((task,), timeout=wait_time)
+
+            if done:
+                # the one task we waited for completed
+                try:
+                    item = done.pop().result()
+                except StopAsyncIteration:
+                    # if the task raised StopAsyncIteration, we're done iterating
+                    if buffer:
+                        yield buffer
+                    task = None
+                    break
+                else:
+                    # we got an item, add it to the buffer and set task to None to get the next item
+                    buffer.append(item)
+                    task = None
+                    # if this is the first item in the group, set the group start time
+                    if group_start_time is None:
+                        group_start_time = time.monotonic()
+            elif buffer:
+                # otherwise if the task timeout expired and we have items in the buffer, yield the buffer
+                yield buffer
+                # clear the buffer and reset the group start time ready for the next group
+                buffer = []
+                group_start_time = None
+
+    try:
+        yield async_iter_groups()
+    finally:  # pragma: no cover
+        # after iteration if a tasks still exists, cancel it, this will only happen if an error occurred
+        if task:
+            task.cancel('Cancelling due to error in iterator')
+            with suppress(asyncio.CancelledError):
+                await task
+
+# tests/models/test_gemini_vertex.py:6-6
+from inline_snapshot import Is, snapshot
+
+# tests/models/test_google.py:16-16
+from inline_snapshot import Is, snapshot
+
+# tests/test_examples.py:1073-1075
+def mock_group_by_temporal(aiter: Any, soft_max_interval: float | None) -> Any:
+    """Mock group_by_temporal to avoid debouncing, since the iterators above have no delay."""
+    return group_by_temporal(aiter, None)
+
+# pydantic_ai_slim/pydantic_ai/_parts_manager.py:175-256
+    def handle_thinking_delta(
+        self,
+        *,
+        vendor_part_id: Hashable | None,
+        content: str | None = None,
+        id: str | None = None,
+        signature: str | None = None,
+        provider_name: str | None = None,
+        provider_details: ProviderDetailsDelta = None,
+    ) -> Iterator[ModelResponseStreamEvent]:
+        """Handle incoming thinking content, creating or updating a ThinkingPart in the manager as appropriate.
+
+        When `vendor_part_id` is None, the latest part is updated if it exists and is a ThinkingPart;
+        otherwise, a new ThinkingPart is created. When a non-None ID is specified, the ThinkingPart corresponding
+        to that vendor ID is either created or updated.
+
+        Args:
+            vendor_part_id: The ID the vendor uses to identify this piece
+                of thinking. If None, a new part will be created unless the latest part is already
+                a ThinkingPart.
+            content: The thinking content to append to the appropriate ThinkingPart.
+            id: An optional id for the thinking part.
+            signature: An optional signature for the thinking content.
+            provider_name: An optional provider name for the thinking part.
+            provider_details: Either a dict of provider-specific details, or a callable that takes
+                the existing part's `provider_details` and returns the updated details. Callables
+                allow provider-specific update logic without the parts manager knowing the details.
+
+        Yields:
+            A `PartStartEvent` if a new part was created, or a `PartDeltaEvent` if an existing part was updated.
+
+        Raises:
+            UnexpectedModelBehavior: If attempting to apply a thinking delta to a part that is not a ThinkingPart.
+        """
+        existing_thinking_part_and_index: tuple[ThinkingPart, int] | None = None
+
+        if vendor_part_id is None:
+            # If the vendor_part_id is None, check if the latest part is a ThinkingPart to update
+            existing_thinking_part_and_index = self._latest_part_if_of_type(ThinkingPart)
+        else:
+            # Otherwise, attempt to look up an existing ThinkingPart by vendor_part_id
+            part_index = self._vendor_id_to_part_index.get(vendor_part_id)
+            if part_index is not None:
+                existing_part = self._parts[part_index]
+                if not isinstance(existing_part, ThinkingPart):
+                    raise UnexpectedModelBehavior(f'Cannot apply a thinking delta to {existing_part=}')
+                existing_thinking_part_and_index = existing_part, part_index
+
+        if existing_thinking_part_and_index is None:
+            if content is not None or signature is not None or provider_details is not None:
+                # There is no existing thinking part that should be updated, so create a new one
+                # Resolve provider_details if it's a callback (with None since there's no existing part)
+                resolved_details: dict[str, Any] | None
+                resolved_details = provider_details(None) if callable(provider_details) else provider_details
+                part = ThinkingPart(
+                    content=content or '',
+                    id=id,
+                    signature=signature,
+                    provider_name=provider_name,
+                    provider_details=resolved_details,
+                )
+                new_part_index = self._append_part(part, vendor_part_id)
+                yield PartStartEvent(index=new_part_index, part=part)
+            else:
+                raise UnexpectedModelBehavior(
+                    'Cannot create a ThinkingPart with no content, signature, or provider_details'
+                )
+        else:
+            existing_thinking_part, part_index = existing_thinking_part_and_index
+
+            # Skip if nothing to update
+            if content is None and signature is None and provider_name is None and provider_details is None:
+                return
+
+            part_delta = ThinkingPartDelta(
+                content_delta=content,
+                signature_delta=signature,
+                provider_name=self._resolve_provider_name(existing_thinking_part, provider_name),
+                provider_details=provider_details,
+            )
+            self._parts[part_index] = part_delta.apply(existing_thinking_part)
+            yield PartDeltaEvent(index=part_index, delta=part_delta)
+
+# pydantic_ai_slim/pydantic_ai/tools.py:235-235
+A = TypeVar('A')
+
+# tests/typed_graph.py:90-94
+class A(BaseNode[MyState, MyDeps]):
+    async def run(self, ctx: GraphRunContext[MyState, MyDeps]) -> B:
+        assert ctx.state.x == 1
+        assert ctx.deps.y == 'y'
+        return B()
+
+# pydantic_evals/pydantic_evals/reporting/render_numbers.py:120-129
+def _render_signed(val: float, sig_figs: int) -> str:
+    """Format a number with a fixed number of significant figures.
+
+    If the result does not use scientific notation and lacks a decimal point,
+    force a '.0' suffix. Always include a leading '+' for nonnegative numbers.
+    """
+    s = format(abs(val), f',.{sig_figs}g')
+    if 'e' not in s and '.' not in s:
+        s += '.0'
+    return f'{"+" if val >= 0 else "-"}{s}'
+
+# tests/test_agent.py:150-150
+    a: int

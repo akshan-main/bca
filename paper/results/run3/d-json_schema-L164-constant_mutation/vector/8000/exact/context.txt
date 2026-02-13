@@ -1,0 +1,848 @@
+# pydantic_ai_slim/pydantic_ai/tools.py:235-235
+A = TypeVar('A')
+
+# pydantic_evals/pydantic_evals/dataset.py:778-825
+    def model_json_schema_with_evaluators(
+        cls,
+        custom_evaluator_types: Sequence[type[Evaluator[InputsT, OutputT, MetadataT]]] = (),
+        custom_report_evaluator_types: Sequence[type[ReportEvaluator[InputsT, OutputT, MetadataT]]] = (),
+    ) -> dict[str, Any]:
+        """Generate a JSON schema for this dataset type, including evaluator details.
+
+        This is useful for generating a schema that can be used to validate YAML-format dataset files.
+
+        Args:
+            custom_evaluator_types: Custom evaluator classes to include in the schema.
+            custom_report_evaluator_types: Custom report evaluator classes to include in the schema.
+
+        Returns:
+            A dictionary representing the JSON schema.
+        """
+        evaluator_schema_types = _build_evaluator_schema_types(
+            _get_evaluator_registry(custom_evaluator_types, Evaluator, DEFAULT_EVALUATORS, 'evaluator')
+        )
+        report_evaluator_schema_types = _build_evaluator_schema_types(
+            _get_evaluator_registry(
+                custom_report_evaluator_types, ReportEvaluator, DEFAULT_REPORT_EVALUATORS, 'report evaluator'
+            )
+        )
+
+        in_type, out_type, meta_type = cls._params()
+
+        # Note: we shadow the `Case` and `Dataset` class names here to generate a clean JSON schema
+        class Case(BaseModel, extra='forbid'):  # pyright: ignore[reportUnusedClass]  # this _is_ used below, but pyright doesn't seem to notice..
+            name: str | None = None
+            inputs: in_type  # pyright: ignore[reportInvalidTypeForm]
+            metadata: meta_type | None = None  # pyright: ignore[reportInvalidTypeForm]
+            expected_output: out_type | None = None  # pyright: ignore[reportInvalidTypeForm]
+            if evaluator_schema_types:  # pragma: no branch
+                evaluators: list[Union[tuple(evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
+
+        class Dataset(BaseModel, extra='forbid'):
+            name: str | None = None
+            cases: list[Case]
+            if evaluator_schema_types:  # pragma: no branch
+                evaluators: list[Union[tuple(evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
+            if report_evaluator_schema_types:  # pragma: no branch
+                report_evaluators: list[Union[tuple(report_evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
+
+        json_schema = Dataset.model_json_schema()
+        # See `_add_json_schema` below, since `$schema` is added to the JSON, it has to be supported in the JSON
+        json_schema['properties']['$schema'] = {'type': 'string'}
+        return json_schema
+
+# tests/typed_graph.py:90-94
+class A(BaseNode[MyState, MyDeps]):
+    async def run(self, ctx: GraphRunContext[MyState, MyDeps]) -> B:
+        assert ctx.state.x == 1
+        assert ctx.deps.y == 'y'
+        return B()
+
+# pydantic_ai_slim/pydantic_ai/messages.py:681-703
+class ToolReturn:
+    """A structured return value for tools that need to provide both a return value and custom content to the model.
+
+    This class allows tools to return complex responses that include:
+    - A return value for actual tool return
+    - Custom content (including multi-modal content) to be sent to the model as a UserPromptPart
+    - Optional metadata for application use
+    """
+
+    return_value: ToolReturnContent
+    """The return value to be used in the tool response."""
+
+    _: KW_ONLY
+
+    content: str | Sequence[UserContent] | None = None
+    """The content to be sent to the model as a UserPromptPart."""
+
+    metadata: Any = None
+    """Additional data that can be accessed programmatically by the application but is not sent to the LLM."""
+
+    kind: Literal['tool-return'] = 'tool-return'
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+# pydantic_evals/pydantic_evals/dataset.py:1388-1436
+def _build_evaluator_schema_types(registry: Mapping[str, type[Any]]) -> list[Any]:
+    """Build a list of schema types for evaluators from a registry.
+
+    This is used to generate the JSON schema for both case-level and report-level evaluators.
+
+    Args:
+        registry: Mapping from evaluator names to evaluator classes.
+
+    Returns:
+        A list of types suitable for use in a Union for JSON schema generation.
+    """
+    schema_types: list[Any] = []
+    for name, evaluator_class in registry.items():
+        type_hints = _typing_extra.get_function_type_hints(evaluator_class)
+        type_hints.pop('return', None)
+        required_type_hints: dict[str, Any] = {}
+
+        for p in inspect.signature(evaluator_class).parameters.values():
+            type_hints.setdefault(p.name, Any)
+            if p.default is not p.empty:
+                type_hints[p.name] = NotRequired[type_hints[p.name]]
+            else:
+                required_type_hints[p.name] = type_hints[p.name]
+
+        def _make_typed_dict(cls_name_prefix: str, fields: dict[str, Any]) -> Any:
+            td = TypedDict(f'{cls_name_prefix}_{name}', fields)  # pyright: ignore[reportArgumentType]
+            config = ConfigDict(extra='forbid', arbitrary_types_allowed=True)
+            # TODO: Replace with pydantic.with_config once pydantic 2.11 is the min supported version
+            td.__pydantic_config__ = config  # pyright: ignore[reportAttributeAccessIssue]
+            return td
+
+        # Shortest form: just the call name
+        if len(type_hints) == 0 or not required_type_hints:
+            schema_types.append(Literal[name])
+
+        # Short form: can be called with only one parameter
+        if len(type_hints) == 1:
+            [type_hint_type] = type_hints.values()
+            schema_types.append(_make_typed_dict('short_evaluator', {name: type_hint_type}))
+        elif len(required_type_hints) == 1:  # pragma: no branch
+            [type_hint_type] = required_type_hints.values()
+            schema_types.append(_make_typed_dict('short_evaluator', {name: type_hint_type}))
+
+        # Long form: multiple parameters, possibly required
+        if len(type_hints) > 1:
+            params_td = _make_typed_dict('evaluator_params', type_hints)
+            schema_types.append(_make_typed_dict('evaluator', {name: params_td}))
+
+    return schema_types
+
+# pydantic_evals/pydantic_evals/reporting/render_numbers.py:62-94
+def default_render_number_diff(old: float | int, new: float | int) -> str | None:
+    """Return a string representing the difference between old and new values.
+
+    Rules:
+      - If the two values are equal, return None.
+      - For integers, return the raw difference (with a leading sign), e.g.:
+            _default_format_number_diff(3, 4) -> '+1'
+      - For floats (or a mix of float and int):
+          * Compute the raw delta = new - old and format it with ABS_SIG_FIGS significant figures.
+          * If `old` is nonzero, compute a relative change:
+              - If |delta|/|old| ≤ 1, render the relative change as a percentage with
+                PERC_DECIMALS decimal places, e.g. '+0.7 / +70.0%'.
+              - If |delta|/|old| > 1, render a multiplier (new/old). Use one decimal place
+                if the absolute multiplier is less than MULTIPLIER_ONE_DECIMAL_THRESHOLD,
+                otherwise no decimals.
+          * However, if the percentage rounds to 0.0% (e.g. '+0.0%'), return only the absolute diff.
+          * Also, if |old| is below BASE_THRESHOLD and |delta| exceeds MULTIPLIER_DROP_FACTOR×|old|,
+            drop the relative change indicator.
+    """
+    if old == new:
+        return None
+
+    if isinstance(old, int) and isinstance(new, int):
+        diff_int = new - old
+        return f'{diff_int:+d}'
+
+    delta = new - old
+    abs_diff_str = _render_signed(delta, ABS_SIG_FIGS)
+    rel_diff_str = _render_relative(new, old, BASE_THRESHOLD)
+    if rel_diff_str is None:
+        return abs_diff_str
+    else:
+        return f'{abs_diff_str} / {rel_diff_str}'
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:442-455
+    def _str_gen(self, schema: dict[str, Any]) -> str:
+        """Generate a string from a JSON Schema string."""
+        min_len = schema.get('minLength')
+        if min_len is not None:
+            return self._char() * min_len
+
+        if schema.get('maxLength') == 0:
+            return ''
+
+        if fmt := schema.get('format'):
+            if fmt == 'date':
+                return (date(2024, 1, 1) + timedelta(days=self.seed)).isoformat()
+
+        return self._char()
+
+# pydantic_evals/pydantic_evals/dataset.py:828-845
+    def _save_schema(
+        cls,
+        path: Path | str,
+        custom_evaluator_types: Sequence[type[Evaluator[InputsT, OutputT, MetadataT]]] = (),
+        custom_report_evaluator_types: Sequence[type[ReportEvaluator[InputsT, OutputT, MetadataT]]] = (),
+    ):
+        """Save the JSON schema for this dataset type to a file.
+
+        Args:
+            path: Path to save the schema to.
+            custom_evaluator_types: Custom evaluator classes to include in the schema.
+            custom_report_evaluator_types: Custom report evaluator classes to include in the schema.
+        """
+        path = Path(path)
+        json_schema = cls.model_json_schema_with_evaluators(custom_evaluator_types, custom_report_evaluator_types)
+        schema_content = to_json(json_schema, indent=2).decode() + '\n'
+        if not path.exists() or path.read_text(encoding='utf-8') != schema_content:  # pragma: no branch
+            path.write_text(schema_content, encoding='utf-8')
+
+# tests/test_agent.py:150-150
+    a: int
+
+# tests/test_agent_output_schemas.py:24-24
+    a: list[Bar]
+
+# tests/test_streaming.py:65-65
+    a: int
+
+# tests/typed_agent.py:154-154
+    a: int
+
+# pydantic_ai_slim/pydantic_ai/output.py:296-360
+def StructuredDict(
+    json_schema: JsonSchemaValue, name: str | None = None, description: str | None = None
+) -> type[JsonSchemaValue]:
+    """Returns a `dict[str, Any]` subclass with a JSON schema attached that will be used for structured output.
+
+    Args:
+        json_schema: A JSON schema of type `object` defining the structure of the dictionary content.
+        name: Optional name of the structured output. If not provided, the `title` field of the JSON schema will be used if it's present.
+        description: Optional description of the structured output. If not provided, the `description` field of the JSON schema will be used if it's present.
+
+    Example:
+    ```python {title="structured_dict.py"}
+    from pydantic_ai import Agent, StructuredDict
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'name': {'type': 'string'},
+            'age': {'type': 'integer'}
+        },
+        'required': ['name', 'age']
+    }
+
+    agent = Agent('openai:gpt-5.2', output_type=StructuredDict(schema))
+    result = agent.run_sync('Create a person')
+    print(result.output)
+    #> {'name': 'John Doe', 'age': 30}
+    ```
+    """
+    json_schema = _utils.check_object_json_schema(json_schema)
+
+    # Pydantic `TypeAdapter` fails when `object.__get_pydantic_json_schema__` has `$defs`, so we inline them
+    # See https://github.com/pydantic/pydantic/issues/12145
+    if '$defs' in json_schema:
+        json_schema = InlineDefsJsonSchemaTransformer(json_schema).walk()
+        if '$defs' in json_schema:
+            raise exceptions.UserError(
+                '`StructuredDict` does not currently support recursive `$ref`s and `$defs`. See https://github.com/pydantic/pydantic/issues/12145 for more information.'
+            )
+
+    if name:
+        json_schema['title'] = name
+
+    if description:
+        json_schema['description'] = description
+
+    class _StructuredDict(JsonSchemaValue):
+        __is_model_like__ = True
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls, source_type: Any, handler: GetCoreSchemaHandler
+        ) -> core_schema.CoreSchema:
+            return core_schema.dict_schema(
+                keys_schema=core_schema.str_schema(),
+                values_schema=core_schema.any_schema(),
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, core_schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler
+        ) -> JsonSchemaValue:
+            return json_schema
+
+    return _StructuredDict
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:370-520
+class _JsonSchemaTestData:
+    """Generate data that matches a JSON schema.
+
+    This tries to generate the minimal viable data for the schema.
+    """
+
+    def __init__(self, schema: _utils.ObjectJsonSchema, seed: int = 0):
+        self.schema = schema
+        self.defs = schema.get('$defs', {})
+        self.seed = seed
+
+    def generate(self) -> dict[str, Any]:
+        """Generate data for the JSON schema."""
+        return self._gen_any(self.schema)
+
+    def _gen_any(self, schema: dict[str, Any]) -> Any:
+        """Generate data for any JSON Schema."""
+        if const := schema.get('const'):
+            return const
+        elif enum := schema.get('enum'):
+            return enum[self.seed % len(enum)]
+        elif examples := schema.get('examples'):
+            return examples[self.seed % len(examples)]
+        elif ref := schema.get('$ref'):
+            key = re.sub(r'^#/\$defs/', '', ref)
+            js_def = self.defs[key]
+            return self._gen_any(js_def)
+        elif any_of := schema.get('anyOf'):
+            return self._gen_any(any_of[self.seed % len(any_of)])
+
+        type_ = schema.get('type')
+        if type_ is None:
+            # if there's no type or ref, we can't generate anything
+            return self._char()
+        elif type_ == 'object':
+            return self._object_gen(schema)
+        elif type_ == 'string':
+            return self._str_gen(schema)
+        elif type_ == 'integer':
+            return self._int_gen(schema)
+        elif type_ == 'number':
+            return float(self._int_gen(schema))
+        elif type_ == 'boolean':
+            return self._bool_gen()
+        elif type_ == 'array':
+            return self._array_gen(schema)
+        elif type_ == 'null':
+            return None
+        else:
+            raise NotImplementedError(f'Unknown type: {type_}, please submit a PR to extend JsonSchemaTestData!')
+
+    def _object_gen(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """Generate data for a JSON Schema object."""
+        required = set(schema.get('required', []))
+
+        data: dict[str, Any] = {}
+        if properties := schema.get('properties'):
+            for key, value in properties.items():
+                if key in required:
+                    data[key] = self._gen_any(value)
+
+        if addition_props := schema.get('additionalProperties'):
+            add_prop_key = 'additionalProperty'
+            while add_prop_key in data:
+                add_prop_key += '_'
+            if addition_props is True:
+                data[add_prop_key] = self._char()
+            else:
+                data[add_prop_key] = self._gen_any(addition_props)
+
+        return data
+
+    def _str_gen(self, schema: dict[str, Any]) -> str:
+        """Generate a string from a JSON Schema string."""
+        min_len = schema.get('minLength')
+        if min_len is not None:
+            return self._char() * min_len
+
+        if schema.get('maxLength') == 0:
+            return ''
+
+        if fmt := schema.get('format'):
+            if fmt == 'date':
+                return (date(2024, 1, 1) + timedelta(days=self.seed)).isoformat()
+
+        return self._char()
+
+    def _int_gen(self, schema: dict[str, Any]) -> int:
+        """Generate an integer from a JSON Schema integer."""
+        maximum = schema.get('maximum')
+        if maximum is None:
+            exc_max = schema.get('exclusiveMaximum')
+            if exc_max is not None:
+                maximum = exc_max - 1
+
+        minimum = schema.get('minimum')
+        if minimum is None:
+            exc_min = schema.get('exclusiveMinimum')
+            if exc_min is not None:
+                minimum = exc_min + 1
+
+        if minimum is not None and maximum is not None:
+            return minimum + self.seed % (maximum - minimum)
+        elif minimum is not None:
+            return minimum + self.seed
+        elif maximum is not None:
+            return maximum - self.seed
+        else:
+            return self.seed
+
+    def _bool_gen(self) -> bool:
+        """Generate a boolean from a JSON Schema boolean."""
+        return bool(self.seed % 2)
+
+    def _array_gen(self, schema: dict[str, Any]) -> list[Any]:
+        """Generate an array from a JSON Schema array."""
+        data: list[Any] = []
+        unique_items = schema.get('uniqueItems')
+        if prefix_items := schema.get('prefixItems'):
+            for item in prefix_items:
+                data.append(self._gen_any(item))
+                if unique_items:
+                    self.seed += 1
+
+        items_schema = schema.get('items', {})
+        min_items = schema.get('minItems', 0)
+        if min_items > len(data):
+            for _ in range(min_items - len(data)):
+                data.append(self._gen_any(items_schema))
+                if unique_items:
+                    self.seed += 1
+        elif items_schema:
+            # if there is an `items` schema, add an item unless it would break `maxItems` rule
+            max_items = schema.get('maxItems')
+            if max_items is None or max_items > len(data):
+                data.append(self._gen_any(items_schema))
+                if unique_items:
+                    self.seed += 1
+
+        return data
+
+    def _char(self) -> str:
+        """Generate a character on the same principle as Excel columns, e.g. a-z, aa-az..."""
+        chars = len(_chars)
+        s = ''
+        rem = self.seed // chars
+        while rem > 0:
+            s += _chars[(rem - 1) % chars]
+            rem //= chars
+        s += _chars[self.seed % chars]
+        return s
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:136-384
+class Embedder:
+    """High-level interface for generating text embeddings.
+
+    The `Embedder` class provides a convenient way to generate vector embeddings from text
+    using various embedding model providers. It handles model inference, settings management,
+    and optional OpenTelemetry instrumentation.
+
+    Example:
+    ```python
+    from pydantic_ai import Embedder
+
+    embedder = Embedder('openai:text-embedding-3-small')
+
+
+    async def main():
+        result = await embedder.embed_query('What is machine learning?')
+        print(result.embeddings[0][:5])  # First 5 dimensions
+        #> [1.0, 1.0, 1.0, 1.0, 1.0]
+    ```
+    """
+
+    instrument: InstrumentationSettings | bool | None
+    """Options to automatically instrument with OpenTelemetry.
+
+    Set to `True` to use default instrumentation settings, which will use Logfire if it's configured.
+    Set to an instance of [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings] to customize.
+    If this isn't set, then the last value set by
+    [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all]
+    will be used, which defaults to False.
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    _instrument_default: ClassVar[InstrumentationSettings | bool] = False
+
+    def __init__(
+        self,
+        model: EmbeddingModel | KnownEmbeddingModelName | str,
+        *,
+        settings: EmbeddingSettings | None = None,
+        defer_model_check: bool = True,
+        instrument: InstrumentationSettings | bool | None = None,
+    ) -> None:
+        """Initialize an Embedder.
+
+        Args:
+            model: The embedding model to use. Can be specified as:
+
+                - A model name string in the format `'provider:model-name'`
+                  (e.g., `'openai:text-embedding-3-small'`)
+                - An [`EmbeddingModel`][pydantic_ai.embeddings.EmbeddingModel] instance
+            settings: Optional [`EmbeddingSettings`][pydantic_ai.embeddings.EmbeddingSettings]
+                to use as defaults for all embed calls.
+            defer_model_check: Whether to defer model validation until first use.
+                Set to `False` to validate the model immediately on construction.
+            instrument: OpenTelemetry instrumentation settings. Set to `True` to enable with defaults,
+                or pass an [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize. If `None`, uses the value from
+                [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all].
+        """
+        self._model = model if defer_model_check else infer_embedding_model(model)
+        self._settings = settings
+        self.instrument = instrument
+
+        self._override_model: ContextVar[EmbeddingModel | None] = ContextVar('_override_model', default=None)
+
+    @staticmethod
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the default instrumentation options for all embedders where `instrument` is not explicitly set.
+
+        This is useful for enabling instrumentation globally without modifying each embedder individually.
+
+        Args:
+            instrument: Instrumentation settings to use as the default. Set to `True` for default settings,
+                `False` to disable, or pass an
+                [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize.
+        """
+        Embedder._instrument_default = instrument
+
+    @property
+    def model(self) -> EmbeddingModel | KnownEmbeddingModelName | str:
+        """The embedding model used by this embedder."""
+        return self._model
+
+    @contextmanager
+    def override(
+        self,
+        *,
+        model: EmbeddingModel | KnownEmbeddingModelName | str | _utils.Unset = _utils.UNSET,
+    ) -> Iterator[None]:
+        """Context manager to temporarily override the embedding model.
+
+        Useful for testing or dynamically switching models.
+
+        Args:
+            model: The embedding model to use within this context.
+
+        Example:
+        ```python
+        from pydantic_ai import Embedder
+
+        embedder = Embedder('openai:text-embedding-3-small')
+
+
+        async def main():
+            # Temporarily use a different model
+            with embedder.override(model='openai:text-embedding-3-large'):
+                result = await embedder.embed_query('test')
+                print(len(result.embeddings[0]))  # 3072 dimensions for large model
+                #> 3072
+        ```
+        """
+        if _utils.is_set(model):
+            model_token = self._override_model.set(infer_embedding_model(model))
+        else:
+            model_token = None
+
+        try:
+            yield
+        finally:
+            if model_token is not None:
+                self._override_model.reset(model_token)
+
+    async def embed_query(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more query texts.
+
+        Use this method when embedding search queries that will be compared against document embeddings.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            query: A single query string or sequence of query strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(query, input_type='query', settings=settings)
+
+    async def embed_documents(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more document texts.
+
+        Use this method when embedding documents that will be stored and later searched against.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            documents: A single document string or sequence of document strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(documents, input_type='document', settings=settings)
+
+    async def embed(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed text inputs with explicit input type specification.
+
+        This is the low-level embedding method. For most use cases, prefer
+        [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query] or
+        [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents].
+
+        Args:
+            inputs: A single string or sequence of strings to embed.
+            input_type: The type of input, either `'query'` or `'document'`.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        model = self._get_model()
+        settings = merge_embedding_settings(self._settings, settings)
+        return await model.embed(inputs, input_type=input_type, settings=settings)
+
+    async def max_input_tokens(self) -> int | None:
+        """Get the maximum number of tokens the model can accept as input.
+
+        Returns:
+            The maximum token count, or `None` if the limit is unknown for this model.
+        """
+        model = self._get_model()
+        return await model.max_input_tokens()
+
+    async def count_tokens(self, text: str) -> int:
+        """Count the number of tokens in the given text.
+
+        Args:
+            text: The text to tokenize and count.
+
+        Returns:
+            The number of tokens in the text.
+
+        Raises:
+            NotImplementedError: If the model doesn't support token counting.
+            UserError: If the model or tokenizer is not supported.
+        """
+        model = self._get_model()
+        return await model.count_tokens(text)
+
+    def embed_query_sync(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_query(query, settings=settings))
+
+    def embed_documents_sync(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_documents(documents, settings=settings))
+
+    def embed_sync(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed()`][pydantic_ai.embeddings.Embedder.embed]."""
+        return _utils.get_event_loop().run_until_complete(self.embed(inputs, input_type=input_type, settings=settings))
+
+    def max_input_tokens_sync(self) -> int | None:
+        """Synchronous version of [`max_input_tokens()`][pydantic_ai.embeddings.Embedder.max_input_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.max_input_tokens())
+
+    def count_tokens_sync(self, text: str) -> int:
+        """Synchronous version of [`count_tokens()`][pydantic_ai.embeddings.Embedder.count_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.count_tokens(text))
+
+    def _get_model(self) -> EmbeddingModel:
+        """Create a model configured for this embedder.
+
+        Returns:
+            The embedding model to use, with instrumentation applied if configured.
+        """
+        model_: EmbeddingModel
+        if some_model := self._override_model.get():
+            model_ = some_model
+        else:
+            model_ = self._model = infer_embedding_model(self.model)
+
+        instrument = self.instrument
+        if instrument is None:
+            instrument = self._instrument_default
+
+        return instrument_embedding_model(model_, instrument)
+
+# pydantic_ai_slim/pydantic_ai/messages.py:906-924
+class BuiltinToolReturnPart(BaseToolReturnPart):
+    """A tool return message from a built-in tool."""
+
+    _: KW_ONLY
+
+    provider_name: str | None = None
+    """The name of the provider that generated the response.
+
+    Required to be set when `provider_details` is set.
+    """
+
+    provider_details: dict[str, Any] | None = None
+    """Additional data returned by the provider that can't be mapped to standard fields.
+
+    This is used for data that is required to be sent back to APIs, as well as data users may want to access programmatically.
+    When this field is set, `provider_name` is required to identify the provider that generated this data."""
+
+    part_kind: Literal['builtin-tool-return'] = 'builtin-tool-return'
+    """Part type identifier, this is available on all parts as a discriminator."""
+
+# pydantic_ai_slim/pydantic_ai/_json_schema.py:53-55
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        """Make changes to the schema."""
+        return schema
+
+# pydantic_evals/pydantic_evals/dataset.py:884-894
+    def _add_json_schema(self, nxt: SerializerFunctionWrapHandler, info: SerializationInfo) -> dict[str, Any]:
+        """Add the JSON schema path to the serialized output.
+
+        See <https://github.com/json-schema-org/json-schema-spec/issues/828> for context, that seems to be the nearest
+        there is to a spec for this.
+        """
+        context = cast(dict[str, Any] | None, info.context)
+        if isinstance(context, dict) and (schema := context.get('$schema')):
+            return {'$schema': schema} | nxt(self)
+        else:
+            return nxt(self)
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:376-379
+    def __init__(self, schema: _utils.ObjectJsonSchema, seed: int = 0):
+        self.schema = schema
+        self.defs = schema.get('$defs', {})
+        self.seed = seed
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:421-440
+    def _object_gen(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """Generate data for a JSON Schema object."""
+        required = set(schema.get('required', []))
+
+        data: dict[str, Any] = {}
+        if properties := schema.get('properties'):
+            for key, value in properties.items():
+                if key in required:
+                    data[key] = self._gen_any(value)
+
+        if addition_props := schema.get('additionalProperties'):
+            add_prop_key = 'additionalProperty'
+            while add_prop_key in data:
+                add_prop_key += '_'
+            if addition_props is True:
+                data[add_prop_key] = self._char()
+            else:
+                data[add_prop_key] = self._gen_any(addition_props)
+
+        return data
+
+# pydantic_ai_slim/pydantic_ai/models/mistral.py:438-488
+    def _get_python_type(cls, value: dict[str, Any]) -> str:
+        """Return a string representation of the Python type for a single JSON schema property.
+
+        This function handles recursion for nested arrays/objects and `anyOf`.
+        """
+        # 1) Handle anyOf first, because it's a different schema structure
+        if any_of := value.get('anyOf'):
+            # Simplistic approach: pick the first option in anyOf
+            # (In reality, you'd possibly want to merge or union types)
+            return f'Optional[{cls._get_python_type(any_of[0])}]'
+
+        # 2) If we have a top-level "type" field
+        value_type = value.get('type')
+        if not value_type:
+            # No explicit type; fallback
+            return 'Any'
+
+        # 3) Direct simple type mapping (string, integer, float, bool, None)
+        if value_type in SIMPLE_JSON_TYPE_MAPPING and value_type != 'array' and value_type != 'object':
+            return SIMPLE_JSON_TYPE_MAPPING[value_type]
+
+        # 4) Array: Recursively get the item type
+        if value_type == 'array':
+            items = value.get('items', {})
+            return f'list[{cls._get_python_type(items)}]'
+
+        # 5) Object: Check for additionalProperties
+        if value_type == 'object':
+            additional_properties = value.get('additionalProperties', {})
+            if isinstance(additional_properties, bool):
+                return 'bool'  # pragma: lax no cover
+            additional_properties_type = additional_properties.get('type')
+            if (
+                additional_properties_type in SIMPLE_JSON_TYPE_MAPPING
+                and additional_properties_type != 'array'
+                and additional_properties_type != 'object'
+            ):
+                # dict[str, bool/int/float/etc...]
+                return f'dict[str, {SIMPLE_JSON_TYPE_MAPPING[additional_properties_type]}]'
+            elif additional_properties_type == 'array':
+                array_items = additional_properties.get('items', {})
+                return f'dict[str, list[{cls._get_python_type(array_items)}]]'
+            elif additional_properties_type == 'object':
+                # nested dictionary of unknown shape
+                return 'dict[str, dict[str, Any]]'
+            else:
+                # If no additionalProperties type or something else, default to a generic dict
+                return 'dict[str, Any]'
+
+        # 6) Fallback
+        return 'Any'
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:457-478
+    def _int_gen(self, schema: dict[str, Any]) -> int:
+        """Generate an integer from a JSON Schema integer."""
+        maximum = schema.get('maximum')
+        if maximum is None:
+            exc_max = schema.get('exclusiveMaximum')
+            if exc_max is not None:
+                maximum = exc_max - 1
+
+        minimum = schema.get('minimum')
+        if minimum is None:
+            exc_min = schema.get('exclusiveMinimum')
+            if exc_min is not None:
+                minimum = exc_min + 1
+
+        if minimum is not None and maximum is not None:
+            return minimum + self.seed % (maximum - minimum)
+        elif minimum is not None:
+            return minimum + self.seed
+        elif maximum is not None:
+            return maximum - self.seed
+        else:
+            return self.seed
+
+# tests/models/test_openai.py:1668-1668
+    a = 'a'
+
+# tests/typed_deps.py:11-11
+    a: int
+
+# pydantic_ai_slim/pydantic_ai/messages.py:896-902
+class ToolReturnPart(BaseToolReturnPart):
+    """A tool return message, this encodes the result of running a tool."""
+
+    _: KW_ONLY
+
+    part_kind: Literal['tool-return'] = 'tool-return'
+    """Part type identifier, this is available on all parts as a discriminator."""

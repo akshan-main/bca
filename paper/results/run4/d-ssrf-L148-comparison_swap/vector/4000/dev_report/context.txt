@@ -1,0 +1,471 @@
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:130-148
+def validate_url_protocol(url: str) -> tuple[str, bool]:
+    """Validate that the URL uses an allowed protocol (http or https).
+
+    Args:
+        url: The URL to validate.
+
+    Returns:
+        Tuple of (scheme, is_https).
+
+    Raises:
+        ValueError: If the protocol is not http or https.
+    """
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+
+    if scheme not in ('http', 'https'):
+        raise ValueError(f'URL protocol "{scheme}" is not allowed. Only http:// and https:// are supported.')
+
+    return scheme, scheme != 'https'
+
+# tests/test_ssrf.py:160-163
+    def test_allowed_protocols(self, url: str) -> None:
+        scheme, is_https = validate_url_protocol(url)
+        assert scheme in ('http', 'https')
+        assert is_https == (scheme == 'https')
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:1226-1285
+class MCPServerStreamableHTTP(_MCPServerHTTP):
+    """An MCP server that connects over HTTP using the Streamable HTTP transport.
+
+    This class implements the Streamable HTTP transport from the MCP specification.
+    See <https://modelcontextprotocol.io/introduction#streamable-http> for more information.
+
+    !!! note
+        Using this class as an async context manager will create a new pool of HTTP connections to connect
+        to a server which should already be running.
+
+    Example:
+    ```python {py="3.10"}
+    from pydantic_ai import Agent
+    from pydantic_ai.mcp import MCPServerStreamableHTTP
+
+    server = MCPServerStreamableHTTP('http://localhost:8000/mcp')
+    agent = Agent('openai:gpt-5.2', toolsets=[server])
+    ```
+    """
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, _: Any, __: Any) -> CoreSchema:
+        return core_schema.no_info_after_validator_function(
+            lambda dct: MCPServerStreamableHTTP(**dct),
+            core_schema.typed_dict_schema(
+                {
+                    'url': core_schema.typed_dict_field(core_schema.str_schema()),
+                    'headers': core_schema.typed_dict_field(
+                        core_schema.dict_schema(core_schema.str_schema(), core_schema.str_schema()), required=False
+                    ),
+                }
+            ),
+        )
+
+    @asynccontextmanager
+    async def client_streams(
+        self,
+    ) -> AsyncIterator[
+        tuple[
+            MemoryObjectReceiveStream[SessionMessage | Exception],
+            MemoryObjectSendStream[SessionMessage],
+        ]
+    ]:
+        if self.http_client and self.headers:
+            raise ValueError('`http_client` is mutually exclusive with `headers`.')
+
+        aexit_stack = AsyncExitStack()
+        http_client = self.http_client or await aexit_stack.enter_async_context(
+            httpx.AsyncClient(timeout=httpx.Timeout(self.timeout, read=self.read_timeout), headers=self.headers)
+        )
+        read_stream, write_stream, *_ = await aexit_stack.enter_async_context(
+            streamable_http_client(self.url, http_client=http_client)
+        )
+        try:
+            yield read_stream, write_stream
+        finally:
+            await aexit_stack.aclose()
+
+    def __eq__(self, value: object, /) -> bool:
+        return super().__eq__(value) and isinstance(value, MCPServerStreamableHTTP) and self.url == value.url
+
+# tests/test_ssrf.py:148-179
+class TestValidateUrlProtocol:
+    """Tests for validate_url_protocol function."""
+
+    @pytest.mark.parametrize(
+        'url',
+        [
+            'http://example.com',
+            'https://example.com',
+            'HTTP://EXAMPLE.COM',
+            'HTTPS://EXAMPLE.COM',
+        ],
+    )
+    def test_allowed_protocols(self, url: str) -> None:
+        scheme, is_https = validate_url_protocol(url)
+        assert scheme in ('http', 'https')
+        assert is_https == (scheme == 'https')
+
+    @pytest.mark.parametrize(
+        ('url', 'protocol'),
+        [
+            ('file:///etc/passwd', 'file'),
+            ('ftp://ftp.example.com/file.txt', 'ftp'),
+            ('gopher://gopher.example.com', 'gopher'),
+            ('gs://bucket/object', 'gs'),
+            ('s3://bucket/key', 's3'),
+            ('data:text/plain,hello', 'data'),
+            ('javascript:alert(1)', 'javascript'),
+        ],
+    )
+    def test_blocked_protocols(self, url: str, protocol: str) -> None:
+        with pytest.raises(ValueError, match=f'URL protocol "{protocol}" is not allowed'):
+            validate_url_protocol(url)
+
+# pydantic_ai_slim/pydantic_ai/providers/anthropic.py:56-93
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        anthropic_client: AsyncAnthropicClient | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        """Create a new Anthropic provider.
+
+        Args:
+            api_key: The API key to use for authentication, if not provided, the `ANTHROPIC_API_KEY` environment variable
+                will be used if available.
+            base_url: The base URL to use for the Anthropic API.
+            anthropic_client: An existing Anthropic client to use. Accepts
+                [`AsyncAnthropic`](https://github.com/anthropics/anthropic-sdk-python),
+                [`AsyncAnthropicBedrock`](https://docs.anthropic.com/en/api/claude-on-amazon-bedrock),
+                [`AsyncAnthropicFoundry`](https://platform.claude.com/docs/en/build-with-claude/claude-in-microsoft-foundry), or
+                [`AsyncAnthropicVertex`](https://docs.anthropic.com/en/api/claude-on-vertex-ai).
+                If provided, the `api_key` and `http_client` arguments will be ignored.
+            http_client: An existing `httpx.AsyncClient` to use for making HTTP requests.
+        """
+        if anthropic_client is not None:
+            assert http_client is None, 'Cannot provide both `anthropic_client` and `http_client`'
+            assert api_key is None, 'Cannot provide both `anthropic_client` and `api_key`'
+            self._client = anthropic_client
+        else:
+            api_key = api_key or os.getenv('ANTHROPIC_API_KEY')
+            if not api_key:
+                raise UserError(
+                    'Set the `ANTHROPIC_API_KEY` environment variable or pass it via `AnthropicProvider(api_key=...)`'
+                    'to use the Anthropic provider.'
+                )
+            if http_client is not None:
+                self._client = AsyncAnthropic(api_key=api_key, base_url=base_url, http_client=http_client)
+            else:
+                http_client = cached_async_http_client(provider='anthropic')
+                self._client = AsyncAnthropic(api_key=api_key, base_url=base_url, http_client=http_client)
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:1124-1201
+class MCPServerSSE(_MCPServerHTTP):
+    """An MCP server that connects over streamable HTTP connections.
+
+    This class implements the SSE transport from the MCP specification.
+    See <https://spec.modelcontextprotocol.io/specification/2024-11-05/basic/transports/#http-with-sse> for more information.
+
+    !!! note
+        Using this class as an async context manager will create a new pool of HTTP connections to connect
+        to a server which should already be running.
+
+    Example:
+    ```python {py="3.10"}
+    from pydantic_ai import Agent
+    from pydantic_ai.mcp import MCPServerSSE
+
+    server = MCPServerSSE('http://localhost:3001/sse')
+    agent = Agent('openai:gpt-5.2', toolsets=[server])
+    ```
+    """
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, _: Any, __: Any) -> CoreSchema:
+        return core_schema.no_info_after_validator_function(
+            lambda dct: MCPServerSSE(**dct),
+            core_schema.typed_dict_schema(
+                {
+                    'url': core_schema.typed_dict_field(core_schema.str_schema()),
+                    'headers': core_schema.typed_dict_field(
+                        core_schema.dict_schema(core_schema.str_schema(), core_schema.str_schema()), required=False
+                    ),
+                }
+            ),
+        )
+
+    # sse_client has a hang bug (https://github.com/modelcontextprotocol/python-sdk/issues/1811)
+    # that prevents testing SSE transport in CI.
+    # TODO: Remove pragma and add a test
+    # once https://github.com/modelcontextprotocol/python-sdk/pull/1838 is released.
+    @asynccontextmanager
+    async def client_streams(  # pragma: no cover
+        self,
+    ) -> AsyncIterator[
+        tuple[
+            MemoryObjectReceiveStream[SessionMessage | Exception],
+            MemoryObjectSendStream[SessionMessage],
+        ]
+    ]:
+        if self.http_client and self.headers:
+            raise ValueError('`http_client` is mutually exclusive with `headers`.')
+
+        if self.http_client is not None:
+
+            def httpx_client_factory(
+                headers: dict[str, str] | None = None,
+                timeout: httpx.Timeout | None = None,
+                auth: httpx.Auth | None = None,
+            ) -> httpx.AsyncClient:
+                assert self.http_client is not None
+                return self.http_client
+
+            async with sse_client(
+                url=self.url,
+                timeout=self.timeout,
+                sse_read_timeout=self.read_timeout,
+                httpx_client_factory=httpx_client_factory,
+            ) as (read_stream, write_stream, *_):
+                yield read_stream, write_stream
+        else:
+            async with sse_client(
+                url=self.url,
+                timeout=self.timeout,
+                sse_read_timeout=self.read_timeout,
+                headers=self.headers,
+            ) as (read_stream, write_stream, *_):
+                yield read_stream, write_stream
+
+    def __eq__(self, value: object, /) -> bool:
+        return super().__eq__(value) and isinstance(value, MCPServerSSE) and self.url == value.url
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:1205-1223
+class MCPServerHTTP(MCPServerSSE):
+    """An MCP server that connects over HTTP using the old SSE transport.
+
+    This class implements the SSE transport from the MCP specification.
+    See <https://spec.modelcontextprotocol.io/specification/2024-11-05/basic/transports/#http-with-sse> for more information.
+
+    !!! note
+        Using this class as an async context manager will create a new pool of HTTP connections to connect
+        to a server which should already be running.
+
+    Example:
+    ```python {py="3.10" test="skip"}
+    from pydantic_ai import Agent
+    from pydantic_ai.mcp import MCPServerHTTP
+
+    server = MCPServerHTTP('http://localhost:3001/sse')
+    agent = Agent('openai:gpt-5.2', toolsets=[server])
+    ```
+    """
+
+# examples/pydantic_ai_examples/rag.py:176-180
+    def url(self) -> str:
+        url_path = re.sub(r'\.md$', '', self.path)
+        return (
+            f'https://logfire.pydantic.dev/docs/{url_path}/#{slugify(self.title, "-")}'
+        )
+
+# pydantic_ai_slim/pydantic_ai/messages.py:367-367
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/messages.py:413-413
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/messages.py:261-261
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/messages.py:320-320
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/builtin_tools.py:387-387
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/messages.py:174-174
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/retries.py:168-197
+    def handle_request(self, request: Request) -> Response:
+        """Handle an HTTP request with retry logic.
+
+        Args:
+            request: The HTTP request to handle.
+
+        Returns:
+            The HTTP response.
+
+        Raises:
+            RuntimeError: If the retry controller did not make any attempts.
+            Exception: Any exception raised by the wrapped transport or validation function.
+        """
+
+        @retry(**self.config)
+        def handle_request(req: Request) -> Response:
+            response = self.wrapped.handle_request(req)
+
+            # this is normally set by httpx _after_ calling this function, but we want the request in the validator:
+            response.request = req
+
+            if self.validate_response:
+                try:
+                    self.validate_response(response)
+                except Exception:
+                    response.close()
+                    raise
+            return response
+
+        return handle_request(request)
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:986-986
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/retries.py:265-294
+    async def handle_async_request(self, request: Request) -> Response:
+        """Handle an async HTTP request with retry logic.
+
+        Args:
+            request: The HTTP request to handle.
+
+        Returns:
+            The HTTP response.
+
+        Raises:
+            RuntimeError: If the retry controller did not make any attempts.
+            Exception: Any exception raised by the wrapped transport or validation function.
+        """
+
+        @retry(**self.config)
+        async def handle_async_request(req: Request) -> Response:
+            response = await self.wrapped.handle_async_request(req)
+
+            # this is normally set by httpx _after_ calling this function, but we want the request in the validator:
+            response.request = req
+
+            if self.validate_response:
+                try:
+                    self.validate_response(response)
+                except Exception:
+                    await response.aclose()
+                    raise
+            return response
+
+        return await handle_async_request(request)
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:89-89
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/common_tools/exa.py:42-42
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/common_tools/exa.py:72-72
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:59-59
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/common_tools/tavily.py:29-29
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:176-176
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:196-196
+    url: str
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:37-37
+    url: NotRequired[str]
+
+# pydantic_ai_slim/pydantic_ai/common_tools/tavily.py:69-81
+def tavily_search_tool(api_key: str):
+    """Creates a Tavily search tool.
+
+    Args:
+        api_key: The Tavily API key.
+
+            You can get one by signing up at [https://app.tavily.com/home](https://app.tavily.com/home).
+    """
+    return Tool[Any](
+        TavilySearchTool(client=AsyncTavilyClient(api_key)).__call__,
+        name='tavily_search',
+        description='Searches Tavily for the given query and returns the results.',
+    )
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:67-67
+    is_https: bool
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:849-861
+class _GeminiResponse(TypedDict):
+    """Schema for the response from the Gemini API.
+
+    See <https://ai.google.dev/api/generate-content#v1beta.GenerateContentResponse>
+    and <https://cloud.google.com/vertex-ai/docs/reference/rest/v1/GenerateContentResponse>
+    """
+
+    candidates: list[_GeminiCandidates]
+    # usageMetadata appears to be required by both APIs but is omitted when streaming responses until the last response
+    usage_metadata: NotRequired[Annotated[_GeminiUsageMetaData, pydantic.Field(alias='usageMetadata')]]
+    prompt_feedback: NotRequired[Annotated[_GeminiPromptFeedback, pydantic.Field(alias='promptFeedback')]]
+    model_version: NotRequired[Annotated[str, pydantic.Field(alias='modelVersion')]]
+    vendor_id: NotRequired[Annotated[str, pydantic.Field(alias='responseId')]]
+
+# tests/models/test_anthropic.py:7044-7064
+async def test_anthropic_tool_with_thinking(allow_model_requests: None, anthropic_api_key: str):
+    """When using thinking with tool calls in Anthropic, we need to send the thinking part back to the provider.
+
+    This tests the issue raised in https://github.com/pydantic/pydantic-ai/issues/2040.
+    """
+    m = AnthropicModel('claude-sonnet-4-0', provider=AnthropicProvider(api_key=anthropic_api_key))
+    settings = AnthropicModelSettings(anthropic_thinking={'type': 'enabled', 'budget_tokens': 3000})
+    agent = Agent(m, model_settings=settings)
+
+    @agent.tool_plain
+    async def get_user_country() -> str:
+        return 'Mexico'
+
+    result = await agent.run('What is the largest city in the user country?')
+    assert result.output == snapshot("""\
+Based on the information that you're from Mexico, the largest city in your country is **Mexico City** (Ciudad de México). \n\
+
+Mexico City is not only the largest city in Mexico but also one of the largest metropolitan areas in the world. The city proper has a population of approximately 9.2 million people, while the greater Mexico City metropolitan area (which includes surrounding municipalities) has over 21 million inhabitants, making it one of the most populous urban agglomerations globally.
+
+Mexico City serves as the country's capital and is the political, economic, and cultural center of Mexico.\
+""")
+
+# pydantic_ai_slim/pydantic_ai/models/__init__.py:1337-1341
+def get_user_agent() -> str:
+    """Get the user agent string for the HTTP client."""
+    from .. import __version__
+
+    return f'pydantic-ai/{__version__}'
+
+# tests/test_ssrf.py:177-179
+    def test_blocked_protocols(self, url: str, protocol: str) -> None:
+        with pytest.raises(ValueError, match=f'URL protocol "{protocol}" is not allowed'):
+            validate_url_protocol(url)
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:405-414
+def is_async_callable(obj: Any) -> Any:
+    """Correctly check if a callable is async.
+
+    This function was copied from Starlette:
+    https://github.com/encode/starlette/blob/78da9b9e218ab289117df7d62aee200ed4c59617/starlette/_utils.py#L36-L40
+    """
+    while isinstance(obj, functools.partial):
+        obj = obj.func
+
+    return inspect.iscoroutinefunction(obj) or (callable(obj) and inspect.iscoroutinefunction(obj.__call__))
+
+# pydantic_evals/pydantic_evals/dataset.py:16-16
+import traceback
+
+# pydantic_evals/pydantic_evals/evaluators/_run_evaluator.py:3-3
+import traceback
+
+# pydantic_ai_slim/pydantic_ai/_output.py:14-14
+from typing_extensions import Self, TypedDict, TypeVar
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:16-16
+from typing_extensions import Self, TypeVar, deprecated

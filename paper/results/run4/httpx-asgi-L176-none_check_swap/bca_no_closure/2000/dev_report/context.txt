@@ -1,0 +1,232 @@
+## httpx/_client.py
+
+T = typing.TypeVar("T", bound="Client")
+
+USE_CLIENT_DEFAULT = UseClientDefault()
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    def base_url(self, url: URL | str) -> None:
+        self._base_url = self._enforce_trailing_slash(URL(url))
+
+    def build_request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Request:
+        """
+        Build and return a request instance.
+
+        * The `params`, `headers` and `cookies` arguments
+        are merged with any values set on the client.
+        * The `url` argument is merged with any `base_url` set on the client.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        url = self._merge_url(url)
+        headers = self._merge_headers(headers)
+        cookies = self._merge_cookies(cookies)
+        params = self._merge_queryparams(params)
+        extensions = {} if extensions is None else extensions
+        if "timeout" not in extensions:
+            timeout = (
+                self.timeout
+                if isinstance(timeout, UseClientDefault)
+                else Timeout(timeout)
+            )
+            extensions = dict(**extensions, timeout=timeout.as_dict())
+        return Request(
+            method,
+            url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            extensions=extensions,
+        )
+
+    def request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Build and send a request.
+
+        Equivalent to:
+
+        ```python
+        request = client.build_request(...)
+        response = client.send(request, ...)
+        ```
+
+        See `Client.build_request()`, `Client.send()` and
+        [Merging of configuration][0] for how the various parameters
+        are merged with client-level configuration.
+
+        [0]: /advanced/clients/#merging-of-configuration
+        """
+        if cookies is not None:
+            message = (
+                "Setting per-request cookies=<...> is being deprecated, because "
+                "the expected behaviour on cookie persistence is ambiguous. Set "
+                "cookies directly on the client instance instead."
+            )
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        return self.send(request, auth=auth, follow_redirects=follow_redirects)
+
+    def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `Client.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                response.read()
+
+            return response
+
+        except BaseException as exc:
+            response.close()
+            raise exc
+
+## httpx/_models.py
+
+    def request(self, value: Request) -> None:
+        self._request = value
+
+## tests/test_asgi.py
+
+async def test_asgi_transport():
+    async with httpx.ASGITransport(app=hello_world) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b"Hello, World!"
+
+async def test_asgi_urlencoded_path():
+    transport = httpx.ASGITransport(app=echo_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"path": "/user@example.org"}
+
+async def test_asgi_raw_path():
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/user@example.org"}
+
+async def test_asgi_raw_path_should_not_include_querystring_portion():
+    """
+    See https://github.com/encode/httpx/issues/2810
+    """
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/path?query")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/path"}
+
+## tests/test_timeouts.py
+
+async def test_async_client_new_request_send_timeout(server):
+    timeout = httpx.Timeout(1e-6)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with pytest.raises(httpx.TimeoutException):
+            await client.send(
+                httpx.Request("GET", server.url.copy_with(path="/slow_response"))
+            )

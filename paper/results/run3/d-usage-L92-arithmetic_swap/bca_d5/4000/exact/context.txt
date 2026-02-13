@@ -1,0 +1,514 @@
+## clai/clai/__init__.py
+
+def cli():
+    """Run the clai CLI and exit."""
+    _cli.cli_exit('clai')
+
+## examples/pydantic_ai_examples/chat_app.py
+
+async def index() -> FileResponse:
+    return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
+
+    timestamp: str
+
+## examples/pydantic_ai_examples/evals/agent.py
+
+    now: datetime = field(default_factory=lambda: datetime.now().astimezone())
+
+## examples/pydantic_ai_examples/flight_booking.py
+
+    date: datetime.date
+
+async def buy_tickets(flight_details: FlightDetails, seat: SeatPreference):
+    print(f'Purchasing flight {flight_details=!r} {seat=!r}...')
+
+## examples/pydantic_ai_examples/rag.py
+
+    id: int
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/agent.py
+
+async def analyze_profile(profile: Profile) -> Analysis | None:
+    result = await agent.run(profile.as_prompt())
+    return result.output  ### [/analyze_profile]
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    usage: _usage.RunUsage = dataclasses.field(default_factory=_usage.RunUsage)
+
+    request: _messages.ModelRequest
+
+    model_response: _messages.ModelResponse
+
+async def _call_tools(  # noqa: C901
+    tool_manager: ToolManager[DepsT],
+    tool_calls: list[_messages.ToolCallPart],
+    tool_call_results: dict[str, DeferredToolResult],
+    tool_call_metadata: dict[str, dict[str, Any]] | None,
+    tracer: Tracer,
+    usage: _usage.RunUsage,
+    usage_limits: _usage.UsageLimits,
+    output_parts: list[_messages.ModelRequestPart],
+    output_deferred_calls: dict[Literal['external', 'unapproved'], list[_messages.ToolCallPart]],
+    output_deferred_metadata: dict[str, dict[str, Any]],
+) -> AsyncIterator[_messages.HandleResponseEvent]:
+    tool_parts_by_index: dict[int, _messages.ModelRequestPart] = {}
+    user_parts_by_index: dict[int, _messages.UserPromptPart] = {}
+    deferred_calls_by_index: dict[int, Literal['external', 'unapproved']] = {}
+    deferred_metadata_by_index: dict[int, dict[str, Any] | None] = {}
+
+    if usage_limits.tool_calls_limit is not None:
+        projected_usage = deepcopy(usage)
+        projected_usage.tool_calls += len(tool_calls)
+        usage_limits.check_before_tool_call(projected_usage)
+
+    for call in tool_calls:
+        yield _messages.FunctionToolCallEvent(call)
+
+    with tracer.start_as_current_span(
+        'running tools',
+        attributes={
+            'tools': [call.tool_name for call in tool_calls],
+            'logfire.msg': f'running {len(tool_calls)} tool{"" if len(tool_calls) == 1 else "s"}',
+        },
+    ):
+
+        async def handle_call_or_result(
+            coro_or_task: Awaitable[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ]
+            | Task[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ],
+            index: int,
+        ) -> _messages.HandleResponseEvent | None:
+            try:
+                tool_part, tool_user_content = (
+                    (await coro_or_task) if inspect.isawaitable(coro_or_task) else coro_or_task.result()
+                )
+            except exceptions.CallDeferred as e:
+                deferred_calls_by_index[index] = 'external'
+                deferred_metadata_by_index[index] = e.metadata
+            except exceptions.ApprovalRequired as e:
+                deferred_calls_by_index[index] = 'unapproved'
+                deferred_metadata_by_index[index] = e.metadata
+            else:
+                tool_parts_by_index[index] = tool_part
+                if tool_user_content:
+                    user_parts_by_index[index] = _messages.UserPromptPart(content=tool_user_content)
+
+                return _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
+
+        parallel_execution_mode = tool_manager.get_parallel_execution_mode(tool_calls)
+        if parallel_execution_mode == 'sequential':
+            for index, call in enumerate(tool_calls):
+                if event := await handle_call_or_result(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    index,
+                ):
+                    yield event
+
+        else:
+            tasks = [
+                asyncio.create_task(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    name=call.tool_name,
+                )
+                for call in tool_calls
+            ]
+            try:
+                if parallel_execution_mode == 'parallel_ordered_events':
+                    # Wait for all tasks to complete before yielding any events
+                    await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+                    for index, task in enumerate(tasks):
+                        if event := await handle_call_or_result(coro_or_task=task, index=index):
+                            yield event
+                else:
+                    pending: set[
+                        asyncio.Task[
+                            tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, _messages.UserPromptPart | None]
+                        ]
+                    ] = set(tasks)  # pyright: ignore[reportAssignmentType]
+                    while pending:
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            index = tasks.index(task)  # pyright: ignore[reportArgumentType]
+                            if event := await handle_call_or_result(coro_or_task=task, index=index):  # pyright: ignore[reportArgumentType]
+                                yield event
+
+            except asyncio.CancelledError as e:
+                for task in tasks:
+                    task.cancel(msg=e.args[0] if len(e.args) != 0 else None)
+
+                raise
+
+    # We append the results at the end, rather than as they are received, to retain a consistent ordering
+    # This is mostly just to simplify testing
+    output_parts.extend([tool_parts_by_index[k] for k in sorted(tool_parts_by_index)])
+    output_parts.extend([user_parts_by_index[k] for k in sorted(user_parts_by_index)])
+
+    _populate_deferred_calls(
+        tool_calls, deferred_calls_by_index, deferred_metadata_by_index, output_deferred_calls, output_deferred_metadata
+    )
+
+def get_captured_run_messages() -> _RunMessages:
+    return _messages_ctx_var.get()
+
+## pydantic_ai_slim/pydantic_ai/_otel_messages.py
+
+    type: Literal['text']
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def is_set(t_or_unset: T | Unset) -> TypeGuard[T]:
+    return t_or_unset is not UNSET
+
+def number_to_datetime(x: int | float) -> datetime:
+    return _datetime_ta.validate_python(x)
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far. This will not be the final usage until the stream is exhausted."""
+        return self._usage
+
+def get_user_agent() -> str:
+    """Get the user agent string for the HTTP client."""
+    from .. import __version__
+
+    return f'pydantic-ai/{__version__}'
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+def _function_call_part_from_call(tool: ToolCallPart) -> _GeminiFunctionCallPart:
+    return _GeminiFunctionCallPart(function_call=_GeminiFunctionCall(name=tool.tool_name, args=tool.args_as_dict()))
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._initial_run_ctx_usage + self._raw_stream_response.usage()
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    sleep: Callable[[int | float], None | Awaitable[None]]
+
+    wait: WaitBaseT
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def usage(self) -> _usage.RunUsage:
+        """Get usage statistics for the run so far, including token usage, model requests, and so on."""
+        return self._graph_run.state.usage
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+def _incr_usage_tokens(slf: RunUsage | RequestUsage, incr_usage: RunUsage | RequestUsage) -> None:
+    """Increment the usage in place.
+
+    Args:
+        slf: The usage to increment.
+        incr_usage: The usage to increment by.
+    """
+    slf.input_tokens += incr_usage.input_tokens
+    slf.cache_write_tokens += incr_usage.cache_write_tokens
+    slf.cache_read_tokens += incr_usage.cache_read_tokens
+    slf.input_audio_tokens += incr_usage.input_audio_tokens
+    slf.cache_audio_read_tokens += incr_usage.cache_audio_read_tokens
+    slf.output_tokens += incr_usage.output_tokens
+
+    for key, value in incr_usage.details.items():
+        # Note: value can be None at runtime from model responses despite the type annotation
+        if isinstance(value, (int, float)):
+            slf.details[key] = slf.details.get(key, 0) + value
+
+class Usage(RunUsage):
+    """Deprecated alias for `RunUsage`."""
+
+## pydantic_graph/pydantic_graph/beta/graph.py
+
+    def value(self) -> OutputT:
+        return self._value
+
+def _is_any_iterable(x: Any) -> TypeGuard[Iterable[Any]]:
+    return isinstance(x, Iterable)
+
+def _is_any_async_iterable(x: Any) -> TypeGuard[AsyncIterable[Any]]:
+    return isinstance(x, AsyncIterable)
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+    items: list[PathItem]
+
+## tests/evals/test_dataset.py
+
+class TaskInput(BaseModel):
+    query: str
+
+## tests/evals/test_report_evaluators.py
+
+def _make_report(cases: list[ReportCase]) -> EvaluationReport:
+    return EvaluationReport(name='test', cases=cases)
+
+## tests/graph/beta/test_broadcast_and_spread.py
+
+class CounterState:
+    values: list[int] = field(default_factory=list[int])
+
+    values: list[int] = field(default_factory=list[int])
+
+## tests/graph/beta/test_decisions.py
+
+class DecisionState:
+    path_taken: str | None = None
+    value: int = 0
+
+## tests/graph/beta/test_edge_cases.py
+
+class EdgeCaseState:
+    value: int = 0
+    error_raised: bool = False
+
+## tests/graph/beta/test_edge_labels.py
+
+class LabelState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_builder.py
+
+class SimpleState:
+    counter: int = 0
+    result: str | None = None
+
+## tests/graph/beta/test_graph_edge_cases.py
+
+class MyState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_execution.py
+
+class ExecutionState:
+    log: list[str] = field(default_factory=list[str])
+    counter: int = 0
+
+## tests/graph/beta/test_graph_iteration.py
+
+class IterState:
+    counter: int = 0
+
+## tests/graph/beta/test_v1_v2_integration.py
+
+class IntegrationState:
+    log: list[str] = field(default_factory=list[str])
+
+## tests/models/test_anthropic.py
+
+async def test_anthropic_model_usage_limit_exceeded(
+    allow_model_requests: None,
+    anthropic_api_key: str,
+):
+    model = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+    agent = Agent(model=model)
+
+    with pytest.raises(
+        UsageLimitExceeded,
+        match='The next request would exceed the input_tokens_limit of 18 \\(input_tokens=19\\)',
+    ):
+        await agent.run(
+            'The quick brown fox jumps over the lazydog.',
+            usage_limits=UsageLimits(input_tokens_limit=18, count_tokens_before_request=True),
+        )
+
+async def test_anthropic_model_usage_limit_not_exceeded(
+    allow_model_requests: None,
+    anthropic_api_key: str,
+):
+    model = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+    agent = Agent(model=model)
+
+    result = await agent.run(
+        'The quick brown fox jumps over the lazydog.',
+        usage_limits=UsageLimits(input_tokens_limit=25, count_tokens_before_request=True),
+    )
+    assert result.output == snapshot(
+        """\
+I noticed a small typo in that famous pangram! It should be:
+
+"The quick brown fox jumps over the **lazy dog**."
+
+(There should be a space between "lazy" and "dog")
+
+This sentence is often used for testing typewriters, fonts, and keyboards because it contains every letter of the English alphabet at least once.\
+"""
+    )
+
+## tests/models/test_gemini.py
+
+def example_usage() -> _GeminiUsageMetaData:
+    return _GeminiUsageMetaData(prompt_token_count=1, candidates_token_count=2, total_token_count=3)
+
+## tests/models/test_groq.py
+
+def text_chunk(text: str, finish_reason: FinishReason | None = None) -> chat.ChatCompletionChunk:
+    return chunk([ChoiceDelta(content=text, role='assistant')], finish_reason=finish_reason)
+
+## tests/models/test_huggingface.py
+
+async def test_request_simple_usage(allow_model_requests: None, huggingface_api_key: str):
+    model = HuggingFaceModel(
+        'Qwen/Qwen2.5-72B-Instruct',
+        provider=HuggingFaceProvider(provider_name='nebius', api_key=huggingface_api_key),
+    )
+    agent = Agent(model)
+
+    result = await agent.run('Hello')
+    assert (
+        result.output
+        == "Hello! It's great to meet you. How can I assist you today? Whether you have any questions, need some advice, or just want to chat, feel free to let me know!"
+    )
+    assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=30, output_tokens=40))
+
+def test_system_property():
+    model = HuggingFaceModel('some-model', provider=HuggingFaceProvider(hf_client=Mock(), api_key='x'))
+    assert model.system == 'huggingface'
+
+## tests/models/test_mcp_sampling.py
+
+def fake_session(create_message: Any) -> Any:
+    return FakeSession(create_message)
+
+## tests/models/test_model_names.py
+
+    object: Literal['model']
+
+## tests/models/test_model_test.py
+
+class AgentRunDeps:
+    run_id: int
+
+## tests/models/test_openrouter.py
+
+async def test_openrouter_usage(allow_model_requests: None, openrouter_api_key: str) -> None:
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('openai/gpt-5-mini', provider=provider)
+    agent = Agent(model, instructions='Be helpful.', retries=1)
+
+    result = await agent.run('Tell me about Venus')
+
+    assert result.usage() == snapshot(
+        RunUsage(input_tokens=17, output_tokens=1515, details={'reasoning_tokens': 704}, requests=1)
+    )
+
+    settings = OpenRouterModelSettings(openrouter_usage={'include': True})
+
+    result = await agent.run('Tell me about Mars', model_settings=settings)
+
+    assert result.usage() == snapshot(
+        RunUsage(
+            input_tokens=17,
+            output_tokens=2177,
+            details={'is_byok': 0, 'reasoning_tokens': 960, 'image_tokens': 0},
+            requests=1,
+        )
+    )
+
+    last_message = result.all_messages()[-1]
+
+    assert isinstance(last_message, ModelResponse)
+    assert last_message.provider_details is not None
+    for key in ['cost', 'upstream_inference_cost', 'is_byok']:
+        assert key in last_message.provider_details
+
+## tests/providers/test_huggingface.py
+
+def test_huggingface_provider_init_http_client_error():
+    with pytest.raises(ValueError, match='`http_client` is ignored'):
+        HuggingFaceProvider(api_key='key', http_client=Mock())  # type: ignore[call-overload]
+
+## tests/test_agent.py
+
+class UserContext:
+    location: str | None
+
+## tests/test_deps.py
+
+class MyDeps:
+    foo: int
+    bar: int
+
+## tests/test_mcp.py
+
+def model(openai_api_key: str) -> Model:
+    return OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))
+
+async def test_agent_with_server_not_running(agent: Agent, allow_model_requests: None):
+    result = await agent.run('What is 0 degrees Celsius in Fahrenheit?')
+    assert result.output == snapshot('0 degrees Celsius is 32.0 degrees Fahrenheit.')
+
+def test_load_mcp_servers_with_non_string_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test that non-string primitive values (int, bool, null) in nested structures are passed through unchanged."""
+    config = tmp_path / 'mcp.json'
+
+    # Create a config with environment variables and extra fields containing primitives
+    # The extra fields will be ignored during validation but go through _expand_env_vars
+    monkeypatch.setenv('PYTHON_CMD', 'python')
+    config.write_text(
+        '{"mcpServers": {"my_server": {"command": "${PYTHON_CMD}", "args": ["-m", "tests.mcp_server"], '
+        '"metadata": {"count": 42, "enabled": true, "value": null}}}}',
+        encoding='utf-8',
+    )
+
+    # This should successfully expand env vars and ignore the metadata field
+    servers = load_mcp_servers(config)
+
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == 'python'
+
+## tests/test_usage_limits.py
+
+def test_add_usages_with_none_detail_value():
+    """Test that None values in details are skipped when incrementing usage."""
+    usage = RunUsage(
+        requests=1,
+        input_tokens=10,
+        output_tokens=20,
+        details={'reasoning_tokens': 5},
+    )
+
+    # Create a usage with None in details (simulating model response with missing detail)
+    incr_usage = RunUsage(
+        requests=1,
+        input_tokens=5,
+        output_tokens=10,
+    )
+    # Manually set a None value in details to simulate edge case from model responses
+    incr_usage.details = {'reasoning_tokens': None, 'other_tokens': 10}  # type: ignore[dict-item]
+
+    result = usage + incr_usage
+    assert result == snapshot(
+        RunUsage(
+            requests=2,
+            input_tokens=15,
+            output_tokens=30,
+            details={'reasoning_tokens': 5, 'other_tokens': 10},
+        )
+    )

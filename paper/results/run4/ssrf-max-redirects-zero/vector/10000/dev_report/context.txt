@@ -1,0 +1,1075 @@
+# tests/test_ssrf.py:432-459
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+# tests/test_ssrf.py:402-672
+class TestSafeDownload:
+    """Tests for safe_download function."""
+
+    async def test_successful_download(self) -> None:
+        """Test successful download of a public URL."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+        mock_response.content = b'test content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'test content'
+
+            # Verify the request was made to the resolved IP with Host header and SNI
+            mock_client.get.assert_called_once()
+            call_args = mock_client.get.call_args
+            assert '93.184.215.14' in call_args[0][0]
+            assert call_args[1]['headers']['Host'] == 'example.com'
+            assert call_args[1]['extensions'] == {'sni_hostname': 'example.com'}
+
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+    async def test_redirect_to_private_ip_blocked(self) -> None:
+        """Test that redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'http://internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com (public), second for internal.local (private)
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_relative_redirect_resolved(self) -> None:
+        """Test that relative redirect URLs are resolved correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '/new-path/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/old-path/file.txt')
+            assert response.content == b'final content'
+
+            # Check that the second request was to the correct path
+            second_call = mock_client.get.call_args_list[1]
+            assert '/new-path/file.txt' in second_call[0][0]
+
+    async def test_missing_location_header(self) -> None:
+        """Test that redirect without Location header raises error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Redirect response missing Location header'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_protocol_relative_redirect(self) -> None:
+        """Test that protocol-relative redirects are handled correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+            # Verify second request was to cdn.example.com with https
+            second_call = mock_client.get.call_args_list[1]
+            assert second_call[1]['headers']['Host'] == 'cdn.example.com'
+
+    async def test_protocol_relative_redirect_to_private_blocked(self) -> None:
+        """Test that protocol-relative redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_http_no_sni_extension(self) -> None:
+        """Test that sni_hostname extension is not set for HTTP requests."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('http://example.com/file.txt')
+
+            call_args = mock_client.get.call_args
+            assert call_args[1]['extensions'] == {}
+
+    async def test_protocol_validation(self) -> None:
+        """Test that non-http(s) protocols are rejected."""
+        with pytest.raises(ValueError, match='URL protocol "file" is not allowed'):
+            await safe_download('file:///etc/passwd')
+
+        with pytest.raises(ValueError, match='URL protocol "ftp" is not allowed'):
+            await safe_download('ftp://ftp.example.com/file.txt')
+
+    async def test_timeout_parameter(self) -> None:
+        """Test that timeout parameter is passed to client."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('https://example.com/file.txt', timeout=60)
+
+            mock_client_fn.assert_called_once_with(timeout=60)
+
+    async def test_default_timeout(self) -> None:
+        """Test that default timeout is used."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('https://example.com/file.txt')
+
+            mock_client_fn.assert_called_once_with(timeout=_DEFAULT_TIMEOUT)
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:136-384
+class Embedder:
+    """High-level interface for generating text embeddings.
+
+    The `Embedder` class provides a convenient way to generate vector embeddings from text
+    using various embedding model providers. It handles model inference, settings management,
+    and optional OpenTelemetry instrumentation.
+
+    Example:
+    ```python
+    from pydantic_ai import Embedder
+
+    embedder = Embedder('openai:text-embedding-3-small')
+
+
+    async def main():
+        result = await embedder.embed_query('What is machine learning?')
+        print(result.embeddings[0][:5])  # First 5 dimensions
+        #> [1.0, 1.0, 1.0, 1.0, 1.0]
+    ```
+    """
+
+    instrument: InstrumentationSettings | bool | None
+    """Options to automatically instrument with OpenTelemetry.
+
+    Set to `True` to use default instrumentation settings, which will use Logfire if it's configured.
+    Set to an instance of [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings] to customize.
+    If this isn't set, then the last value set by
+    [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all]
+    will be used, which defaults to False.
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    _instrument_default: ClassVar[InstrumentationSettings | bool] = False
+
+    def __init__(
+        self,
+        model: EmbeddingModel | KnownEmbeddingModelName | str,
+        *,
+        settings: EmbeddingSettings | None = None,
+        defer_model_check: bool = True,
+        instrument: InstrumentationSettings | bool | None = None,
+    ) -> None:
+        """Initialize an Embedder.
+
+        Args:
+            model: The embedding model to use. Can be specified as:
+
+                - A model name string in the format `'provider:model-name'`
+                  (e.g., `'openai:text-embedding-3-small'`)
+                - An [`EmbeddingModel`][pydantic_ai.embeddings.EmbeddingModel] instance
+            settings: Optional [`EmbeddingSettings`][pydantic_ai.embeddings.EmbeddingSettings]
+                to use as defaults for all embed calls.
+            defer_model_check: Whether to defer model validation until first use.
+                Set to `False` to validate the model immediately on construction.
+            instrument: OpenTelemetry instrumentation settings. Set to `True` to enable with defaults,
+                or pass an [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize. If `None`, uses the value from
+                [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all].
+        """
+        self._model = model if defer_model_check else infer_embedding_model(model)
+        self._settings = settings
+        self.instrument = instrument
+
+        self._override_model: ContextVar[EmbeddingModel | None] = ContextVar('_override_model', default=None)
+
+    @staticmethod
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the default instrumentation options for all embedders where `instrument` is not explicitly set.
+
+        This is useful for enabling instrumentation globally without modifying each embedder individually.
+
+        Args:
+            instrument: Instrumentation settings to use as the default. Set to `True` for default settings,
+                `False` to disable, or pass an
+                [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize.
+        """
+        Embedder._instrument_default = instrument
+
+    @property
+    def model(self) -> EmbeddingModel | KnownEmbeddingModelName | str:
+        """The embedding model used by this embedder."""
+        return self._model
+
+    @contextmanager
+    def override(
+        self,
+        *,
+        model: EmbeddingModel | KnownEmbeddingModelName | str | _utils.Unset = _utils.UNSET,
+    ) -> Iterator[None]:
+        """Context manager to temporarily override the embedding model.
+
+        Useful for testing or dynamically switching models.
+
+        Args:
+            model: The embedding model to use within this context.
+
+        Example:
+        ```python
+        from pydantic_ai import Embedder
+
+        embedder = Embedder('openai:text-embedding-3-small')
+
+
+        async def main():
+            # Temporarily use a different model
+            with embedder.override(model='openai:text-embedding-3-large'):
+                result = await embedder.embed_query('test')
+                print(len(result.embeddings[0]))  # 3072 dimensions for large model
+                #> 3072
+        ```
+        """
+        if _utils.is_set(model):
+            model_token = self._override_model.set(infer_embedding_model(model))
+        else:
+            model_token = None
+
+        try:
+            yield
+        finally:
+            if model_token is not None:
+                self._override_model.reset(model_token)
+
+    async def embed_query(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more query texts.
+
+        Use this method when embedding search queries that will be compared against document embeddings.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            query: A single query string or sequence of query strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(query, input_type='query', settings=settings)
+
+    async def embed_documents(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more document texts.
+
+        Use this method when embedding documents that will be stored and later searched against.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            documents: A single document string or sequence of document strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(documents, input_type='document', settings=settings)
+
+    async def embed(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed text inputs with explicit input type specification.
+
+        This is the low-level embedding method. For most use cases, prefer
+        [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query] or
+        [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents].
+
+        Args:
+            inputs: A single string or sequence of strings to embed.
+            input_type: The type of input, either `'query'` or `'document'`.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        model = self._get_model()
+        settings = merge_embedding_settings(self._settings, settings)
+        return await model.embed(inputs, input_type=input_type, settings=settings)
+
+    async def max_input_tokens(self) -> int | None:
+        """Get the maximum number of tokens the model can accept as input.
+
+        Returns:
+            The maximum token count, or `None` if the limit is unknown for this model.
+        """
+        model = self._get_model()
+        return await model.max_input_tokens()
+
+    async def count_tokens(self, text: str) -> int:
+        """Count the number of tokens in the given text.
+
+        Args:
+            text: The text to tokenize and count.
+
+        Returns:
+            The number of tokens in the text.
+
+        Raises:
+            NotImplementedError: If the model doesn't support token counting.
+            UserError: If the model or tokenizer is not supported.
+        """
+        model = self._get_model()
+        return await model.count_tokens(text)
+
+    def embed_query_sync(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_query(query, settings=settings))
+
+    def embed_documents_sync(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_documents(documents, settings=settings))
+
+    def embed_sync(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed()`][pydantic_ai.embeddings.Embedder.embed]."""
+        return _utils.get_event_loop().run_until_complete(self.embed(inputs, input_type=input_type, settings=settings))
+
+    def max_input_tokens_sync(self) -> int | None:
+        """Synchronous version of [`max_input_tokens()`][pydantic_ai.embeddings.Embedder.max_input_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.max_input_tokens())
+
+    def count_tokens_sync(self, text: str) -> int:
+        """Synchronous version of [`count_tokens()`][pydantic_ai.embeddings.Embedder.count_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.count_tokens(text))
+
+    def _get_model(self) -> EmbeddingModel:
+        """Create a model configured for this embedder.
+
+        Returns:
+            The embedding model to use, with instrumentation applied if configured.
+        """
+        model_: EmbeddingModel
+        if some_model := self._override_model.get():
+            model_ = some_model
+        else:
+            model_ = self._model = infer_embedding_model(self.model)
+
+        instrument = self.instrument
+        if instrument is None:
+            instrument = self._instrument_default
+
+        return instrument_embedding_model(model_, instrument)
+
+# tests/test_ssrf.py:484-501
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/models/test_mcp_sampling.py:4-4
+from unittest.mock import AsyncMock
+
+# tests/models/test_openai.py:11-11
+from unittest.mock import AsyncMock, patch
+
+# tests/test_direct.py:5-5
+from unittest.mock import AsyncMock, patch
+
+# tests/test_embeddings.py:8-8
+from unittest.mock import AsyncMock, MagicMock, patch
+
+# tests/test_mcp.py:10-10
+from unittest.mock import AsyncMock, patch
+
+# tests/test_ssrf.py:5-5
+from unittest.mock import AsyncMock, patch
+
+# tests/test_tenacity.py:9-9
+from unittest.mock import AsyncMock, Mock
+
+# tests/test_toolsets.py:7-7
+from unittest.mock import AsyncMock
+
+# tests/test_ui_web.py:9-9
+from unittest.mock import AsyncMock
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:1354-1408
+    def to_a2a(
+        self,
+        *,
+        storage: Storage | None = None,
+        broker: Broker | None = None,
+        # Agent card
+        name: str | None = None,
+        url: str = 'http://localhost:8000',
+        version: str = '1.0.0',
+        description: str | None = None,
+        provider: AgentProvider | None = None,
+        skills: list[Skill] | None = None,
+        # Starlette
+        debug: bool = False,
+        routes: Sequence[Route] | None = None,
+        middleware: Sequence[Middleware] | None = None,
+        exception_handlers: dict[Any, ExceptionHandler] | None = None,
+        lifespan: Lifespan[FastA2A] | None = None,
+    ) -> FastA2A:
+        """Convert the agent to a FastA2A application.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+        app = agent.to_a2a()
+        ```
+
+        The `app` is an ASGI application that can be used with any ASGI server.
+
+        To run the application, you can use the following command:
+
+        ```bash
+        uvicorn app:app --host 0.0.0.0 --port 8000
+        ```
+        """
+        from .._a2a import agent_to_a2a
+
+        return agent_to_a2a(
+            self,
+            storage=storage,
+            broker=broker,
+            name=name,
+            url=url,
+            version=version,
+            description=description,
+            provider=provider,
+            skills=skills,
+            debug=debug,
+            routes=routes,
+            middleware=middleware,
+            exception_handlers=exception_handlers,
+            lifespan=lifespan,
+        )
+
+# tests/models/test_groq.py:10-10
+from unittest.mock import patch
+
+# tests/models/test_model.py:4-4
+from unittest.mock import patch
+
+# tests/models/test_openai.py:11-11
+from unittest.mock import AsyncMock, patch
+
+# tests/providers/test_gateway.py:4-4
+from unittest.mock import patch
+
+# tests/providers/test_google_vertex.py:8-8
+from unittest.mock import patch
+
+# tests/providers/test_huggingface.py:4-4
+from unittest.mock import MagicMock, Mock, patch
+
+# tests/providers/test_provider_names.py:5-5
+from unittest.mock import patch
+
+# tests/test_direct.py:5-5
+from unittest.mock import AsyncMock, patch
+
+# tests/test_embeddings.py:8-8
+from unittest.mock import AsyncMock, MagicMock, patch
+
+# tests/test_mcp.py:10-10
+from unittest.mock import AsyncMock, patch
+
+# tests/test_ssrf.py:5-5
+from unittest.mock import AsyncMock, patch
+
+# tests/models/mock_xai.py:723-737
+def create_usage(
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    cached_prompt_text_tokens: int = 0,
+    server_side_tools_used: list[usage_pb2.ServerSideTool] | None = None,
+) -> usage_pb2.SamplingUsage:
+    """Helper to create xAI SamplingUsage protobuf objects for tests with all required fields."""
+    return usage_pb2.SamplingUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cached_prompt_text_tokens=cached_prompt_text_tokens,
+        server_side_tools_used=server_side_tools_used or [],
+    )
+
+# pydantic_ai_slim/pydantic_ai/result.py:434-436
+    async def stream(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[OutputDataT]:
+        async for output in self.stream_output(debounce_by=debounce_by):
+            yield output
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:297-368
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+# tests/test_ssrf.py:461-482
+    async def test_redirect_to_private_ip_blocked(self) -> None:
+        """Test that redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'http://internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com (public), second for internal.local (private)
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/test_ssrf.py:550-581
+    async def test_protocol_relative_redirect(self) -> None:
+        """Test that protocol-relative redirects are handled correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+            # Verify second request was to cdn.example.com with https
+            second_call = mock_client.get.call_args_list[1]
+            assert second_call[1]['headers']['Host'] == 'cdn.example.com'
+
+# pydantic_ai_slim/pydantic_ai/direct.py:144-203
+def model_request_stream(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> AbstractAsyncContextManager[models.StreamedResponse]:
+    """Make a streamed async request to a model.
+
+    ```py {title="model_request_stream_example.py"}
+
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_stream
+
+
+    async def main():
+        messages = [ModelRequest.user_text_prompt('Who was Albert Einstein?')]  # (1)!
+        async with model_request_stream('openai:gpt-5-mini', messages) as stream:
+            chunks = []
+            async for chunk in stream:
+                chunks.append(chunk)
+            print(chunks)
+            '''
+            [
+                PartStartEvent(index=0, part=TextPart(content='Albert Einstein was ')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(
+                    index=0, delta=TextPartDelta(content_delta='a German-born theoretical ')
+                ),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='physicist.')),
+                PartEndEvent(
+                    index=0,
+                    part=TextPart(
+                        content='Albert Einstein was a German-born theoretical physicist.'
+                    ),
+                ),
+            ]
+            '''
+    ```
+
+    1. See [`ModelRequest.user_text_prompt`][pydantic_ai.messages.ModelRequest.user_text_prompt] for details.
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        A [stream response][pydantic_ai.models.StreamedResponse] async context manager.
+    """
+    model_instance = _prepare_model(model, instrument)
+    return model_instance.request_stream(
+        list(messages),
+        model_settings,
+        model_request_parameters or models.ModelRequestParameters(),
+    )
+
+# tests/test_ssrf.py:583-603
+    async def test_protocol_relative_redirect_to_private_blocked(self) -> None:
+        """Test that protocol-relative redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/test_streaming.py:968-1010
+    async def test_stream_output_partial_then_final_validation(self):
+        """Test that stream_output() calls validators with partial_output=True during streaming, then False at the end.
+
+        This verifies the critical invariant: output validators/functions are called multiple times with
+        partial_output=True as chunks arrive, followed by exactly one call with partial_output=False
+        for final validation. The final yield may have the same content as the last partial yield,
+        but the validation semantics differ (partial validation may accept incomplete data).
+        """
+        call_log: list[tuple[Foo, bool]] = []
+
+        def process_foo(ctx: RunContext[None], foo: Foo) -> Foo:
+            call_log.append((foo, ctx.partial_output))
+            return Foo(a=foo.a * 2, b=foo.b.upper())
+
+        async def sf(_: list[ModelMessage], info: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+            assert info.output_tools is not None
+            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args='{"a": 21')}
+            yield {0: DeltaToolCall(json_args=', "b": "f')}
+            yield {0: DeltaToolCall(json_args='oo"}')}
+
+        agent = Agent(FunctionModel(stream_function=sf), output_type=ToolOutput(process_foo, name='my_output'))
+
+        async with agent.run_stream('test') as result:
+            outputs = [output async for output in result.stream_output(debounce_by=None)]
+
+        assert outputs[-1] == Foo(a=42, b='FOO')
+
+        # Verify the pattern: multiple True calls, exactly one False call at the end
+        partial_output_flags = [partial for _, partial in call_log]
+        assert partial_output_flags[-1] is False, 'Last call must have partial_output=False'
+        assert all(flag is True for flag in partial_output_flags[:-1]), (
+            'All calls except last must have partial_output=True'
+        )
+        assert len([f for f in partial_output_flags if f is False]) == 1, 'Exactly one partial_output=False call'
+
+        # The full call log shows progressive partial outputs followed by final validation
+        assert call_log == snapshot(
+            [
+                (Foo(a=21, b='f'), True),
+                (Foo(a=21, b='foo'), True),
+                (Foo(a=21, b='foo'), False),  # Final validation - same content, different validation mode
+            ]
+        )
+
+# tests/models/test_anthropic.py:8219-8257
+async def test_anthropic_cache_messages_real_api(allow_model_requests: None, anthropic_api_key: str):
+    """Test that anthropic_cache_messages setting adds cache_control and produces cache usage metrics.
+
+    This test uses a cassette to verify the cache behavior without making real API calls in CI.
+    When run with real API credentials, it demonstrates that:
+    1. The first call with a long context creates a cache (cache_write_tokens > 0)
+    2. Follow-up messages in the same conversation can read from that cache (cache_read_tokens > 0)
+    """
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+    agent = Agent(
+        m,
+        system_prompt='You are a helpful assistant.',
+        model_settings=AnthropicModelSettings(
+            anthropic_cache_messages=True,
+        ),
+    )
+
+    # First call with a longer message - this will cache the message content
+    result1 = await agent.run('Please explain what Python is and its main use cases. ' * 100)
+    usage1 = result1.usage()
+
+    # With anthropic_cache_messages, the first call should write cache for the last message
+    # (cache_write_tokens > 0 indicates that caching occurred)
+    assert usage1.requests == 1
+    assert usage1.cache_write_tokens > 0
+    assert usage1.output_tokens > 0
+
+    # Continue the conversation - this message appends to history
+    # The previous cached message should still be in the request
+    result2 = await agent.run('Can you summarize that in one sentence?', message_history=result1.all_messages())
+    usage2 = result2.usage()
+
+    # The second call should potentially read from cache if the previous message is still cached
+    # (cache_read_tokens > 0 when cache hit occurs)
+    # (cache_write_tokens > 0 as new message is added to cache)
+    assert usage2.requests == 1
+    assert usage2.cache_read_tokens > 0
+    assert usage2.cache_write_tokens > 0
+    assert usage2.output_tokens > 0
+
+# pydantic_evals/pydantic_evals/reporting/render_numbers.py:62-94
+def default_render_number_diff(old: float | int, new: float | int) -> str | None:
+    """Return a string representing the difference between old and new values.
+
+    Rules:
+      - If the two values are equal, return None.
+      - For integers, return the raw difference (with a leading sign), e.g.:
+            _default_format_number_diff(3, 4) -> '+1'
+      - For floats (or a mix of float and int):
+          * Compute the raw delta = new - old and format it with ABS_SIG_FIGS significant figures.
+          * If `old` is nonzero, compute a relative change:
+              - If |delta|/|old| ≤ 1, render the relative change as a percentage with
+                PERC_DECIMALS decimal places, e.g. '+0.7 / +70.0%'.
+              - If |delta|/|old| > 1, render a multiplier (new/old). Use one decimal place
+                if the absolute multiplier is less than MULTIPLIER_ONE_DECIMAL_THRESHOLD,
+                otherwise no decimals.
+          * However, if the percentage rounds to 0.0% (e.g. '+0.0%'), return only the absolute diff.
+          * Also, if |old| is below BASE_THRESHOLD and |delta| exceeds MULTIPLIER_DROP_FACTOR×|old|,
+            drop the relative change indicator.
+    """
+    if old == new:
+        return None
+
+    if isinstance(old, int) and isinstance(new, int):
+        diff_int = new - old
+        return f'{diff_int:+d}'
+
+    delta = new - old
+    abs_diff_str = _render_signed(delta, ABS_SIG_FIGS)
+    rel_diff_str = _render_relative(new, old, BASE_THRESHOLD)
+    if rel_diff_str is None:
+        return abs_diff_str
+    else:
+        return f'{abs_diff_str} / {rel_diff_str}'
+
+# tests/test_ssrf.py:394-399
+    async def test_cgnat_range_blocked(self) -> None:
+        """Test that CGNAT range (100.64.0.0/10) is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.64.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://cgnat-host.internal/path', allow_local=False)
+
+# pydantic_ai_slim/pydantic_ai/result.py:93-104
+    async def stream_responses(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[_messages.ModelResponse]:
+        """Asynchronously stream the (unvalidated) model responses for the agent."""
+        # if the message currently has any parts with content, yield before streaming
+        msg = self.response
+        for part in msg.parts:
+            if part.has_content():
+                yield msg
+                break
+
+        async with _utils.group_by_temporal(self, debounce_by) as group_iter:
+            async for _items in group_iter:
+                yield self.response  # current state of the response
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:16-16
+    content: NotRequired[str]

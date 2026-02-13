@@ -1,0 +1,989 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    def run_stream_sync(
+        self,
+        user_prompt: str | Sequence[_messages.UserContent] | None = None,
+        *,
+        output_type: OutputSpec[RunOutputDataT] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: models.Model | models.KnownModelName | str | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+        usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool | BuiltinToolFunc[AgentDepsT]] | None = None,
+        event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+    ) -> result.StreamedRunResultSync[AgentDepsT, Any]:
+        """Run the agent with a user prompt in sync streaming mode.
+
+        This is a convenience method that wraps [`run_stream()`][pydantic_ai.agent.AbstractAgent.run_stream] with `loop.run_until_complete(...)`.
+        You therefore can't use this method inside async code or if there's an active event loop.
+
+        This method builds an internal agent graph (using system prompts, tools and output schemas) and then
+        runs the graph until the model produces output matching the `output_type`, for example text or structured data.
+        At this point, a streaming run result object is yielded from which you can stream the output as it comes in,
+        and -- once this output has completed streaming -- get the complete output, message history, and usage.
+
+        As this method will consider the first output matching the `output_type` to be the final output,
+        it will stop running the agent graph and will not execute any tool calls made by the model after this "final" output.
+        If you want to always run the agent graph to completion and stream events and output at the same time,
+        use [`agent.run()`][pydantic_ai.agent.AbstractAgent.run] with an `event_stream_handler` or [`agent.iter()`][pydantic_ai.agent.AbstractAgent.iter] instead.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+
+        def main():
+            response = agent.run_stream_sync('What is the capital of the UK?')
+            print(response.get_output())
+            #> The capital of the UK is London.
+        ```
+
+        Args:
+            user_prompt: User input to start/continue the conversation.
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has no
+                output validators since output validators would expect an argument that matches the agent's output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            metadata: Optional metadata to attach to this run. Accepts a dictionary or a callable taking
+                [`RunContext`][pydantic_ai.tools.RunContext]; merged with the agent's configured metadata.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            event_stream_handler: Optional handler for events from the model's streaming response and the agent's execution of tools to use for this run.
+                It will receive all the events up until the final result is found, which you can then read or stream from inside the context manager.
+                Note that it does _not_ receive any events after the final result is found.
+
+        Returns:
+            The result of the run.
+        """
+        if infer_name and self.name is None:
+            self._infer_name(inspect.currentframe())
+
+        async def _consume_stream():
+            async with self.run_stream(
+                user_prompt,
+                output_type=output_type,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                model=model,
+                deps=deps,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+                usage=usage,
+                metadata=metadata,
+                infer_name=infer_name,
+                toolsets=toolsets,
+                builtin_tools=builtin_tools,
+                event_stream_handler=event_stream_handler,
+            ) as stream_result:
+                yield stream_result
+
+        async_result = _utils.get_event_loop().run_until_complete(anext(_consume_stream()))
+        return result.StreamedRunResultSync(async_result)
+
+## pydantic_ai_slim/pydantic_ai/direct.py
+
+def model_request_stream_sync(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> StreamedResponseSync:
+    """Make a streamed synchronous request to a model.
+
+    This is the synchronous version of [`model_request_stream`][pydantic_ai.direct.model_request_stream].
+    It uses threading to run the asynchronous stream in the background while providing a synchronous iterator interface.
+
+    ```py {title="model_request_stream_sync_example.py"}
+
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_stream_sync
+
+    messages = [ModelRequest.user_text_prompt('Who was Albert Einstein?')]
+    with model_request_stream_sync('openai:gpt-5-mini', messages) as stream:
+        chunks = []
+        for chunk in stream:
+            chunks.append(chunk)
+        print(chunks)
+        '''
+        [
+            PartStartEvent(index=0, part=TextPart(content='Albert Einstein was ')),
+            FinalResultEvent(tool_name=None, tool_call_id=None),
+            PartDeltaEvent(
+                index=0, delta=TextPartDelta(content_delta='a German-born theoretical ')
+            ),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='physicist.')),
+            PartEndEvent(
+                index=0,
+                part=TextPart(
+                    content='Albert Einstein was a German-born theoretical physicist.'
+                ),
+            ),
+        ]
+        '''
+    ```
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        A [sync stream response][pydantic_ai.direct.StreamedResponseSync] context manager.
+    """
+    async_stream_cm = model_request_stream(
+        model=model,
+        messages=list(messages),
+        model_settings=model_settings,
+        model_request_parameters=model_request_parameters,
+        instrument=instrument,
+    )
+
+    return StreamedResponseSync(async_stream_cm)
+
+class StreamedResponseSync:
+    """Synchronous wrapper to async streaming responses by running the async producer in a background thread and providing a synchronous iterator.
+
+    This class must be used as a context manager with the `with` statement.
+    """
+
+    _async_stream_cm: AbstractAsyncContextManager[StreamedResponse]
+    _queue: queue.Queue[messages.ModelResponseStreamEvent | Exception | None] = field(
+        default_factory=queue.Queue[messages.ModelResponseStreamEvent | Exception | None], init=False
+    )
+    _thread: threading.Thread | None = field(default=None, init=False)
+    _stream_response: StreamedResponse | None = field(default=None, init=False)
+    _exception: Exception | None = field(default=None, init=False)
+    _context_entered: bool = field(default=False, init=False)
+    _stream_ready: threading.Event = field(default_factory=threading.Event, init=False)
+
+    def __enter__(self) -> StreamedResponseSync:
+        self._context_entered = True
+        self._start_producer()
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc_val: BaseException | None,
+        _exc_tb: TracebackType | None,
+    ) -> None:
+        self._cleanup()
+
+    def __iter__(self) -> Iterator[messages.ModelResponseStreamEvent]:
+        """Stream the response as an iterable of [`ModelResponseStreamEvent`][pydantic_ai.messages.ModelResponseStreamEvent]s."""
+        self._check_context_manager_usage()
+
+        while True:
+            item = self._queue.get()
+            if item is None:  # End of stream
+                break
+            elif isinstance(item, Exception):
+                raise item
+            else:
+                yield item
+
+    def __repr__(self) -> str:
+        if self._stream_response:
+            return repr(self._stream_response)
+        else:
+            return f'{self.__class__.__name__}(context_entered={self._context_entered})'
+
+    __str__ = __repr__
+
+    def _check_context_manager_usage(self) -> None:
+        if not self._context_entered:
+            raise RuntimeError(
+                'StreamedResponseSync must be used as a context manager. '
+                'Use: `with model_request_stream_sync(...) as stream:`'
+            )
+
+    def _ensure_stream_ready(self) -> StreamedResponse:
+        self._check_context_manager_usage()
+
+        if self._stream_response is not None:
+            # Wait for the background thread to signal that the stream is ready
+            if not self._stream_ready.wait(timeout=STREAM_INITIALIZATION_TIMEOUT):
+                raise RuntimeError('Stream failed to initialize within timeout')
+
+            if self._stream_response is None:  # pragma: no cover
+                raise RuntimeError('Stream failed to initialize')
+
+        return self._stream_response
+
+    def _start_producer(self):
+        self._thread = threading.Thread(target=self._async_producer, daemon=True)
+        self._thread.start()
+
+    def _async_producer(self):
+        async def _consume_async_stream():
+            try:
+                async with self._async_stream_cm as stream:
+                    self._stream_response = stream
+                    # Signal that the stream is ready
+                    self._stream_ready.set()
+                    async for event in stream:
+                        self._queue.put(event)
+            except Exception as e:
+                # Signal ready even on error so waiting threads don't hang
+                self._stream_ready.set()
+                self._queue.put(e)
+            finally:
+                self._queue.put(None)  # Signal end
+
+        _get_event_loop().run_until_complete(_consume_async_stream())
+
+    def _cleanup(self):
+        if self._thread and self._thread.is_alive():
+            self._thread.join()
+
+    # TODO (v2): Drop in favor of `response` property
+    def get(self) -> messages.ModelResponse:
+        """Build a ModelResponse from the data received from the stream so far."""
+        return self._ensure_stream_ready().get()
+
+    @property
+    def response(self) -> messages.ModelResponse:
+        """Get the current state of the response."""
+        return self.get()
+
+    # TODO (v2): Make this a property
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far."""
+        return self._ensure_stream_ready().usage()
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name of the response."""
+        return self._ensure_stream_ready().model_name
+
+    @property
+    def timestamp(self) -> datetime:
+        """Get the timestamp of the response."""
+        return self._ensure_stream_ready().timestamp
+
+    def get(self) -> messages.ModelResponse:
+        """Build a ModelResponse from the data received from the stream so far."""
+        return self._ensure_stream_ready().get()
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_model.py
+
+    def get(self) -> ModelResponse:
+        return self.response
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def get(self) -> ModelResponse:
+        return self.response
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py
+
+    def get(self) -> ModelResponse:
+        return self.response
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class ModelResponse:
+    """A response from a model, e.g. a message from the model to the Pydantic AI app."""
+
+    parts: Sequence[ModelResponsePart]
+    """The parts of the model message."""
+
+    _: KW_ONLY
+
+    usage: RequestUsage = field(default_factory=RequestUsage)
+    """Usage information for the request.
+
+    This has a default to make tests easier, and to support loading old messages where usage will be missing.
+    """
+
+    model_name: str | None = None
+    """The name of the model that generated the response."""
+
+    timestamp: datetime = field(default_factory=_now_utc)
+    """The timestamp when the response was received locally.
+
+    This is always a high-precision local datetime. Provider-specific timestamps
+    (if available) are stored in `provider_details['timestamp']`.
+    """
+
+    kind: Literal['response'] = 'response'
+    """Message type identifier, this is available on all parts as a discriminator."""
+
+    provider_name: str | None = None
+    """The name of the LLM provider that generated the response."""
+
+    provider_url: str | None = None
+    """The base URL of the LLM provider that generated the response."""
+
+    provider_details: Annotated[
+        dict[str, Any] | None,
+        # `vendor_details` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        pydantic.Field(validation_alias=pydantic.AliasChoices('provider_details', 'vendor_details')),
+    ] = None
+    """Additional data returned by the provider that can't be mapped to standard fields."""
+
+    provider_response_id: Annotated[
+        str | None,
+        # `vendor_id` is deprecated, but we still want to support deserializing model responses stored in a DB before the name was changed
+        pydantic.Field(validation_alias=pydantic.AliasChoices('provider_response_id', 'vendor_id')),
+    ] = None
+    """request ID as specified by the model provider. This can be used to track the specific request to the model."""
+
+    finish_reason: FinishReason | None = None
+    """Reason the model finished generating the response, normalized to OpenTelemetry values."""
+
+    run_id: str | None = None
+    """The unique identifier of the agent run in which this message originated."""
+
+    metadata: dict[str, Any] | None = None
+    """Additional data that can be accessed programmatically by the application but is not sent to the LLM."""
+
+    @property
+    def text(self) -> str | None:
+        """Get the text in the response."""
+        texts: list[str] = []
+        last_part: ModelResponsePart | None = None
+        for part in self.parts:
+            if isinstance(part, TextPart):
+                # Adjacent text parts should be joined together, but if there are parts in between
+                # (like built-in tool calls) they should have newlines between them
+                if isinstance(last_part, TextPart):
+                    texts[-1] += part.content
+                else:
+                    texts.append(part.content)
+            last_part = part
+        if not texts:
+            return None
+
+        return '\n\n'.join(texts)
+
+    @property
+    def thinking(self) -> str | None:
+        """Get the thinking in the response."""
+        thinking_parts = [part.content for part in self.parts if isinstance(part, ThinkingPart)]
+        if not thinking_parts:
+            return None
+        return '\n\n'.join(thinking_parts)
+
+    @property
+    def files(self) -> list[BinaryContent]:
+        """Get the files in the response."""
+        return [part.content for part in self.parts if isinstance(part, FilePart)]
+
+    @property
+    def images(self) -> list[BinaryImage]:
+        """Get the images in the response."""
+        return [file for file in self.files if isinstance(file, BinaryImage)]
+
+    @property
+    def tool_calls(self) -> list[ToolCallPart]:
+        """Get the tool calls in the response."""
+        return [part for part in self.parts if isinstance(part, ToolCallPart)]
+
+    @property
+    def builtin_tool_calls(self) -> list[tuple[BuiltinToolCallPart, BuiltinToolReturnPart]]:
+        """Get the builtin tool calls and results in the response."""
+        calls = [part for part in self.parts if isinstance(part, BuiltinToolCallPart)]
+        if not calls:
+            return []
+        returns_by_id = {part.tool_call_id: part for part in self.parts if isinstance(part, BuiltinToolReturnPart)}
+        return [
+            (call_part, returns_by_id[call_part.tool_call_id])
+            for call_part in calls
+            if call_part.tool_call_id in returns_by_id
+        ]
+
+    @deprecated('`price` is deprecated, use `cost` instead')
+    def price(self) -> genai_types.PriceCalculation:  # pragma: no cover
+        return self.cost()
+
+    def cost(self) -> genai_types.PriceCalculation:
+        """Calculate the cost of the usage.
+
+        Uses [`genai-prices`](https://github.com/pydantic/genai-prices).
+        """
+        assert self.model_name, 'Model name is required to calculate price'
+        # Try matching on provider_api_url first as this is more specific, then fall back to provider_id.
+        if self.provider_url:
+            try:
+                return calc_price(
+                    self.usage,
+                    self.model_name,
+                    provider_api_url=self.provider_url,
+                    genai_request_timestamp=self.timestamp,
+                )
+            except LookupError:
+                pass
+        return calc_price(
+            self.usage,
+            self.model_name,
+            provider_id=self.provider_name,
+            genai_request_timestamp=self.timestamp,
+        )
+
+    def otel_events(self, settings: InstrumentationSettings) -> list[LogRecord]:
+        """Return OpenTelemetry events for the response."""
+        result: list[LogRecord] = []
+
+        def new_event_body():
+            new_body: dict[str, Any] = {'role': 'assistant'}
+            ev = LogRecord(attributes={'event.name': 'gen_ai.assistant.message'}, body=new_body)
+            result.append(ev)
+            return new_body
+
+        body = new_event_body()
+        for part in self.parts:
+            if isinstance(part, ToolCallPart):
+                body.setdefault('tool_calls', []).append(
+                    {
+                        'id': part.tool_call_id,
+                        'type': 'function',
+                        'function': {
+                            'name': part.tool_name,
+                            **({'arguments': part.args} if settings.include_content else {}),
+                        },
+                    }
+                )
+            elif isinstance(part, TextPart | ThinkingPart):
+                kind = part.part_kind
+                body.setdefault('content', []).append(
+                    {'kind': kind, **({'text': part.content} if settings.include_content else {})}
+                )
+            elif isinstance(part, FilePart):
+                body.setdefault('content', []).append(
+                    {
+                        'kind': 'binary',
+                        'media_type': part.content.media_type,
+                        **(
+                            {'binary_content': part.content.base64}
+                            if settings.include_content and settings.include_binary_content
+                            else {}
+                        ),
+                    }
+                )
+
+        if content := body.get('content'):
+            text_content = content[0].get('text')
+            if content == [{'kind': 'text', 'text': text_content}]:
+                body['content'] = text_content
+
+        return result
+
+    def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
+        parts: list[_otel_messages.MessagePart] = []
+        for part in self.parts:
+            if isinstance(part, TextPart):
+                parts.append(
+                    _otel_messages.TextPart(
+                        type='text',
+                        **({'content': part.content} if settings.include_content else {}),
+                    )
+                )
+            elif isinstance(part, ThinkingPart):
+                parts.append(
+                    _otel_messages.ThinkingPart(
+                        type='thinking',
+                        **({'content': part.content} if settings.include_content else {}),
+                    )
+                )
+            elif isinstance(part, FilePart):
+                converted_part = _otel_messages.BinaryDataPart(type='binary', media_type=part.content.media_type)
+                if settings.include_content and settings.include_binary_content:
+                    converted_part['content'] = part.content.base64
+                parts.append(converted_part)
+            elif isinstance(part, BaseToolCallPart):
+                call_part = _otel_messages.ToolCallPart(type='tool_call', id=part.tool_call_id, name=part.tool_name)
+                if isinstance(part, BuiltinToolCallPart):
+                    call_part['builtin'] = True
+                if settings.include_content and part.args is not None:
+                    from .models.instrumented import InstrumentedModel
+
+                    if isinstance(part.args, str):
+                        call_part['arguments'] = part.args
+                    else:
+                        call_part['arguments'] = {k: InstrumentedModel.serialize_any(v) for k, v in part.args.items()}
+
+                parts.append(call_part)
+            elif isinstance(part, BuiltinToolReturnPart):
+                return_part = _otel_messages.ToolCallResponsePart(
+                    type='tool_call_response',
+                    id=part.tool_call_id,
+                    name=part.tool_name,
+                    builtin=True,
+                )
+                if settings.include_content and part.content is not None:  # pragma: no branch
+                    from .models.instrumented import InstrumentedModel
+
+                    return_part['result'] = InstrumentedModel.serialize_any(part.content)
+
+                parts.append(return_part)
+        return parts
+
+    @property
+    @deprecated('`vendor_details` is deprecated, use `provider_details` instead')
+    def vendor_details(self) -> dict[str, Any] | None:
+        return self.provider_details
+
+    @property
+    @deprecated('`vendor_id` is deprecated, use `provider_response_id` instead')
+    def vendor_id(self) -> str | None:
+        return self.provider_response_id
+
+    @property
+    @deprecated('`provider_request_id` is deprecated, use `provider_response_id` instead')
+    def provider_request_id(self) -> str | None:
+        return self.provider_response_id
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    def price(self) -> genai_types.PriceCalculation:  # pragma: no cover
+        return self.cost()
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def get(self) -> ModelResponse:
+        """Build a [`ModelResponse`][pydantic_ai.messages.ModelResponse] from the data received from the stream so far."""
+        return ModelResponse(
+            parts=self._parts_manager.get_parts(),
+            model_name=self.model_name,
+            timestamp=self.timestamp,
+            usage=self.usage(),
+            provider_name=self.provider_name,
+            provider_url=self.provider_url,
+            provider_response_id=self.provider_response_id,
+            provider_details=self.provider_details,
+            finish_reason=self.finish_reason,
+        )
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def get(self) -> _messages.ModelResponse:
+        """Get the current state of the response."""
+        return self._raw_stream_response.get()
+
+## pydantic_graph/pydantic_graph/exceptions.py
+
+class GraphRuntimeError(RuntimeError):
+    """Error caused by an issue during graph execution."""
+
+    message: str
+    """The error message."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+## tests/example_modules/fake_database.py
+
+    def get(self, name: str) -> int | None:
+        if name == 'John Doe':
+            return 123
+
+## tests/models/test_model_settings.py
+
+def test_direct_model_request_merges_model_settings():
+    """Ensure direct requests merge model defaults with provided run settings."""
+
+    captured_settings = None
+
+    async def capture(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+        nonlocal captured_settings
+        captured_settings = agent_info.model_settings
+        return ModelResponse(parts=[TextPart('ok')])
+
+    model = FunctionModel(
+        capture,
+        settings=ModelSettings(max_tokens=50, temperature=0.3),
+    )
+
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('hi')]
+    run_settings = ModelSettings(temperature=0.9, top_p=0.2)
+
+    async def _run() -> ModelResponse:
+        return await direct_model_request(
+            model,
+            messages,
+            model_settings=run_settings,
+            model_request_parameters=ModelRequestParameters(),
+        )
+
+    response = asyncio.run(_run())
+
+    assert response.parts == [TextPart('ok')]
+    assert captured_settings == {
+        'max_tokens': 50,
+        'temperature': 0.9,
+        'top_p': 0.2,
+    }
+
+## tests/test_direct.py
+
+async def test_model_request():
+    model_response = await model_request('test', [ModelRequest.user_text_prompt('x')])
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[TextPart(content='success (no tool calls)')],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=4),
+        )
+    )
+
+async def test_model_request_tool_call():
+    model_response = await model_request(
+        'test',
+        [ModelRequest.user_text_prompt('x')],
+        model_request_parameters=ModelRequestParameters(
+            function_tools=[ToolDefinition(name='tool_name', parameters_json_schema={'type': 'object'})],
+            allow_text_output=False,
+        ),
+    )
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[ToolCallPart(tool_name='tool_name', args={}, tool_call_id=IsStr(regex='pyd_ai_.*'))],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=2),
+        )
+    )
+
+def test_model_request_sync():
+    model_response = model_request_sync('test', [ModelRequest.user_text_prompt('x')])
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[TextPart(content='success (no tool calls)')],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=4),
+        )
+    )
+
+def test_model_request_stream_sync():
+    with model_request_stream_sync('test', [ModelRequest.user_text_prompt('x')]) as stream:
+        chunks = list(stream)
+        assert chunks == snapshot(
+            [
+                PartStartEvent(index=0, part=TextPart(content='')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='success ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='(no ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='tool ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='calls)')),
+                PartEndEvent(index=0, part=TextPart(content='success (no tool calls)')),
+            ]
+        )
+        assert stream.response == snapshot(
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=51, output_tokens=4),
+                model_name='test',
+                timestamp=IsDatetime(),
+                provider_name='test',
+            )
+        )
+
+        repr_str = repr(stream)
+        assert 'TestStreamedResponse' in repr_str
+        assert 'test' in repr_str
+
+async def test_model_request_stream():
+    async with model_request_stream('test', [ModelRequest.user_text_prompt('x')]) as stream:
+        chunks = [chunk async for chunk in stream]
+    assert chunks == snapshot(
+        [
+            PartStartEvent(index=0, part=TextPart(content='')),
+            FinalResultEvent(tool_name=None, tool_call_id=None),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='success ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='(no ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='tool ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='calls)')),
+            PartEndEvent(index=0, part=TextPart(content='success (no tool calls)')),
+        ]
+    )
+
+def test_model_request_stream_sync_without_context_manager():
+    """Test that accessing properties or iterating without context manager raises RuntimeError."""
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('x')]
+
+    expected_error_msg = re.escape(
+        'StreamedResponseSync must be used as a context manager. Use: `with model_request_stream_sync(...) as stream:`'
+    )
+
+    stream_cm = model_request_stream_sync('test', messages)
+
+    stream_repr = repr(stream_cm)
+    assert 'StreamedResponseSync' in stream_repr
+    assert 'context_entered=False' in stream_repr
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        _ = stream_cm.model_name
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        _ = stream_cm.timestamp
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        stream_cm.get()
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        stream_cm.usage()
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        list(stream_cm)
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        for _ in stream_cm:
+            break  # pragma: no cover
+
+def test_model_request_stream_sync_exception_in_stream():
+    """Test handling of exceptions raised during streaming."""
+    async_stream_mock = AsyncMock()
+    async_stream_mock.__aenter__ = AsyncMock(side_effect=ValueError('Stream error'))
+
+    stream_sync = StreamedResponseSync(_async_stream_cm=async_stream_mock)
+
+    with stream_sync:
+        with pytest.raises(ValueError, match='Stream error'):
+            list(stream_sync)
+
+def test_model_request_stream_sync_timeout():
+    """Test timeout when stream fails to initialize."""
+    async_stream_mock = AsyncMock()
+
+    async def slow_init():
+        await asyncio.sleep(0.1)
+
+    async_stream_mock.__aenter__ = AsyncMock(side_effect=slow_init)
+
+    stream_sync = StreamedResponseSync(_async_stream_cm=async_stream_mock)
+
+    with patch('pydantic_ai.direct.STREAM_INITIALIZATION_TIMEOUT', 0.01):
+        with stream_sync:
+            with pytest.raises(RuntimeError, match='Stream failed to initialize within timeout'):
+                stream_sync.get()
+
+def test_model_request_stream_sync_intermediate_get():
+    """Test getting properties of StreamedResponse before consuming all events."""
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('x')]
+
+    with model_request_stream_sync('test', messages) as stream:
+        response = stream.get()
+        assert response is not None
+
+        usage = stream.usage()
+        assert usage is not None
+
+def set_instrument_default(value: bool):
+    """Context manager to temporarily set the default instrumentation value."""
+    initial_value = Agent._instrument_default  # pyright: ignore[reportPrivateUsage]
+    try:
+        Agent._instrument_default = value  # pyright: ignore[reportPrivateUsage]
+        yield
+    finally:
+        Agent._instrument_default = initial_value  # pyright: ignore[reportPrivateUsage]
+
+def test_prepare_model():
+    with set_instrument_default(False):
+        model = _prepare_model('test', None)
+        assert isinstance(model, TestModel)
+
+        model = _prepare_model('test', True)
+        assert isinstance(model, InstrumentedModel)
+
+    with set_instrument_default(True):
+        model = _prepare_model('test', None)
+        assert isinstance(model, InstrumentedModel)
+
+        model = _prepare_model('test', False)
+        assert isinstance(model, TestModel)
+
+## tests/test_streaming.py
+
+def test_streamed_text_stream_sync():
+    m = TestModel(custom_output_text='The cat sat on the mat.')
+
+    agent = Agent(m)
+
+    result = agent.run_stream_sync('Hello')
+    # typehint to test (via static typing) that the stream type is correctly inferred
+    chunks: list[str] = [c for c in result.stream_text()]
+    # one chunk with `stream_text()` due to group_by_temporal
+    assert chunks == snapshot(['The cat sat on the mat.'])
+    assert result.is_complete
+
+    result = agent.run_stream_sync('Hello')
+    # typehint to test (via static typing) that the stream type is correctly inferred
+    chunks: list[str] = [c for c in result.stream_output()]
+    # two chunks with `stream()` due to not-final vs. final
+    assert chunks == snapshot(['The cat sat on the mat.', 'The cat sat on the mat.'])
+    assert result.is_complete
+
+    result = agent.run_stream_sync('Hello')
+    assert [c for c in result.stream_text(debounce_by=None)] == snapshot(
+        [
+            'The ',
+            'The cat ',
+            'The cat sat ',
+            'The cat sat on ',
+            'The cat sat on the ',
+            'The cat sat on the mat.',
+        ]
+    )
+
+    result = agent.run_stream_sync('Hello')
+    # with stream_text, there is no need to do partial validation, so we only get the final message once:
+    assert [c for c in result.stream_text(delta=False, debounce_by=None)] == snapshot(
+        ['The ', 'The cat ', 'The cat sat ', 'The cat sat on ', 'The cat sat on the ', 'The cat sat on the mat.']
+    )
+
+    result = agent.run_stream_sync('Hello')
+    assert [c for c in result.stream_text(delta=True, debounce_by=None)] == snapshot(
+        ['The ', 'cat ', 'sat ', 'on ', 'the ', 'mat.']
+    )
+
+    def upcase(text: str) -> str:
+        return text.upper()
+
+    result = agent.run_stream_sync('Hello', output_type=TextOutput(upcase))
+    assert [c for c in result.stream_output(debounce_by=None)] == snapshot(
+        [
+            'THE ',
+            'THE CAT ',
+            'THE CAT SAT ',
+            'THE CAT SAT ON ',
+            'THE CAT SAT ON THE ',
+            'THE CAT SAT ON THE MAT.',
+            'THE CAT SAT ON THE MAT.',
+        ]
+    )
+
+    result = agent.run_stream_sync('Hello')
+    assert [c for c, _is_last in result.stream_responses(debounce_by=None)] == snapshot(
+        [
+            ModelResponse(
+                parts=[TextPart(content='The ')],
+                usage=RequestUsage(input_tokens=51, output_tokens=1),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='The cat ')],
+                usage=RequestUsage(input_tokens=51, output_tokens=2),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='The cat sat ')],
+                usage=RequestUsage(input_tokens=51, output_tokens=3),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='The cat sat on ')],
+                usage=RequestUsage(input_tokens=51, output_tokens=4),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='The cat sat on the ')],
+                usage=RequestUsage(input_tokens=51, output_tokens=5),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='The cat sat on the mat.')],
+                usage=RequestUsage(input_tokens=51, output_tokens=7),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='The cat sat on the mat.')],
+                usage=RequestUsage(input_tokens=51, output_tokens=7),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='The cat sat on the mat.')],
+                usage=RequestUsage(input_tokens=51, output_tokens=7),
+                model_name='test',
+                timestamp=IsDatetime(),
+                provider_name='test',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_temporal.py
+
+def test_pydantic_ai_plugin_preserves_custom_payload_codec() -> None:
+    """When converter has a custom payload_codec, preserve it while replacing payload_converter_class."""
+    plugin = PydanticAIPlugin()
+    codec = MockPayloadCodec()
+    converter = DataConverter(
+        payload_converter_class=DefaultPayloadConverter,
+        payload_codec=codec,
+    )
+    config: dict[str, Any] = {'data_converter': converter}
+    result = plugin.configure_client(config)  # type: ignore[arg-type]
+    assert result['data_converter'] is not converter
+    assert result['data_converter'].payload_converter_class is PydanticPayloadConverter
+    assert result['data_converter'].payload_codec is codec
+
+def test_pydantic_ai_plugin_with_non_pydantic_converter_warns() -> None:
+    """When converter uses a non-Pydantic payload converter, warn and replace."""
+    plugin = PydanticAIPlugin()
+    converter = DataConverter(payload_converter_class=CustomPayloadConverter)
+    config: dict[str, Any] = {'data_converter': converter}
+    with pytest.warns(
+        UserWarning,
+        match='A non-Pydantic Temporal payload converter was used which has been replaced with PydanticPayloadConverter',
+    ):
+        result = plugin.configure_client(config)  # type: ignore[arg-type]
+    assert result['data_converter'].payload_converter_class is PydanticPayloadConverter
+
+def test_pydantic_ai_plugin_with_non_pydantic_converter_preserves_codec() -> None:
+    """When converter uses a non-Pydantic payload converter with custom codec, warn but preserve codec."""
+    plugin = PydanticAIPlugin()
+    codec = MockPayloadCodec()
+    converter = DataConverter(
+        payload_converter_class=CustomPayloadConverter,
+        payload_codec=codec,
+    )
+    config: dict[str, Any] = {'data_converter': converter}
+    with pytest.warns(UserWarning):
+        result = plugin.configure_client(config)  # type: ignore[arg-type]
+    assert result['data_converter'].payload_converter_class is PydanticPayloadConverter
+    assert result['data_converter'].payload_codec is codec

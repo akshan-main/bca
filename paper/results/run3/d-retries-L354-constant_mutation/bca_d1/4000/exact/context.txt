@@ -1,0 +1,401 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## examples/pydantic_ai_examples/question_graph.py
+
+from pydantic_graph import (
+    BaseNode,
+    End,
+    Graph,
+    GraphRunContext,
+)
+
+class Ask(BaseNode[QuestionState]):
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/store.py
+
+    async def add(cls, analysis: Analysis):
+        await cls._get_store().put.aio(analysis.profile.email, analysis.model_dump())
+
+    async def list(cls) -> list[Analysis]:
+        return [
+            Analysis.model_validate(analysis)
+            async for analysis in cls._get_store().values.aio()
+        ]
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    def increment_retries(
+        self,
+        max_result_retries: int,
+        error: BaseException | None = None,
+        model_settings: ModelSettings | None = None,
+    ) -> None:
+        self.retries += 1
+        if self.retries > max_result_retries:
+            if (
+                self.message_history
+                and isinstance(model_response := self.message_history[-1], _messages.ModelResponse)
+                and model_response.finish_reason == 'length'
+                and model_response.parts
+                and isinstance(tool_call := model_response.parts[-1], _messages.ToolCallPart)
+            ):
+                try:
+                    tool_call.args_as_dict()
+                except Exception:
+                    max_tokens = model_settings.get('max_tokens') if model_settings else None
+                    raise exceptions.IncompleteToolCall(
+                        f'Model token limit ({max_tokens or "provider default"}) exceeded while generating a tool call, resulting in incomplete arguments. Increase the `max_tokens` model setting, or simplify the prompt to result in a shorter response that will fit within the limit.'
+                    )
+            message = f'Exceeded maximum retries ({max_result_retries}) for output validation'
+            if error:
+                if isinstance(error, exceptions.UnexpectedModelBehavior) and error.__cause__ is not None:
+                    error = error.__cause__
+                raise exceptions.UnexpectedModelBehavior(message) from error
+            else:
+                raise exceptions.UnexpectedModelBehavior(message)
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_utils.py
+
+    retries_allowed: bool
+
+## tests/conftest.py
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+## tests/models/test_model_test.py
+
+class AgentRunDeps:
+    run_id: int
+
+async def test_multiple_concurrent_tool_retries():
+    class OutputModel(BaseModel):
+        x: int
+        y: str
+
+    agent = Agent('test', deps_type=AgentRunDeps, output_type=OutputModel, retries=2)
+    retried_run_ids = set[int]()
+    event = Event()
+
+    run_ids = list(range(5))  # fire off 5 run ids that will all retry the tool before they finish
+
+    @agent.tool
+    async def tool_that_must_be_retried(ctx: RunContext[AgentRunDeps]) -> None:
+        if ctx.deps.run_id not in retried_run_ids:
+            retried_run_ids.add(ctx.deps.run_id)
+            raise ModelRetry('Fail')
+        if len(retried_run_ids) == len(run_ids):  # pragma: no branch  # won't branch if all runs happen very quickly
+            event.set()
+        await event.wait()  # ensure a retry is done by all runs before any of them finish their flow
+        return None
+
+    await asyncio.gather(*[agent.run('Hello', model=TestModel(), deps=AgentRunDeps(run_id)) for run_id in run_ids])
+
+## tests/models/test_xai.py
+
+async def test_xai_model_retries(allow_model_requests: None):
+    """Test xAI model with retries."""
+    # Create error response then success
+    success_response = create_response(content='Success after retry')
+
+    mock_client = MockXai.create_mock([success_response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+    result = await agent.run('hello')
+    assert result.output == 'Success after retry'
+
+## tests/test_agent.py
+
+def test_output_validator_retries():
+    """Test that ctx.retry and ctx.max_retries are correctly tracked in RunContext for output validators."""
+    retries_log: list[int] = []
+    max_retries_log: list[int] = []
+    target_retries = 3
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        # Always return the same value, let the validator control retries
+        args_json = '{"a": 1, "b": "foo"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=Foo, output_retries=target_retries)
+
+    @agent.output_validator
+    def validate_output(ctx: RunContext[None], o: Foo) -> Foo:
+        retries_log.append(ctx.retry)
+        max_retries_log.append(ctx.max_retries)
+        # Succeed on the last retry
+        if ctx.retry == target_retries:
+            return o
+        else:
+            raise ModelRetry(f'Retry {ctx.retry}')
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, Foo)
+
+    # Should have been called target_retries + 1 times (0, 1, 2, 3)
+    assert retries_log == [0, 1, 2, 3]
+    assert max_retries_log == [target_retries] * (target_retries + 1)
+
+def test_output_function_retries():
+    """Test that ctx.retry and ctx.max_retries are correctly tracked in RunContext for output functions."""
+    retries_log: list[int] = []
+    max_retries_log: list[int] = []
+    target_retries = 3
+
+    def get_weather(ctx: RunContext[None], text: str) -> str:
+        retries_log.append(ctx.retry)
+        max_retries_log.append(ctx.max_retries)
+        if ctx.retry == target_retries:
+            return f'Weather: {text}'
+        else:
+            raise ModelRetry(f'Retry {ctx.retry}')
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content='sunny')])
+
+    agent = Agent(FunctionModel(return_model), output_type=TextOutput(get_weather), output_retries=target_retries)
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'Weather: sunny'
+
+    # Should have been called target_retries + 1 times (0, 1, 2, 3)
+    assert retries_log == [0, 1, 2, 3]
+    assert max_retries_log == [target_retries] * (target_retries + 1)
+
+def test_tool_output_function_retries():
+    """Test that ctx.retry and ctx.max_retries are correctly tracked in RunContext for tool output functions."""
+    retries_log: list[int] = []
+    max_retries_log: list[int] = []
+    target_retries = 3
+
+    def get_weather(ctx: RunContext[None], city: str) -> str:
+        retries_log.append(ctx.retry)
+        max_retries_log.append(ctx.max_retries)
+        if ctx.retry == target_retries:
+            return f'Weather in {city}'
+        else:
+            raise ModelRetry(f'Retry {ctx.retry}')
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        args_json = '{"city": "Mexico City"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=get_weather, output_retries=target_retries)
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'Weather in Mexico City'
+
+    # Should have been called target_retries + 1 times (0, 1, 2, 3)
+    assert retries_log == [0, 1, 2, 3]
+    assert max_retries_log == [target_retries] * (target_retries + 1)
+
+def test_unknown_tool_multiple_retries():
+    num_retries = 2
+
+    def empty(_: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ToolCallPart('foobar', '{}')])
+
+    agent = Agent(FunctionModel(empty), retries=num_retries)
+
+    with capture_run_messages() as messages:
+        with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(2\) for output validation'):
+            agent.run_sync('Hello')
+    assert messages == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=51, output_tokens=2),
+                model_name='function:empty:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        tool_name='foobar',
+                        content="Unknown tool name: 'foobar'. No tools available.",
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=65, output_tokens=4),
+                model_name='function:empty:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        tool_name='foobar',
+                        content="Unknown tool name: 'foobar'. No tools available.",
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=79, output_tokens=6),
+                model_name='function:empty:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_fastmcp.py
+
+    async def test_init_with_custom_retries_and_error_behavior(self, fastmcp_client: Client[FastMCPTransport]):
+        """Test initialization with custom retries and error behavior."""
+        toolset = FastMCPToolset(fastmcp_client, max_retries=5, tool_error_behavior='model_retry')
+
+        # Test that the toolset was created successfully
+        assert toolset.client is fastmcp_client
+
+## tests/test_mcp.py
+
+async def test_server_capabilities_list_changed_fields() -> None:
+    """Test that ServerCapabilities correctly parses listChanged fields."""
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+    async with server:
+        caps = server.capabilities
+        assert isinstance(caps.prompts_list_changed, bool)
+        assert isinstance(caps.tools_list_changed, bool)
+        assert isinstance(caps.resources_list_changed, bool)
+
+## tests/test_temporal.py
+
+def test_pydantic_ai_plugin_with_pydantic_payload_converter_unchanged() -> None:
+    """When converter already uses PydanticPayloadConverter, return it unchanged."""
+    plugin = PydanticAIPlugin()
+    converter = DataConverter(payload_converter_class=PydanticPayloadConverter)
+    config: dict[str, Any] = {'data_converter': converter}
+    result = plugin.configure_client(config)  # type: ignore[arg-type]
+    assert result['data_converter'] is converter
+
+def test_pydantic_ai_plugin_with_custom_pydantic_subclass_unchanged() -> None:
+    """When converter uses a subclass of PydanticPayloadConverter, return it unchanged (no warning)."""
+    plugin = PydanticAIPlugin()
+    converter = DataConverter(payload_converter_class=CustomPydanticPayloadConverter)
+    config: dict[str, Any] = {'data_converter': converter}
+    result = plugin.configure_client(config)  # type: ignore[arg-type]
+    assert result['data_converter'] is converter
+    assert result['data_converter'].payload_converter_class is CustomPydanticPayloadConverter
+
+## tests/test_tenacity.py
+
+    def test_default_fallback_strategy(self):
+        """Test that default fallback strategy is used when none is provided."""
+        wait_func = wait_retry_after(max_wait=300)
+
+        # Create a retry state with no exception to trigger fallback
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = None
+        retry_state.attempt_number = 1
+
+        # Should use default exponential backoff, exact value depends on retry state
+        result = wait_func(retry_state)
+
+        assert result == 1  # first backoff
+
+## tests/test_tools.py
+
+def test_tool_retries():
+    prepare_tools_retries: list[int] = []
+    prepare_retries: list[int] = []
+    prepare_max_retries: list[int] = []
+    prepare_last_attempt: list[bool] = []
+    call_retries: list[int] = []
+    call_max_retries: list[int] = []
+    call_last_attempt: list[bool] = []
+
+    async def prepare_tool_defs(ctx: RunContext[None], tool_defs: list[ToolDefinition]) -> list[ToolDefinition] | None:
+        nonlocal prepare_tools_retries
+        retry = ctx.retries.get('infinite_retry_tool', 0)
+        prepare_tools_retries.append(retry)
+        return tool_defs
+
+    agent = Agent(TestModel(), retries=3, prepare_tools=prepare_tool_defs)
+
+    async def prepare_tool_def(ctx: RunContext[None], tool_def: ToolDefinition) -> ToolDefinition | None:
+        nonlocal prepare_retries
+        prepare_retries.append(ctx.retry)
+        prepare_max_retries.append(ctx.max_retries)
+        prepare_last_attempt.append(ctx.last_attempt)
+        return tool_def
+
+    @agent.tool(retries=5, prepare=prepare_tool_def)
+    def infinite_retry_tool(ctx: RunContext[None]) -> int:
+        nonlocal call_retries
+        call_retries.append(ctx.retry)
+        call_max_retries.append(ctx.max_retries)
+        call_last_attempt.append(ctx.last_attempt)
+        raise ModelRetry('Please try again.')
+
+    with pytest.raises(UnexpectedModelBehavior, match="Tool 'infinite_retry_tool' exceeded max retries count of 5"):
+        agent.run_sync('Begin infinite retry loop!')
+
+    assert prepare_tools_retries == snapshot([0, 1, 2, 3, 4, 5])
+
+    assert prepare_retries == snapshot([0, 1, 2, 3, 4, 5])
+    assert prepare_max_retries == snapshot([5, 5, 5, 5, 5, 5])
+    assert prepare_last_attempt == snapshot([False, False, False, False, False, True])
+
+    assert call_retries == snapshot([0, 1, 2, 3, 4, 5])
+    assert call_max_retries == snapshot([5, 5, 5, 5, 5, 5])
+    assert call_last_attempt == snapshot([False, False, False, False, False, True])

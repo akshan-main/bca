@@ -1,0 +1,797 @@
+## examples/pydantic_ai_examples/chat_app.py
+
+async def post_chat(
+    prompt: Annotated[str, fastapi.Form()], database: Database = Depends(get_db)
+) -> StreamingResponse:
+    async def stream_messages():
+        """Streams new line delimited JSON `Message`s to the client."""
+        # stream the user prompt so that can be displayed straight away
+        yield (
+            json.dumps(
+                {
+                    'role': 'user',
+                    'timestamp': datetime.now(tz=timezone.utc).isoformat(),
+                    'content': prompt,
+                }
+            ).encode('utf-8')
+            + b'\n'
+        )
+        # get the chat history so far to pass as context to the agent
+        messages = await database.get_messages()
+        # run the agent with the user prompt and the chat history
+        async with agent.run_stream(prompt, message_history=messages) as result:
+            async for text in result.stream_output(debounce_by=0.01):
+                # text here is a `str` and the frontend wants
+                # JSON encoded ModelResponse, so we create one
+                m = ModelResponse(parts=[TextPart(text)], timestamp=result.timestamp())
+                yield json.dumps(to_chat_message(m)).encode('utf-8') + b'\n'
+
+        # add new messages (e.g. the user prompt and the agent response in this case) to the database
+        await database.add_messages(result.new_messages_json())
+
+    return StreamingResponse(stream_messages(), media_type='text/plain')
+
+    async def add_messages(self, messages: bytes):
+        await self._asyncify(
+            self._execute,
+            'INSERT INTO messages (message_list) VALUES (?);',
+            messages,
+            commit=True,
+        )
+        await self._asyncify(self.con.commit)
+
+    async def _asyncify(
+        self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
+    ) -> R:
+        return await self._loop.run_in_executor(  # type: ignore
+            self._executor,
+            partial(func, **kwargs),
+            *args,  # type: ignore
+        )
+
+## pydantic_ai_slim/pydantic_ai/__init__.py
+
+from .settings import ModelSettings
+
+## pydantic_ai_slim/pydantic_ai/_a2a.py
+
+from typing import Any, Generic, TypeVar
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+class _RunMessages:
+    messages: list[_messages.ModelMessage]
+    used: bool = False
+
+def capture_run_messages() -> Iterator[list[_messages.ModelMessage]]:
+    """Context manager to access the messages used in a [`run`][pydantic_ai.agent.AbstractAgent.run], [`run_sync`][pydantic_ai.agent.AbstractAgent.run_sync], or [`run_stream`][pydantic_ai.agent.AbstractAgent.run_stream] call.
+
+    Useful when a run may raise an exception, see [model errors](../agent.md#model-errors) for more information.
+
+    Examples:
+    ```python
+    from pydantic_ai import Agent, capture_run_messages
+
+    agent = Agent('test')
+
+    with capture_run_messages() as messages:
+        try:
+            result = agent.run_sync('foobar')
+        except Exception:
+            print(messages)
+            raise
+    ```
+
+    !!! note
+        If you call `run`, `run_sync`, or `run_stream` more than once within a single `capture_run_messages` context,
+        `messages` will represent the messages exchanged during the first call only.
+    """
+    token = None
+    messages: list[_messages.ModelMessage] = []
+
+    # Try to reuse existing message context if available
+    try:
+        messages = _messages_ctx_var.get().messages
+    except LookupError:
+        # No existing context, create a new one
+        token = _messages_ctx_var.set(_RunMessages(messages))
+
+    try:
+        yield messages
+    finally:
+        # Clean up context if we created it
+        if token is not None:
+            _messages_ctx_var.reset(token)
+
+## pydantic_ai_slim/pydantic_ai/_mcp.py
+
+def map_from_pai_messages(pai_messages: list[messages.ModelMessage]) -> tuple[str, list[mcp_types.SamplingMessage]]:
+    """Convert from pydantic-ai messages to MCP sampling messages.
+
+    Returns:
+        A tuple containing the system prompt and a list of sampling messages.
+    """
+    sampling_msgs: list[mcp_types.SamplingMessage] = []
+
+    def add_msg(
+        role: Literal['user', 'assistant'],
+        content: mcp_types.TextContent | mcp_types.ImageContent | mcp_types.AudioContent,
+    ):
+        sampling_msgs.append(mcp_types.SamplingMessage(role=role, content=content))
+
+    system_prompt: list[str] = []
+    for pai_message in pai_messages:
+        if isinstance(pai_message, messages.ModelRequest):
+            if pai_message.instructions is not None:
+                system_prompt.append(pai_message.instructions)
+
+            for part in pai_message.parts:
+                if isinstance(part, messages.SystemPromptPart):
+                    system_prompt.append(part.content)
+                if isinstance(part, messages.UserPromptPart):
+                    if isinstance(part.content, str):
+                        add_msg('user', mcp_types.TextContent(type='text', text=part.content))
+                    else:
+                        for chunk in part.content:
+                            if isinstance(chunk, str):
+                                add_msg('user', mcp_types.TextContent(type='text', text=chunk))
+                            elif isinstance(chunk, messages.BinaryContent) and chunk.is_image:
+                                add_msg(
+                                    'user',
+                                    mcp_types.ImageContent(
+                                        type='image',
+                                        data=chunk.base64,
+                                        mimeType=chunk.media_type,
+                                    ),
+                                )
+                            # TODO(Marcelo): Add support for audio content.
+                            else:
+                                raise NotImplementedError(f'Unsupported content type: {type(chunk)}')
+        else:
+            add_msg('assistant', map_from_model_response(pai_message))
+    return ''.join(system_prompt), sampling_msgs
+
+def map_from_model_response(model_response: messages.ModelResponse) -> mcp_types.TextContent:
+    """Convert from a model response to MCP text content."""
+    text_parts: list[str] = []
+    for part in model_response.parts:
+        if isinstance(part, messages.TextPart):
+            text_parts.append(part.content)
+        elif isinstance(part, messages.ThinkingPart):
+            continue
+        else:
+            raise exceptions.UnexpectedModelBehavior(f'Unexpected part type: {type(part).__name__}, expected TextPart')
+    return mcp_types.TextContent(type='text', text=''.join(text_parts))
+
+## pydantic_ai_slim/pydantic_ai/ag_ui.py
+
+from .models import KnownModelName, Model
+
+## pydantic_ai_slim/pydantic_ai/models/bedrock.py
+
+class BedrockModelSettings(ModelSettings, total=False):
+    """Settings for Bedrock models.
+
+    See [the Bedrock Converse API docs](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html#API_runtime_Converse_RequestSyntax) for a full list.
+    See [the boto3 implementation](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/bedrock-runtime/client/converse.html) of the Bedrock Converse API.
+    """
+
+    # ALL FIELDS MUST BE `bedrock_` PREFIXED SO YOU CAN MERGE THEM WITH OTHER MODELS.
+
+    bedrock_guardrail_config: GuardrailConfigurationTypeDef
+    """Content moderation and safety settings for Bedrock API requests.
+
+    See more about it on <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_GuardrailConfiguration.html>.
+    """
+
+    bedrock_performance_configuration: PerformanceConfigurationTypeDef
+    """Performance optimization settings for model inference.
+
+    See more about it on <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_PerformanceConfiguration.html>.
+    """
+
+    bedrock_request_metadata: dict[str, str]
+    """Additional metadata to attach to Bedrock API requests.
+
+    See more about it on <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html#API_runtime_Converse_RequestSyntax>.
+    """
+
+    bedrock_additional_model_response_fields_paths: list[str]
+    """JSON paths to extract additional fields from model responses.
+
+    See more about it on <https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html>.
+    """
+
+    bedrock_prompt_variables: Mapping[str, PromptVariableValuesTypeDef]
+    """Variables for substitution into prompt templates.
+
+    See more about it on <https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_PromptVariableValues.html>.
+    """
+
+    bedrock_additional_model_requests_fields: Mapping[str, Any]
+    """Additional model-specific parameters to include in requests.
+
+    See more about it on <https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters.html>.
+    """
+
+    bedrock_cache_tool_definitions: bool
+    """Whether to add a cache point after the last tool definition.
+
+    When enabled, the last tool in the `tools` array will include a `cachePoint`, allowing Bedrock to cache tool
+    definitions and reduce costs for compatible models.
+    See https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html for more information.
+    """
+
+    bedrock_cache_instructions: bool
+    """Whether to add a cache point after the system prompt blocks.
+
+    When enabled, an extra `cachePoint` is appended to the system prompt so Bedrock can cache system instructions.
+    See https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html for more information.
+    """
+
+    bedrock_cache_messages: bool
+    """Convenience setting to enable caching for the last user message.
+
+    When enabled, this automatically adds a cache point to the last content block
+    in the final user message, which is useful for caching conversation history
+    or context in multi-turn conversations.
+
+    Note: Uses 1 of Bedrock's 4 available cache points per request. Any additional CachePoint
+    markers in messages will be automatically limited to respect the 4-cache-point maximum.
+    See https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html for more information.
+    """
+
+    bedrock_service_tier: ServiceTierTypeDef
+    """Setting for optimizing performance and cost
+
+    See more about it on <https://docs.aws.amazon.com/bedrock/latest/userguide/service-tiers-inference.html>.
+    """
+
+## pydantic_ai_slim/pydantic_ai/models/mcp_sampling.py
+
+class MCPSamplingModel
+    """A model that uses MCP Sampling.
+
+    [MCP Sampling](https://modelcontextprotocol.io/docs/concepts/sampling)
+    allows an MCP server to make requests to a model by calling back to the MCP client that connected to it."""
+    ...  # (skeleton: full source omitted for budget)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        system_prompt, sampling_messages = _mcp.map_from_pai_messages(messages)
+
+        model_settings, _ = self.prepare_request(model_settings, model_request_parameters)
+        model_settings = cast(MCPSamplingModelSettings, model_settings or {})
+
+        result = await self.session.create_message(
+            sampling_messages,
+            max_tokens=model_settings.get('max_tokens', self.default_max_tokens),
+            system_prompt=system_prompt,
+            temperature=model_settings.get('temperature'),
+            model_preferences=model_settings.get('mcp_model_preferences'),
+            stop_sequences=model_settings.get('stop_sequences'),
+        )
+        if result.role == 'assistant':
+            return ModelResponse(
+                parts=[_mcp.map_from_sampling_content(result.content)],
+                model_name=result.model,
+            )
+        else:
+            raise exceptions.UnexpectedModelBehavior(
+                f'Unexpected result from MCP sampling, expected "assistant" role, got {result.role}.'
+            )
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def all_messages(self) -> list[_messages.ModelMessage]:
+        """Return all messages for the run so far.
+
+        Messages from older runs are included.
+        """
+        return self.ctx.state.message_history
+
+    def all_messages_json(self, *, output_tool_return_content: str | None = None) -> bytes:
+        """Return all messages from [`all_messages`][pydantic_ai.agent.AgentRun.all_messages] as JSON bytes.
+
+        Returns:
+            JSON bytes representing the messages.
+        """
+        return _messages.ModelMessagesTypeAdapter.dump_json(self.all_messages())
+
+## pydantic_ai_slim/pydantic_ai/ui/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the protocol-specific run input."""
+        raise NotImplementedError
+
+## pydantic_evals/pydantic_evals/dataset.py
+
+class Case(Generic[InputsT, OutputT, MetadataT]):
+    """A single row of a [`Dataset`][pydantic_evals.Dataset].
+
+    Each case represents a single test scenario with inputs to test. A case may optionally specify a name, expected
+    outputs to compare against, and arbitrary metadata.
+
+    Cases can also have their own specific evaluators which are run in addition to dataset-level evaluators.
+
+    Example:
+    ```python
+    from pydantic_evals import Case
+
+    case = Case(
+        name='Simple addition',
+        inputs={'a': 1, 'b': 2},
+        expected_output=3,
+        metadata={'description': 'Tests basic addition'},
+    )
+    ```
+    """
+
+    name: str | None
+    """Name of the case. This is used to identify the case in the report and can be used to filter cases."""
+    inputs: InputsT
+    """Inputs to the task. This is the input to the task that will be evaluated."""
+    metadata: MetadataT | None = None
+    """Metadata to be used in the evaluation.
+
+    This can be used to provide additional information about the case to the evaluators.
+    """
+    expected_output: OutputT | None = None
+    """Expected output of the task. This is the expected output of the task that will be evaluated."""
+    evaluators: list[Evaluator[InputsT, OutputT, MetadataT]] = field(
+        default_factory=list[Evaluator[InputsT, OutputT, MetadataT]]
+    )
+    """Evaluators to be used just on this case."""
+
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        inputs: InputsT,
+        metadata: MetadataT | None = None,
+        expected_output: OutputT | None = None,
+        evaluators: tuple[Evaluator[InputsT, OutputT, MetadataT], ...] = (),
+    ):
+        """Initialize a new test case.
+
+        Args:
+            name: Optional name for the case. If not provided, a generic name will be assigned when added to a dataset.
+            inputs: The inputs to the task being evaluated.
+            metadata: Optional metadata for the case, which can be used by evaluators.
+            expected_output: Optional expected output of the task, used for comparison in evaluators.
+            evaluators: Tuple of evaluators specific to this case. These are in addition to any
+                dataset-level evaluators.
+
+        """
+        # Note: `evaluators` must be a tuple instead of Sequence due to misbehavior with pyright's generic parameter
+        # inference if it has type `Sequence`
+        self.name = name
+        self.inputs = inputs
+        self.metadata = metadata
+        self.expected_output = expected_output
+        self.evaluators = list(evaluators)
+
+## pydantic_evals/pydantic_evals/evaluators/common.py
+
+class IsInstance(Evaluator[object, object, object]):
+    """Check if the output is an instance of a type with the given name."""
+
+    type_name: str
+    evaluation_name: str | None = field(default=None)
+
+    def evaluate(self, ctx: EvaluatorContext[object, object, object]) -> EvaluationReason:
+        output = ctx.output
+        for cls in type(output).__mro__:
+            if cls.__name__ == self.type_name or cls.__qualname__ == self.type_name:
+                return EvaluationReason(value=True)
+
+        reason = f'output is of type {type(output).__name__}'
+        if type(output).__qualname__ != type(output).__name__:
+            reason += f' (qualname: {type(output).__qualname__})'
+        return EvaluationReason(value=False, reason=reason)
+
+## pydantic_graph/pydantic_graph/beta/decision.py
+
+class Decision(Generic[StateT, DepsT, HandledT]):
+    """Decision node for conditional branching in graph execution.
+
+    A Decision node evaluates conditions and routes execution to different
+    branches based on the input data type or custom matching logic.
+    """
+
+    id: NodeID
+    """Unique identifier for this decision node."""
+
+    branches: list[DecisionBranch[Any]]
+    """List of branches that can be taken from this decision."""
+
+    note: str | None
+    """Optional documentation note for this decision."""
+
+    def branch(self, branch: DecisionBranch[T]) -> Decision[StateT, DepsT, HandledT | T]:
+        """Add a new branch to this decision.
+
+        Args:
+            branch: The branch to add to this decision.
+
+        Returns:
+            A new Decision with the additional branch.
+        """
+        return Decision(id=self.id, branches=self.branches + [branch], note=self.note)
+
+    def _force_handled_contravariant(self, inputs: HandledT) -> Never:  # pragma: no cover
+        """Forces this type to be contravariant in the HandledT type variable.
+
+        This is an implementation detail of how we can type-check that all possible input types have
+        been exhaustively covered.
+
+        Args:
+            inputs: Input data of handled types.
+
+        Raises:
+            RuntimeError: Always, as this method should never be executed.
+        """
+        raise RuntimeError('This method should never be called, it is just defined for typing purposes.')
+
+    def branch(self, branch: DecisionBranch[T]) -> Decision[StateT, DepsT, HandledT | T]:
+        """Add a new branch to this decision.
+
+        Args:
+            branch: The branch to add to this decision.
+
+        Returns:
+            A new Decision with the additional branch.
+        """
+        return Decision(id=self.id, branches=self.branches + [branch], note=self.note)
+
+    def _force_handled_contravariant(self, inputs: HandledT) -> Never:  # pragma: no cover
+        """Forces this type to be contravariant in the HandledT type variable.
+
+        This is an implementation detail of how we can type-check that all possible input types have
+        been exhaustively covered.
+
+        Args:
+            inputs: Input data of handled types.
+
+        Raises:
+            RuntimeError: Always, as this method should never be executed.
+        """
+        raise RuntimeError('This method should never be called, it is just defined for typing purposes.')
+
+class DecisionBranch(Generic[SourceT]):
+    """Represents a single branch within a decision node.
+
+    Each branch defines the conditions under which it should be taken
+    and the path to follow when those conditions are met.
+
+    Note: with the current design, it is actually _critical_ that this class is invariant in SourceT for the sake
+    of type-checking that inputs to a Decision are actually handled. See the `# type: ignore` comment in
+    `tests.graph.beta.test_graph_edge_cases.test_decision_no_matching_branch` for an example of how this works.
+    """
+
+    source: TypeOrTypeExpression[SourceT]
+    """The expected type of data for this branch.
+
+    This is necessary for exhaustiveness-checking when handling the inputs to a decision node."""
+
+    matches: Callable[[Any], bool] | None
+    """An optional predicate function used to determine whether input data matches this branch.
+
+    If `None`, default logic is used which attempts to check the value for type-compatibility with the `source` type:
+    * If `source` is `Any` or `object`, the branch will always match
+    * If `source` is a `Literal` type, this branch will match if the value is one of the parametrizing literal values
+    * If `source` is any other type, the value will be checked for matching using `isinstance`
+
+    Inputs are tested against each branch of a decision node in order, and the path of the first matching branch is
+    used to handle the input value.
+    """
+
+    path: Path
+    """The execution path to follow when an input value matches this branch of a decision node.
+
+    This can include transforming, mapping, and broadcasting the output before sending to the next node or nodes.
+
+    The path can also include position-aware labels which are used when generating mermaid diagrams."""
+
+    destinations: list[AnyDestinationNode]
+    """The destination nodes that can be referenced by DestinationMarker in the path."""
+
+## pydantic_graph/pydantic_graph/graph.py
+
+from .persistence import BaseStatePersistence
+
+## pydantic_graph/pydantic_graph/persistence/in_mem.py
+
+class FullStatePersistence(BaseStatePersistence[StateT, RunEndT]):
+    """In memory state persistence that hold a list of snapshots."""
+
+    deep_copy: bool = True
+    """Whether to deep copy the state and nodes when storing them.
+
+    Defaults to `True` so even if nodes or state are modified after the snapshot is taken,
+    the persistence history will record the value at the time of the snapshot.
+    """
+    history: list[Snapshot[StateT, RunEndT]] = field(default_factory=list[Snapshot[StateT, RunEndT]])
+    """List of snapshots taken during the graph run."""
+    _snapshots_type_adapter: pydantic.TypeAdapter[list[Snapshot[StateT, RunEndT]]] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    async def snapshot_node(self, state: StateT, next_node: BaseNode[StateT, Any, RunEndT]) -> None:
+        snapshot = NodeSnapshot(
+            state=self._prep_state(state),
+            node=next_node.deep_copy() if self.deep_copy else next_node,
+        )
+        self.history.append(snapshot)
+
+    async def snapshot_node_if_new(
+        self, snapshot_id: str, state: StateT, next_node: BaseNode[StateT, Any, RunEndT]
+    ) -> None:
+        if not any(s.id == snapshot_id for s in self.history):
+            await self.snapshot_node(state, next_node)
+
+    async def snapshot_end(self, state: StateT, end: End[RunEndT]) -> None:
+        snapshot = EndSnapshot(
+            state=self._prep_state(state),
+            result=end.deep_copy_data() if self.deep_copy else end,
+        )
+        self.history.append(snapshot)
+
+    @asynccontextmanager
+    async def record_run(self, snapshot_id: str) -> AsyncIterator[None]:
+        try:
+            snapshot = next(s for s in self.history if s.id == snapshot_id)
+        except StopIteration as e:
+            raise LookupError(f'No snapshot found with id={snapshot_id!r}') from e
+
+        assert isinstance(snapshot, NodeSnapshot), 'Only NodeSnapshot can be recorded'
+        exceptions.GraphNodeStatusError.check(snapshot.status)
+        snapshot.status = 'running'
+        snapshot.start_ts = _utils.now_utc()
+        start = perf_counter()
+        try:
+            yield
+        except Exception:
+            snapshot.duration = perf_counter() - start
+            snapshot.status = 'error'
+            raise
+        else:
+            snapshot.duration = perf_counter() - start
+            snapshot.status = 'success'
+
+    async def load_next(self) -> NodeSnapshot[StateT, RunEndT] | None:
+        if snapshot := next((s for s in self.history if isinstance(s, NodeSnapshot) and s.status == 'created'), None):
+            snapshot.status = 'pending'
+            return copy.deepcopy(snapshot)
+
+    async def load_all(self) -> list[Snapshot[StateT, RunEndT]]:
+        return self.history
+
+    def should_set_types(self) -> bool:
+        return self._snapshots_type_adapter is None
+
+    def set_types(self, state_type: type[StateT], run_end_type: type[RunEndT]) -> None:
+        self._snapshots_type_adapter = build_snapshot_list_type_adapter(state_type, run_end_type)
+
+    def dump_json(self, *, indent: int | None = None) -> bytes:
+        """Dump the history to JSON bytes."""
+        assert self._snapshots_type_adapter is not None, 'type adapter must be set to use `dump_json`'
+        return self._snapshots_type_adapter.dump_json(self.history, indent=indent)
+
+    def load_json(self, json_data: str | bytes | bytearray) -> None:
+        """Load the history from JSON."""
+        assert self._snapshots_type_adapter is not None, 'type adapter must be set to use `load_json`'
+        self.history = self._snapshots_type_adapter.validate_json(json_data)
+
+    def _prep_state(self, state: StateT) -> StateT:
+        """Prepare state for snapshot, uses [`copy.deepcopy`][copy.deepcopy] by default."""
+        if not self.deep_copy or state is None:
+            return state
+        else:
+            return copy.deepcopy(state)
+
+    def dump_json(self, *, indent: int | None = None) -> bytes:
+        """Dump the history to JSON bytes."""
+        assert self._snapshots_type_adapter is not None, 'type adapter must be set to use `dump_json`'
+        return self._snapshots_type_adapter.dump_json(self.history, indent=indent)
+
+## tests/conftest.py
+
+def raise_if_exception(e: Any) -> None:
+    if isinstance(e, Exception):
+        raise e
+
+## tests/graph/beta/test_node_and_step.py
+
+def test_is_destination_type_guard():
+    """Test is_destination type guard function."""
+    # Test with EndNode
+    end = EndNode[int]()
+    assert is_destination(end)
+
+    # Test with Step
+    async def my_step(ctx: StepContext[Any, Any, Any]):
+        return 42  # pragma: no cover
+
+    step = Step[None, None, None, int](id=NodeID('test'), call=my_step)
+    assert is_destination(step)
+
+    # Test with Decision
+    decision = Decision[None, None, int](id=NodeID('test_decision'), branches=[], note=None)
+    assert is_destination(decision)
+
+    # Test with StartNode (should be False)
+    start = StartNode[int]()
+    assert not is_destination(start)
+
+## tests/models/mock_async_stream.py
+
+class MockAsyncStream(Generic[T]):
+    """Wraps a synchronous iterator in an asynchronous interface.
+
+    This class allows a synchronous iterator to be treated as an
+    asynchronous iterator, enabling iteration in `async for` loops
+    and usage within `async with` blocks.
+
+    Example usage:
+        async def example():
+            sync_iter = iter([1, 2, 3])
+            async_stream = MockAsyncStream(sync_iter)
+
+            async for item in async_stream:
+                print(item)
+
+            async with MockAsyncStream(sync_iter) as stream:
+                async for item in stream:
+                    print(item)
+    """
+
+    _iter: Iterator[T]
+    """The underlying synchronous iterator."""
+
+    async def __anext__(self) -> T:
+        """Return the next item from the synchronous iterator as if it were asynchronous.
+
+        Calls `_utils.sync_anext` to retrieve the next item from the underlying
+        synchronous iterator. If the iterator is exhausted, `StopAsyncIteration`
+        is raised.
+        """
+        next = _utils.sync_anext(self._iter)
+        raise_if_exception(next)
+        return next
+
+    def __aiter__(self) -> MockAsyncStream[T]:
+        return self
+
+    async def __aenter__(self) -> MockAsyncStream[T]:
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        pass
+
+## tests/models/test_anthropic.py
+
+    def messages(self) -> Any:
+        return type('Messages', (), {'create': self.messages_create, 'count_tokens': self.messages_count_tokens})
+
+    async def messages_create(
+        self, *_args: Any, stream: bool = False, **kwargs: Any
+    ) -> BetaMessage | MockAsyncStream[MockRawMessageStreamEvent]:
+        self.chat_completion_kwargs.append({k: v for k, v in kwargs.items() if v is not NOT_GIVEN})
+
+        if stream:
+            assert self.stream is not None, 'you can only use `stream=True` if `stream` is provided'
+            if isinstance(self.stream[0], Sequence):
+                response = MockAsyncStream(iter(cast(list[MockRawMessageStreamEvent], self.stream[self.index])))
+            else:
+                response = MockAsyncStream(iter(cast(list[MockRawMessageStreamEvent], self.stream)))
+        else:
+            assert self.messages_ is not None, '`messages` must be provided'
+            if isinstance(self.messages_, Sequence):
+                raise_if_exception(self.messages_[self.index])
+                response = cast(BetaMessage, self.messages_[self.index])
+            else:
+                raise_if_exception(self.messages_)
+                response = cast(BetaMessage, self.messages_)
+        self.index += 1
+        return response
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_cache_messages_no_user_messages(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    """Test that bedrock_cache_messages handles case with no user messages."""
+    model = BedrockConverseModel('us.anthropic.claude-3-5-sonnet-20240620-v1:0', provider=bedrock_provider)
+    # Only assistant message, no user message
+    messages: list[ModelMessage] = [ModelResponse(parts=[TextPart(content='Assistant response')])]
+    _, bedrock_messages = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        messages,
+        ModelRequestParameters(),
+        BedrockModelSettings(bedrock_cache_messages=True),
+    )
+    # Should not crash, no cache point added since no user message
+    assert len(bedrock_messages) == 1
+    assert bedrock_messages[0]['role'] == 'assistant'
+
+## tests/test_mcp.py
+
+def test_map_from_pai_messages_with_binary_content():
+    """Test that map_from_pai_messages correctly converts image and audio content to MCP format.
+
+    Note: `data` in this case are base64-encoded bytes (e.g., base64.b64encode(b'raw')).
+    map_from_pai_messages decodes this to get the base64 string for MCP.
+    """
+
+    message = ModelRequest(
+        parts=[
+            UserPromptPart(content='text message'),
+            UserPromptPart(content=[BinaryContent(data=b'raw_image_bytes', media_type='image/png')]),
+            # TODO uncomment when audio content is supported
+            # UserPromptPart(content=[BinaryContent(data=b'raw_audio_bytes', media_type='audio/wav'), 'text after audio']),
+        ]
+    )
+    system_prompt, sampling_msgs = map_from_pai_messages([message])
+    assert system_prompt == ''
+    assert [m.model_dump(by_alias=True) for m in sampling_msgs] == snapshot(
+        [
+            {
+                'role': 'user',
+                'content': {'type': 'text', 'text': 'text message', 'annotations': None, '_meta': None},
+                '_meta': None,
+            },
+            {
+                'role': 'user',
+                'content': {
+                    'type': 'image',
+                    'data': 'cmF3X2ltYWdlX2J5dGVz',
+                    'mimeType': 'image/png',
+                    'annotations': None,
+                    '_meta': None,
+                },
+                '_meta': None,
+            },
+        ]
+    )
+
+    # Unsupported content type raises NotImplementedError
+    message_with_video = ModelRequest(
+        parts=[UserPromptPart(content=[BinaryContent(data=b'raw_video_bytes', media_type='video/mp4')])]
+    )
+    with pytest.raises(
+        NotImplementedError, match="Unsupported content type: <class 'pydantic_ai.messages.BinaryContent'>"
+    ):
+        map_from_pai_messages([message_with_video])
+
+## tests/test_vercel_ai.py
+
+async def test_adapter_load_messages_json_list_args():
+    """Test that JSON list args are kept as strings (not parsed)."""
+    ui_messages = [
+        UIMessage(
+            id='msg1',
+            role='assistant',
+            parts=[
+                DynamicToolOutputAvailablePart(
+                    tool_name='my_tool',
+                    tool_call_id='tc1',
+                    input='[1, 2, 3]',  # JSON list - should stay as string
+                    output='result',
+                    state='output-available',
+                )
+            ],
+        )
+    ]
+
+    messages = VercelAIAdapter.load_messages(ui_messages)
+
+    assert len(messages) == 2  # ToolCall in response + ToolReturn in request
+    response = messages[0]
+    assert isinstance(response, ModelResponse)
+    assert len(response.parts) == 1
+    tool_call = response.parts[0]
+    assert isinstance(tool_call, ToolCallPart)
+    # Args should remain as string since it parses to a list, not a dict
+    assert tool_call.args == '[1, 2, 3]'

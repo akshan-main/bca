@@ -1,0 +1,908 @@
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+## httpx/_content.py
+
+def encode_multipart_data(
+    data: RequestData, files: RequestFiles, boundary: bytes | None
+) -> tuple[dict[str, str], MultipartStream]:
+    multipart = MultipartStream(data=data, files=files, boundary=boundary)
+    headers = multipart.get_headers()
+    return headers, multipart
+
+## httpx/_exceptions.py
+
+class StreamError(RuntimeError):
+    """
+    The base class for stream exceptions.
+
+    The developer made an error in accessing the request stream in
+    an invalid way.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+class RequestNotRead(StreamError):
+    """
+    Attempted to access streaming request content, without having called `read()`.
+    """
+
+    def __init__(self) -> None:
+        message = (
+            "Attempted to access streaming request content,"
+            " without having called `read()`."
+        )
+        super().__init__(message)
+
+## httpx/_main.py
+
+def handle_help(
+    ctx: click.Context,
+    param: click.Option | click.Parameter,
+    value: typing.Any,
+) -> None:
+    if not value or ctx.resilient_parsing:
+        return
+
+    print_help()
+    ctx.exit()
+
+## httpx/_multipart.py
+
+def _format_form_param(name: str, value: str) -> bytes:
+    """
+    Encode a name/value pair within a multipart form.
+    """
+
+    def replacer(match: typing.Match[str]) -> str:
+        return _HTML5_FORM_ENCODING_REPLACEMENTS[match.group(0)]
+
+    value = _HTML5_FORM_ENCODING_RE.sub(replacer, value)
+    return f'{name}="{value}"'.encode()
+
+    def get_content_length(self) -> int | None:
+        """
+        Return the length of the multipart encoded content, or `None` if
+        any of the files have a length that cannot be determined upfront.
+        """
+        boundary_length = len(self.boundary)
+        length = 0
+
+        for field in self.fields:
+            field_length = field.get_length()
+            if field_length is None:
+                return None
+
+            length += 2 + boundary_length + 2  # b"--{boundary}\r\n"
+            length += field_length
+            length += 2  # b"\r\n"
+
+        length += 2 + boundary_length + 4  # b"--{boundary}--\r\n"
+        return length
+
+## tests/client/test_async_client.py
+
+async def test_get(server):
+    url = server.url
+    async with httpx.AsyncClient(http2=True) as client:
+        response = await client.get(url)
+    assert response.status_code == 200
+    assert response.text == "Hello, world!"
+    assert response.http_version == "HTTP/1.1"
+    assert response.headers
+    assert repr(response) == "<Response [200 OK]>"
+    assert response.elapsed > timedelta(seconds=0)
+
+async def test_get_invalid_url(server, url):
+    async with httpx.AsyncClient() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            await client.get(url)
+
+async def test_client_closed_state_using_with_block():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(hello_world)) as client:
+        assert not client.is_closed
+        await client.get("http://example.com")
+
+    assert client.is_closed
+    with pytest.raises(RuntimeError):
+        await client.get("http://example.com")
+
+async def test_async_mock_transport():
+    async def hello_world(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="Hello, world!")
+
+    transport = httpx.MockTransport(hello_world)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("https://www.example.com")
+        assert response.status_code == 200
+        assert response.text == "Hello, world!"
+
+async def test_server_extensions(server):
+    url = server.url
+    async with httpx.AsyncClient(http2=True) as client:
+        response = await client.get(url)
+    assert response.status_code == 200
+    assert response.extensions["http_version"] == b"HTTP/1.1"
+
+## tests/client/test_auth.py
+
+async def test_basic_auth() -> None:
+    url = "https://example.org/"
+    auth = ("user", "password123")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+async def test_basic_auth_in_url() -> None:
+    url = "https://user:password123@example.org/"
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+async def test_auth_hidden_header() -> None:
+    url = "https://example.org/"
+    auth = ("example-username", "example-password")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert "'authorization': '[secure]'" in str(response.request.headers)
+
+async def test_digest_auth_qop_including_spaces_and_auth_returns_auth(qop: str) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop=qop)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+async def test_digest_auth_qop_auth_int_not_implemented() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="auth-int")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(NotImplementedError):
+            await client.get(url, auth=auth)
+
+async def test_digest_auth_qop_must_be_auth_or_auth_int() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="not-auth")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+async def test_digest_auth_incorrect_credentials() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(send_response_after_attempt=2)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert len(response.history) == 1
+
+async def test_async_digest_auth_raises_protocol_error_on_malformed_header(
+    auth_header: str,
+) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App(auth_header=auth_header, status_code=401)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+def test_sync_digest_auth_raises_protocol_error_on_malformed_header(
+    auth_header: str,
+) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App(auth_header=auth_header, status_code=401)
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            client.get(url, auth=auth)
+
+async def test_digest_auth_unavailable_streaming_body():
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp()
+
+    async def streaming_body() -> typing.AsyncIterator[bytes]:
+        yield b"Example request body"  # pragma: no cover
+
+    async with httpx.AsyncClient(transport=ConsumeBodyTransport(app)) as client:
+        with pytest.raises(httpx.StreamConsumed):
+            await client.post(url, content=streaming_body(), auth=auth)
+
+## tests/client/test_client.py
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+def test_get_invalid_url(server, url):
+    with httpx.Client() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            client.get(url)
+
+def test_base_url(server):
+    base_url = server.url
+    with httpx.Client(base_url=base_url) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    assert response.url == base_url
+
+def test_client_closed_state_using_with_block():
+    with httpx.Client(transport=httpx.MockTransport(hello_world)) as client:
+        assert not client.is_closed
+        client.get("http://example.com")
+
+    assert client.is_closed
+    with pytest.raises(RuntimeError):
+        client.get("http://example.com")
+
+def test_all_mounted_transport():
+    mounts = {"all://": httpx.MockTransport(mounted)}
+
+    client = httpx.Client(mounts=mounts)
+
+    response = client.get("https://www.example.com")
+    assert response.status_code == 200
+    assert response.json() == {"app": "mounted"}
+
+def test_server_extensions(server):
+    url = server.url.copy_with(path="/http_version_2")
+    with httpx.Client(http2=True) as client:
+        response = client.get(url)
+    assert response.status_code == 200
+    assert response.extensions["http_version"] == b"HTTP/1.1"
+
+## tests/client/test_cookies.py
+
+def get_and_set_cookies(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/echo_cookies":
+        data = {"cookies": request.headers.get("cookie")}
+        return httpx.Response(200, json=data)
+    elif request.url.path == "/set_cookie":
+        return httpx.Response(200, headers={"set-cookie": "example-name=example-value"})
+    else:
+        raise NotImplementedError()  # pragma: no cover
+
+def test_get_cookie() -> None:
+    url = "http://example.org/set_cookie"
+
+    client = httpx.Client(transport=httpx.MockTransport(get_and_set_cookies))
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.cookies["example-name"] == "example-value"
+    assert client.cookies["example-name"] == "example-value"
+
+## tests/client/test_proxies.py
+
+async def test_async_proxy_close():
+    try:
+        transport = httpx.AsyncHTTPTransport(proxy=PROXY_URL)
+        client = httpx.AsyncClient(mounts={"https://": transport})
+        await client.get("http://example.com")
+    finally:
+        await client.aclose()
+
+def test_sync_proxy_close():
+    try:
+        transport = httpx.HTTPTransport(proxy=PROXY_URL)
+        client = httpx.Client(mounts={"https://": transport})
+        client.get("http://example.com")
+    finally:
+        client.close()
+
+## tests/client/test_redirects.py
+
+def test_redirect_301():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.post("https://example.org/redirect_301", follow_redirects=True)
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/"
+    assert len(response.history) == 1
+
+def test_redirect_302():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.post("https://example.org/redirect_302", follow_redirects=True)
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/"
+    assert len(response.history) == 1
+
+def test_redirect_303():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get("https://example.org/redirect_303", follow_redirects=True)
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/"
+    assert len(response.history) == 1
+
+def test_relative_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/relative_redirect", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/"
+    assert len(response.history) == 1
+
+def test_malformed_redirect():
+    # https://github.com/encode/httpx/issues/771
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "http://example.org/malformed_redirect", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org:443/"
+    assert len(response.history) == 1
+
+def test_invalid_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.RemoteProtocolError):
+        client.get("http://example.org/invalid_redirect", follow_redirects=True)
+
+def test_no_scheme_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/no_scheme_redirect", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/"
+    assert len(response.history) == 1
+
+def test_fragment_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "https://example.org/relative_redirect#fragment", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/#fragment"
+    assert len(response.history) == 1
+
+async def test_async_too_many_redirects():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        with pytest.raises(httpx.TooManyRedirects):
+            await client.get(
+                "https://example.org/multiple_redirects?count=21", follow_redirects=True
+            )
+
+def test_sync_too_many_redirects():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get(
+            "https://example.org/multiple_redirects?count=21", follow_redirects=True
+        )
+
+def test_redirect_loop():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get("https://example.org/redirect_loop", follow_redirects=True)
+
+def test_cross_domain_redirect_with_auth_header():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_domain"
+    headers = {"Authorization": "abc"}
+    response = client.get(url, headers=headers, follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert "authorization" not in response.json()["headers"]
+
+def test_cross_domain_https_redirect_with_auth_header():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "http://example.com/cross_domain"
+    headers = {"Authorization": "abc"}
+    response = client.get(url, headers=headers, follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert "authorization" not in response.json()["headers"]
+
+def test_cross_domain_redirect_with_auth():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_domain"
+    response = client.get(url, auth=("user", "pass"), follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert "authorization" not in response.json()["headers"]
+
+def test_same_domain_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.org/cross_domain"
+    headers = {"Authorization": "abc"}
+    response = client.get(url, headers=headers, follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert response.json()["headers"]["authorization"] == "abc"
+
+def test_same_domain_https_redirect_with_auth_header():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "http://example.org/cross_domain"
+    headers = {"Authorization": "abc"}
+    response = client.get(url, headers=headers, follow_redirects=True)
+    assert response.url == "https://example.org/cross_domain_target"
+    assert response.json()["headers"]["authorization"] == "abc"
+
+def test_can_stream_if_no_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.org/redirect_301"
+    with client.stream("GET", url, follow_redirects=False) as response:
+        pass
+    assert response.status_code == httpx.codes.MOVED_PERMANENTLY
+    assert response.headers["location"] == "https://example.org/"
+
+def test_cannot_redirect_streaming_body():
+    client = httpx.Client(transport=ConsumeBodyTransport(redirects))
+    url = "https://example.org/redirect_body"
+
+    def streaming_body() -> typing.Iterator[bytes]:
+        yield b"Example request body"  # pragma: no cover
+
+    with pytest.raises(httpx.StreamConsumed):
+        client.post(url, content=streaming_body(), follow_redirects=True)
+
+def test_cross_subdomain_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_subdomain"
+    response = client.get(url, follow_redirects=True)
+    assert response.url == "https://www.example.org/cross_subdomain"
+
+def test_redirect_custom_scheme():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.UnsupportedProtocol) as e:
+        client.post("https://example.org/redirect_custom_scheme", follow_redirects=True)
+    assert str(e.value) == "Scheme 'market' not supported."
+
+async def test_async_invalid_redirect():
+    async with httpx.AsyncClient(transport=httpx.MockTransport(redirects)) as client:
+        with pytest.raises(httpx.RemoteProtocolError):
+            await client.get(
+                "http://example.org/invalid_redirect", follow_redirects=True
+            )
+
+## tests/models/test_cookies.py
+
+def test_cookies_update():
+    cookies = httpx.Cookies()
+    more_cookies = httpx.Cookies()
+    more_cookies.set("name", "value", domain="example.com")
+
+    cookies.update(more_cookies)
+    assert dict(cookies) == {"name": "value"}
+    assert cookies.get("name", domain="example.com") == "value"
+
+## tests/models/test_requests.py
+
+def test_content_length_header():
+    request = httpx.Request("POST", "http://example.org", content=b"test 123")
+    assert request.headers["Content-Length"] == "8"
+
+def test_generator_with_transfer_encoding_header():
+    def content() -> typing.Iterator[bytes]:
+        yield b"test 123"  # pragma: no cover
+
+    request = httpx.Request("POST", "http://example.org", content=content())
+    assert request.headers == {"Host": "example.org", "Transfer-Encoding": "chunked"}
+
+def test_generator_with_content_length_header():
+    def content() -> typing.Iterator[bytes]:
+        yield b"test 123"  # pragma: no cover
+
+    headers = {"Content-Length": "8"}
+    request = httpx.Request(
+        "POST", "http://example.org", content=content(), headers=headers
+    )
+    assert request.headers == {"Host": "example.org", "Content-Length": "8"}
+
+def test_cannot_access_streaming_content_without_read():
+    # Ensure that streaming requests
+    def streaming_body() -> typing.Iterator[bytes]:  # pragma: no cover
+        yield b""
+
+    request = httpx.Request("POST", "http://example.org", content=streaming_body())
+    with pytest.raises(httpx.RequestNotRead):
+        request.content  # noqa: B018
+
+def test_transfer_encoding_header():
+    async def streaming_body(data: bytes) -> typing.AsyncIterator[bytes]:
+        yield data  # pragma: no cover
+
+    data = streaming_body(b"test 123")
+
+    request = httpx.Request("POST", "http://example.org", content=data)
+    assert "Content-Length" not in request.headers
+    assert request.headers["Transfer-Encoding"] == "chunked"
+
+def test_ignore_transfer_encoding_header_if_content_length_exists():
+    """
+    `Transfer-Encoding` should be ignored if `Content-Length` has been set explicitly.
+    See https://github.com/encode/httpx/issues/1168
+    """
+
+    def streaming_body(data: bytes) -> typing.Iterator[bytes]:
+        yield data  # pragma: no cover
+
+    data = streaming_body(b"abcd")
+
+    headers = {"Content-Length": "4"}
+    request = httpx.Request("POST", "http://example.org", content=data, headers=headers)
+    assert "Transfer-Encoding" not in request.headers
+    assert request.headers["Content-Length"] == "4"
+
+def test_override_content_length_header():
+    async def streaming_body(data: bytes) -> typing.AsyncIterator[bytes]:
+        yield data  # pragma: no cover
+
+    data = streaming_body(b"test 123")
+    headers = {"Content-Length": "8"}
+
+    request = httpx.Request("POST", "http://example.org", content=data, headers=headers)
+    assert request.headers["Content-Length"] == "8"
+
+async def test_request_async_streaming_content_picklable():
+    async def streaming_body(data: bytes) -> typing.AsyncIterator[bytes]:
+        yield data
+
+    data = streaming_body(b"test 123")
+    request = httpx.Request("POST", "http://example.org", content=data)
+    pickle_request = pickle.loads(pickle.dumps(request))
+    with pytest.raises(httpx.RequestNotRead):
+        pickle_request.content  # noqa: B018
+    with pytest.raises(httpx.StreamClosed):
+        await pickle_request.aread()
+
+    request = httpx.Request("POST", "http://example.org", content=data)
+    await request.aread()
+    pickle_request = pickle.loads(pickle.dumps(request))
+    assert pickle_request.content == b"test 123"
+
+def test_request_generator_content_picklable():
+    def content() -> typing.Iterator[bytes]:
+        yield b"test 123"  # pragma: no cover
+
+    request = httpx.Request("POST", "http://example.org", content=content())
+    pickle_request = pickle.loads(pickle.dumps(request))
+    with pytest.raises(httpx.RequestNotRead):
+        pickle_request.content  # noqa: B018
+    with pytest.raises(httpx.StreamClosed):
+        pickle_request.read()
+
+    request = httpx.Request("POST", "http://example.org", content=content())
+    request.read()
+    pickle_request = pickle.loads(pickle.dumps(request))
+    assert pickle_request.content == b"test 123"
+
+## tests/models/test_responses.py
+
+def streaming_body() -> typing.Iterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+def test_iter_raw():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    raw = b""
+    for part in response.iter_raw():
+        raw += part
+    assert raw == b"Hello, world!"
+
+def test_iter_raw_with_chunksize():
+    response = httpx.Response(200, content=streaming_body())
+    parts = list(response.iter_raw(chunk_size=5))
+    assert parts == [b"Hello", b", wor", b"ld!"]
+
+    response = httpx.Response(200, content=streaming_body())
+    parts = list(response.iter_raw(chunk_size=7))
+    assert parts == [b"Hello, ", b"world!"]
+
+    response = httpx.Response(200, content=streaming_body())
+    parts = list(response.iter_raw(chunk_size=13))
+    assert parts == [b"Hello, world!"]
+
+    response = httpx.Response(200, content=streaming_body())
+    parts = list(response.iter_raw(chunk_size=20))
+    assert parts == [b"Hello, world!"]
+
+def test_iter_raw_increments_updates_counter():
+    response = httpx.Response(200, content=streaming_body())
+
+    num_downloaded = response.num_bytes_downloaded
+    for part in response.iter_raw():
+        assert len(part) == (response.num_bytes_downloaded - num_downloaded)
+        num_downloaded = response.num_bytes_downloaded
+
+async def test_aiter_raw_on_sync():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    with pytest.raises(RuntimeError):
+        [part async for part in response.aiter_raw()]
+
+async def test_aclose_on_sync():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    with pytest.raises(RuntimeError):
+        await response.aclose()
+
+def test_iter_bytes_with_chunk_size():
+    response = httpx.Response(200, content=streaming_body())
+    parts = list(response.iter_bytes(chunk_size=5))
+    assert parts == [b"Hello", b", wor", b"ld!"]
+
+    response = httpx.Response(200, content=streaming_body())
+    parts = list(response.iter_bytes(chunk_size=13))
+    assert parts == [b"Hello, world!"]
+
+    response = httpx.Response(200, content=streaming_body())
+    parts = list(response.iter_bytes(chunk_size=20))
+    assert parts == [b"Hello, world!"]
+
+def test_sync_streaming_response():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    assert response.status_code == 200
+    assert not response.is_closed
+
+    content = response.read()
+
+    assert content == b"Hello, world!"
+    assert response.content == b"Hello, world!"
+    assert response.is_closed
+
+def test_cannot_read_after_stream_consumed():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    content = b""
+    for part in response.iter_bytes():
+        content += part
+
+    with pytest.raises(httpx.StreamConsumed):
+        response.read()
+
+def test_cannot_read_after_response_closed():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    response.close()
+    with pytest.raises(httpx.StreamClosed):
+        response.read()
+
+def test_generator_with_transfer_encoding_header():
+    def content() -> typing.Iterator[bytes]:
+        yield b"test 123"  # pragma: no cover
+
+    response = httpx.Response(200, content=content())
+    assert response.headers == {"Transfer-Encoding": "chunked"}
+
+def test_generator_with_content_length_header():
+    def content() -> typing.Iterator[bytes]:
+        yield b"test 123"  # pragma: no cover
+
+    headers = {"Content-Length": "8"}
+    response = httpx.Response(200, content=content(), headers=headers)
+    assert response.headers == {"Content-Length": "8"}
+
+## tests/models/test_url.py
+
+def test_url_non_printing_character_in_url():
+    with pytest.raises(httpx.InvalidURL) as exc:
+        httpx.URL("https://www.example.com/\n")
+    assert str(exc.value) == (
+        "Invalid non-printable ASCII character in URL, '\\n' at position 24."
+    )
+
+def test_url_non_printing_character_in_component():
+    with pytest.raises(httpx.InvalidURL) as exc:
+        httpx.URL("https://www.example.com", path="/\n")
+    assert str(exc.value) == (
+        "Invalid non-printable ASCII character in URL path component, "
+        "'\\n' at position 1."
+    )
+
+## tests/test_api.py
+
+def test_get(server):
+    response = httpx.get(server.url)
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+    assert response.text == "Hello, world!"
+    assert response.http_version == "HTTP/1.1"
+
+def test_get_invalid_url():
+    with pytest.raises(httpx.UnsupportedProtocol):
+        httpx.get("invalid://example.org")
+
+## tests/test_asgi.py
+
+async def echo_body(scope, receive, send):
+    status = 200
+    headers = [(b"content-type", "text/plain")]
+
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    more_body = True
+    while more_body:
+        message = await receive()
+        body = message.get("body", b"")
+        more_body = message.get("more_body", False)
+        await send({"type": "http.response.body", "body": body, "more_body": more_body})
+
+async def test_asgi():
+    transport = httpx.ASGITransport(app=hello_world)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+    assert response.status_code == 200
+    assert response.text == "Hello, World!"
+
+async def test_asgi_urlencoded_path():
+    transport = httpx.ASGITransport(app=echo_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"path": "/user@example.org"}
+
+async def test_asgi_raw_path():
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/user@example.org"}
+
+async def test_asgi_exc():
+    transport = httpx.ASGITransport(app=raise_exc)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError):
+            await client.get("http://www.example.org/")
+
+async def test_asgi_exc_after_response():
+    transport = httpx.ASGITransport(app=raise_exc_after_response)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError):
+            await client.get("http://www.example.org/")
+
+async def test_asgi_exc_no_raise():
+    transport = httpx.ASGITransport(app=raise_exc, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+        assert response.status_code == 500
+
+## tests/test_config.py
+
+def test_SSLContext_with_get_request(server, cert_pem_file):
+    context = httpx.create_ssl_context()
+    context.load_verify_locations(cert_pem_file)
+    response = httpx.get(server.url, verify=context)
+    assert response.status_code == 200
+
+## tests/test_multipart.py
+
+def test_multipart_header_without_boundary(header: str) -> None:
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"content-type": header}
+    response = client.post("http://127.0.0.1:8000/", files=files, headers=headers)
+
+    assert response.status_code == 200
+    assert response.request.headers["Content-Type"] == header
+
+def test_multipart_invalid_value(value):
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    data = {"text": value}
+    files = {"file": io.BytesIO(b"<file content>")}
+    with pytest.raises(TypeError) as e:
+        client.post("http://127.0.0.1:8000/", data=data, files=files)
+    assert "Invalid type for value" in str(e.value)
+
+## tests/test_status_codes.py
+
+def test_status_code_as_int():
+    # mypy doesn't (yet) recognize that IntEnum members are ints, so ignore it here
+    assert httpx.codes.NOT_FOUND == 404  # type: ignore[comparison-overlap]
+    assert str(httpx.codes.NOT_FOUND) == "404"
+
+## tests/test_timeouts.py
+
+async def test_read_timeout(server):
+    timeout = httpx.Timeout(None, read=1e-6)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with pytest.raises(httpx.ReadTimeout):
+            await client.get(server.url.copy_with(path="/slow_response"))
+
+async def test_connect_timeout(server):
+    timeout = httpx.Timeout(None, connect=1e-6)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with pytest.raises(httpx.ConnectTimeout):
+            # See https://stackoverflow.com/questions/100841/
+            await client.get("http://10.255.255.1/")
+
+async def test_pool_timeout(server):
+    limits = httpx.Limits(max_connections=1)
+    timeout = httpx.Timeout(None, pool=1e-4)
+
+    async with httpx.AsyncClient(limits=limits, timeout=timeout) as client:
+        with pytest.raises(httpx.PoolTimeout):
+            async with client.stream("GET", server.url):
+                await client.get(server.url)
+
+## tests/test_wsgi.py
+
+def test_wsgi():
+    transport = httpx.WSGITransport(app=application_factory([b"Hello, World!"]))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "Hello, World!"
+
+def test_wsgi_exc():
+    transport = httpx.WSGITransport(app=raise_exc)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(ValueError):
+        client.get("http://www.example.org/")
+
+def test_wsgi_http_error():
+    transport = httpx.WSGITransport(app=partial(raise_exc, exc=RuntimeError))
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")
+
+def test_wsgi_generator():
+    output = [b"", b"", b"Some content", b" and more content"]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == "Some content and more content"
+
+def test_wsgi_generator_empty():
+    output = [b"", b"", b"", b""]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == ""

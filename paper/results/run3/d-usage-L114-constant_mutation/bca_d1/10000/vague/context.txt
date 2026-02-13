@@ -1,0 +1,1056 @@
+## examples/pydantic_ai_examples/ag_ui/api/agentic_generative_ui.py
+
+from pydantic import BaseModel, Field
+
+## examples/pydantic_ai_examples/flight_booking.py
+
+usage_limits = UsageLimits(request_limit=15)
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+    value: T
+
+## pydantic_ai_slim/pydantic_ai/concurrency.py
+
+class ConcurrencyLimit:
+    """Configuration for concurrency limiting with optional backpressure.
+
+    Args:
+        max_running: Maximum number of concurrent operations allowed.
+        max_queued: Maximum number of operations waiting in the queue.
+            If None, the queue is unlimited. If exceeded, raises `ConcurrencyLimitExceeded`.
+    """
+
+    max_running: int
+    max_queued: int | None = None
+
+    def from_limit(
+        cls,
+        limit: int | ConcurrencyLimit,
+        *,
+        name: str | None = None,
+        tracer: Tracer | None = None,
+    ) -> Self:
+        """Create a ConcurrencyLimiter from a ConcurrencyLimit configuration.
+
+        Args:
+            limit: Either an int for simple limiting or a ConcurrencyLimit for full config.
+            name: Optional name for this limiter, used for observability.
+            tracer: OpenTelemetry tracer for span creation.
+
+        Returns:
+            A configured ConcurrencyLimiter.
+        """
+        if isinstance(limit, int):
+            return cls(max_running=limit, name=name, tracer=tracer)
+        else:
+            return cls(
+                max_running=limit.max_running,
+                max_queued=limit.max_queued,
+                name=name,
+                tracer=tracer,
+            )
+
+AnyConcurrencyLimit: TypeAlias = 'int | ConcurrencyLimit | AbstractConcurrencyLimiter | None'
+
+async def _null_context() -> AsyncIterator[None]:
+    """A no-op async context manager."""
+    yield
+
+async def _limiter_context(limiter: AbstractConcurrencyLimiter, source: str) -> AsyncIterator[None]:
+    """Context manager that acquires and releases a limiter with the given source."""
+    await limiter.acquire(source)
+    try:
+        yield
+    finally:
+        limiter.release()
+
+def get_concurrency_context(
+    limiter: AbstractConcurrencyLimiter | None,
+    source: str = 'unnamed',
+) -> AbstractAsyncContextManager[None]:
+    """Get an async context manager for the concurrency limiter.
+
+    If limiter is None, returns a no-op context manager.
+
+    Args:
+        limiter: The AbstractConcurrencyLimiter or None.
+        source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+
+    Returns:
+        An async context manager.
+    """
+    if limiter is None:
+        return _null_context()
+    return _limiter_context(limiter, source)
+
+def normalize_to_limiter(
+    limit: AnyConcurrencyLimit,
+    *,
+    name: str | None = None,
+) -> AbstractConcurrencyLimiter | None:
+    """Normalize a concurrency limit configuration to an AbstractConcurrencyLimiter.
+
+    Args:
+        limit: The concurrency limit configuration.
+        name: Optional name for the limiter if one is created.
+
+    Returns:
+        An AbstractConcurrencyLimiter if limit is not None, otherwise None.
+    """
+    if limit is None:
+        return None
+    elif isinstance(limit, AbstractConcurrencyLimiter):
+        return limit
+    else:
+        return ConcurrencyLimiter.from_limit(limit, name=name)
+
+## pydantic_ai_slim/pydantic_ai/exceptions.py
+
+class UsageLimitExceeded(AgentRunError):
+    """Error raised when a Model's usage exceeds the specified limits."""
+
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+def _expand_env_vars(value: Any) -> Any:
+    """Recursively expand environment variables in a JSON structure.
+
+    Environment variables can be referenced using `${VAR_NAME}` syntax,
+    or `${VAR_NAME:-default}` syntax to provide a default value if the variable is not set.
+
+    Args:
+        value: The value to expand (can be str, dict, list, or other JSON types).
+
+    Returns:
+        The value with all environment variables expanded.
+
+    Raises:
+        ValueError: If an environment variable is not defined and no default value is provided.
+    """
+    if isinstance(value, str):
+        # Find all environment variable references in the string
+        # Supports both ${VAR_NAME} and ${VAR_NAME:-default} syntax
+        def replace_match(match: re.Match[str]) -> str:
+            var_name = match.group(1)
+            has_default = match.group(2) is not None
+            default_value = match.group(3) if has_default else None
+
+            # Check if variable exists in environment
+            if var_name in os.environ:
+                return os.environ[var_name]
+            elif has_default:
+                # Use default value if the :- syntax was present (even if empty string)
+                return default_value or ''
+            else:
+                # No default value and variable not set - raise error
+                raise ValueError(f'Environment variable ${{{var_name}}} is not defined')
+
+        value = _ENV_VAR_PATTERN.sub(replace_match, value)
+
+        return value
+    elif isinstance(value, dict):
+        return {k: _expand_env_vars(v) for k, v in value.items()}  # type: ignore[misc]
+    elif isinstance(value, list):
+        return [_expand_env_vars(item) for item in value]  # type: ignore[misc]
+    else:
+        return value
+
+def load_mcp_servers(config_path: str | Path) -> list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE]:
+    """Load MCP servers from a configuration file.
+
+    Environment variables can be referenced in the configuration file using:
+    - `${VAR_NAME}` syntax - expands to the value of VAR_NAME, raises error if not defined
+    - `${VAR_NAME:-default}` syntax - expands to VAR_NAME if set, otherwise uses the default value
+
+    Args:
+        config_path: The path to the configuration file.
+
+    Returns:
+        A list of MCP servers.
+
+    Raises:
+        FileNotFoundError: If the configuration file does not exist.
+        ValidationError: If the configuration file does not match the schema.
+        ValueError: If an environment variable referenced in the configuration is not defined and no default value is provided.
+    """
+    config_path = Path(config_path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f'Config file {config_path} not found')
+
+    config_data = pydantic_core.from_json(config_path.read_bytes())
+    expanded_config_data = _expand_env_vars(config_data)
+    config = MCPServerConfig.model_validate(expanded_config_data)
+
+    servers: list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE] = []
+    for name, server in config.mcp_servers.items():
+        server.id = name
+        server.tool_prefix = name
+        servers.append(server)
+
+    return servers
+
+## pydantic_ai_slim/pydantic_ai/models/concurrency.py
+
+    _limiter: AbstractConcurrencyLimiter
+
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        limiter: int | ConcurrencyLimit | AbstractConcurrencyLimiter,
+    ):
+        """Initialize the ConcurrencyLimitedModel.
+
+        Args:
+            wrapped: The model to wrap, either a Model instance or a known model name.
+            limiter: The concurrency limit configuration. Can be:
+                - An `int`: Simple limit on concurrent operations (unlimited queue).
+                - A `ConcurrencyLimit`: Full configuration with optional backpressure.
+                - An `AbstractConcurrencyLimiter`: A pre-created limiter for sharing across models.
+        """
+        super().__init__(wrapped)
+        if isinstance(limiter, AbstractConcurrencyLimiter):
+            self._limiter = limiter
+        else:
+            self._limiter = ConcurrencyLimiter.from_limit(limiter)
+
+def limit_model_concurrency(
+    model: Model | KnownModelName,
+    limiter: AnyConcurrencyLimit,
+) -> Model:
+    """Wrap a model with concurrency limiting.
+
+    This is a convenience function to wrap a model with concurrency limiting.
+    If the limiter is None, the model is returned unchanged.
+
+    Args:
+        model: The model to wrap.
+        limiter: The concurrency limit configuration.
+
+    Returns:
+        The wrapped model with concurrency limiting, or the original model if limiter is None.
+
+    Example:
+    ```python
+    from pydantic_ai.models.concurrency import limit_model_concurrency
+
+    model = limit_model_concurrency('openai:gpt-4o', limiter=5)
+    ```
+    """
+    normalized_limiter = normalize_to_limiter(limiter)
+    if normalized_limiter is None:
+        from . import infer_model
+
+        return infer_model(model) if isinstance(model, str) else model
+    return ConcurrencyLimitedModel(model, normalized_limiter)
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+    threshold: Literal[
+        'HARM_BLOCK_THRESHOLD_UNSPECIFIED',
+        'BLOCK_LOW_AND_ABOVE',
+        'BLOCK_MEDIUM_AND_ABOVE',
+        'BLOCK_ONLY_HIGH',
+        'BLOCK_NONE',
+        'OFF',
+    ]
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    request_limit: int | None = 50
+
+    tool_calls_limit: int | None = None
+
+    input_tokens_limit: int | None = None
+
+    output_tokens_limit: int | None = None
+
+    total_tokens_limit: int | None = None
+
+    def request_tokens_limit(self) -> int | None:
+        return self.input_tokens_limit
+
+    def response_tokens_limit(self) -> int | None:
+        return self.output_tokens_limit
+
+## pydantic_evals/pydantic_evals/evaluators/report_common.py
+
+    n_thresholds: int = 100
+
+## pydantic_evals/pydantic_evals/reporting/__init__.py
+
+class RenderValueConfig(TypedDict, total=False):
+    """A configuration for rendering a values in an Evaluation report."""
+
+    value_formatter: str | Callable[[Any], str]
+    diff_checker: Callable[[Any, Any], bool] | None
+    diff_formatter: Callable[[Any, Any], str | None] | None
+    diff_style: str
+
+_DEFAULT_VALUE_CONFIG = RenderValueConfig()
+
+## pydantic_evals/pydantic_evals/reporting/analyses.py
+
+    threshold: float
+
+## pydantic_evals/pydantic_evals/reporting/render_numbers.py
+
+MULTIPLIER_ONE_DECIMAL_THRESHOLD = 100  # If |multiplier| is below this, use one decimal; otherwise, use none.
+
+BASE_THRESHOLD = 1e-2  # If |old| is below this and delta is > MULTIPLIER_DROP_FACTOR * |old|, drop relative change.
+
+def default_render_number(value: float | int) -> str:
+    """The default logic for formatting numerical values in an Evaluation report.
+
+    * If the value is an integer, format it as an integer.
+    * If the value is a float, include at least one decimal place and at least 3 significant figures.
+    """
+    # If it's an int, just return its string representation.
+    if isinstance(value, int):
+        return f'{value:,d}'
+
+    abs_val = abs(value)
+
+    # Special case for zero:
+    if abs_val == 0:
+        return f'{value:,.{VALUE_SIG_FIGS}f}'
+
+    if abs_val >= 1:
+        # Count the digits in the integer part.
+        digits = math.floor(math.log10(abs_val)) + 1
+        # Number of decimals: at least one, and enough to reach 4 significant figures.
+        decimals = max(1, VALUE_SIG_FIGS - digits)
+    else:
+        # For numbers between 0 and 1, determine the exponent.
+        # For example: 0.1 -> log10(0.1) = -1, so we want -(-1) + 3 = 4 decimals.
+        exponent = math.floor(math.log10(abs_val))
+        decimals = -exponent + VALUE_SIG_FIGS - 1  # because the first nonzero digit is in the 10^exponent place.
+
+    return f'{value:,.{decimals}f}'
+
+def default_render_number_diff(old: float | int, new: float | int) -> str | None:
+    """Return a string representing the difference between old and new values.
+
+    Rules:
+      - If the two values are equal, return None.
+      - For integers, return the raw difference (with a leading sign), e.g.:
+            _default_format_number_diff(3, 4) -> '+1'
+      - For floats (or a mix of float and int):
+          * Compute the raw delta = new - old and format it with ABS_SIG_FIGS significant figures.
+          * If `old` is nonzero, compute a relative change:
+              - If |delta|/|old| ≤ 1, render the relative change as a percentage with
+                PERC_DECIMALS decimal places, e.g. '+0.7 / +70.0%'.
+              - If |delta|/|old| > 1, render a multiplier (new/old). Use one decimal place
+                if the absolute multiplier is less than MULTIPLIER_ONE_DECIMAL_THRESHOLD,
+                otherwise no decimals.
+          * However, if the percentage rounds to 0.0% (e.g. '+0.0%'), return only the absolute diff.
+          * Also, if |old| is below BASE_THRESHOLD and |delta| exceeds MULTIPLIER_DROP_FACTOR×|old|,
+            drop the relative change indicator.
+    """
+    if old == new:
+        return None
+
+    if isinstance(old, int) and isinstance(new, int):
+        diff_int = new - old
+        return f'{diff_int:+d}'
+
+    delta = new - old
+    abs_diff_str = _render_signed(delta, ABS_SIG_FIGS)
+    rel_diff_str = _render_relative(new, old, BASE_THRESHOLD)
+    if rel_diff_str is None:
+        return abs_diff_str
+    else:
+        return f'{abs_diff_str} / {rel_diff_str}'
+
+def default_render_duration(seconds: float) -> str:
+    """Format a duration given in seconds to a string.
+
+    If the duration is less than 1 millisecond, show microseconds.
+    If it's less than one second, show milliseconds.
+    Otherwise, show seconds.
+    """
+    return _render_duration(seconds, False)
+
+def default_render_duration_diff(old: float, new: float) -> str | None:
+    """Format a duration difference (in seconds) with an explicit sign."""
+    if old == new:
+        return None
+
+    abs_diff_str = _render_duration(new - old, True)
+    rel_diff_str = _render_relative(new, old, BASE_THRESHOLD)
+    if rel_diff_str is None:
+        return abs_diff_str
+    else:
+        return f'{abs_diff_str} / {rel_diff_str}'
+
+def _render_relative(new: float, base: float, small_base_threshold: float) -> str | None:
+    # If we cannot compute a relative change, return just the diff.
+    if base == 0:
+        return None
+
+    delta = new - base
+
+    # For very small base values with huge changes, drop the relative indicator.
+    if abs(base) < small_base_threshold and abs(delta) > MULTIPLIER_DROP_FACTOR * abs(base):
+        return None
+
+    # Compute the relative change as a percentage.
+    rel_change = (delta / base) * 100
+    perc_str = f'{rel_change:+.{PERC_DECIMALS}f}%'
+    # If the percentage rounds to 0.0%, return only the absolute difference.
+    if perc_str in ('+0.0%', '-0.0%'):
+        return None
+
+    # Decide whether to use percentage style or multiplier style.
+    if abs(delta) / abs(base) <= 1:
+        # Percentage style.
+        return perc_str
+    else:
+        # Multiplier style.
+        multiplier = new / base
+        if abs(multiplier) < MULTIPLIER_ONE_DECIMAL_THRESHOLD:
+            mult_str = f'{multiplier:,.1f}x'
+        else:
+            mult_str = f'{multiplier:,.0f}x'
+        return mult_str
+
+## pydantic_graph/pydantic_graph/beta/graph.py
+
+    def value(self) -> OutputT:
+        return self._value
+
+## tests/conftest.py
+
+SNAPSHOT_BYTES_COLLAPSE_THRESHOLD = 50
+
+## tests/evals/test_render_numbers.py
+
+def test_default_render_number(value: float | int, expected: str):
+    assert default_render_number(value) == expected
+
+def test_default_render_duration(value: float, expected: str):
+    assert default_render_duration(value) == expected
+
+## tests/graph/test_mermaid.py
+
+def test_mermaid_code_start_wrong():
+    with pytest.raises(LookupError):
+        graph1.mermaid_code(start_node=Spam)
+
+def test_mermaid_highlight_wrong():
+    with pytest.raises(LookupError):
+        graph1.mermaid_code(highlighted_nodes=Spam)
+
+def test_wrong_return_type():
+    @dataclass
+    class NoReturnType(BaseNode):
+        async def run(self, ctx: GraphRunContext) -> int:  # type: ignore
+            raise NotImplementedError()
+
+    with pytest.raises(GraphSetupError, match="Invalid return type: <class 'int'>"):
+        NoReturnType.get_node_def({})
+
+## tests/models/test_openai.py
+
+async def test_openai_auto_mode_reasoning_field_different_provider_uses_tags(allow_model_requests: None):
+    """Test that auto mode falls back to tags when provider_name doesn't match."""
+    # This test verifies behavior by checking that when thinking comes from a different provider, auto mode falls back to tags.
+    c1 = completion_message(ChatCompletionMessage.model_construct(content='response2', role='assistant'))
+    m = OpenAIChatModel(
+        'foobar',
+        provider=OpenAIProvider(openai_client=MockOpenAI.create_mock(c1)),
+        profile=OpenAIModelProfile(
+            openai_chat_thinking_field='reasoning_content',
+            openai_chat_send_back_thinking_parts='auto',
+        ),
+    )
+
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='question')]),
+        ModelResponse(
+            parts=[
+                ThinkingPart(
+                    content='reasoning from different provider',
+                    id='reasoning_content',
+                    provider_name='different-provider',
+                ),
+            ]
+        ),
+    ]
+
+    settings = ModelSettings()
+    params = ModelRequestParameters()
+    await m.request(messages=messages, model_settings=settings, model_request_parameters=params)
+
+    mapped = m._map_model_response(messages[1])  # type: ignore[reportPrivateUsage]
+    assert mapped == snapshot(
+        {
+            'role': 'assistant',
+            'content': """<think>
+reasoning from different provider
+</think>""",
+        }
+    )
+
+async def test_openai_auto_mode_no_thinking_field_uses_default_fields(allow_model_requests: None):
+    """Test that auto mode with no thinking_field set checks default reasoning and reasoning_content fields."""
+    c1 = completion_message(
+        ChatCompletionMessage.model_construct(content='response', reasoning='thought', role='assistant')
+    )
+    m1 = OpenAIChatModel(
+        'foobar',
+        provider=OpenAIProvider(openai_client=MockOpenAI.create_mock(c1)),
+        profile=OpenAIModelProfile(
+            openai_chat_send_back_thinking_parts='auto',
+        ),
+    )
+    settings = ModelSettings()
+    params = ModelRequestParameters()
+    resp1 = await m1.request(messages=[], model_settings=settings, model_request_parameters=params)
+
+    thinking_parts = [p for p in resp1.parts if isinstance(p, ThinkingPart)]
+    assert len(thinking_parts) == 1
+    assert thinking_parts[0].id == 'reasoning'
+    mapped1 = m1._map_model_response(resp1)  # type: ignore[reportPrivateUsage]
+    assert mapped1 == snapshot({'role': 'assistant', 'reasoning': 'thought', 'content': 'response'})
+
+    c2 = completion_message(
+        ChatCompletionMessage.model_construct(content='response', reasoning_content='thought', role='assistant')
+    )
+    m2 = OpenAIChatModel(
+        'foobar',
+        provider=OpenAIProvider(openai_client=MockOpenAI.create_mock(c2)),
+        profile=OpenAIModelProfile(
+            openai_chat_send_back_thinking_parts='auto',
+        ),
+    )
+    resp2 = await m2.request(messages=[], model_settings=settings, model_request_parameters=params)
+
+    thinking_parts = [p for p in resp2.parts if isinstance(p, ThinkingPart)]
+    assert len(thinking_parts) == 1
+    assert thinking_parts[0].id == 'reasoning_content'
+    mapped2 = m2._map_model_response(resp2)  # type: ignore[reportPrivateUsage]
+    assert mapped2 == snapshot({'role': 'assistant', 'reasoning_content': 'thought', 'content': 'response'})
+
+## tests/test_agent.py
+
+def test_dynamic_system_prompt_none_return():
+    """Test dynamic system prompts with None return values."""
+    agent = Agent('test')
+
+    dynamic_values = [None, 'DYNAMIC']
+
+    @agent.system_prompt(dynamic=True)
+    def dynamic_sys() -> str | None:
+        return dynamic_values.pop(0)
+
+    with capture_run_messages() as base_messages:
+        agent.run_sync('Hi', model=TestModel(custom_output_text='baseline'))
+
+    base_req = base_messages[0]
+    assert isinstance(base_req, ModelRequest)
+    sys_texts = [p.content for p in base_req.parts if isinstance(p, SystemPromptPart)]
+    # The None value should have a '' placeholder due to keeping a reference to the dynamic prompt
+    assert '' in sys_texts
+    assert 'DYNAMIC' not in sys_texts
+
+    # Run a second time to capture the updated system prompt
+    with capture_run_messages() as messages:
+        agent.run_sync('Hi', model=TestModel(custom_output_text='baseline'))
+
+    req = messages[0]
+    assert isinstance(req, ModelRequest)
+    sys_texts = [p.content for p in req.parts if isinstance(p, SystemPromptPart)]
+    # The None value should have a '' placeholder due to keep a reference to the dynamic prompt
+    assert '' not in sys_texts
+    assert 'DYNAMIC' in sys_texts
+
+def test_system_prompt_none_return_are_omitted():
+    """Test dynamic system prompts with None return values."""
+    agent = Agent('test', system_prompt='STATIC')
+
+    @agent.system_prompt
+    def dynamic_sys() -> str | None:
+        return None
+
+    with capture_run_messages() as base_messages:
+        agent.run_sync('Hi', model=TestModel(custom_output_text='baseline'))
+
+    base_req = base_messages[0]
+    assert isinstance(base_req, ModelRequest)
+    sys_texts = [p.content for p in base_req.parts if isinstance(p, SystemPromptPart)]
+    # The None value should be omitted
+    assert 'STATIC' in sys_texts
+    assert '' not in sys_texts
+
+## tests/test_concurrency.py
+
+    async def test_agent_no_limit_by_default(self):
+        """Test that agents have no concurrency limit by default."""
+        agent = Agent(TestModel())
+        assert agent._concurrency_limiter is None
+
+    async def test_with_int_limiter(self):
+        """Test ConcurrencyLimitedModel with int limiter."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        model = ConcurrencyLimitedModel(TestModel(), limiter=5)
+        assert model._limiter.max_running == 5
+        assert model._limiter._max_queued is None
+
+    async def test_with_concurrency_limit(self):
+        """Test ConcurrencyLimitedModel with ConcurrencyLimit."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        model = ConcurrencyLimitedModel(TestModel(), limiter=ConcurrencyLimit(max_running=5, max_queued=10))
+        assert model._limiter.max_running == 5
+        assert model._limiter._max_queued == 10
+
+    async def test_shared_limiter_limits_across_models(self):
+        """Test that shared limiter limits concurrent requests across multiple models."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        request_count = 0
+        max_concurrent = 0
+        lock = anyio.Lock()
+
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        def create_tracking_model():
+            base_model = TestModel()
+            original_request = TestModel.request.__get__(base_model)
+
+            async def tracking_request(*args: Any, **kwargs: Any):
+                nonlocal request_count, max_concurrent
+                async with lock:
+                    request_count += 1
+                    max_concurrent = max(max_concurrent, request_count)
+                try:
+                    await anyio.sleep(0.1)
+                    return await original_request(*args, **kwargs)
+                finally:
+                    async with lock:
+                        request_count -= 1
+
+            base_model.request = tracking_request
+            return ConcurrencyLimitedModel(base_model, limiter=shared_limiter)
+
+        model1 = create_tracking_model()
+        model2 = create_tracking_model()
+
+        agent1 = Agent(model1)
+        agent2 = Agent(model2)
+
+        # Run 3 requests on each agent (6 total), but limit is 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(agent1.run, f'prompt {i}')
+            for i in range(3):
+                tg.start_soon(agent2.run, f'prompt {i}')
+
+        # Should never exceed 2 concurrent requests across both models
+        assert max_concurrent <= 2
+
+    async def test_limiter_without_name(self):
+        """Test that limiter name is None by default."""
+        limiter = ConcurrencyLimiter(max_running=5)
+        assert limiter.name is None
+
+    async def test_from_limit_with_name(self):
+        """Test creating limiter from limit with name."""
+        limiter = ConcurrencyLimiter.from_limit(5, name='my-limit')
+        assert limiter.name == 'my-limit'
+        assert limiter.max_running == 5
+
+    async def test_unnamed_limiter_waiting_uses_source_in_span_name(self, capfire: CaptureLogfire):
+        """Test that waiting without a limiter name uses source for span name."""
+        limiter = ConcurrencyLimiter(max_running=1)  # No name
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span uses source in name when limiter has no name
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for model:gpt-4 concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'model:gpt-4'
+        assert 'limiter_name' not in attrs  # Should not be present when name is None
+        assert attrs['max_running'] == 1
+
+## tests/test_direct.py
+
+def set_instrument_default(value: bool):
+    """Context manager to temporarily set the default instrumentation value."""
+    initial_value = Agent._instrument_default  # pyright: ignore[reportPrivateUsage]
+    try:
+        Agent._instrument_default = value  # pyright: ignore[reportPrivateUsage]
+        yield
+    finally:
+        Agent._instrument_default = initial_value  # pyright: ignore[reportPrivateUsage]
+
+## tests/test_function_schema.py
+
+def test_function_wrong_annotation_type():
+    """Test function with wrong annotation type for first parameter."""
+
+    def func_wrong_annotation(ctx: str, x: int) -> str: ...  # pragma: no cover
+
+    assert _takes_ctx(func_wrong_annotation) is False
+
+## tests/test_mcp.py
+
+def test_load_mcp_servers(tmp_path: Path):
+    config = tmp_path / 'mcp.json'
+
+    config.write_text('{"mcpServers": {"potato": {"url": "https://example.com/mcp"}}}', encoding='utf-8')
+    server = load_mcp_servers(config)[0]
+    assert server == MCPServerStreamableHTTP(url='https://example.com/mcp', id='potato', tool_prefix='potato')
+
+    config.write_text(
+        '{"mcpServers": {"potato": {"command": "python", "args": ["-m", "tests.mcp_server"]}}}', encoding='utf-8'
+    )
+    server = load_mcp_servers(config)[0]
+    assert server == MCPServerStdio(
+        command='python', args=['-m', 'tests.mcp_server'], id='potato', tool_prefix='potato'
+    )
+
+    config.write_text('{"mcpServers": {"potato": {"url": "https://example.com/sse"}}}', encoding='utf-8')
+    server = load_mcp_servers(config)[0]
+    assert server == MCPServerSSE(url='https://example.com/sse', id='potato', tool_prefix='potato')
+
+    with pytest.raises(FileNotFoundError):
+        load_mcp_servers(tmp_path / 'does_not_exist.json')
+
+def test_load_mcp_servers_with_env_vars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test environment variable expansion in config files."""
+    config = tmp_path / 'mcp.json'
+
+    # Test with environment variables in command
+    monkeypatch.setenv('PYTHON_CMD', 'python3')
+    monkeypatch.setenv('MCP_MODULE', 'tests.mcp_server')
+    config.write_text(
+        '{"mcpServers": {"my_server": {"command": "${PYTHON_CMD}", "args": ["-m", "${MCP_MODULE}"]}}}', encoding='utf-8'
+    )
+
+    servers = load_mcp_servers(config)
+
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == 'python3'
+    assert server.args == ['-m', 'tests.mcp_server']
+    assert server.id == 'my_server'
+    assert server.tool_prefix == 'my_server'
+
+def test_load_mcp_servers_env_var_in_env_dict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test environment variable expansion in env dict."""
+    config = tmp_path / 'mcp.json'
+
+    # Test with environment variables in env dict
+    monkeypatch.setenv('API_KEY', 'secret123')
+    config.write_text(
+        '{"mcpServers": {"my_server": {"command": "python", "args": ["-m", "tests.mcp_server"], '
+        '"env": {"API_KEY": "${API_KEY}"}}}}',
+        encoding='utf-8',
+    )
+
+    servers = load_mcp_servers(config)
+
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.env == {'API_KEY': 'secret123'}
+
+def test_load_mcp_servers_env_var_expansion_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test environment variable expansion in URL."""
+    config = tmp_path / 'mcp.json'
+
+    # Test with environment variables in URL
+    monkeypatch.setenv('SERVER_HOST', 'example.com')
+    monkeypatch.setenv('SERVER_PORT', '8080')
+    config.write_text(
+        '{"mcpServers": {"web_server": {"url": "https://${SERVER_HOST}:${SERVER_PORT}/mcp"}}}', encoding='utf-8'
+    )
+
+    servers = load_mcp_servers(config)
+
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStreamableHTTP)
+    assert server.url == 'https://example.com:8080/mcp'
+
+def test_load_mcp_servers_undefined_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test that undefined environment variables raise an error."""
+    config = tmp_path / 'mcp.json'
+
+    # Make sure the environment variable is not set
+    monkeypatch.delenv('UNDEFINED_VAR', raising=False)
+
+    config.write_text('{"mcpServers": {"my_server": {"command": "${UNDEFINED_VAR}", "args": []}}}', encoding='utf-8')
+
+    with pytest.raises(ValueError, match='Environment variable \\$\\{UNDEFINED_VAR\\} is not defined'):
+        load_mcp_servers(config)
+
+def test_load_mcp_servers_partial_env_vars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test environment variables in partial strings."""
+    config = tmp_path / 'mcp.json'
+
+    monkeypatch.setenv('HOST', 'example.com')
+    monkeypatch.setenv('PATH_SUFFIX', 'mcp')
+    config.write_text('{"mcpServers": {"server": {"url": "https://${HOST}/api/${PATH_SUFFIX}"}}}', encoding='utf-8')
+
+    servers = load_mcp_servers(config)
+
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStreamableHTTP)
+    assert server.url == 'https://example.com/api/mcp'
+
+def test_load_mcp_servers_with_non_string_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test that non-string primitive values (int, bool, null) in nested structures are passed through unchanged."""
+    config = tmp_path / 'mcp.json'
+
+    # Create a config with environment variables and extra fields containing primitives
+    # The extra fields will be ignored during validation but go through _expand_env_vars
+    monkeypatch.setenv('PYTHON_CMD', 'python')
+    config.write_text(
+        '{"mcpServers": {"my_server": {"command": "${PYTHON_CMD}", "args": ["-m", "tests.mcp_server"], '
+        '"metadata": {"count": 42, "enabled": true, "value": null}}}}',
+        encoding='utf-8',
+    )
+
+    # This should successfully expand env vars and ignore the metadata field
+    servers = load_mcp_servers(config)
+
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == 'python'
+
+def test_load_mcp_servers_with_default_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test ${VAR:-default} syntax for environment variable expansion."""
+    config = tmp_path / 'mcp.json'
+
+    # Test with undefined variable using default
+    monkeypatch.delenv('UNDEFINED_VAR', raising=False)
+    config.write_text(
+        '{"mcpServers": {"server": {"command": "${UNDEFINED_VAR:-python3}", "args": []}}}', encoding='utf-8'
+    )
+
+    servers = load_mcp_servers(config)
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == 'python3'
+
+    # Test with defined variable (should use actual value, not default)
+    monkeypatch.setenv('DEFINED_VAR', 'actual_value')
+    config.write_text(
+        '{"mcpServers": {"server": {"command": "${DEFINED_VAR:-default_value}", "args": []}}}', encoding='utf-8'
+    )
+
+    servers = load_mcp_servers(config)
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == 'actual_value'
+
+    # Test with empty string as default
+    monkeypatch.delenv('UNDEFINED_VAR', raising=False)
+    config.write_text('{"mcpServers": {"server": {"command": "${UNDEFINED_VAR:-}", "args": []}}}', encoding='utf-8')
+
+    servers = load_mcp_servers(config)
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == ''
+
+def test_load_mcp_servers_with_default_values_in_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test ${VAR:-default} syntax in URLs."""
+    config = tmp_path / 'mcp.json'
+
+    # Test with default values in URL
+    monkeypatch.delenv('HOST', raising=False)
+    monkeypatch.setenv('PROTOCOL', 'https')
+    config.write_text(
+        '{"mcpServers": {"server": {"url": "${PROTOCOL:-http}://${HOST:-localhost}:${PORT:-8080}/mcp"}}}',
+        encoding='utf-8',
+    )
+
+    servers = load_mcp_servers(config)
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStreamableHTTP)
+    assert server.url == 'https://localhost:8080/mcp'
+
+def test_load_mcp_servers_with_default_values_in_env_dict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test ${VAR:-default} syntax in env dictionary."""
+    config = tmp_path / 'mcp.json'
+
+    monkeypatch.delenv('API_KEY', raising=False)
+    monkeypatch.setenv('CUSTOM_VAR', 'custom_value')
+    config.write_text(
+        '{"mcpServers": {"server": {"command": "python", "args": [], '
+        '"env": {"API_KEY": "${API_KEY:-default_key}", "CUSTOM": "${CUSTOM_VAR:-fallback}"}}}}',
+        encoding='utf-8',
+    )
+
+    servers = load_mcp_servers(config)
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.env == {'API_KEY': 'default_key', 'CUSTOM': 'custom_value'}
+
+def test_load_mcp_servers_with_complex_default_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test ${VAR:-default} syntax with special characters in default."""
+    config = tmp_path / 'mcp.json'
+
+    monkeypatch.delenv('PATH_VAR', raising=False)
+    # Test default with slashes, dots, and dashes
+    config.write_text(
+        '{"mcpServers": {"server": {"command": "${PATH_VAR:-/usr/local/bin/python-3.10}", "args": []}}}',
+        encoding='utf-8',
+    )
+
+    servers = load_mcp_servers(config)
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == '/usr/local/bin/python-3.10'
+
+def test_load_mcp_servers_with_mixed_syntax(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test mixing ${VAR} and ${VAR:-default} syntax in the same config."""
+    config = tmp_path / 'mcp.json'
+
+    monkeypatch.setenv('REQUIRED_VAR', 'required_value')
+    monkeypatch.delenv('OPTIONAL_VAR', raising=False)
+    config.write_text(
+        '{"mcpServers": {"server": {"command": "${REQUIRED_VAR}", "args": ["${OPTIONAL_VAR:-default_arg}"]}}}',
+        encoding='utf-8',
+    )
+
+    servers = load_mcp_servers(config)
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == 'required_value'
+    assert server.args == ['default_arg']
+
+## tests/test_parts_manager.py
+
+def test_handle_thinking_delta_wrong_part_type():
+    manager = ModelResponsePartsManager()
+
+    # Add a text part first
+    list(manager.handle_text_delta(vendor_part_id='text', content='hello'))
+
+    # Try to apply thinking delta to the text part - should raise error
+    with pytest.raises(UnexpectedModelBehavior, match=r'Cannot apply a thinking delta to existing_part='):
+        list(manager.handle_thinking_delta(vendor_part_id='text', content='thinking', signature=None))
+
+## tests/test_streaming.py
+
+async def test_call_tool_wrong_name():
+    async def stream_structured_function(_messages: list[ModelMessage], _: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+        yield {0: DeltaToolCall(name='foobar', json_args='{}')}
+
+    agent = Agent(
+        FunctionModel(stream_function=stream_structured_function),
+        output_type=tuple[str, int],
+        retries=0,
+    )
+
+    @agent.tool_plain
+    async def ret_a(x: str) -> str:  # pragma: no cover
+        return x
+
+    with capture_run_messages() as messages:
+        with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(0\) for output validation'):
+            async with agent.run_stream('hello'):
+                pass
+
+    assert messages == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=50, output_tokens=1),
+                model_name='function::stream_structured_function',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_validation_context.py
+
+class Value(BaseModel):
+    x: int
+
+    @field_validator('x')
+    def increment_value(cls, value: int, info: ValidationInfo):
+        return value + (info.context or 0)
+
+    def increment_value(cls, value: int, info: ValidationInfo):
+        return value + (info.context or 0)
+
+def test_agent_output_with_validation_context(output_type: OutputSpec[Value]):
+    """Test that the output is validated using the validation context"""
+
+    def mock_llm(_: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        if isinstance(output_type, ToolOutput):
+            return ModelResponse(parts=[ToolCallPart(tool_name='final_result', args={'x': 0})])
+        else:
+            text = Value(x=0).model_dump_json()
+            return ModelResponse(parts=[TextPart(content=text)])
+
+    agent = Agent(
+        FunctionModel(mock_llm),
+        output_type=output_type,
+        deps_type=Deps,
+        validation_context=lambda ctx: ctx.deps.increment,
+    )
+
+    result = agent.run_sync('', deps=Deps(increment=10))
+    assert result.output.x == snapshot(10)
+
+## tests/typed_agent.py
+
+async def prep_wrong_type(ctx: RunContext[int], tool_def: ToolDefinition) -> ToolDefinition | None:
+    if ctx.deps == 42:
+        return None
+    else:
+        return tool_def
+
+def wrong_tool_prepare(ctx: RunContext[MyDeps], x: int, y: str) -> str:
+    return f'{ctx.deps.foo} {x} {y}'
+
+async def output_validator_wrong(ctx: RunContext[int], result: str) -> str:
+    return result
+
+## tests/typed_graph.py
+
+def run_persistence_wrong() -> None:
+    p = FullStatePersistence[str, int]()
+    g5.run_sync(A(), persistence=p, state=MyState(x=1), deps=MyDeps(y='y'))  # type: ignore[arg-type]

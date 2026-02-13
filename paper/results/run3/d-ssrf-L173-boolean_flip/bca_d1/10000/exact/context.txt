@@ -1,0 +1,1042 @@
+## docs/.hooks/snippets.py
+
+class LineRange:
+    start_line: int  # first line in file is 0
+    end_line: int  # unlike start_line, this line is interpreted as excluded from the range; this should always be larger than the start_line
+
+    def intersection(self, ranges: list[LineRange]) -> list[LineRange]:
+        new_ranges: list[LineRange] = []
+        for r in ranges:
+            new_start_line = max(r.start_line, self.start_line)
+            new_end_line = min(r.end_line, self.end_line)
+            if new_start_line < new_end_line:
+                new_ranges.append(r)
+        return new_ranges
+
+    @staticmethod
+    def merge(ranges: list[LineRange]) -> list[LineRange]:
+        if not ranges:
+            return []
+
+        # Sort ranges by start_line
+        sorted_ranges = sorted(ranges, key=lambda r: r.start_line)
+        merged: list[LineRange] = []
+
+        for current in sorted_ranges:
+            if not merged or merged[-1].end_line < current.start_line:
+                # No overlap with previous range, add as new range
+                merged.append(current)
+            else:
+                # Overlap or adjacent, merge with previous range
+                merged[-1] = LineRange(merged[-1].start_line, max(merged[-1].end_line, current.end_line))
+
+        return merged
+
+class ParsedFile:
+    lines: list[str]
+    sections: dict[str, list[LineRange]]
+    lines_mapping: dict[int, int]
+
+    def render(self, fragment_sections: list[str], highlight_sections: list[str]) -> RenderedSnippet:
+        fragment_ranges: list[LineRange] = []
+        if fragment_sections:
+            for k in fragment_sections:
+                if k not in self.sections:
+                    raise ValueError(f'Unrecognized fragment section: {k!r} (expected {list(self.sections)})')
+                fragment_ranges.extend(self.sections[k])
+            fragment_ranges = LineRange.merge(fragment_ranges)
+        else:
+            fragment_ranges = [LineRange(0, len(self.lines))]
+
+        highlight_ranges: list[LineRange] = []
+        for k in highlight_sections:
+            if k not in self.sections:
+                raise ValueError(f'Unrecognized highlight section: {k!r} (expected {list(self.sections)})')
+            highlight_ranges.extend(self.sections[k])
+        highlight_ranges = LineRange.merge(highlight_ranges)
+
+        rendered_highlight_ranges = list[LineRange]()
+        rendered_lines: list[str] = []
+        last_end_line = 1
+        current_line = 0
+        for fragment_range in fragment_ranges:
+            if fragment_range.start_line > last_end_line:
+                if current_line == 0:
+                    rendered_lines.append('...\n')
+                else:
+                    rendered_lines.append('\n...\n')
+
+                current_line += 1
+            fragment_highlight_ranges = fragment_range.intersection(highlight_ranges)
+            for fragment_highlight_range in fragment_highlight_ranges:
+                rendered_highlight_ranges.append(
+                    LineRange(
+                        fragment_highlight_range.start_line - fragment_range.start_line + current_line,
+                        fragment_highlight_range.end_line - fragment_range.start_line + current_line,
+                    )
+                )
+
+            for i in range(fragment_range.start_line, fragment_range.end_line):
+                rendered_lines.append(self.lines[i])
+                current_line += 1
+            last_end_line = fragment_range.end_line
+
+        if last_end_line < len(self.lines):
+            rendered_lines.append('\n...')
+
+        original_range = LineRange(
+            self.lines_mapping[fragment_ranges[0].start_line],
+            self.lines_mapping[fragment_ranges[-1].end_line - 1] + 1,
+        )
+        return RenderedSnippet('\n'.join(rendered_lines), LineRange.merge(rendered_highlight_ranges), original_range)
+
+def parse_file_sections(file_path: Path) -> ParsedFile:
+    """Parse a file and extract sections marked with ### [section] or /// [section]"""
+    input_lines = file_path.read_text(encoding='utf-8').splitlines()
+    output_lines: list[str] = []
+    lines_mapping: dict[int, int] = {}
+
+    sections: dict[str, list[LineRange]] = {}
+    section_starts: dict[str, int] = {}
+
+    output_line_no = 0
+    for line_no, line in enumerate(input_lines, 1):
+        match: re.Match[str] | None = None
+        for match in re.finditer(r'\s*(?:###|///)\s*\[([^]]+)]\s*$', line):
+            break
+        else:
+            output_lines.append(line)
+            output_line_no += 1
+            lines_mapping[output_line_no - 1] = line_no - 1
+            continue
+
+        pre_matches_line = line[: match.start()]
+        sections_to_start: set[str] = set()
+        sections_to_end: set[str] = set()
+        for item in match.group(1).split(','):
+            if item in sections_to_end or item in sections_to_start:
+                raise ValueError(f'Duplicate section reference: {item!r} at {file_path}:{line_no}')
+            if item.startswith('/'):
+                sections_to_end.add(item[1:])
+            else:
+                sections_to_start.add(item)
+
+        for section_name in sections_to_start:
+            if section_name in section_starts:
+                raise ValueError(f'Cannot nest section with the same name {section_name!r} at {file_path}:{line_no}')
+            section_starts[section_name] = output_line_no
+
+        for section_name in sections_to_end:
+            start_line = section_starts.pop(section_name, None)
+            if start_line is None:
+                raise ValueError(f'Cannot end unstarted section {section_name!r} at {file_path}:{line_no}')
+            if section_name not in sections:
+                sections[section_name] = []
+            end_line = output_line_no + 1 if pre_matches_line else output_line_no
+            sections[section_name].append(LineRange(start_line, end_line))
+
+        if pre_matches_line:
+            output_lines.append(pre_matches_line)
+            output_line_no += 1
+            lines_mapping[output_line_no - 1] = line_no - 1
+
+    if section_starts:
+        raise ValueError(f'Some sections were not finished in {file_path}: {list(section_starts)}')
+
+    return ParsedFile(lines=output_lines, sections=sections, lines_mapping=lines_mapping)
+
+def inject_snippets(markdown: str, relative_path_root: Path) -> str:  # noqa: C901
+    def replace_snippet(match: re.Match[str]) -> str:
+        line = match.group(0)
+        directive = parse_snippet_directive(line)
+        if not directive:
+            return line
+
+        if directive.path.startswith('/'):
+            # If directive path is absolute, treat it as relative to the repo root:
+            file_path = (REPO_ROOT / directive.path[1:]).resolve()
+        else:
+            # Else, resolve as a relative path
+            file_path = (relative_path_root / directive.path).resolve()
+
+        if not file_path.exists():
+            raise FileNotFoundError(f'File {file_path} not found')
+
+        # Parse the file sections
+        parsed_file = parse_file_sections(file_path)
+
+        # Determine fragments to extract
+        fragment_names = directive.fragment.split() if directive.fragment else []
+        highlight_names = directive.highlight.split() if directive.highlight else []
+
+        # Extract content
+        rendered = parsed_file.render(fragment_names, highlight_names)
+
+        # Get file extension for syntax highlighting
+        file_extension = file_path.suffix.lstrip('.')
+
+        # Determine title
+        if directive.title:
+            title = directive.title
+        else:
+            if file_path.is_relative_to(PYDANTIC_AI_EXAMPLES_ROOT):
+                title_path = str(file_path.relative_to(PYDANTIC_AI_EXAMPLES_ROOT))
+            else:
+                title_path = file_path.name
+            title = title_path
+            range_spec: str | None = None
+            if directive.fragment:
+                range_spec = f'L{rendered.original_range.start_line + 1}-L{rendered.original_range.end_line}'
+                title = f'{title_path} ({range_spec})'
+            if file_path.is_relative_to(REPO_ROOT):
+                relative_path = file_path.relative_to(REPO_ROOT)
+                url = f'https://github.com/pydantic/pydantic-ai/blob/main/{relative_path}'
+                if range_spec is not None:
+                    url += f'#{range_spec}'
+                title = f"<a href='{url}' target='_blank' rel='noopener noreferrer'>{title}</a>"
+        # Build attributes for the code block
+        attrs: list[str] = []
+        if title:
+            attrs.append(f'title="{title}"')
+
+        # Add highlight lines
+        if rendered.highlights:
+            hl_lines = format_highlight_lines(rendered.highlights)
+            if hl_lines:
+                attrs.append(f'hl_lines="{hl_lines}"')
+
+        # Add extra attributes
+        if directive.extra_attrs:
+            for key, value in directive.extra_attrs.items():
+                attrs.append(f'{key}="{value}"')
+
+        # Build the replacement
+        attrs_str = ' '.join(attrs)
+        if attrs_str:
+            attrs_str = ' {' + attrs_str + '}'
+
+        result = f'```{file_extension}{attrs_str}\n{rendered.content}\n```'
+
+        return result
+
+    # Find and replace all snippet directives
+    pattern = r'^```snippet\s+\{[^}]+\}```$'
+    return re.sub(pattern, replace_snippet, markdown, flags=re.MULTILINE)
+
+## docs/.hooks/test_snippets.py
+
+def test_parse_file_sections_basic():
+    """Test basic section parsing."""
+    content = """line 1
+### [section1]
+content 1
+content 2
+### [/section1]
+line 6"""
+
+    with temp_text_file(content) as temp_path:
+        result = parse_file_sections(temp_path)
+
+    assert result == snapshot(
+        ParsedFile(
+            lines=['line 1', 'content 1', 'content 2', 'line 6'],
+            sections={'section1': [LineRange(start_line=1, end_line=3)]},
+            lines_mapping={0: 0, 1: 2, 2: 3, 3: 5},
+        )
+    )
+
+def test_parse_file_sections_multiple_ranges():
+    """Test section with multiple disjoint ranges."""
+    content = """line 1
+### [section1]
+content 1
+### [/section1]
+middle line
+### [section1]
+content 2
+### [/section1]
+end line"""
+
+    with temp_text_file(content) as temp_path:
+        result = parse_file_sections(temp_path)
+
+    assert result == snapshot(
+        ParsedFile(
+            lines=[
+                'line 1',
+                'content 1',
+                'middle line',
+                'content 2',
+                'end line',
+            ],
+            sections={'section1': [LineRange(start_line=1, end_line=2), LineRange(start_line=3, end_line=4)]},
+            lines_mapping={0: 0, 1: 2, 2: 4, 3: 6, 4: 8},
+        )
+    )
+
+def test_parse_file_sections_comment_style():
+    """Test parsing with /// comment style."""
+    content = """line 1
+/// [section1]
+content 1
+/// [/section1]
+line 5"""
+
+    with temp_text_file(content) as temp_path:
+        result = parse_file_sections(temp_path)
+
+    assert result == snapshot(
+        ParsedFile(
+            lines=['line 1', 'content 1', 'line 5'],
+            sections={'section1': [LineRange(start_line=1, end_line=2)]},
+            lines_mapping={0: 0, 1: 2, 2: 4},
+        )
+    )
+
+def test_parse_file_sections_nested():
+    """Test nested sections with different names."""
+    content = """line 1
+### [outer]
+outer content
+### [inner]
+inner content
+### [/inner]
+more outer
+### [/outer]
+end"""
+
+    with temp_text_file(content) as temp_path:
+        result = parse_file_sections(temp_path)
+
+    assert result == snapshot(
+        ParsedFile(
+            lines=[
+                'line 1',
+                'outer content',
+                'inner content',
+                'more outer',
+                'end',
+            ],
+            sections={
+                'inner': [LineRange(start_line=2, end_line=3)],
+                'outer': [LineRange(start_line=1, end_line=4)],
+            },
+            lines_mapping={0: 0, 1: 2, 2: 4, 3: 6, 4: 8},
+        )
+    )
+
+def test_extract_fragment_content_entire_file():
+    """Test extracting entire file when no fragments specified."""
+    content = """line 1
+### [section1]
+content 1
+### [/section1]
+line 5"""
+
+    with temp_text_file(content) as temp_path:
+        parsed = parse_file_sections(temp_path)
+
+    assert parsed.render([], []) == snapshot(
+        RenderedSnippet(
+            content="""\
+line 1
+content 1
+line 5\
+""",
+            highlights=[],
+            original_range=LineRange(start_line=0, end_line=5),
+        )
+    )
+
+    assert parsed.render(['section1'], []) == snapshot(
+        RenderedSnippet(
+            content="""\
+content 1
+
+...\
+""",
+            highlights=[],
+            original_range=LineRange(start_line=2, end_line=3),
+        )
+    )
+
+    assert parsed.render([], ['section1']) == snapshot(
+        RenderedSnippet(
+            content="""\
+line 1
+content 1
+line 5\
+""",
+            highlights=[LineRange(start_line=1, end_line=2)],
+            original_range=LineRange(start_line=0, end_line=5),
+        )
+    )
+
+def test_extract_fragment_content_specific_section():
+    """Test extracting specific section."""
+    content = """line 1
+### [section1]
+content 1
+content 2
+### [/section1]
+line 6"""
+
+    with temp_text_file(content) as temp_path:
+        parsed = parse_file_sections(temp_path)
+
+    assert parsed.render([], []) == snapshot(
+        RenderedSnippet(
+            content="""\
+line 1
+content 1
+content 2
+line 6\
+""",
+            highlights=[],
+            original_range=LineRange(start_line=0, end_line=6),
+        )
+    )
+
+    assert parsed.render(['section1'], []) == snapshot(
+        RenderedSnippet(
+            content="""\
+content 1
+content 2
+
+...\
+""",
+            highlights=[],
+            original_range=LineRange(start_line=2, end_line=4),
+        )
+    )
+
+    assert parsed.render([], ['section1']) == snapshot(
+        RenderedSnippet(
+            content="""\
+line 1
+content 1
+content 2
+line 6\
+""",
+            highlights=[LineRange(start_line=1, end_line=3)],
+            original_range=LineRange(start_line=0, end_line=6),
+        )
+    )
+
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/store.py
+
+class AnalysisStore:
+    @classmethod
+    @logfire.instrument('Add analysis to store')
+    async def add(cls, analysis: Analysis):
+        await cls._get_store().put.aio(analysis.profile.email, analysis.model_dump())
+
+    @classmethod
+    @logfire.instrument('List analyses from store')
+    async def list(cls) -> list[Analysis]:
+        return [
+            Analysis.model_validate(analysis)
+            async for analysis in cls._get_store().values.aio()
+        ]
+
+    @classmethod
+    @logfire.instrument('Clear analyses from store')
+    async def clear(cls):
+        await cls._get_store().clear.aio()
+
+    @classmethod
+    def _get_store(cls) -> modal.Dict:
+        return modal.Dict.from_name('analyses', create_if_missing=True)  # type: ignore ### [/analysis_store]
+
+    async def add(cls, analysis: Analysis):
+        await cls._get_store().put.aio(analysis.profile.email, analysis.model_dump())
+
+    async def list(cls) -> list[Analysis]:
+        return [
+            Analysis.model_validate(analysis)
+            async for analysis in cls._get_store().values.aio()
+        ]
+
+## pydantic_ai_slim/pydantic_ai/__init__.py
+
+from .toolsets import (
+    AbstractToolset,
+    ApprovalRequiredToolset,
+    CombinedToolset,
+    ExternalToolset,
+    FilteredToolset,
+    FunctionToolset,
+    PrefixedToolset,
+    PreparedToolset,
+    RenamedToolset,
+    ToolsetFunc,
+    ToolsetTool,
+    WrapperToolset,
+)
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class BinaryContent
+    """Binary content, e.g. an audio or image file."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def from_path(cls, path: PathLike[str]) -> BinaryContent:
+        """Create a `BinaryContent` from a path.
+
+        Defaults to 'application/octet-stream' if the media type cannot be inferred.
+
+        Raises:
+            FileNotFoundError: if the file does not exist.
+            PermissionError: if the file cannot be read.
+        """
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f'File not found: {path}')
+        media_type, _ = _mime_types.guess_type(path)
+        if media_type is None:
+            media_type = 'application/octet-stream'
+
+        return cls.narrow_type(cls(data=path.read_bytes(), media_type=media_type))
+
+## pydantic_ai_slim/pydantic_ai/providers/gateway.py
+
+def gateway_provider(
+    upstream_provider: UpstreamProvider | str,
+    /,
+    *,
+    # Every provider
+    route: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    # OpenAI, Groq, Anthropic & Gemini - Only Bedrock doesn't have an HTTPX client.
+    http_client: httpx.AsyncClient | None = None,
+) -> Provider[Any]:
+    """Create a new Gateway provider.
+
+    Args:
+        upstream_provider: The upstream provider to use.
+        route: The name of the provider or routing group to use to handle the request. If not provided, the default
+            routing group for the API format will be used.
+        api_key: The API key to use for authentication. If not provided, the `PYDANTIC_AI_GATEWAY_API_KEY`
+            environment variable will be used if available.
+        base_url: The base URL to use for the Gateway. If not provided, the `PYDANTIC_AI_GATEWAY_BASE_URL`
+            environment variable will be used if available. Otherwise, defaults to `https://gateway.pydantic.dev/proxy`.
+        http_client: The HTTP client to use for the Gateway.
+    """
+    api_key = api_key or os.getenv('PYDANTIC_AI_GATEWAY_API_KEY', os.getenv('PAIG_API_KEY'))
+    if not api_key:
+        raise UserError(
+            'Set the `PYDANTIC_AI_GATEWAY_API_KEY` environment variable or pass it via `gateway_provider(..., api_key=...)`'
+            ' to use the Pydantic AI Gateway provider.'
+        )
+
+    base_url = (
+        base_url or os.getenv('PYDANTIC_AI_GATEWAY_BASE_URL', os.getenv('PAIG_BASE_URL')) or _infer_base_url(api_key)
+    )
+    http_client = http_client or cached_async_http_client(provider=f'gateway/{upstream_provider}')
+    http_client.event_hooks = {'request': [_request_hook(api_key)]}
+
+    if route is None:
+        # Use the implied providerId as the default route.
+        route = normalize_gateway_provider(upstream_provider)
+
+    base_url = _merge_url_path(base_url, route)
+
+    if upstream_provider in ('openai', 'openai-chat', 'openai-responses', 'chat', 'responses'):
+        from .openai import OpenAIProvider
+
+        return OpenAIProvider(api_key=api_key, base_url=base_url, http_client=http_client)
+    elif upstream_provider == 'groq':
+        from .groq import GroqProvider
+
+        return GroqProvider(api_key=api_key, base_url=base_url, http_client=http_client)
+    elif upstream_provider == 'anthropic':
+        from anthropic import AsyncAnthropic
+
+        from .anthropic import AnthropicProvider
+
+        return AnthropicProvider(
+            anthropic_client=AsyncAnthropic(auth_token=api_key, base_url=base_url, http_client=http_client)
+        )
+    elif upstream_provider in ('bedrock', 'converse'):
+        from .bedrock import BedrockProvider
+
+        return BedrockProvider(
+            api_key=api_key,
+            base_url=base_url,
+            region_name='pydantic-ai-gateway',  # Fake region name to avoid NoRegionError
+        )
+    elif upstream_provider in ('google-vertex', 'gemini'):
+        from .google import GoogleProvider
+
+        return GoogleProvider(vertexai=True, api_key=api_key, base_url=base_url, http_client=http_client)
+    else:
+        raise UserError(f'Unknown upstream provider: {upstream_provider}')
+
+def _merge_url_path(base_url: str, path: str) -> str:
+    """Merge a base URL and a path.
+
+    Args:
+        base_url: The base URL to merge.
+        path: The path to merge.
+    """
+    return base_url.rstrip('/') + '/' + path.lstrip('/')
+
+## pydantic_ai_slim/pydantic_ai/toolsets/_dynamic.py
+
+class DynamicToolset
+    """A toolset that dynamically builds a toolset using a function that takes the run context."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def copy(self) -> DynamicToolset[AgentDepsT]:
+        """Create a copy of this toolset for use in a new agent run."""
+        return DynamicToolset(
+            self.toolset_func,
+            per_run_step=self.per_run_step,
+            id=self._id,
+        )
+
+## pydantic_graph/pydantic_graph/beta/graph_builder.py
+
+def _replace_placeholder_node_ids(nodes: dict[NodeID, AnyNode], edges_by_source: dict[NodeID, list[Path]]):
+    node_id_remapping = _build_placeholder_node_id_remapping(nodes)
+    replaced_nodes = {
+        node_id_remapping.get(name, name): _update_node_with_id_remapping(node, node_id_remapping)
+        for name, node in nodes.items()
+    }
+    replaced_edges_by_source = {
+        node_id_remapping.get(source, source): [_update_path_with_id_remapping(p, node_id_remapping) for p in paths]
+        for source, paths in edges_by_source.items()
+    }
+    return replaced_nodes, replaced_edges_by_source
+
+def _update_node_with_id_remapping(node: AnyNode, node_id_remapping: dict[NodeID, NodeID]) -> AnyNode:
+    # Note: it's a bit awkward that we mutate the provided nodes, but this is necessary to ensure that
+    # calls to `.as_node` reference the correct node_ids when relying on compatibility with the v1 API.
+    # We only mutate placeholder IDs so I _think_ this should generally be okay. I guess we can
+    # rework it more carefully if it causes issues in the future..
+    if isinstance(node, Step):
+        node.id = node_id_remapping.get(node.id, node.id)
+    elif isinstance(node, Join):
+        node.id = JoinID(node_id_remapping.get(node.id, node.id))
+    elif isinstance(node, Fork):
+        node.id = ForkID(node_id_remapping.get(node.id, node.id))
+        if node.downstream_join_id is not None:
+            node.downstream_join_id = JoinID(node_id_remapping.get(node.downstream_join_id, node.downstream_join_id))
+    elif isinstance(node, Decision):
+        node.id = node_id_remapping.get(node.id, node.id)
+        node.branches = [
+            replace(branch, path=_update_path_with_id_remapping(branch.path, node_id_remapping))
+            for branch in node.branches
+        ]
+    return node
+
+def _update_path_with_id_remapping(path: Path, node_id_remapping: dict[NodeID, NodeID]) -> Path:
+    # Note: we have already deepcopied the node provided to this function so it should be okay to make mutations,
+    # this could change if we change the code surrounding the code paths leading to this function call though.
+    for item in path.items:
+        if isinstance(item, MapMarker):
+            downstream_join_id = item.downstream_join_id
+            if downstream_join_id is not None:
+                item.downstream_join_id = JoinID(node_id_remapping.get(downstream_join_id, downstream_join_id))
+            item.fork_id = ForkID(node_id_remapping.get(item.fork_id, item.fork_id))
+        elif isinstance(item, BroadcastMarker):
+            item.fork_id = ForkID(node_id_remapping.get(item.fork_id, item.fork_id))
+            item.paths = [_update_path_with_id_remapping(p, node_id_remapping) for p in item.paths]
+        elif isinstance(item, DestinationMarker):
+            item.destination_id = node_id_remapping.get(item.destination_id, item.destination_id)
+    return path
+
+## pydantic_graph/pydantic_graph/beta/mermaid.py
+
+def _topological_sort(
+    nodes: list[MermaidNode], edges: list[MermaidEdge]
+) -> tuple[list[MermaidNode], list[MermaidEdge]]:
+    """Sort nodes and edges in a logical topological order.
+
+    Uses BFS from the start node to assign depths, then sorts:
+    - Nodes by their distance from start
+    - Edges by the distance of their source and target nodes
+    """
+    # Build adjacency list for BFS
+    adjacency: dict[str, list[str]] = defaultdict(list)
+    for edge in edges:
+        adjacency[edge.start_id].append(edge.end_id)
+
+    # BFS to assign depth to each node (distance from start)
+    depths: dict[str, int] = {}
+    queue: list[tuple[str, int]] = [(StartNode.id, 0)]
+    depths[StartNode.id] = 0
+
+    while queue:
+        node_id, depth = queue.pop(0)
+        for next_id in adjacency[node_id]:
+            if next_id not in depths:  # pragma: no branch
+                depths[next_id] = depth + 1
+                queue.append((next_id, depth + 1))
+
+    # Sort nodes by depth (distance from start), then by id for stability
+    # Nodes not reachable from start get infinity depth (sorted to end)
+    sorted_nodes = sorted(nodes, key=lambda n: (depths.get(n.id, float('inf')), n.id))
+
+    # Sort edges by source depth, then target depth
+    # This ensures edges closer to start come first, edges closer to end come last
+    sorted_edges = sorted(
+        edges,
+        key=lambda e: (
+            depths.get(e.start_id, float('inf')),
+            depths.get(e.end_id, float('inf')),
+            e.start_id,
+            e.end_id,
+        ),
+    )
+
+    return sorted_nodes, sorted_edges
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+PathItem = TypeAliasType('PathItem', TransformMarker | MapMarker | BroadcastMarker | LabelMarker | DestinationMarker)
+
+    def next_path(self) -> Path:
+        """Create a new path with the first item removed.
+
+        Returns:
+            A new Path with all items except the first one
+        """
+        return Path(self.items[1:])
+
+## tests/conftest.py
+
+class TestEnv:
+    __test__ = False
+
+    def __init__(self):
+        self.envars: dict[str, str | None] = {}
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+    def reset(self) -> None:
+        for name, value in self.envars.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value  # pragma: lax no cover
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+def assets_path() -> Path:
+    return Path(__file__).parent / 'assets'
+
+## tests/evals/test_otel.py
+
+async def test_span_query_logical_combinations():
+    """Test logical combinations (AND/OR) in SpanQuery."""
+
+    with context_subtree() as tree:
+        with logfire.span('root1', level='0'):
+            with logfire.span('child1', level='1', category='important'):
+                pass
+            with logfire.span('child2', level='1', category='normal'):
+                pass
+            with logfire.span('special', level='1', category='important', priority='high'):
+                pass
+    assert isinstance(tree, SpanTree)
+
+    # Test AND logic
+    and_query: SpanQuery = {'and_': [{'name_contains': '1'}, {'has_attributes': {'level': '1'}}]}
+    matched_nodes = list(tree.find(and_query))
+    assert len(matched_nodes) == 1, matched_nodes
+    assert all(node.name in ['child1'] for node in matched_nodes)
+
+    # Test OR logic
+    or_query: SpanQuery = {'or_': [{'name_contains': '2'}, {'has_attributes': {'level': '0'}}]}
+    matched_nodes = list(tree.find(or_query))
+    assert len(matched_nodes) == 2
+    assert any(node.name == 'child2' for node in matched_nodes)
+    assert any(node.attributes.get('level') == '0' for node in matched_nodes)
+
+    # Test complex combination (AND + OR)
+    complex_query: SpanQuery = {
+        'and_': [
+            {'has_attributes': {'level': '1'}},
+            {'or_': [{'has_attributes': {'category': 'important'}}, {'name_equals': 'child2'}]},
+        ]
+    }
+    matched_nodes = list(tree.find(complex_query))
+    assert len(matched_nodes) == 3  # child1, child2, special
+    matched_names = [node.name for node in matched_nodes]
+    assert set(matched_names) == {'child1', 'child2', 'special'}
+
+async def test_span_query_timing_conditions():
+    """Test timing-related conditions in SpanQuery."""
+    from datetime import timedelta
+
+    with context_subtree() as tree:
+        with logfire.span('fast_operation'):
+            pass
+
+        with logfire.span('medium_operation'):
+            logfire.info('add a wait')
+
+        with logfire.span('slow_operation'):
+            logfire.info('add a wait')
+            logfire.info('add a wait')
+    assert isinstance(tree, SpanTree)
+
+    durations = sorted([node.duration for node in tree if node.duration > timedelta(seconds=0)])
+    fast_threshold = (durations[0] + durations[1]) / 2
+    medium_threshold = (durations[1] + durations[2]) / 2
+
+    # Test min_duration
+    min_duration_query: SpanQuery = {'min_duration': fast_threshold}
+    matched_nodes = list(tree.find(min_duration_query))
+    assert len(matched_nodes) == 2
+    assert 'fast_operation' not in [node.name for node in matched_nodes]
+
+    # Test max_duration
+    max_duration_queries: list[SpanQuery] = [
+        {'min_duration': 0.001, 'max_duration': medium_threshold},
+        {'min_duration': 0.001, 'max_duration': medium_threshold.seconds},
+    ]
+    for max_duration_query in max_duration_queries:
+        matched_nodes = list(tree.find(max_duration_query))
+        assert len(matched_nodes) == 2
+        assert 'slow_operation' not in [node.name for node in matched_nodes]
+
+    # Test min and max duration together using timedelta
+    duration_range_query: SpanQuery = {
+        'min_duration': fast_threshold,
+        'max_duration': medium_threshold,
+    }
+    matched_node = tree.first(duration_range_query)
+    assert matched_node is not None
+    assert matched_node.name == 'medium_operation'
+
+## tests/graph/beta/test_paths.py
+
+async def test_path_next_path():
+    """Test Path.next_path removes first item."""
+    items: list[PathItem] = [LabelMarker('first'), LabelMarker('second'), DestinationMarker(NodeID('dest'))]
+    path = Path(items=items)
+
+    next_path = path.next_path
+    assert len(next_path.items) == 2
+    assert next_path.items[0] == items[1]
+    assert next_path.items[1] == items[2]
+
+## tests/graph/beta/test_v1_v2_integration.py
+
+async def test_v1_node_conditional_return():
+    """Test v1 nodes with conditional returns creating implicit decisions."""
+
+    @dataclass
+    class RouterNode(BaseNode[IntegrationState, None, str]):
+        value: int
+
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> PathA | PathB:
+            if self.value < 10:
+                return PathA()
+            else:
+                return PathB()
+
+    @dataclass
+    class PathA(BaseNode[IntegrationState, None, str]):
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> End[str]:
+            return End('Path A')
+
+    @dataclass
+    class PathB(BaseNode[IntegrationState, None, str]):
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> End[str]:
+            return End('Path B')
+
+    g = GraphBuilder(state_type=IntegrationState, input_type=int, output_type=str)
+
+    @g.step
+    async def create_router(ctx: StepContext[IntegrationState, None, int]) -> RouterNode:
+        return RouterNode(ctx.inputs)
+
+    g.add(
+        g.node(RouterNode),
+        g.node(PathA),
+        g.node(PathB),
+        g.edge_from(g.start_node).to(create_router),
+    )
+
+    graph = g.build()
+
+    assert str(graph) == snapshot("""\
+stateDiagram-v2
+  create_router
+  RouterNode
+  state decision <<choice>>
+  PathA
+  PathB
+
+  [*] --> create_router
+  create_router --> RouterNode
+  RouterNode --> decision
+  decision --> PathA
+  decision --> PathB
+  PathA --> [*]
+  PathB --> [*]\
+""")
+
+    # Test path A
+    result_a = await graph.run(state=IntegrationState(), inputs=5)
+    assert result_a == 'Path A'
+
+    # Test path B
+    result_b = await graph.run(state=IntegrationState(), inputs=15)
+    assert result_b == 'Path B'
+
+## tests/models/xai_proto_cassettes.py
+
+class XaiProtoCassette
+    """Cassette storing an ordered list of request/response interactions.
+
+    Each interaction pairs a request with its response, using `SampleInteraction`
+    for `chat.sample()` calls and `StreamInteraction` for `chat.stream()` calls."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def load(cls, path: Path) -> XaiProtoCassette:
+        data = yaml.safe_load(path.read_text(encoding='utf-8'))
+
+        interactions: list[Interaction] = []
+        for item in data.get('interactions', []):
+            if 'request_sample' in item:
+                req = item['request_sample']
+                resp = item['response_sample']
+                interactions.append(
+                    SampleInteraction(
+                        request_raw=req['raw'],
+                        response_raw=resp['raw'],
+                        request_json=req.get('json'),
+                        response_json=resp.get('json'),
+                    )
+                )
+            elif 'request_stream' in item:
+                req = item['request_stream']
+                resp = item['response_stream']
+                interactions.append(
+                    StreamInteraction(
+                        request_raw=req['raw'],
+                        chunks_raw=resp['chunks_raw'],
+                        request_json=req.get('json'),
+                        chunks_json=resp.get('chunks_json'),
+                    )
+                )
+        return cls(interactions=interactions)
+
+    def from_path(cls, path: Path) -> XaiProtoCassetteClient:
+        return cls(cassette=XaiProtoCassette.load(path))
+
+## tests/test_examples.py
+
+def tmp_path_cwd(tmp_path: Path):
+    cwd = os.getcwd()
+
+    root_dir = Path(__file__).parent.parent
+    for file in (root_dir / 'tests' / 'example_modules').glob('*.py'):
+        shutil.copy(file, tmp_path)
+    sys.path.append(str(tmp_path))
+    os.chdir(tmp_path)
+
+    try:
+        yield tmp_path
+    finally:
+        os.chdir(cwd)
+        sys.path.remove(str(tmp_path))
+
+## tests/test_messages.py
+
+def test_binary_content_from_path(tmp_path: Path):
+    # test normal file
+    test_xml_file = tmp_path / 'test.xml'
+    test_xml_file.write_text('<think>about trains</think>', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_xml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'<think>about trains</think>', media_type='application/xml'))
+
+    # test non-existent file
+    non_existent_file = tmp_path / 'non-existent.txt'
+    with pytest.raises(FileNotFoundError, match='File not found:'):
+        BinaryContent.from_path(non_existent_file)
+
+    # test file with unknown media type
+    test_unknown_file = tmp_path / 'test.unknownext'
+    test_unknown_file.write_text('some content', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_unknown_file)
+    assert binary_content == snapshot(BinaryContent(data=b'some content', media_type='application/octet-stream'))
+
+    # test string path
+    test_txt_file = tmp_path / 'test.txt'
+    test_txt_file.write_text('just some text', encoding='utf-8')
+    string_path = test_txt_file.as_posix()
+    binary_content = BinaryContent.from_path(string_path)  # pyright: ignore[reportArgumentType]
+    assert binary_content == snapshot(BinaryContent(data=b'just some text', media_type='text/plain'))
+
+    # test image file
+    test_jpg_file = tmp_path / 'test.jpg'
+    test_jpg_file.write_bytes(b'\xff\xd8\xff\xe0' + b'0' * 100)  # minimal JPEG header + padding
+    binary_content = BinaryContent.from_path(test_jpg_file)
+    assert binary_content == snapshot(
+        BinaryImage(data=b'\xff\xd8\xff\xe0' + b'0' * 100, media_type='image/jpeg', _identifier='bc8d49')
+    )
+
+    # test yaml file
+    test_yaml_file = tmp_path / 'config.yaml'
+    test_yaml_file.write_text('key: value', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_yaml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'key: value', media_type='application/yaml'))
+
+    # test yml file (alternative extension)
+    test_yml_file = tmp_path / 'docker-compose.yml'
+    test_yml_file.write_text('version: "3"', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_yml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'version: "3"', media_type='application/yaml'))
+
+    # test toml file
+    test_toml_file = tmp_path / 'pyproject.toml'
+    test_toml_file.write_text('[project]\nname = "test"', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_toml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'[project]\nname = "test"', media_type='application/toml'))
+
+## tests/test_prefect.py
+
+def conditions(city: str) -> str:
+    # Simplified version without RunContext
+    return "It's raining"

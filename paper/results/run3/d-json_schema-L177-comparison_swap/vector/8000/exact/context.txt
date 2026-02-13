@@ -1,0 +1,879 @@
+# pydantic_ai_slim/pydantic_ai/_utils.py:305-372
+class PeekableAsyncStream(Generic[T]):
+    """Wraps an async iterable of type T and allows peeking at the *next* item without consuming it.
+
+    We only buffer one item at a time (the next item). Once that item is yielded, it is discarded.
+    This is a single-pass stream.
+    """
+
+    def __init__(self, source: AsyncIterable[T]):
+        self._source = source
+        self._source_iter: AsyncIterator[T] | None = None
+        self._buffer: T | Unset = UNSET
+        self._exhausted = False
+
+    async def peek(self) -> T | Unset:
+        """Returns the next item that would be yielded without consuming it.
+
+        Returns None if the stream is exhausted.
+        """
+        if self._exhausted:
+            return UNSET
+
+        # If we already have a buffered item, just return it.
+        if not isinstance(self._buffer, Unset):
+            return self._buffer
+
+        # Otherwise, we need to fetch the next item from the underlying iterator.
+        if self._source_iter is None:
+            self._source_iter = aiter(self._source)
+
+        try:
+            self._buffer = await anext(self._source_iter)
+        except StopAsyncIteration:
+            self._exhausted = True
+            return UNSET
+
+        return self._buffer
+
+    async def is_exhausted(self) -> bool:
+        """Returns True if the stream is exhausted, False otherwise."""
+        return isinstance(await self.peek(), Unset)
+
+    def __aiter__(self) -> AsyncIterator[T]:
+        # For a single-pass iteration, we can return self as the iterator.
+        return self
+
+    async def __anext__(self) -> T:
+        """Yields the buffered item if present, otherwise fetches the next item from the underlying source.
+
+        Raises StopAsyncIteration if the stream is exhausted.
+        """
+        if self._exhausted:
+            raise StopAsyncIteration
+
+        # If we have a buffered item, yield it.
+        if not isinstance(self._buffer, Unset):
+            item = self._buffer
+            self._buffer = UNSET
+            return item
+
+        # Otherwise, fetch the next item from the source.
+        if self._source_iter is None:
+            self._source_iter = aiter(self._source)
+
+        try:
+            return await anext(self._source_iter)
+        except StopAsyncIteration:
+            self._exhausted = True
+            raise
+
+# tests/models/mock_async_stream.py:22-63
+class MockAsyncStream(Generic[T]):
+    """Wraps a synchronous iterator in an asynchronous interface.
+
+    This class allows a synchronous iterator to be treated as an
+    asynchronous iterator, enabling iteration in `async for` loops
+    and usage within `async with` blocks.
+
+    Example usage:
+        async def example():
+            sync_iter = iter([1, 2, 3])
+            async_stream = MockAsyncStream(sync_iter)
+
+            async for item in async_stream:
+                print(item)
+
+            async with MockAsyncStream(sync_iter) as stream:
+                async for item in stream:
+                    print(item)
+    """
+
+    _iter: Iterator[T]
+    """The underlying synchronous iterator."""
+
+    async def __anext__(self) -> T:
+        """Return the next item from the synchronous iterator as if it were asynchronous.
+
+        Calls `_utils.sync_anext` to retrieve the next item from the underlying
+        synchronous iterator. If the iterator is exhausted, `StopAsyncIteration`
+        is raised.
+        """
+        next = _utils.sync_anext(self._iter)
+        raise_if_exception(next)
+        return next
+
+    def __aiter__(self) -> MockAsyncStream[T]:
+        return self
+
+    async def __aenter__(self) -> MockAsyncStream[T]:
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        pass
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:350-372
+    async def __anext__(self) -> T:
+        """Yields the buffered item if present, otherwise fetches the next item from the underlying source.
+
+        Raises StopAsyncIteration if the stream is exhausted.
+        """
+        if self._exhausted:
+            raise StopAsyncIteration
+
+        # If we have a buffered item, yield it.
+        if not isinstance(self._buffer, Unset):
+            item = self._buffer
+            self._buffer = UNSET
+            return item
+
+        # Otherwise, fetch the next item from the source.
+        if self._source_iter is None:
+            self._source_iter = aiter(self._source)
+
+        try:
+            return await anext(self._source_iter)
+        except StopAsyncIteration:
+            self._exhausted = True
+            raise
+
+# pydantic_ai_slim/pydantic_ai/models/__init__.py:1274-1333
+async def download_item(
+    item: FileUrl,
+    data_format: Literal['bytes', 'base64', 'base64_uri', 'text'] = 'bytes',
+    type_format: Literal['mime', 'extension'] = 'mime',
+) -> DownloadedItem[str] | DownloadedItem[bytes]:
+    """Download an item by URL and return the content as a bytes object or a (base64-encoded) string.
+
+    This function includes SSRF (Server-Side Request Forgery) protection:
+    - Only http:// and https:// protocols are allowed
+    - Private/internal IP addresses are blocked by default
+    - Cloud metadata endpoints (169.254.169.254) are always blocked
+    - Hostnames are resolved before requests to prevent DNS rebinding
+
+    Set `item.force_download='allow-local'` to allow private IP addresses.
+
+    Args:
+        item: The item to download.
+        data_format: The format to return the content in:
+            - `bytes`: The raw bytes of the content.
+            - `base64`: The base64-encoded content.
+            - `base64_uri`: The base64-encoded content as a data URI.
+            - `text`: The content as a string.
+        type_format: The format to return the media type in:
+            - `mime`: The media type as a MIME type.
+            - `extension`: The media type as an extension.
+
+    Raises:
+        UserError: If the URL points to a YouTube video.
+        ValueError: If the URL uses an unsupported protocol or targets a private/internal
+            IP address (unless allow-local is set).
+    """
+    if isinstance(item, VideoUrl) and item.is_youtube:
+        raise UserError('Downloading YouTube videos is not supported.')
+
+    from .._ssrf import safe_download
+
+    allow_local = item.force_download == 'allow-local'
+    response = await safe_download(item.url, allow_local=allow_local)
+
+    if content_type := response.headers.get('content-type'):
+        content_type = content_type.split(';')[0]
+        if content_type == 'application/octet-stream':
+            content_type = None
+
+    media_type = content_type or item.media_type
+
+    data_type = media_type
+    if type_format == 'extension':
+        data_type = item.format
+
+    data = response.content
+    if data_format in ('base64', 'base64_uri'):
+        data = base64.b64encode(data).decode('utf-8')
+        if data_format == 'base64_uri':
+            data = f'data:{media_type};base64,{data}'
+        return DownloadedItem[str](data=data, data_type=data_type)
+    elif data_format == 'text':
+        return DownloadedItem[str](data=data.decode('utf-8'), data_type=data_type)
+    else:
+        return DownloadedItem[bytes](data=data, data_type=data_type)
+
+# tests/models/mock_async_stream.py:45-54
+    async def __anext__(self) -> T:
+        """Return the next item from the synchronous iterator as if it were asynchronous.
+
+        Calls `_utils.sync_anext` to retrieve the next item from the underlying
+        synchronous iterator. If the iterator is exhausted, `StopAsyncIteration`
+        is raised.
+        """
+        next = _utils.sync_anext(self._iter)
+        raise_if_exception(next)
+        return next
+
+# pydantic_ai_slim/pydantic_ai/embeddings/result.py:85-101
+    def __getitem__(self, item: int | str) -> Sequence[float]:
+        """Get the embedding for an input by index or by the original input text.
+
+        Args:
+            item: Either an integer index or the original input string.
+
+        Returns:
+            The embedding vector for the specified input.
+
+        Raises:
+            IndexError: If the index is out of range.
+            ValueError: If the string is not found in the inputs.
+        """
+        if isinstance(item, str):
+            item = self.inputs.index(item)
+
+        return self.embeddings[item]
+
+# pydantic_evals/pydantic_evals/dataset.py:230-230
+    cases: list[Case[InputsT, OutputT, MetadataT]]
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:305-305
+    cases: list[ReportCase[InputsT, OutputT, MetadataT]]
+
+# pydantic_evals/pydantic_evals/dataset.py:105-105
+    cases: list[_CaseModel[InputsT, OutputT, MetadataT]]
+
+# pydantic_graph/pydantic_graph/beta/graph.py:462-472
+    async def __anext__(self) -> EndMarker[OutputT] | Sequence[GraphTask]:
+        """Get the next item in the async iteration.
+
+        Returns:
+            The next execution result from the graph
+        """
+        if self._next is None:
+            self._next = await anext(self._iterator)
+        else:
+            self._next = await self._iterator.asend(self._next)
+        return self._next
+
+# pydantic_ai_slim/pydantic_ai/format_prompt.py:20-77
+def format_as_xml(
+    obj: Any,
+    root_tag: str | None = None,
+    item_tag: str = 'item',
+    none_str: str = 'null',
+    indent: str | None = '  ',
+    include_field_info: Literal['once'] | bool = False,
+) -> str:
+    """Format a Python object as XML.
+
+    This is useful since LLMs often find it easier to read semi-structured data (e.g. examples) as XML,
+    rather than JSON etc.
+
+    Supports: `str`, `bytes`, `bytearray`, `bool`, `int`, `float`, `Decimal`, `date`, `datetime`, `time`, `timedelta`,
+    `UUID`, `Enum`, `Mapping`, `Iterable`, `dataclass`, and `BaseModel`.
+
+    Args:
+        obj: Python Object to serialize to XML.
+        root_tag: Outer tag to wrap the XML in, use `None` to omit the outer tag.
+        item_tag: Tag to use for each item in an iterable (e.g. list), this is overridden by the class name
+            for dataclasses and Pydantic models.
+        none_str: String to use for `None` values.
+        indent: Indentation string to use for pretty printing.
+        include_field_info: Whether to include attributes like Pydantic `Field` attributes and dataclasses `field()`
+            `metadata` as XML attributes. In both cases the allowed `Field` attributes and `field()` metadata keys are
+            `title` and `description`. If a field is repeated in the data (e.g. in a list) by setting `once`
+            the attributes are included only in the first occurrence of an XML element relative to the same field.
+
+    Returns:
+        XML representation of the object.
+
+    Example:
+    ```python {title="format_as_xml_example.py" lint="skip"}
+    from pydantic_ai import format_as_xml
+
+    print(format_as_xml({'name': 'John', 'height': 6, 'weight': 200}, root_tag='user'))
+    '''
+    <user>
+      <name>John</name>
+      <height>6</height>
+      <weight>200</weight>
+    </user>
+    '''
+    ```
+    """
+    el = _ToXml(
+        data=obj,
+        item_tag=item_tag,
+        none_str=none_str,
+        include_field_info=include_field_info,
+    ).to_xml(root_tag)
+    if root_tag is None and el.text is None:
+        join = '' if indent is None else '\n'
+        return join.join(_rootless_xml_elements(el, indent))
+    else:
+        if indent is not None:
+            ElementTree.indent(el, space=indent)
+        return ElementTree.tostring(el, encoding='unicode')
+
+# tests/test_usage_limits.py:3-3
+import operator
+
+# pydantic_ai_slim/pydantic_ai/models/wrapper.py:87-88
+    def __getattr__(self, item: str):
+        return getattr(self.wrapped, item)
+
+# pydantic_ai_slim/pydantic_ai/embeddings/wrapper.py:71-72
+    def __getattr__(self, item: str):
+        return getattr(self.wrapped, item)  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/models/openai.py:1030-1037
+        def _map_response_builtin_part(self, item: BuiltinToolCallPart | BuiltinToolReturnPart) -> None:
+            """Maps a built-in tool call or return part to the response context.
+
+            This method serves as a hook that can be overridden by subclasses
+            to implement custom logic for handling built-in tool parts.
+            """
+            # OpenAI doesn't return built-in tool calls
+            pass
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:650-676
+    async def read_resource(
+        self, uri: str | Resource
+    ) -> str | messages.BinaryContent | list[str | messages.BinaryContent]:
+        """Read the contents of a specific resource by URI.
+
+        Args:
+            uri: The URI of the resource to read, or a Resource object.
+
+        Returns:
+            The resource contents. If the resource has a single content item, returns that item directly.
+            If the resource has multiple content items, returns a list of items.
+
+        Raises:
+            MCPError: If the server returns an error.
+        """
+        resource_uri = uri if isinstance(uri, str) else uri.uri
+        async with self:  # Ensure server is running
+            try:
+                result = await self._client.read_resource(AnyUrl(resource_uri))
+            except mcp_exceptions.McpError as e:
+                raise MCPError.from_mcp_sdk(e) from e
+
+        return (
+            self._get_content(result.contents[0])
+            if len(result.contents) == 1
+            else [self._get_content(resource) for resource in result.contents]
+        )
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:318-340
+    async def peek(self) -> T | Unset:
+        """Returns the next item that would be yielded without consuming it.
+
+        Returns None if the stream is exhausted.
+        """
+        if self._exhausted:
+            return UNSET
+
+        # If we already have a buffered item, just return it.
+        if not isinstance(self._buffer, Unset):
+            return self._buffer
+
+        # Otherwise, we need to fetch the next item from the underlying iterator.
+        if self._source_iter is None:
+            self._source_iter = aiter(self._source)
+
+        try:
+            self._buffer = await anext(self._source_iter)
+        except StopAsyncIteration:
+            self._exhausted = True
+            return UNSET
+
+        return self._buffer
+
+# pydantic_graph/pydantic_graph/_utils.py:89-95
+def comma_and(items: list[str]) -> str:
+    """Join with a comma and 'and' for the last item."""
+    if len(items) == 1:
+        return items[0]
+    else:
+        # oxford comma ¯\_(ツ)_/¯
+        return ', '.join(items[:-1]) + ', and ' + items[-1]
+
+# pydantic_graph/pydantic_graph/beta/graph.py:500-506
+    def next_task(self) -> EndMarker[OutputT] | Sequence[GraphTask]:
+        """Get the next task(s) to be executed.
+
+        Returns:
+            The next execution item, or the initial task if none is set
+        """
+        return self._next or [self._first_task]
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:20-20
+    type: Literal['tool_call']
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:15-15
+    type: Literal['text']
+
+# pydantic_ai_slim/pydantic_ai/models/openrouter.py:587-593
+        def _map_response_thinking_part(self, item: ThinkingPart) -> None:
+            assert isinstance(self._model, OpenRouterModel)
+            if item.provider_name == self._model.system:
+                if reasoning_detail := _into_reasoning_detail(item):  # pragma: lax no cover
+                    self.reasoning_details.append(reasoning_detail.model_dump())
+            else:  # pragma: lax no cover
+                super()._map_response_thinking_part(item)
+
+# pydantic_graph/pydantic_graph/beta/step.py:90-112
+class StreamFunction(Protocol[StateT, DepsT, InputT, OutputT]):
+    """Protocol for stream functions that can be executed in the graph.
+
+    Stream functions are async callables that receive a step context and return an async iterator.
+
+    Type Parameters:
+        StateT: The type of the graph state
+        DepsT: The type of the dependencies
+        InputT: The type of the input data
+        OutputT: The type of the output data
+    """
+
+    def __call__(self, ctx: StepContext[StateT, DepsT, InputT]) -> AsyncIterator[OutputT]:
+        """Execute the stream function with the given context.
+
+        Args:
+            ctx: The step context containing state, dependencies, and inputs
+
+        Returns:
+            An async iterator yielding the streamed output
+        """
+        raise NotImplementedError
+        yield
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:47-47
+    type: Literal['thinking']
+
+# tests/graph/beta/test_edge_cases.py:106-129
+async def test_map_single_item():
+    """Test mapping a single-item list."""
+    g = GraphBuilder(state_type=EdgeCaseState, output_type=list[int])
+
+    @g.step
+    async def single_item(ctx: StepContext[EdgeCaseState, None, None]) -> list[int]:
+        return [42]
+
+    @g.step
+    async def process(ctx: StepContext[EdgeCaseState, None, int]) -> int:
+        return ctx.inputs * 2
+
+    collect = g.join(reduce_list_append, initial_factory=list[int])
+
+    g.add(
+        g.edge_from(g.start_node).to(single_item),
+        g.edge_from(single_item).map().to(process),
+        g.edge_from(process).to(collect),
+        g.edge_from(collect).to(g.end_node),
+    )
+
+    graph = g.build()
+    result = await graph.run(state=EdgeCaseState())
+    assert result == [84]
+
+# pydantic_graph/pydantic_graph/beta/step.py:66-87
+class StepFunction(Protocol[StateT, DepsT, InputT, OutputT]):
+    """Protocol for step functions that can be executed in the graph.
+
+    Step functions are async callables that receive a step context and return a result.
+
+    Type Parameters:
+        StateT: The type of the graph state
+        DepsT: The type of the dependencies
+        InputT: The type of the input data
+        OutputT: The type of the output data
+    """
+
+    def __call__(self, ctx: StepContext[StateT, DepsT, InputT]) -> Awaitable[OutputT]:
+        """Execute the step function with the given context.
+
+        Args:
+            ctx: The step context containing state, dependencies, and inputs
+
+        Returns:
+            An awaitable that resolves to the step's output
+        """
+        raise NotImplementedError
+
+# pydantic_ai_slim/pydantic_ai/models/anthropic.py:1379-1407
+def _map_server_tool_use_block(item: BetaServerToolUseBlock, provider_name: str) -> BuiltinToolCallPart:
+    if item.name == 'web_search':
+        return BuiltinToolCallPart(
+            provider_name=provider_name,
+            tool_name=WebSearchTool.kind,
+            args=cast(dict[str, Any], item.input) or None,
+            tool_call_id=item.id,
+        )
+    elif item.name == 'code_execution':
+        return BuiltinToolCallPart(
+            provider_name=provider_name,
+            tool_name=CodeExecutionTool.kind,
+            args=cast(dict[str, Any], item.input) or None,
+            tool_call_id=item.id,
+        )
+    elif item.name == 'web_fetch':
+        return BuiltinToolCallPart(
+            provider_name=provider_name,
+            tool_name=WebFetchTool.kind,
+            args=cast(dict[str, Any], item.input) or None,
+            tool_call_id=item.id,
+        )
+    elif item.name in ('bash_code_execution', 'text_editor_code_execution'):  # pragma: no cover
+        raise NotImplementedError(f'Anthropic built-in tool {item.name!r} is not currently supported.')
+    elif item.name in ('tool_search_tool_regex', 'tool_search_tool_bm25'):  # pragma: no cover
+        # NOTE this is being implemented in https://github.com/pydantic/pydantic-ai/pull/3550
+        raise NotImplementedError(f'Anthropic built-in tool {item.name!r} is not currently supported.')
+    else:
+        assert_never(item.name)
+
+# pydantic_ai_slim/pydantic_ai/models/anthropic.py:1450-1460
+def _map_mcp_server_use_block(item: BetaMCPToolUseBlock, provider_name: str) -> BuiltinToolCallPart:
+    return BuiltinToolCallPart(
+        provider_name=provider_name,
+        tool_name=':'.join([MCPServerTool.kind, item.server_name]),
+        args={
+            'action': 'call_tool',
+            'tool_name': item.name,
+            'tool_args': cast(dict[str, Any], item.input),
+        },
+        tool_call_id=item.id,
+    )
+
+# pydantic_ai_slim/pydantic_ai/models/anthropic.py:1415-1421
+def _map_web_search_tool_result_block(item: BetaWebSearchToolResultBlock, provider_name: str) -> BuiltinToolReturnPart:
+    return BuiltinToolReturnPart(
+        provider_name=provider_name,
+        tool_name=WebSearchTool.kind,
+        content=web_search_tool_result_content_ta.dump_python(item.content, mode='json'),
+        tool_call_id=item.tool_use_id,
+    )
+
+# pydantic_ai_slim/pydantic_ai/models/anthropic.py:1429-1437
+def _map_code_execution_tool_result_block(
+    item: BetaCodeExecutionToolResultBlock, provider_name: str
+) -> BuiltinToolReturnPart:
+    return BuiltinToolReturnPart(
+        provider_name=provider_name,
+        tool_name=CodeExecutionTool.kind,
+        content=code_execution_tool_result_content_ta.dump_python(item.content, mode='json'),
+        tool_call_id=item.tool_use_id,
+    )
+
+# pydantic_ai_slim/pydantic_ai/models/anthropic.py:1440-1447
+def _map_web_fetch_tool_result_block(item: BetaWebFetchToolResultBlock, provider_name: str) -> BuiltinToolReturnPart:
+    return BuiltinToolReturnPart(
+        provider_name=provider_name,
+        tool_name=WebFetchTool.kind,
+        # Store just the content field (BetaWebFetchBlock) which has {content, type, url, retrieved_at}
+        content=item.content.model_dump(mode='json'),
+        tool_call_id=item.tool_use_id,
+    )
+
+# pydantic_graph/pydantic_graph/beta/paths.py:73-83
+class MapMarker:
+    """A marker indicating that iterable data should be map across parallel paths.
+
+    Spread markers take iterable input and create parallel execution paths
+    for each item in the iterable.
+    """
+
+    fork_id: ForkID
+    """Unique identifier for the fork created by this map operation."""
+    downstream_join_id: JoinID | None
+    """Optional identifier of a downstream join node that should be jumped to if mapping an empty iterable."""
+
+# tests/graph/beta/test_paths.py:100-108
+async def test_path_next_path():
+    """Test Path.next_path removes first item."""
+    items: list[PathItem] = [LabelMarker('first'), LabelMarker('second'), DestinationMarker(NodeID('dest'))]
+    path = Path(items=items)
+
+    next_path = path.next_path
+    assert len(next_path.items) == 2
+    assert next_path.items[0] == items[1]
+    assert next_path.items[1] == items[2]
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:262-270
+def sync_anext(iterator: Iterator[T]) -> T:
+    """Get the next item from a sync iterator, raising `StopAsyncIteration` if it's exhausted.
+
+    Useful when iterating over a sync iterator in an async context.
+    """
+    try:
+        return next(iterator)
+    except StopIteration as e:
+        raise StopAsyncIteration() from e
+
+# pydantic_graph/pydantic_graph/beta/step.py:120-165
+class Step(Generic[StateT, DepsT, InputT, OutputT]):
+    """A step in the graph execution that wraps a step function.
+
+    Steps represent individual units of execution in the graph, encapsulating
+    a step function along with metadata like ID and label.
+
+    Type Parameters:
+        StateT: The type of the graph state
+        DepsT: The type of the dependencies
+        InputT: The type of the input data
+        OutputT: The type of the output data
+    """
+
+    id: NodeID
+    """Unique identifier for this step."""
+    _call: StepFunction[StateT, DepsT, InputT, OutputT]
+    """The step function to execute."""
+    label: str | None
+    """Optional human-readable label for this step."""
+
+    def __init__(self, *, id: NodeID, call: StepFunction[StateT, DepsT, InputT, OutputT], label: str | None = None):
+        self.id = id
+        self._call = call
+        self.label = label
+
+    @property
+    def call(self) -> StepFunction[StateT, DepsT, InputT, OutputT]:
+        """The step function to execute. This needs to be a property for proper variance inference."""
+        return self._call
+
+    @overload
+    def as_node(self, inputs: None = None) -> StepNode[StateT, DepsT]: ...
+
+    @overload
+    def as_node(self, inputs: InputT) -> StepNode[StateT, DepsT]: ...
+
+    def as_node(self, inputs: InputT | None = None) -> StepNode[StateT, DepsT]:
+        """Create a step node with bound inputs.
+
+        Args:
+            inputs: The input data to bind to this step, or None
+
+        Returns:
+            A [`StepNode`][pydantic_graph.beta.step.StepNode] with this step and the bound inputs
+        """
+        return StepNode(self, inputs)
+
+# pydantic_evals/pydantic_evals/dataset.py:237-266
+    def __init__(
+        self,
+        *,
+        name: str | None = None,
+        cases: Sequence[Case[InputsT, OutputT, MetadataT]],
+        evaluators: Sequence[Evaluator[InputsT, OutputT, MetadataT]] = (),
+        report_evaluators: Sequence[ReportEvaluator[InputsT, OutputT, MetadataT]] = (),
+    ):
+        """Initialize a new dataset with test cases and optional evaluators.
+
+        Args:
+            name: Optional name for the dataset.
+            cases: Sequence of test cases to include in the dataset.
+            evaluators: Optional sequence of evaluators to apply to all cases in the dataset.
+            report_evaluators: Optional sequence of report evaluators that run on the full evaluation report.
+        """
+        case_names = set[str]()
+        for case in cases:
+            if case.name is None:
+                continue
+            if case.name in case_names:
+                raise ValueError(f'Duplicate case name: {case.name!r}')
+            case_names.add(case.name)
+
+        super().__init__(
+            name=name,
+            cases=cases,
+            evaluators=list(evaluators),
+            report_evaluators=list(report_evaluators),
+        )
+
+# pydantic_ai_slim/pydantic_ai/models/openai.py:2895-2925
+def _map_web_search_tool_call(
+    item: responses.ResponseFunctionWebSearch, provider_name: str
+) -> tuple[BuiltinToolCallPart, BuiltinToolReturnPart]:
+    args: dict[str, Any] | None = None
+
+    result = {
+        'status': item.status,
+    }
+
+    if action := item.action:
+        # We need to exclude None values because of https://github.com/pydantic/pydantic-ai/issues/3653
+        args = action.model_dump(mode='json', exclude_none=True)
+
+        # To prevent `Unknown parameter: 'input[2].action.sources'` for `ActionSearch`
+        if sources := args.pop('sources', None):
+            result['sources'] = sources
+
+    return (
+        BuiltinToolCallPart(
+            tool_name=WebSearchTool.kind,
+            tool_call_id=item.id,
+            args=args,
+            provider_name=provider_name,
+        ),
+        BuiltinToolReturnPart(
+            tool_name=WebSearchTool.kind,
+            tool_call_id=item.id,
+            content=result,
+            provider_name=provider_name,
+        ),
+    )
+
+# pydantic_ai_slim/pydantic_ai/models/openai.py:2928-2953
+def _map_file_search_tool_call(
+    item: responses.ResponseFileSearchToolCall,
+    provider_name: str,
+) -> tuple[BuiltinToolCallPart, BuiltinToolReturnPart]:
+    args = {'queries': item.queries}
+
+    result: dict[str, Any] = {
+        'status': item.status,
+    }
+    if item.results is not None:
+        result['results'] = [r.model_dump(mode='json') for r in item.results]
+
+    return (
+        BuiltinToolCallPart(
+            tool_name=FileSearchTool.kind,
+            tool_call_id=item.id,
+            args=args,
+            provider_name=provider_name,
+        ),
+        BuiltinToolReturnPart(
+            tool_name=FileSearchTool.kind,
+            tool_call_id=item.id,
+            content=result,
+            provider_name=provider_name,
+        ),
+    )
+
+# pydantic_evals/pydantic_evals/dataset.py:281-405
+    async def evaluate(
+        self,
+        task: Callable[[InputsT], Awaitable[OutputT]] | Callable[[InputsT], OutputT],
+        name: str | None = None,
+        max_concurrency: int | None = None,
+        progress: bool = True,
+        retry_task: RetryConfig | None = None,
+        retry_evaluators: RetryConfig | None = None,
+        *,
+        task_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        repeat: int = 1,
+    ) -> EvaluationReport[InputsT, OutputT, MetadataT]:
+        """Evaluates the test cases in the dataset using the given task.
+
+        This method runs the task on each case in the dataset, applies evaluators,
+        and collects results into a report. Cases are run concurrently, limited by `max_concurrency` if specified.
+
+        Args:
+            task: The task to evaluate. This should be a callable that takes the inputs of the case
+                and returns the output.
+            name: The name of the experiment being run, this is used to identify the experiment in the report.
+                If omitted, the task_name will be used; if that is not specified, the name of the task function is used.
+            max_concurrency: The maximum number of concurrent evaluations of the task to allow.
+                If None, all cases will be evaluated concurrently.
+            progress: Whether to show a progress bar for the evaluation. Defaults to `True`.
+            retry_task: Optional retry configuration for the task execution.
+            retry_evaluators: Optional retry configuration for evaluator execution.
+            task_name: Optional override to the name of the task being executed, otherwise the name of the task
+                function will be used.
+            metadata: Optional dict of experiment metadata.
+            repeat: Number of times to run each case. When > 1, each case is run multiple times and
+                results are grouped by the original case name for aggregation. Defaults to 1.
+
+        Returns:
+            A report containing the results of the evaluation.
+        """
+        if repeat < 1:
+            raise ValueError(f'repeat must be >= 1, got {repeat}')
+
+        task_name = task_name or get_unwrapped_function_name(task)
+        name = name or task_name
+
+        tasks_to_run = self._build_tasks_to_run(repeat)
+        total_tasks = len(tasks_to_run)
+        progress_bar = Progress() if progress else None
+
+        limiter = anyio.Semaphore(max_concurrency) if max_concurrency is not None else AsyncExitStack()
+
+        extra_attributes: dict[str, Any] = {'gen_ai.operation.name': 'experiment'}
+        if metadata is not None:
+            extra_attributes['metadata'] = metadata
+        if repeat > 1:
+            extra_attributes['logfire.experiment.repeat'] = repeat
+        with (
+            logfire_span(
+                'evaluate {name}',
+                name=name,
+                task_name=task_name,
+                dataset_name=self.name,
+                n_cases=len(self.cases),
+                **extra_attributes,
+            ) as eval_span,
+            progress_bar or nullcontext(),
+        ):
+            task_id = progress_bar.add_task(f'Evaluating {task_name}', total=total_tasks) if progress_bar else None
+
+            async def _handle_case(
+                case: Case[InputsT, OutputT, MetadataT],
+                report_case_name: str,
+                source_case_name: str | None,
+            ):
+                async with limiter:
+                    result = await _run_task_and_evaluators(
+                        task,
+                        case,
+                        report_case_name,
+                        self.evaluators,
+                        retry_task,
+                        retry_evaluators,
+                        source_case_name=source_case_name,
+                    )
+                    if progress_bar and task_id is not None:  # pragma: no branch
+                        progress_bar.update(task_id, advance=1)
+                    return result
+
+            if (context := eval_span.context) is None:  # pragma: no cover
+                trace_id = None
+                span_id = None
+            else:
+                trace_id = f'{context.trace_id:032x}'
+                span_id = f'{context.span_id:016x}'
+            cases_and_failures = await task_group_gather(
+                [
+                    lambda case=case, rn=report_name, scn=source_name: _handle_case(case, rn, scn)
+                    for case, report_name, source_name in tasks_to_run
+                ]
+            )
+            cases: list[ReportCase] = []
+            failures: list[ReportCaseFailure] = []
+            for item in cases_and_failures:
+                if isinstance(item, ReportCase):
+                    cases.append(item)
+                else:
+                    failures.append(item)
+            report = EvaluationReport(
+                name=name,
+                cases=cases,
+                failures=failures,
+                experiment_metadata=metadata,
+                span_id=span_id,
+                trace_id=trace_id,
+            )
+
+            # Run report evaluators
+            if self.report_evaluators:
+                report_ctx = ReportEvaluatorContext(
+                    name=name,
+                    report=report,
+                    experiment_metadata=metadata,
+                )
+                await _run_report_evaluators(self.report_evaluators, report_ctx)
+
+            _set_experiment_span_attributes(eval_span, report, metadata, len(self.cases), repeat)
+        return report
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:152-152
+    type: Annotated[str, Field(pattern=r'^tool-')]

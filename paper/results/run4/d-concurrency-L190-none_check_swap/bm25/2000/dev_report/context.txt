@@ -1,0 +1,225 @@
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/__init__.py:36-36
+import anyio._backends._asyncio  # pyright: ignore[reportUnusedImport]  #noqa: F401
+
+# tests/test_concurrency.py:44-60
+    async def test_basic_acquisition(self):
+        """Test that limiter limits concurrent access."""
+        limiter = ConcurrencyLimiter(max_running=2)
+        acquired: list[int] = []
+
+        async def acquire_and_hold(id: int, hold_time: float):
+            async with get_concurrency_context(limiter, 'test'):
+                acquired.append(id)
+                await anyio.sleep(hold_time)
+
+        # Start 3 tasks with limit of 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(acquire_and_hold, i, 0.1)
+            await anyio.sleep(0.05)
+            assert len(acquired) == 2  # Only 2 can proceed
+        assert len(acquired) == 3
+
+# tests/test_concurrency.py:571-590
+class TestConcurrencyLimiterWithTracer:
+    """Tests for ConcurrencyLimiter with custom tracer."""
+
+    async def test_custom_tracer_is_stored(self):
+        """Test that custom tracer is stored and returned by _get_tracer."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter(max_running=5, tracer=custom_tracer)
+
+        # Verify the tracer is stored and returned
+        assert limiter._get_tracer() is custom_tracer
+
+    async def test_from_limit_with_tracer(self):
+        """Test that from_limit passes tracer to the created limiter."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter.from_limit(5, tracer=custom_tracer)
+        assert limiter._get_tracer() is custom_tracer
+
+# tests/test_concurrency.py:453-568
+class TestConcurrencyLimiterName:
+    """Tests for ConcurrencyLimiter name parameter."""
+
+    async def test_limiter_with_name(self):
+        """Test that limiter name is properly set and accessible."""
+        limiter = ConcurrencyLimiter(max_running=5, name='my-limiter')
+        assert limiter.name == 'my-limiter'
+
+    async def test_limiter_without_name(self):
+        """Test that limiter name is None by default."""
+        limiter = ConcurrencyLimiter(max_running=5)
+        assert limiter.name is None
+
+    async def test_from_limit_with_name(self):
+        """Test creating limiter from limit with name."""
+        limiter = ConcurrencyLimiter.from_limit(5, name='my-limit')
+        assert limiter.name == 'my-limit'
+        assert limiter.max_running == 5
+
+    @pytest.mark.skipif(not logfire_installed, reason='logfire not installed')
+    async def test_named_limiter_waiting_adds_limiter_name_attribute(self, capfire: CaptureLogfire):
+        """Test that waiting with a named limiter adds limiter_name to span attributes."""
+        limiter = ConcurrencyLimiter(max_running=1, name='test-pool')
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test-source'):
+                await hold.wait()
+
+        # Start a waiter - this will trigger the span with limiter_name attribute
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test-source'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            # Start holder to occupy the slot
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span was created with the correct attributes
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for test-pool concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'test-source'
+        assert attrs['limiter_name'] == 'test-pool'
+        assert attrs['max_running'] == 1
+        assert 'waiting_count' in attrs
+
+    @pytest.mark.skipif(not logfire_installed, reason='logfire not installed')
+    async def test_unnamed_limiter_waiting_uses_source_in_span_name(self, capfire: CaptureLogfire):
+        """Test that waiting without a limiter name uses source for span name."""
+        limiter = ConcurrencyLimiter(max_running=1)  # No name
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span uses source in name when limiter has no name
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for model:gpt-4 concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'model:gpt-4'
+        assert 'limiter_name' not in attrs  # Should not be present when name is None
+        assert attrs['max_running'] == 1
+
+    @pytest.mark.skipif(not logfire_installed, reason='logfire not installed')
+    async def test_limiter_with_max_queued_includes_attribute_in_span(self, capfire: CaptureLogfire):
+        """Test that max_queued is included in span attributes when set."""
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=5, name='queued-pool')
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify max_queued is in span attributes
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        attrs = spans[0]['attributes']
+        assert attrs['max_queued'] == 5
+
+# tests/test_concurrency.py:461-464
+    async def test_limiter_without_name(self):
+        """Test that limiter name is None by default."""
+        limiter = ConcurrencyLimiter(max_running=5)
+        assert limiter.name is None
+
+# tests/test_concurrency.py:456-459
+    async def test_limiter_with_name(self):
+        """Test that limiter name is properly set and accessible."""
+        limiter = ConcurrencyLimiter(max_running=5, name='my-limiter')
+        assert limiter.name == 'my-limiter'
+
+# tests/test_concurrency.py:439-450
+class TestAgentWithSharedLimiter:
+    """Tests for agent with shared ConcurrencyLimiter."""
+
+    async def test_agent_with_shared_limiter(self):
+        """Test that agents can share a ConcurrencyLimiter."""
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        agent1 = Agent(TestModel(), max_concurrency=shared_limiter)
+        agent2 = Agent(TestModel(), max_concurrency=shared_limiter)
+
+        # Both agents should share the same limiter
+        assert agent1._concurrency_limiter is agent2._concurrency_limiter
+
+# tests/test_concurrency.py:176-180
+    async def test_from_int_limit(self):
+        """Test creating from simple int."""
+        limiter = ConcurrencyLimiter.from_limit(5)
+        assert limiter.max_running == 5
+        assert limiter._max_queued is None
+
+# tests/test_concurrency.py:338-344
+    async def test_with_int_limiter(self):
+        """Test ConcurrencyLimitedModel with int limiter."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        model = ConcurrencyLimitedModel(TestModel(), limiter=5)
+        assert model._limiter.max_running == 5
+        assert model._limiter._max_queued is None
+
+# pydantic_ai_slim/pydantic_ai/retries.py:61-61
+    sleep: Callable[[int | float], None | Awaitable[None]]
+
+# pydantic_ai_slim/pydantic_ai/retries.py:95-95
+    before_sleep: Callable[[RetryCallState], None | Awaitable[None]] | None
+
+# tests/test_concurrency.py:466-470
+    async def test_from_limit_with_name(self):
+        """Test creating limiter from limit with name."""
+        limiter = ConcurrencyLimiter.from_limit(5, name='my-limit')
+        assert limiter.name == 'my-limit'
+        assert limiter.max_running == 5
+
+# tests/test_concurrency.py:584-590
+    async def test_from_limit_with_tracer(self):
+        """Test that from_limit passes tracer to the created limiter."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter.from_limit(5, tracer=custom_tracer)
+        assert limiter._get_tracer() is custom_tracer

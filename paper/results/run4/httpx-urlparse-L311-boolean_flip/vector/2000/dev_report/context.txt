@@ -1,0 +1,233 @@
+# tests/models/test_whatwg.py:23-52
+def test_urlparse(test_case):
+    if test_case["href"] in ("a: foo.com", "lolscheme:x x#x%20x"):
+        # Skip these two test cases.
+        # WHATWG cases where are not using percent-encoding for the space character.
+        # Anyone know what's going on here?
+        return
+
+    p = urlparse(test_case["href"])
+
+    # Test cases include the protocol with the trailing ":"
+    protocol = p.scheme + ":"
+    # Include the square brackets for IPv6 addresses.
+    hostname = f"[{p.host}]" if ":" in p.host else p.host
+    # The test cases use a string representation of the port.
+    port = "" if p.port is None else str(p.port)
+    # I have nothing to say about this one.
+    path = p.path
+    # The 'search' and 'hash' components in the whatwg tests are semantic, not literal.
+    # Our parsing differentiates between no query/hash and empty-string query/hash.
+    search = "" if p.query in (None, "") else "?" + str(p.query)
+    hash = "" if p.fragment in (None, "") else "#" + str(p.fragment)
+
+    # URL hostnames are case-insensitive.
+    # We normalize these, unlike the WHATWG test cases.
+    assert protocol == test_case["protocol"]
+    assert hostname.lower() == test_case["hostname"].lower()
+    assert port == test_case["port"]
+    assert path == test_case["pathname"]
+    assert search == test_case["search"]
+    assert hash == test_case["hash"]
+
+# httpx/_urlparse.py:497-527
+def quote(string: str, safe: str) -> str:
+    """
+    Use percent-encoding to quote a string, omitting existing '%xx' escape sequences.
+
+    See: https://www.rfc-editor.org/rfc/rfc3986#section-2.1
+
+    * `string`: The string to be percent-escaped.
+    * `safe`: A string containing characters that may be treated as safe, and do not
+        need to be escaped. Unreserved characters are always treated as safe.
+        See: https://www.rfc-editor.org/rfc/rfc3986#section-2.3
+    """
+    parts = []
+    current_position = 0
+    for match in re.finditer(PERCENT_ENCODED_REGEX, string):
+        start_position, end_position = match.start(), match.end()
+        matched_text = match.group(0)
+        # Add any text up to the '%xx' escape sequence.
+        if start_position != current_position:
+            leading_text = string[current_position:start_position]
+            parts.append(percent_encoded(leading_text, safe=safe))
+
+        # Add the '%xx' escape sequence.
+        parts.append(matched_text)
+        current_position = end_position
+
+    # Add any text after the final '%xx' escape sequence.
+    if current_position != len(string):
+        trailing_text = string[current_position:]
+        parts.append(percent_encoded(trailing_text, safe=safe))
+
+    return "".join(parts)
+
+# httpx/_urlparse.py:482-494
+def percent_encoded(string: str, safe: str) -> str:
+    """
+    Use percent-encoding to quote a string.
+    """
+    NON_ESCAPED_CHARS = UNRESERVED_CHARACTERS + safe
+
+    # Fast path for strings that don't need escaping.
+    if not string.rstrip(NON_ESCAPED_CHARS):
+        return string
+
+    return "".join(
+        [char if char in NON_ESCAPED_CHARS else PERCENT(char) for char in string]
+    )
+
+# httpx/_utils.py:120-226
+class URLPattern:
+    """
+    A utility class currently used for making lookups against proxy keys...
+
+    # Wildcard matching...
+    >>> pattern = URLPattern("all://")
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    True
+
+    # Witch scheme matching...
+    >>> pattern = URLPattern("https://")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    False
+
+    # With domain matching...
+    >>> pattern = URLPattern("https://example.com")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    False
+    >>> pattern.matches(httpx.URL("https://other.com"))
+    False
+
+    # Wildcard scheme, with domain matching...
+    >>> pattern = URLPattern("all://example.com")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("https://other.com"))
+    False
+
+    # With port matching...
+    >>> pattern = URLPattern("https://example.com:1234")
+    >>> pattern.matches(httpx.URL("https://example.com:1234"))
+    True
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    False
+    """
+
+    def __init__(self, pattern: str) -> None:
+        from ._urls import URL
+
+        if pattern and ":" not in pattern:
+            raise ValueError(
+                f"Proxy keys should use proper URL forms rather "
+                f"than plain scheme strings. "
+                f'Instead of "{pattern}", use "{pattern}://"'
+            )
+
+        url = URL(pattern)
+        self.pattern = pattern
+        self.scheme = "" if url.scheme == "all" else url.scheme
+        self.host = "" if url.host == "*" else url.host
+        self.port = url.port
+        if not url.host or url.host == "*":
+            self.host_regex: typing.Pattern[str] | None = None
+        elif url.host.startswith("*."):
+            # *.example.com should match "www.example.com", but not "example.com"
+            domain = re.escape(url.host[2:])
+            self.host_regex = re.compile(f"^.+\\.{domain}$")
+        elif url.host.startswith("*"):
+            # *example.com should match "www.example.com" and "example.com"
+            domain = re.escape(url.host[1:])
+            self.host_regex = re.compile(f"^(.+\\.)?{domain}$")
+        else:
+            # example.com should match "example.com" but not "www.example.com"
+            domain = re.escape(url.host)
+            self.host_regex = re.compile(f"^{domain}$")
+
+    def matches(self, other: URL) -> bool:
+        if self.scheme and self.scheme != other.scheme:
+            return False
+        if (
+            self.host
+            and self.host_regex is not None
+            and not self.host_regex.match(other.host)
+        ):
+            return False
+        if self.port is not None and self.port != other.port:
+            return False
+        return True
+
+    @property
+    def priority(self) -> tuple[int, int, int]:
+        """
+        The priority allows URLPattern instances to be sortable, so that
+        we can match from most specific to least specific.
+        """
+        # URLs with a port should take priority over URLs without a port.
+        port_priority = 0 if self.port is not None else 1
+        # Longer hostnames should match first.
+        host_priority = -len(self.host)
+        # Longer schemes should match first.
+        scheme_priority = -len(self.scheme)
+        return (port_priority, host_priority, scheme_priority)
+
+    def __hash__(self) -> int:
+        return hash(self.pattern)
+
+    def __lt__(self, other: URLPattern) -> bool:
+        return self.priority < other.priority
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return isinstance(other, URLPattern) and self.pattern == other.pattern
+
+# httpx/_urls.py:9-9
+from ._urlparse import urlparse
+
+# tests/models/test_whatwg.py:9-9
+from httpx._urlparse import urlparse
+
+# httpx/_auth.py:5-5
+import re
+
+# httpx/_models.py:7-7
+import re
+
+# httpx/_multipart.py:6-6
+import re
+
+# httpx/_urlparse.py:22-22
+import re
+
+# httpx/_utils.py:5-5
+import re
+
+# httpx/_urlparse.py:478-479
+def PERCENT(string: str) -> str:
+    return "".join([f"%{byte:02X}" for byte in string.encode("utf-8")])
+
+# httpx/_urls.py:143-148
+    def userinfo(self) -> bytes:
+        """
+        The URL userinfo as a raw bytestring.
+        For example: b"jo%40email.com:a%20secret".
+        """
+        return self._uri_reference.userinfo.encode("ascii")
+
+# httpx/_urlparse.py:37-37
+PERCENT_ENCODED_REGEX = re.compile("%[A-Fa-f0-9]{2}")
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_auth.py:18-18
+import httpx
+
+# tests/client/test_client.py:9-9
+import httpx

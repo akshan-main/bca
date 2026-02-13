@@ -1,0 +1,805 @@
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+class ResolvedUrl:
+    """Result of URL validation and DNS resolution."""
+
+    resolved_ip: str
+    """The resolved IP address to connect to."""
+
+    hostname: str
+    """The original hostname (used for Host header)."""
+
+    port: int
+    """The port number."""
+
+    is_https: bool
+    """Whether to use HTTPS."""
+
+    path: str
+    """The path including query string and fragment."""
+
+def is_cloud_metadata_ip(ip_str: str) -> bool:
+    """Check if an IP address is a cloud metadata endpoint.
+
+    These are always blocked for security reasons, even with allow_local=True.
+    """
+    return ip_str in _CLOUD_METADATA_IPS
+
+def is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address is in a private/internal range.
+
+    Handles both IPv4 and IPv6 addresses, including IPv4-mapped IPv6 addresses.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:192.168.1.1)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        return any(ip in network for network in _PRIVATE_NETWORKS)
+    except ValueError:
+        # Invalid IP address, treat as potentially dangerous
+        return True
+
+async def validate_and_resolve_url(url: str, allow_local: bool) -> ResolvedUrl:
+    """Validate URL and resolve hostname to IP addresses.
+
+    Performs protocol validation, DNS resolution, and IP validation.
+
+    Args:
+        url: The URL to validate.
+        allow_local: Whether to allow private/internal IP addresses.
+
+    Returns:
+        ResolvedUrl with all the information needed to make the request.
+
+    Raises:
+        ValueError: If the URL fails validation.
+    """
+    hostname, path, port, is_https = extract_host_and_port(url)
+
+    # Check if hostname is already an IP address
+    try:
+        # Handle IPv6 addresses in brackets
+        ip_str = hostname.strip('[]')
+        ipaddress.ip_address(ip_str)
+        ips = [ip_str]
+    except ValueError:
+        # It's a hostname, resolve it
+        ips = await resolve_hostname(hostname)
+
+    # Validate all resolved IPs
+    for ip in ips:
+        # Cloud metadata IPs are always blocked
+        if is_cloud_metadata_ip(ip):
+            raise ValueError(f'Access to cloud metadata service ({ip}) is blocked for security reasons.')
+
+        # Private IPs are blocked unless allow_local is True
+        if not allow_local and is_private_ip(ip):
+            raise ValueError(
+                f'Access to private/internal IP address ({ip}) is blocked. '
+                f'Use force_download="allow-local" to allow local network access.'
+            )
+
+    # Use the first resolved IP
+    return ResolvedUrl(
+        resolved_ip=ips[0],
+        hostname=hostname,
+        port=port,
+        is_https=is_https,
+        path=path,
+    )
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py
+
+    def _temporal_overrides(
+        self, *, model: models.Model | models.KnownModelName | str | None = None, force: bool = False
+    ) -> Iterator[None]:
+        """Context manager for workflow-specific overrides.
+
+        When called outside a workflow, this is a no-op.
+        When called inside a workflow, it overrides the model and toolsets.
+        """
+        if not workflow.in_workflow() and not force:
+            yield
+            return
+
+        # We reset tools here as the temporalized function toolset is already in self._toolsets.
+        # Override model and set the model for workflow execution
+        with (
+            super().override(model=self._temporal_model, toolsets=self._toolsets, tools=[]),
+            self._temporal_model.using_model(model),
+            _utils.disable_threads(),
+        ):
+            temporal_active_token = self._temporal_overrides_active.set(True)
+            try:
+                yield
+            except PydanticSerializationError as e:
+                raise UserError(
+                    "The `deps` object failed to be serialized. Temporal requires all objects that are passed to activities to be serializable using Pydantic's `TypeAdapter`."
+                ) from e
+            finally:
+                self._temporal_overrides_active.reset(temporal_active_token)
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class TestModel(Model):
+    """A model specifically for testing purposes.
+
+    This will (by default) call all tools in the agent, then return a tool response if possible,
+    otherwise a plain response.
+
+    How useful this model is will vary significantly.
+
+    Apart from `__init__` derived by the `dataclass` decorator, all methods are private or match those
+    of the base class.
+    """
+
+    # NOTE: Avoid test discovery by pytest.
+    __test__ = False
+
+    call_tools: list[str] | Literal['all'] = 'all'
+    """List of tools to call. If `'all'`, all tools will be called."""
+    custom_output_text: str | None = None
+    """If set, this text is returned as the final output."""
+    custom_output_args: Any | None = None
+    """If set, these args will be passed to the output tool."""
+    seed: int = 0
+    """Seed for generating random data."""
+    last_model_request_parameters: ModelRequestParameters | None = field(default=None, init=False)
+    """The last ModelRequestParameters passed to the model in a request.
+
+    The ModelRequestParameters contains information about the function and output tools available during request handling.
+
+    This is set when a request is made, so will reflect the function tools from the last step of the last run.
+    """
+    _model_name: str = field(default='test', repr=False)
+    _system: str = field(default='test', repr=False)
+
+    def __init__(
+        self,
+        *,
+        call_tools: list[str] | Literal['all'] = 'all',
+        custom_output_text: str | None = None,
+        custom_output_args: Any | None = None,
+        seed: int = 0,
+        model_name: str = 'test',
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize TestModel with optional settings and profile."""
+        self.call_tools = call_tools
+        self.custom_output_text = custom_output_text
+        self.custom_output_args = custom_output_args
+        self.seed = seed
+        self.last_model_request_parameters = None
+        self._model_name = model_name
+        self._system = 'test'
+        super().__init__(settings=settings, profile=profile)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        model_response.usage = _estimate_usage([*messages, model_response])
+        return model_response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        yield TestStreamedResponse(
+            model_request_parameters=model_request_parameters,
+            _model_name=self._model_name,
+            _structured_response=model_response,
+            _messages=messages,
+            _provider_name=self._system,
+        )
+
+    @property
+    def model_name(self) -> str:
+        """The model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The model provider."""
+        return self._system
+
+    @classmethod
+    def supported_builtin_tools(cls) -> frozenset[type[AbstractBuiltinTool]]:
+        """TestModel supports all builtin tools for testing flexibility."""
+        return SUPPORTED_BUILTIN_TOOLS
+
+    def gen_tool_args(self, tool_def: ToolDefinition) -> Any:
+        return _JsonSchemaTestData(tool_def.parameters_json_schema, self.seed).generate()
+
+    def _get_tool_calls(self, model_request_parameters: ModelRequestParameters) -> list[tuple[str, ToolDefinition]]:
+        if self.call_tools == 'all':
+            return [(r.name, r) for r in model_request_parameters.function_tools]
+        else:
+            function_tools_lookup = {t.name: t for t in model_request_parameters.function_tools}
+            tools_to_call = (function_tools_lookup[name] for name in self.call_tools)
+            return [(r.name, r) for r in tools_to_call]
+
+    def _get_output(self, model_request_parameters: ModelRequestParameters) -> _WrappedTextOutput | _WrappedToolOutput:
+        if self.custom_output_text is not None:
+            assert model_request_parameters.output_mode != 'tool', (
+                'Plain response not allowed, but `custom_output_text` is set.'
+            )
+            assert self.custom_output_args is None, 'Cannot set both `custom_output_text` and `custom_output_args`.'
+            return _WrappedTextOutput(self.custom_output_text)
+        elif self.custom_output_args is not None:
+            assert model_request_parameters.output_tools is not None, (
+                'No output tools provided, but `custom_output_args` is set.'
+            )
+            output_tool = model_request_parameters.output_tools[0]
+
+            if k := output_tool.outer_typed_dict_key:
+                return _WrappedToolOutput({k: self.custom_output_args})
+            else:
+                return _WrappedToolOutput(self.custom_output_args)
+        elif model_request_parameters.allow_text_output:
+            return _WrappedTextOutput(None)
+        elif model_request_parameters.output_tools:
+            return _WrappedToolOutput(None)
+        else:
+            return _WrappedTextOutput(None)
+
+    def _request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        if model_request_parameters.builtin_tools:
+            raise UserError('TestModel does not support built-in tools')
+
+        tool_calls = self._get_tool_calls(model_request_parameters)
+        output_wrapper = self._get_output(model_request_parameters)
+        output_tools = model_request_parameters.output_tools
+
+        # if there are tools, the first thing we want to do is call all of them
+        if tool_calls and not any(isinstance(m, ModelResponse) for m in messages):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(name, self.gen_tool_args(args), tool_call_id=f'pyd_ai_tool_call_id__{name}')
+                    for name, args in tool_calls
+                ],
+                model_name=self._model_name,
+            )
+
+        if messages:  # pragma: no branch
+            last_message = messages[-1]
+            assert isinstance(last_message, ModelRequest), 'Expected last message to be a `ModelRequest`.'
+
+            # check if there are any retry prompts, if so retry them
+            new_retry_names = {p.tool_name for p in last_message.parts if isinstance(p, RetryPromptPart)}
+            if new_retry_names:
+                # Handle retries for both function tools and output tools
+                # Check function tools first
+                retry_parts: list[ModelResponsePart] = [
+                    ToolCallPart(name, self.gen_tool_args(args)) for name, args in tool_calls if name in new_retry_names
+                ]
+                # Check output tools
+                if output_tools:
+                    retry_parts.extend(
+                        [
+                            ToolCallPart(
+                                tool.name,
+                                output_wrapper.value
+                                if isinstance(output_wrapper, _WrappedToolOutput) and output_wrapper.value is not None
+                                else self.gen_tool_args(tool),
+                                tool_call_id=f'pyd_ai_tool_call_id__{tool.name}',
+                            )
+                            for tool in output_tools
+                            if tool.name in new_retry_names
+                        ]
+                    )
+                return ModelResponse(parts=retry_parts, model_name=self._model_name)
+
+        if isinstance(output_wrapper, _WrappedTextOutput):
+            if (response_text := output_wrapper.value) is None:
+                # build up details of tool responses
+                output: dict[str, Any] = {}
+                for message in messages:
+                    if isinstance(message, ModelRequest):
+                        for part in message.parts:
+                            if isinstance(part, ToolReturnPart):
+                                output[part.tool_name] = part.content
+                if output:
+                    return ModelResponse(
+                        parts=[TextPart(pydantic_core.to_json(output).decode())], model_name=self._model_name
+                    )
+                else:
+                    return ModelResponse(parts=[TextPart('success (no tool calls)')], model_name=self._model_name)
+            else:
+                return ModelResponse(parts=[TextPart(response_text)], model_name=self._model_name)
+        else:
+            assert output_tools, 'No output tools provided'
+            custom_output_args = output_wrapper.value
+            output_tool = output_tools[self.seed % len(output_tools)]
+            if custom_output_args is not None:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            custom_output_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+            else:
+                response_args = self.gen_tool_args(output_tool)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            response_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        model_response.usage = _estimate_usage([*messages, model_response])
+        return model_response
+
+    def model_name(self) -> str:
+        """The model name."""
+        return self._model_name
+
+    def system(self) -> str:
+        """The model provider."""
+        return self._system
+
+    def supported_builtin_tools(cls) -> frozenset[type[AbstractBuiltinTool]]:
+        """TestModel supports all builtin tools for testing flexibility."""
+        return SUPPORTED_BUILTIN_TOOLS
+
+    def gen_tool_args(self, tool_def: ToolDefinition) -> Any:
+        return _JsonSchemaTestData(tool_def.parameters_json_schema, self.seed).generate()
+
+    def _get_tool_calls(self, model_request_parameters: ModelRequestParameters) -> list[tuple[str, ToolDefinition]]:
+        if self.call_tools == 'all':
+            return [(r.name, r) for r in model_request_parameters.function_tools]
+        else:
+            function_tools_lookup = {t.name: t for t in model_request_parameters.function_tools}
+            tools_to_call = (function_tools_lookup[name] for name in self.call_tools)
+            return [(r.name, r) for r in tools_to_call]
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+class ToolsetTool(Generic[AgentDepsT]):
+    """Definition of a tool available on a toolset.
+
+    This is a wrapper around a plain tool definition that includes information about:
+
+    - the toolset that provided it, for use in error messages
+    - the maximum number of retries to attempt if the tool call fails
+    - the validator for the tool's arguments
+    """
+
+    toolset: AbstractToolset[AgentDepsT]
+    """The toolset that provided this tool, for use in error messages."""
+    tool_def: ToolDefinition
+    """The tool definition for this tool, including the name, description, and parameters."""
+    max_retries: int
+    """The maximum number of retries to attempt if the tool call fails."""
+    args_validator: SchemaValidator | SchemaValidatorProt
+    """The Pydantic Core validator for the tool's arguments.
+
+    For example, a [`pydantic.TypeAdapter(...).validator`](https://docs.pydantic.dev/latest/concepts/type_adapter/) or [`pydantic_core.SchemaValidator`](https://docs.pydantic.dev/latest/api/pydantic_core/#pydantic_core.SchemaValidator).
+    """
+
+## pydantic_evals/pydantic_evals/otel/_context_in_memory_span_exporter.py
+
+    def shutdown(self) -> None:
+        """Shut downs the exporter.
+
+        Calls to export after the exporter has been shut down will fail.
+        """
+        self._stopped = True
+
+## tests/models/test_download_item.py
+
+async def test_download_item_raises_user_error_with_unsupported_protocol(
+    url: AudioUrl | DocumentUrl | ImageUrl | VideoUrl,
+    protocol: str,
+) -> None:
+    with pytest.raises(ValueError, match=f'URL protocol "{protocol}" is not allowed'):
+        _ = await download_item(url, data_format='bytes')
+
+## tests/models/test_google.py
+
+async def test_http_video_url_downloads_on_google_gla(mocker: MockerFixture):
+    """HTTP VideoUrls are downloaded on google-gla with video_metadata preserved."""
+    model = GoogleModel('gemini-1.5-flash', provider=GoogleProvider(api_key='test-key'))
+
+    mock_download = mocker.patch(
+        'pydantic_ai.models.google.download_item',
+        return_value={'data': b'fake video data', 'data_type': 'video/mp4'},
+    )
+
+    video = VideoUrl(
+        url='https://example.com/video.mp4',
+        vendor_metadata={'start_offset': '10s', 'end_offset': '20s'},
+    )
+    content = await model._map_user_prompt(UserPromptPart(content=[video]))  # pyright: ignore[reportPrivateUsage]
+
+    mock_download.assert_called_once()
+    assert len(content) == 1
+    assert 'inline_data' in content[0]
+    assert 'file_data' not in content[0]
+    # video_metadata is preserved even when video is downloaded
+    assert content[0].get('video_metadata') == {'start_offset': '10s', 'end_offset': '20s'}
+
+## tests/models/test_model_test.py
+
+def test_custom_output_text():
+    agent = Agent()
+    result = agent.run_sync('x', model=TestModel(custom_output_text='custom'))
+    assert result.output == snapshot('custom')
+    agent = Agent(output_type=tuple[str, str])
+    with pytest.raises(AssertionError, match='Plain response not allowed, but `custom_output_text` is set.'):
+        agent.run_sync('x', model=TestModel(custom_output_text='custom'))
+
+def test_output_tool_retry_error_handled_with_custom_args():
+    class ResultModel(BaseModel):
+        x: int
+        y: str
+
+    agent = Agent('test', output_type=ResultModel, retries=2)
+
+    with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(2\) for output validation'):
+        agent.run_sync('Hello', model=TestModel(custom_output_args={'foo': 'a', 'bar': 1}))
+
+def test_different_content_input(content: AudioUrl | VideoUrl | ImageUrl | BinaryContent):
+    agent = Agent()
+    result = agent.run_sync(['x', content], model=TestModel(custom_output_text='custom'))
+    assert result.output == snapshot('custom')
+    assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=1))
+
+## tests/test_ag_ui.py
+
+class StateInt(BaseModel):
+    """Example state class for testing purposes."""
+
+    value: int = 0
+
+## tests/test_agent.py
+
+def test_agent_message_history_includes_run_id() -> None:
+    agent = Agent(TestModel(custom_output_text='testing run_id'))
+
+    result = agent.run_sync('Hello')
+    history = result.all_messages()
+
+    run_ids = [message.run_id for message in history]
+    assert run_ids == snapshot([IsStr(), IsStr()])
+    assert len({*run_ids}) == snapshot(1)
+
+async def test_agent_metadata_override_with_dict() -> None:
+    agent = Agent(TestModel(custom_output_text='override dict base'), metadata={'env': 'base'})
+
+    with agent.override(metadata={'env': 'override'}):
+        result = await agent.run('override dict prompt')
+
+    assert result.metadata == {'env': 'override'}
+
+async def test_agent_metadata_override_with_callable() -> None:
+    agent = Agent(TestModel(custom_output_text='override callable base'), metadata={'env': 'base'})
+
+    with agent.override(metadata=lambda ctx: {'computed': ctx.prompt}):
+        result = await agent.run('callable override prompt')
+
+    assert result.metadata == {'computed': 'callable override prompt'}
+
+async def test_agent_run_metadata_kwarg_dict() -> None:
+    agent = Agent(TestModel(custom_output_text='kwarg dict output'))
+
+    result = await agent.run('kwarg dict prompt', metadata={'env': 'run'})
+
+    assert result.metadata == {'env': 'run'}
+
+async def test_agent_run_metadata_kwarg_merges_agent_metadata() -> None:
+    agent = Agent(TestModel(custom_output_text='kwarg merge output'), metadata={'env': 'base', 'shared': 'agent'})
+
+    result = await agent.run('kwarg merge prompt', metadata={'run': 'value', 'shared': 'run'})
+
+    assert result.metadata == {'env': 'base', 'run': 'value', 'shared': 'run'}
+
+async def test_agent_run_metadata_kwarg_ignored_with_override() -> None:
+    agent = Agent(TestModel(custom_output_text='kwarg override output'), metadata={'env': 'base'})
+
+    with agent.override(metadata={'env': 'override', 'override_only': True}):
+        result = await agent.run('kwarg override prompt', metadata={'run_only': True})
+
+    assert result.metadata == {'env': 'override', 'override_only': True}
+
+def test_override_replaces_instructions():
+    """Test overriding instructions replaces the base instructions."""
+    agent = Agent('test', instructions='ORIG_INSTR')
+
+    with agent.override(instructions='NEW_INSTR'):
+        with capture_run_messages() as messages:
+            agent.run_sync('Hi', model=TestModel(custom_output_text='ok'))
+
+    req = messages[0]
+    assert isinstance(req, ModelRequest)
+    assert req.instructions == 'NEW_INSTR'
+
+async def test_override_async_run():
+    """Test override with async run method."""
+    agent = Agent('test', instructions='ORIG')
+
+    with agent.override(instructions='ASYNC_OVERRIDE'):
+        with capture_run_messages() as messages:
+            await agent.run('Hi', model=TestModel(custom_output_text='ok'))
+
+    req = messages[0]
+    assert isinstance(req, ModelRequest)
+    assert req.instructions == 'ASYNC_OVERRIDE'
+
+async def test_dynamic_builtin_tool_omitted():
+    model = TestModel()
+    agent = Agent(model, builtin_tools=[prepared_web_search], deps_type=UserContext)
+
+    user_context = UserContext(location=None)
+
+    await agent.run('Hello', deps=user_context)
+
+    assert model.last_model_request_parameters is not None
+    tools = model.last_model_request_parameters.builtin_tools
+    assert len(tools) == 0
+
+async def test_sync_dynamic_tool():
+    model = TestModel()
+    agent = Agent(model, builtin_tools=[sync_dynamic_tool], deps_type=UserContext)
+
+    with pytest.raises(UserError, match='TestModel does not support built-in tools'):
+        await agent.run('Hello', deps=UserContext(location='London'))
+
+    assert model.last_model_request_parameters is not None
+    tools = model.last_model_request_parameters.builtin_tools
+    assert len(tools) == 1
+    assert isinstance(tools[0], WebSearchTool)
+    assert tools[0].search_context_size == 'low'
+
+## tests/test_cli.py
+
+def test_cli_prompt(capfd: CaptureFixture[str], env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    with cli_agent.override(model=TestModel(custom_output_text='# result\n\n```py\nx = 1\n```')):
+        assert cli(['hello']) == 0
+        assert capfd.readouterr().out.splitlines() == snapshot([IsStr(), '# result', '', 'py', 'x = 1', '/py'])
+        assert cli(['--no-stream', 'hello']) == 0
+        assert capfd.readouterr().out.splitlines() == snapshot([IsStr(), '# result', '', 'py', 'x = 1', '/py'])
+
+## tests/test_logfire.py
+
+def test_logfire_metadata_values(
+    get_logfire_summary: Callable[[], LogfireSummary],
+    metadata: dict[str, Any] | Callable[[RunContext[Any]], dict[str, Any]],
+    expected: dict[str, Any],
+) -> None:
+    agent = Agent(model=TestModel(), instrument=InstrumentationSettings(version=2), metadata=metadata)
+    agent.run_sync('Hello')
+
+    summary = get_logfire_summary()
+    assert summary.attributes[0]['metadata'] == expected
+
+def test_logfire_metadata_override(get_logfire_summary: Callable[[], LogfireSummary]) -> None:
+    agent = Agent(model=TestModel(), instrument=InstrumentationSettings(version=2), metadata={'env': 'base'})
+    with agent.override(metadata={'env': 'override'}):
+        agent.run_sync('Hello')
+
+    summary = get_logfire_summary()
+    assert summary.attributes[0]['metadata'] == '{"env": "override"}'
+
+## tests/test_mcp.py
+
+async def test_client_sampling_disabled(run_context: RunContext[int]):
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'], allow_sampling=False)
+    server.sampling_model = TestModel(custom_output_text='sampling model response')
+    async with server:
+        with pytest.raises(ModelRetry, match='Error executing tool use_sampling: Sampling not supported'):
+            await server.direct_call_tool('use_sampling', {'foo': 'bar'})
+
+## tests/test_prefect.py
+
+def test_prefect_agent_run_sync(allow_model_requests: None):
+    """Test that agent.run_sync() works."""
+    result = simple_prefect_agent.run_sync('What is the capital of Mexico?')
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_prefect_agent_iter(allow_model_requests: None):
+    """Test that agent.iter() works."""
+    outputs: list[str] = []
+    async with simple_prefect_agent.iter('What is the capital of Mexico?') as run:
+        async for node in run:
+            if Agent.is_model_request_node(node):
+                async with node.stream(run.ctx) as stream:
+                    async for chunk in stream.stream_text(debounce_by=None):
+                        outputs.append(chunk)
+    assert outputs == snapshot(
+        [
+            'The',
+            'The capital',
+            'The capital of',
+            'The capital of Mexico',
+            'The capital of Mexico is',
+            'The capital of Mexico is Mexico',
+            'The capital of Mexico is Mexico City',
+            'The capital of Mexico is Mexico City.',
+        ]
+    )
+
+async def test_iter_in_flow(allow_model_requests: None) -> None:
+    """Test that iter works inside a Prefect flow."""
+
+    @flow(name='test_iter_in_flow')
+    async def run_iter_workflow():
+        outputs: list[str] = []
+        async with simple_prefect_agent.iter('What is the capital of Mexico?') as run:
+            async for node in run:
+                if Agent.is_model_request_node(node):
+                    async with node.stream(run.ctx) as stream:
+                        async for chunk in stream.stream_text(debounce_by=None):
+                            outputs.append(chunk)
+        return outputs
+
+    outputs = await run_iter_workflow()
+    # If called in a workflow, the output is a single concatenated string.
+    assert outputs == snapshot(
+        [
+            'The capital of Mexico is Mexico City.',
+        ]
+    )
+
+## tests/test_streaming.py
+
+async def test_streamed_run_result_metadata_available() -> None:
+    agent = Agent(TestModel(custom_output_text='stream metadata'), metadata={'env': 'stream'})
+
+    async with agent.run_stream('stream metadata prompt') as result:
+        assert await result.get_output() == 'stream metadata'
+
+    assert result.metadata == {'env': 'stream'}
+
+## tests/test_tools.py
+
+def test_tool_raises_call_deferred():
+    agent = Agent(TestModel(), output_type=[str, DeferredToolRequests])
+
+    @agent.tool_plain
+    def my_tool(x: int) -> int:
+        raise CallDeferred
+
+    result = agent.run_sync('Hello')
+    assert result.output == snapshot(
+        DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])
+    )
+
+def test_output_type_deferred_tool_requests_by_itself():
+    with pytest.raises(UserError, match='At least one output type must be provided other than `DeferredToolRequests`.'):
+        Agent(TestModel(), output_type=DeferredToolRequests)
+
+def test_output_type_empty():
+    with pytest.raises(UserError, match='At least one output type must be provided.'):
+        Agent(TestModel(), output_type=[])
+
+## tests/test_ui.py
+
+async def test_run_stream_native_metadata_forwarded():
+    agent = Agent(model=TestModel(custom_output_text='native meta'))
+    adapter = DummyUIAdapter(agent, DummyUIRunInput(messages=[ModelRequest.user_text_prompt('Hello')]))
+
+    events = [event async for event in adapter.run_stream_native(metadata={'ui': 'native'})]
+    run_result_event = next(event for event in events if isinstance(event, AgentRunResultEvent))
+
+    assert run_result_event.result.metadata == {'ui': 'native'}
+
+## tests/test_ui_web.py
+
+def test_agent_to_web_with_model_settings():
+    """Test to_web() accepts model_settings parameter."""
+    agent = Agent(TestModel())
+    settings = ModelSettings(temperature=0.5, max_tokens=100)
+
+    app = agent.to_web(model_settings=settings)
+    assert isinstance(app, Starlette)
+
+def test_model_profile():
+    """Test Model.profile cached property."""
+    model = TestModel()
+    assert model.profile is not None
+
+def test_agent_to_web_with_instructions():
+    """Test to_web() accepts instructions parameter."""
+    agent = Agent(TestModel())
+    app = agent.to_web(instructions='Always respond in Spanish')
+    assert isinstance(app, Starlette)
+
+## tests/test_usage_limits.py
+
+def test_request_token_limit() -> None:
+    test_agent = Agent(TestModel())
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('Exceeded the input_tokens_limit of 5 (input_tokens=59)')):
+        test_agent.run_sync(
+            'Hello, this prompt exceeds the request tokens limit.', usage_limits=UsageLimits(input_tokens_limit=5)
+        )
+
+def test_response_token_limit() -> None:
+    test_agent = Agent(
+        TestModel(custom_output_text='Unfortunately, this response exceeds the response tokens limit by a few!')
+    )
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('Exceeded the output_tokens_limit of 5 (output_tokens=11)')):
+        test_agent.run_sync('Hello', usage_limits=UsageLimits(output_tokens_limit=5))
+
+def test_total_token_limit() -> None:
+    test_agent = Agent(TestModel(custom_output_text='This utilizes 4 tokens!'))
+
+    with pytest.raises(UsageLimitExceeded, match=re.escape('Exceeded the total_tokens_limit of 50 (total_tokens=55)')):
+        test_agent.run_sync('Hello', usage_limits=UsageLimits(total_tokens_limit=50))
+
+def test_usage_so_far() -> None:
+    test_agent = Agent(TestModel())
+
+    with pytest.raises(
+        UsageLimitExceeded, match=re.escape('Exceeded the total_tokens_limit of 105 (total_tokens=163)')
+    ):
+        test_agent.run_sync(
+            'Hello, this prompt exceeds the request tokens limit.',
+            usage_limits=UsageLimits(total_tokens_limit=105),
+            usage=RunUsage(input_tokens=50, output_tokens=50),
+        )
+
+async def test_multi_agent_usage_sync():
+    """As in `test_multi_agent_usage_async`, with a sync tool."""
+    controller_agent = Agent(TestModel())
+
+    @controller_agent.tool
+    def delegate_to_other_agent(ctx: RunContext[None], sentence: str) -> int:
+        new_usage = RunUsage(requests=5, input_tokens=2, output_tokens=3)
+        ctx.usage.incr(new_usage)
+        return 0
+
+    result = await controller_agent.run('foobar')
+    assert result.output == snapshot('{"delegate_to_other_agent":0}')
+    assert result.usage() == snapshot(RunUsage(requests=7, input_tokens=105, output_tokens=16, tool_calls=1))

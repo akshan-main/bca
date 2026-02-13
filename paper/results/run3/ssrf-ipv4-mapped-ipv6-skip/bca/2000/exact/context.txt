@@ -1,0 +1,236 @@
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    request: _messages.ModelRequest
+
+    model_response: _messages.ModelResponse
+
+## pydantic_ai_slim/pydantic_ai/_otel_messages.py
+
+    type: Literal['text']
+
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+def is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address is in a private/internal range.
+
+    Handles both IPv4 and IPv6 addresses, including IPv4-mapped IPv6 addresses.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:192.168.1.1)
+        if isinstance(ip, ipaddress.IPv6Address) and not ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        return any(ip in network for network in _PRIVATE_NETWORKS)
+    except ValueError:
+        # Invalid IP address, treat as potentially dangerous
+        return True
+
+async def validate_and_resolve_url(url: str, allow_local: bool) -> ResolvedUrl:
+    """Validate URL and resolve hostname to IP addresses.
+
+    Performs protocol validation, DNS resolution, and IP validation.
+
+    Args:
+        url: The URL to validate.
+        allow_local: Whether to allow private/internal IP addresses.
+
+    Returns:
+        ResolvedUrl with all the information needed to make the request.
+
+    Raises:
+        ValueError: If the URL fails validation.
+    """
+    hostname, path, port, is_https = extract_host_and_port(url)
+
+    # Check if hostname is already an IP address
+    try:
+        # Handle IPv6 addresses in brackets
+        ip_str = hostname.strip('[]')
+        ipaddress.ip_address(ip_str)
+        ips = [ip_str]
+    except ValueError:
+        # It's a hostname, resolve it
+        ips = await resolve_hostname(hostname)
+
+    # Validate all resolved IPs
+    for ip in ips:
+        # Cloud metadata IPs are always blocked
+        if is_cloud_metadata_ip(ip):
+            raise ValueError(f'Access to cloud metadata service ({ip}) is blocked for security reasons.')
+
+        # Private IPs are blocked unless allow_local is True
+        if not allow_local and is_private_ip(ip):
+            raise ValueError(
+                f'Access to private/internal IP address ({ip}) is blocked. '
+                f'Use force_download="allow-local" to allow local network access.'
+            )
+
+    # Use the first resolved IP
+    return ResolvedUrl(
+        resolved_ip=ips[0],
+        hostname=hostname,
+        port=port,
+        is_https=is_https,
+        path=path,
+    )
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+async def download_item(
+    item: FileUrl,
+    data_format: Literal['bytes', 'base64', 'base64_uri', 'text'] = 'bytes',
+    type_format: Literal['mime', 'extension'] = 'mime',
+) -> DownloadedItem[str] | DownloadedItem[bytes]:
+    """Download an item by URL and return the content as a bytes object or a (base64-encoded) string.
+
+    This function includes SSRF (Server-Side Request Forgery) protection:
+    - Only http:// and https:// protocols are allowed
+    - Private/internal IP addresses are blocked by default
+    - Cloud metadata endpoints (169.254.169.254) are always blocked
+    - Hostnames are resolved before requests to prevent DNS rebinding
+
+    Set `item.force_download='allow-local'` to allow private IP addresses.
+
+    Args:
+        item: The item to download.
+        data_format: The format to return the content in:
+            - `bytes`: The raw bytes of the content.
+            - `base64`: The base64-encoded content.
+            - `base64_uri`: The base64-encoded content as a data URI.
+            - `text`: The content as a string.
+        type_format: The format to return the media type in:
+            - `mime`: The media type as a MIME type.
+            - `extension`: The media type as an extension.
+
+    Raises:
+        UserError: If the URL points to a YouTube video.
+        ValueError: If the URL uses an unsupported protocol or targets a private/internal
+            IP address (unless allow-local is set).
+    """
+    if isinstance(item, VideoUrl) and item.is_youtube:
+        raise UserError('Downloading YouTube videos is not supported.')
+
+    from .._ssrf import safe_download
+
+    allow_local = item.force_download == 'allow-local'
+    response = await safe_download(item.url, allow_local=allow_local)
+
+    if content_type := response.headers.get('content-type'):
+        content_type = content_type.split(';')[0]
+        if content_type == 'application/octet-stream':
+            content_type = None
+
+    media_type = content_type or item.media_type
+
+    data_type = media_type
+    if type_format == 'extension':
+        data_type = item.format
+
+    data = response.content
+    if data_format in ('base64', 'base64_uri'):
+        data = base64.b64encode(data).decode('utf-8')
+        if data_format == 'base64_uri':
+            data = f'data:{media_type};base64,{data}'
+        return DownloadedItem[str](data=data, data_type=data_type)
+    elif data_format == 'text':
+        return DownloadedItem[str](data=data.decode('utf-8'), data_type=data_type)
+    else:
+        return DownloadedItem[bytes](data=data, data_type=data_type)
+
+def _customize_tool_def(transformer: type[JsonSchemaTransformer], tool_def: ToolDefinition):
+    """Customize the tool definition using the given transformer.
+
+    If the tool definition has `strict` set to None, the strictness will be inferred from the transformer.
+    """
+    schema_transformer = transformer(tool_def.parameters_json_schema, strict=tool_def.strict)
+    parameters_json_schema = schema_transformer.walk()
+    return replace(
+        tool_def,
+        parameters_json_schema=parameters_json_schema,
+        strict=schema_transformer.is_strict_compatible if tool_def.strict is None else tool_def.strict,
+    )
+
+def _customize_output_object(transformer: type[JsonSchemaTransformer], output_object: OutputObjectDefinition):
+    schema_transformer = transformer(output_object.json_schema, strict=output_object.strict)
+    json_schema = schema_transformer.walk()
+    return replace(
+        output_object,
+        json_schema=json_schema,
+        strict=schema_transformer.is_strict_compatible if output_object.strict is None else output_object.strict,
+    )
+
+## pydantic_ai_slim/pydantic_ai/models/xai.py
+
+def _map_json_schema(o: OutputObjectDefinition) -> chat_pb2.ResponseFormat:
+    """Convert OutputObjectDefinition to xAI ResponseFormat protobuf object."""
+    return chat_pb2.ResponseFormat(
+        format_type=chat_pb2.FORMAT_TYPE_JSON_SCHEMA,
+        schema=json.dumps(o.json_schema),
+    )
+
+def _map_json_object() -> chat_pb2.ResponseFormat:
+    """Create a ResponseFormat for JSON object mode (prompted output)."""
+    return chat_pb2.ResponseFormat(format_type=chat_pb2.FORMAT_TYPE_JSON_OBJECT)
+
+## pydantic_evals/pydantic_evals/dataset.py
+
+    def _infer_fmt(cls, path: Path, fmt: Literal['yaml', 'json'] | None) -> Literal['yaml', 'json']:
+        """Infer the format to use for a file based on its extension.
+
+        Args:
+            path: The path to infer the format for.
+            fmt: The explicitly provided format, if any.
+
+        Returns:
+            The inferred format ('yaml' or 'json').
+
+        Raises:
+            ValueError: If the format cannot be inferred from the file extension.
+        """
+        if fmt is not None:
+            return fmt
+        suffix = path.suffix.lower()
+        if suffix in {'.yaml', '.yml'}:
+            return 'yaml'
+        elif suffix == '.json':
+            return 'json'
+        raise ValueError(
+            f'Could not infer format for filename {path.name!r}. Use the `fmt` argument to specify the format.'
+        )
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+    items: list[PathItem]
+
+## tests/graph/beta/test_broadcast_and_spread.py
+
+    values: list[int] = field(default_factory=list[int])
+
+## tests/models/anthropic/test_output.py
+
+class CityInfo(BaseModel):
+    """Information about a city."""
+
+    city: str
+    country: str
+    population: int
+
+## tests/test_ag_ui.py
+
+def current_time() -> str:
+    """Get the current time in ISO format.
+
+    Returns:
+        The current UTC time in ISO format string.
+    """
+    return '2023-06-21T12:08:45.485981+00:00'
+
+## tests/test_ssrf.py
+
+    async def test_6to4_address_blocked(self) -> None:
+        """Test that 6to4 addresses (which can embed private IPv4) are blocked."""
+        # 2002:c0a8:0101::1 embeds 192.168.1.1
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://[2002:c0a8:0101::1]/path', allow_local=False)

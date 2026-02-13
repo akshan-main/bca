@@ -1,0 +1,1059 @@
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:7-7
+from asyncio import Task
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_agent.py:8-8
+from prefect import flow, task
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_function_toolset.py:5-5
+from prefect import task
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_mcp_server.py:6-6
+from prefect import task
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py:8-8
+from prefect import task
+
+# tests/models/test_gemini_vertex.py:6-6
+from inline_snapshot import Is, snapshot
+
+# tests/models/test_google.py:16-16
+from inline_snapshot import Is, snapshot
+
+# pydantic_evals/pydantic_evals/dataset.py:281-405
+    async def evaluate(
+        self,
+        task: Callable[[InputsT], Awaitable[OutputT]] | Callable[[InputsT], OutputT],
+        name: str | None = None,
+        max_concurrency: int | None = None,
+        progress: bool = True,
+        retry_task: RetryConfig | None = None,
+        retry_evaluators: RetryConfig | None = None,
+        *,
+        task_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        repeat: int = 1,
+    ) -> EvaluationReport[InputsT, OutputT, MetadataT]:
+        """Evaluates the test cases in the dataset using the given task.
+
+        This method runs the task on each case in the dataset, applies evaluators,
+        and collects results into a report. Cases are run concurrently, limited by `max_concurrency` if specified.
+
+        Args:
+            task: The task to evaluate. This should be a callable that takes the inputs of the case
+                and returns the output.
+            name: The name of the experiment being run, this is used to identify the experiment in the report.
+                If omitted, the task_name will be used; if that is not specified, the name of the task function is used.
+            max_concurrency: The maximum number of concurrent evaluations of the task to allow.
+                If None, all cases will be evaluated concurrently.
+            progress: Whether to show a progress bar for the evaluation. Defaults to `True`.
+            retry_task: Optional retry configuration for the task execution.
+            retry_evaluators: Optional retry configuration for evaluator execution.
+            task_name: Optional override to the name of the task being executed, otherwise the name of the task
+                function will be used.
+            metadata: Optional dict of experiment metadata.
+            repeat: Number of times to run each case. When > 1, each case is run multiple times and
+                results are grouped by the original case name for aggregation. Defaults to 1.
+
+        Returns:
+            A report containing the results of the evaluation.
+        """
+        if repeat < 1:
+            raise ValueError(f'repeat must be >= 1, got {repeat}')
+
+        task_name = task_name or get_unwrapped_function_name(task)
+        name = name or task_name
+
+        tasks_to_run = self._build_tasks_to_run(repeat)
+        total_tasks = len(tasks_to_run)
+        progress_bar = Progress() if progress else None
+
+        limiter = anyio.Semaphore(max_concurrency) if max_concurrency is not None else AsyncExitStack()
+
+        extra_attributes: dict[str, Any] = {'gen_ai.operation.name': 'experiment'}
+        if metadata is not None:
+            extra_attributes['metadata'] = metadata
+        if repeat > 1:
+            extra_attributes['logfire.experiment.repeat'] = repeat
+        with (
+            logfire_span(
+                'evaluate {name}',
+                name=name,
+                task_name=task_name,
+                dataset_name=self.name,
+                n_cases=len(self.cases),
+                **extra_attributes,
+            ) as eval_span,
+            progress_bar or nullcontext(),
+        ):
+            task_id = progress_bar.add_task(f'Evaluating {task_name}', total=total_tasks) if progress_bar else None
+
+            async def _handle_case(
+                case: Case[InputsT, OutputT, MetadataT],
+                report_case_name: str,
+                source_case_name: str | None,
+            ):
+                async with limiter:
+                    result = await _run_task_and_evaluators(
+                        task,
+                        case,
+                        report_case_name,
+                        self.evaluators,
+                        retry_task,
+                        retry_evaluators,
+                        source_case_name=source_case_name,
+                    )
+                    if progress_bar and task_id is not None:  # pragma: no branch
+                        progress_bar.update(task_id, advance=1)
+                    return result
+
+            if (context := eval_span.context) is None:  # pragma: no cover
+                trace_id = None
+                span_id = None
+            else:
+                trace_id = f'{context.trace_id:032x}'
+                span_id = f'{context.span_id:016x}'
+            cases_and_failures = await task_group_gather(
+                [
+                    lambda case=case, rn=report_name, scn=source_name: _handle_case(case, rn, scn)
+                    for case, report_name, source_name in tasks_to_run
+                ]
+            )
+            cases: list[ReportCase] = []
+            failures: list[ReportCaseFailure] = []
+            for item in cases_and_failures:
+                if isinstance(item, ReportCase):
+                    cases.append(item)
+                else:
+                    failures.append(item)
+            report = EvaluationReport(
+                name=name,
+                cases=cases,
+                failures=failures,
+                experiment_metadata=metadata,
+                span_id=span_id,
+                trace_id=trace_id,
+            )
+
+            # Run report evaluators
+            if self.report_evaluators:
+                report_ctx = ReportEvaluatorContext(
+                    name=name,
+                    report=report,
+                    experiment_metadata=metadata,
+                )
+                await _run_report_evaluators(self.report_evaluators, report_ctx)
+
+            _set_experiment_span_attributes(eval_span, report, metadata, len(self.cases), repeat)
+        return report
+
+# pydantic_evals/pydantic_evals/dataset.py:407-455
+    def evaluate_sync(
+        self,
+        task: Callable[[InputsT], Awaitable[OutputT]] | Callable[[InputsT], OutputT],
+        name: str | None = None,
+        max_concurrency: int | None = None,
+        progress: bool = True,
+        retry_task: RetryConfig | None = None,
+        retry_evaluators: RetryConfig | None = None,
+        *,
+        task_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        repeat: int = 1,
+    ) -> EvaluationReport[InputsT, OutputT, MetadataT]:
+        """Evaluates the test cases in the dataset using the given task.
+
+        This is a synchronous wrapper around [`evaluate`][pydantic_evals.dataset.Dataset.evaluate] provided for convenience.
+
+        Args:
+            task: The task to evaluate. This should be a callable that takes the inputs of the case
+                and returns the output.
+            name: The name of the experiment being run, this is used to identify the experiment in the report.
+                If omitted, the task_name will be used; if that is not specified, the name of the task function is used.
+            max_concurrency: The maximum number of concurrent evaluations of the task to allow.
+                If None, all cases will be evaluated concurrently.
+            progress: Whether to show a progress bar for the evaluation. Defaults to `True`.
+            retry_task: Optional retry configuration for the task execution.
+            retry_evaluators: Optional retry configuration for evaluator execution.
+            task_name: Optional override to the name of the task being executed, otherwise the name of the task
+                function will be used.
+            metadata: Optional dict of experiment metadata.
+            repeat: Number of times to run each case. When > 1, each case is run multiple times and
+                results are grouped by the original case name for aggregation. Defaults to 1.
+
+        Returns:
+            A report containing the results of the evaluation.
+        """
+        return get_event_loop().run_until_complete(
+            self.evaluate(
+                task,
+                name=name,
+                max_concurrency=max_concurrency,
+                progress=progress,
+                retry_task=retry_task,
+                retry_evaluators=retry_evaluators,
+                task_name=task_name,
+                metadata=metadata,
+                repeat=repeat,
+            )
+        )
+
+# pydantic_ai_slim/pydantic_ai/toolsets/function.py:239-321
+    def add_function(
+        self,
+        func: ToolFuncEither[AgentDepsT, ToolParams],
+        takes_ctx: bool | None = None,
+        name: str | None = None,
+        description: str | None = None,
+        retries: int | None = None,
+        prepare: ToolPrepareFunc[AgentDepsT] | None = None,
+        docstring_format: DocstringFormat | None = None,
+        require_parameter_descriptions: bool | None = None,
+        schema_generator: type[GenerateJsonSchema] | None = None,
+        strict: bool | None = None,
+        sequential: bool | None = None,
+        requires_approval: bool | None = None,
+        metadata: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Add a function as a tool to the toolset.
+
+        Can take a sync or async function.
+
+        The docstring is inspected to extract both the tool description and description of each parameter,
+        [learn more](../tools.md#function-tools-and-schema).
+
+        Args:
+            func: The tool function to register.
+            takes_ctx: Whether the function takes a [`RunContext`][pydantic_ai.tools.RunContext] as its first argument. If `None`, this is inferred from the function signature.
+            name: The name of the tool, defaults to the function name.
+            description: The description of the tool, defaults to the function docstring.
+            retries: The number of retries to allow for this tool, defaults to the agent's default retries,
+                which defaults to 1.
+            prepare: custom method to prepare the tool definition for each step, return `None` to omit this
+                tool from a given step. This is useful if you want to customise a tool at call time,
+                or omit it completely from a step. See [`ToolPrepareFunc`][pydantic_ai.tools.ToolPrepareFunc].
+            docstring_format: The format of the docstring, see [`DocstringFormat`][pydantic_ai.tools.DocstringFormat].
+                If `None`, the default value is determined by the toolset.
+            require_parameter_descriptions: If True, raise an error if a parameter description is missing.
+                If `None`, the default value is determined by the toolset.
+            schema_generator: The JSON schema generator class to use for this tool.
+                If `None`, the default value is determined by the toolset.
+            strict: Whether to enforce JSON schema compliance (only affects OpenAI).
+                See [`ToolDefinition`][pydantic_ai.tools.ToolDefinition] for more info.
+                If `None`, the default value is determined by the toolset.
+            sequential: Whether the function requires a sequential/serial execution environment. Defaults to False.
+                If `None`, the default value is determined by the toolset.
+            requires_approval: Whether this tool requires human-in-the-loop approval. Defaults to False.
+                See the [tools documentation](../deferred-tools.md#human-in-the-loop-tool-approval) for more info.
+                If `None`, the default value is determined by the toolset.
+            metadata: Optional metadata for the tool. This is not sent to the model but can be used for filtering and tool behavior customization.
+                If `None`, the default value is determined by the toolset. If provided, it will be merged with the toolset's metadata.
+            timeout: Timeout in seconds for tool execution. If the tool takes longer, a retry prompt is returned to the model.
+                Defaults to None (no timeout).
+        """
+        if docstring_format is None:
+            docstring_format = self.docstring_format
+        if require_parameter_descriptions is None:
+            require_parameter_descriptions = self.require_parameter_descriptions
+        if schema_generator is None:
+            schema_generator = self.schema_generator
+        if strict is None:
+            strict = self.strict
+        if sequential is None:
+            sequential = self.sequential
+        if requires_approval is None:
+            requires_approval = self.requires_approval
+
+        tool = Tool[AgentDepsT](
+            func,
+            takes_ctx=takes_ctx,
+            name=name,
+            description=description,
+            max_retries=retries,
+            prepare=prepare,
+            docstring_format=docstring_format,
+            require_parameter_descriptions=require_parameter_descriptions,
+            schema_generator=schema_generator,
+            strict=strict,
+            sequential=sequential,
+            requires_approval=requires_approval,
+            metadata=metadata,
+            timeout=timeout,
+        )
+        self.add_tool(tool)
+
+# pydantic_ai_slim/pydantic_ai/_parts_manager.py:258-350
+    def handle_tool_call_delta(
+        self,
+        *,
+        vendor_part_id: Hashable | None,
+        tool_name: str | None = None,
+        args: str | dict[str, Any] | None = None,
+        tool_call_id: str | None = None,
+        provider_name: str | None = None,
+        provider_details: dict[str, Any] | None = None,
+    ) -> ModelResponseStreamEvent | None:
+        """Handle or update a tool call, creating or updating a `ToolCallPart`, `BuiltinToolCallPart`, or `ToolCallPartDelta`.
+
+        Managed items remain as `ToolCallPartDelta`s until they have at least a tool_name, at which
+        point they are upgraded to `ToolCallPart`s.
+
+        If `vendor_part_id` is None, updates the latest matching ToolCallPart (or ToolCallPartDelta)
+        if any. Otherwise, a new part (or delta) may be created.
+
+        Args:
+            vendor_part_id: The ID the vendor uses for this tool call.
+                If None, the latest matching tool call may be updated.
+            tool_name: The name of the tool. If None, the manager does not enforce
+                a name match when `vendor_part_id` is None.
+            args: Arguments for the tool call, either as a string, a dictionary of key-value pairs, or None.
+            tool_call_id: An optional string representing an identifier for this tool call.
+            provider_name: An optional provider name for the tool call part.
+            provider_details: An optional dictionary of provider-specific details for the tool call part.
+
+        Returns:
+            - A `PartStartEvent` if a new ToolCallPart or BuiltinToolCallPart is created.
+            - A `PartDeltaEvent` if an existing part is updated.
+            - `None` if no new event is emitted (e.g., the part is still incomplete).
+
+        Raises:
+            UnexpectedModelBehavior: If attempting to apply a tool call delta to a part that is not
+                a ToolCallPart, BuiltinToolCallPart, or ToolCallPartDelta.
+        """
+        existing_matching_part_and_index: tuple[ToolCallPartDelta | ToolCallPart | BuiltinToolCallPart, int] | None = (
+            None
+        )
+
+        if vendor_part_id is None:
+            # vendor_part_id is None, so check if the latest part is a matching tool call or delta to update
+            # When the vendor_part_id is None, if the tool_name is _not_ None, assume this should be a new part rather
+            # than a delta on an existing one. We can change this behavior in the future if necessary for some model.
+            if tool_name is None:
+                existing_matching_part_and_index = self._latest_part_if_of_type(
+                    ToolCallPart, BuiltinToolCallPart, ToolCallPartDelta
+                )
+        else:
+            # vendor_part_id is provided, so look up the corresponding part or delta
+            part_index = self._vendor_id_to_part_index.get(vendor_part_id)
+            if part_index is not None:
+                existing_part = self._parts[part_index]
+                if not isinstance(existing_part, ToolCallPartDelta | ToolCallPart | BuiltinToolCallPart):
+                    raise UnexpectedModelBehavior(f'Cannot apply a tool call delta to {existing_part=}')
+                existing_matching_part_and_index = existing_part, part_index
+
+        if existing_matching_part_and_index is None:
+            # No matching part/delta was found, so create a new ToolCallPartDelta (or ToolCallPart if fully formed)
+            delta = ToolCallPartDelta(
+                tool_name_delta=tool_name,
+                args_delta=args,
+                tool_call_id=tool_call_id,
+                provider_name=provider_name,
+                provider_details=provider_details,
+            )
+            part = delta.as_part() or delta
+            new_part_index = self._append_part(part, vendor_part_id)
+            # Only emit a PartStartEvent if we have enough information to produce a full ToolCallPart
+            if isinstance(part, ToolCallPart | BuiltinToolCallPart):
+                return PartStartEvent(index=new_part_index, part=part)
+        else:
+            # Update the existing part or delta with the new information
+            existing_part, part_index = existing_matching_part_and_index
+            delta = ToolCallPartDelta(
+                tool_name_delta=tool_name,
+                args_delta=args,
+                tool_call_id=tool_call_id,
+                provider_name=self._resolve_provider_name(existing_part, provider_name),
+                provider_details=provider_details,
+            )
+            updated_part = delta.apply(existing_part)
+            self._parts[part_index] = updated_part
+            if isinstance(updated_part, ToolCallPart | BuiltinToolCallPart):
+                if isinstance(existing_part, ToolCallPartDelta):
+                    # We just upgraded a delta to a full part, so emit a PartStartEvent
+                    return PartStartEvent(index=part_index, part=updated_part)
+                else:
+                    # We updated an existing part, so emit a PartDeltaEvent
+                    if updated_part.tool_call_id and not delta.tool_call_id:
+                        delta = replace(delta, tool_call_id=updated_part.tool_call_id)
+                    return PartDeltaEvent(index=part_index, delta=delta)
+
+# pydantic_ai_slim/pydantic_ai/_parts_manager.py:87-173
+    def handle_text_delta(
+        self,
+        *,
+        vendor_part_id: VendorId | None,
+        content: str,
+        id: str | None = None,
+        provider_name: str | None = None,
+        provider_details: dict[str, Any] | None = None,
+        thinking_tags: tuple[str, str] | None = None,
+        ignore_leading_whitespace: bool = False,
+    ) -> Iterator[ModelResponseStreamEvent]:
+        """Handle incoming text content, creating or updating a TextPart in the manager as appropriate.
+
+        When `vendor_part_id` is None, the latest part is updated if it exists and is a TextPart;
+        otherwise, a new TextPart is created. When a non-None ID is specified, the TextPart corresponding
+        to that vendor ID is either created or updated.
+
+        Args:
+            vendor_part_id: The ID the vendor uses to identify this piece
+                of text. If None, a new part will be created unless the latest part is already
+                a TextPart.
+            content: The text content to append to the appropriate TextPart.
+            id: An optional id for the text part.
+            provider_name: An optional provider name for the text part.
+            provider_details: An optional dictionary of provider-specific details for the text part.
+            thinking_tags: If provided, will handle content between the thinking tags as thinking parts.
+            ignore_leading_whitespace: If True, will ignore leading whitespace in the content.
+
+        Yields:
+            A `PartStartEvent` if a new part was created, or a `PartDeltaEvent` if an existing part was updated.
+            Yields nothing if no event should be emitted (e.g., the first text part was all whitespace).
+
+        Raises:
+            UnexpectedModelBehavior: If attempting to apply text content to a part that is not a TextPart.
+        """
+        existing_text_part_and_index: tuple[TextPart, int] | None = None
+
+        if vendor_part_id is None:
+            # If the vendor_part_id is None, check if the latest part is a TextPart to update
+            existing_text_part_and_index = self._latest_part_if_of_type(TextPart)
+        else:
+            # Otherwise, attempt to look up an existing TextPart by vendor_part_id
+            part_index = self._vendor_id_to_part_index.get(vendor_part_id)
+            if part_index is not None:
+                existing_part = self._parts[part_index]
+
+                if thinking_tags and isinstance(existing_part, ThinkingPart):
+                    # We may be building a thinking part instead of a text part if we had previously seen a thinking tag
+                    if content == thinking_tags[1]:
+                        # When we see the thinking end tag, we're done with the thinking part and the next text delta will need a new part
+                        self._handle_embedded_thinking_end(vendor_part_id)
+                        return
+                    yield from self._handle_embedded_thinking_content(
+                        existing_part, part_index, content, provider_name, provider_details
+                    )
+                    return
+                elif isinstance(existing_part, TextPart):
+                    existing_text_part_and_index = existing_part, part_index
+                else:
+                    raise UnexpectedModelBehavior(f'Cannot apply a text delta to {existing_part=}')
+
+        if thinking_tags and content == thinking_tags[0]:
+            # When we see a thinking start tag (which is a single token), we'll build a new thinking part instead
+            yield from self._handle_embedded_thinking_start(vendor_part_id, provider_name, provider_details)
+            return
+
+        if existing_text_part_and_index is None:
+            # This is a workaround for models that emit `<think>\n</think>\n\n` or an empty text part ahead of tool calls (e.g. Ollama + Qwen3),
+            # which we don't want to end up treating as a final result when using `run_stream` with `str` a valid `output_type`.
+            if ignore_leading_whitespace and (len(content) == 0 or content.isspace()):
+                return
+
+            # There is no existing text part that should be updated, so create a new one
+            part = TextPart(content=content, id=id, provider_name=provider_name, provider_details=provider_details)
+            new_part_index = self._append_part(part, vendor_part_id)
+            yield PartStartEvent(index=new_part_index, part=part)
+        else:
+            # Update the existing TextPart with the new content delta
+            existing_text_part, part_index = existing_text_part_and_index
+
+            part_delta = TextPartDelta(
+                content_delta=content,
+                provider_name=self._resolve_provider_name(existing_text_part, provider_name),
+                provider_details=provider_details,
+            )
+            self._parts[part_index] = part_delta.apply(existing_text_part)
+            yield PartDeltaEvent(index=part_index, delta=part_delta)
+
+# pydantic_ai_slim/pydantic_ai/_parts_manager.py:175-256
+    def handle_thinking_delta(
+        self,
+        *,
+        vendor_part_id: Hashable | None,
+        content: str | None = None,
+        id: str | None = None,
+        signature: str | None = None,
+        provider_name: str | None = None,
+        provider_details: ProviderDetailsDelta = None,
+    ) -> Iterator[ModelResponseStreamEvent]:
+        """Handle incoming thinking content, creating or updating a ThinkingPart in the manager as appropriate.
+
+        When `vendor_part_id` is None, the latest part is updated if it exists and is a ThinkingPart;
+        otherwise, a new ThinkingPart is created. When a non-None ID is specified, the ThinkingPart corresponding
+        to that vendor ID is either created or updated.
+
+        Args:
+            vendor_part_id: The ID the vendor uses to identify this piece
+                of thinking. If None, a new part will be created unless the latest part is already
+                a ThinkingPart.
+            content: The thinking content to append to the appropriate ThinkingPart.
+            id: An optional id for the thinking part.
+            signature: An optional signature for the thinking content.
+            provider_name: An optional provider name for the thinking part.
+            provider_details: Either a dict of provider-specific details, or a callable that takes
+                the existing part's `provider_details` and returns the updated details. Callables
+                allow provider-specific update logic without the parts manager knowing the details.
+
+        Yields:
+            A `PartStartEvent` if a new part was created, or a `PartDeltaEvent` if an existing part was updated.
+
+        Raises:
+            UnexpectedModelBehavior: If attempting to apply a thinking delta to a part that is not a ThinkingPart.
+        """
+        existing_thinking_part_and_index: tuple[ThinkingPart, int] | None = None
+
+        if vendor_part_id is None:
+            # If the vendor_part_id is None, check if the latest part is a ThinkingPart to update
+            existing_thinking_part_and_index = self._latest_part_if_of_type(ThinkingPart)
+        else:
+            # Otherwise, attempt to look up an existing ThinkingPart by vendor_part_id
+            part_index = self._vendor_id_to_part_index.get(vendor_part_id)
+            if part_index is not None:
+                existing_part = self._parts[part_index]
+                if not isinstance(existing_part, ThinkingPart):
+                    raise UnexpectedModelBehavior(f'Cannot apply a thinking delta to {existing_part=}')
+                existing_thinking_part_and_index = existing_part, part_index
+
+        if existing_thinking_part_and_index is None:
+            if content is not None or signature is not None or provider_details is not None:
+                # There is no existing thinking part that should be updated, so create a new one
+                # Resolve provider_details if it's a callback (with None since there's no existing part)
+                resolved_details: dict[str, Any] | None
+                resolved_details = provider_details(None) if callable(provider_details) else provider_details
+                part = ThinkingPart(
+                    content=content or '',
+                    id=id,
+                    signature=signature,
+                    provider_name=provider_name,
+                    provider_details=resolved_details,
+                )
+                new_part_index = self._append_part(part, vendor_part_id)
+                yield PartStartEvent(index=new_part_index, part=part)
+            else:
+                raise UnexpectedModelBehavior(
+                    'Cannot create a ThinkingPart with no content, signature, or provider_details'
+                )
+        else:
+            existing_thinking_part, part_index = existing_thinking_part_and_index
+
+            # Skip if nothing to update
+            if content is None and signature is None and provider_name is None and provider_details is None:
+                return
+
+            part_delta = ThinkingPartDelta(
+                content_delta=content,
+                signature_delta=signature,
+                provider_name=self._resolve_provider_name(existing_thinking_part, provider_name),
+                provider_details=provider_details,
+            )
+            self._parts[part_index] = part_delta.apply(existing_thinking_part)
+            yield PartDeltaEvent(index=part_index, delta=part_delta)
+
+# pydantic_ai_slim/pydantic_ai/toolsets/function.py:138-237
+    def tool(
+        self,
+        func: ToolFuncEither[AgentDepsT, ToolParams] | None = None,
+        /,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        retries: int | None = None,
+        prepare: ToolPrepareFunc[AgentDepsT] | None = None,
+        docstring_format: DocstringFormat | None = None,
+        require_parameter_descriptions: bool | None = None,
+        schema_generator: type[GenerateJsonSchema] | None = None,
+        strict: bool | None = None,
+        sequential: bool | None = None,
+        requires_approval: bool | None = None,
+        metadata: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """Decorator to register a tool function which takes [`RunContext`][pydantic_ai.tools.RunContext] as its first argument.
+
+        Can decorate a sync or async functions.
+
+        The docstring is inspected to extract both the tool description and description of each parameter,
+        [learn more](../tools.md#function-tools-and-schema).
+
+        We can't add overloads for every possible signature of tool, since the return type is a recursive union
+        so the signature of functions decorated with `@toolset.tool` is obscured.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent, FunctionToolset, RunContext
+
+        toolset = FunctionToolset()
+
+        @toolset.tool
+        def foobar(ctx: RunContext[int], x: int) -> int:
+            return ctx.deps + x
+
+        @toolset.tool(retries=2)
+        async def spam(ctx: RunContext[str], y: float) -> float:
+            return ctx.deps + y
+
+        agent = Agent('test', toolsets=[toolset], deps_type=int)
+        result = agent.run_sync('foobar', deps=1)
+        print(result.output)
+        #> {"foobar":1,"spam":1.0}
+        ```
+
+        Args:
+            func: The tool function to register.
+            name: The name of the tool, defaults to the function name.
+            description: The description of the tool,defaults to the function docstring.
+            retries: The number of retries to allow for this tool, defaults to the agent's default retries,
+                which defaults to 1.
+            prepare: custom method to prepare the tool definition for each step, return `None` to omit this
+                tool from a given step. This is useful if you want to customise a tool at call time,
+                or omit it completely from a step. See [`ToolPrepareFunc`][pydantic_ai.tools.ToolPrepareFunc].
+            docstring_format: The format of the docstring, see [`DocstringFormat`][pydantic_ai.tools.DocstringFormat].
+                If `None`, the default value is determined by the toolset.
+            require_parameter_descriptions: If True, raise an error if a parameter description is missing.
+                If `None`, the default value is determined by the toolset.
+            schema_generator: The JSON schema generator class to use for this tool.
+                If `None`, the default value is determined by the toolset.
+            strict: Whether to enforce JSON schema compliance (only affects OpenAI).
+                See [`ToolDefinition`][pydantic_ai.tools.ToolDefinition] for more info.
+                If `None`, the default value is determined by the toolset.
+            sequential: Whether the function requires a sequential/serial execution environment. Defaults to False.
+                If `None`, the default value is determined by the toolset.
+            requires_approval: Whether this tool requires human-in-the-loop approval. Defaults to False.
+                See the [tools documentation](../deferred-tools.md#human-in-the-loop-tool-approval) for more info.
+                If `None`, the default value is determined by the toolset.
+            metadata: Optional metadata for the tool. This is not sent to the model but can be used for filtering and tool behavior customization.
+                If `None`, the default value is determined by the toolset. If provided, it will be merged with the toolset's metadata.
+            timeout: Timeout in seconds for tool execution. If the tool takes longer, a retry prompt is returned to the model.
+                Defaults to None (no timeout).
+        """
+
+        def tool_decorator(
+            func_: ToolFuncEither[AgentDepsT, ToolParams],
+        ) -> ToolFuncEither[AgentDepsT, ToolParams]:
+            # noinspection PyTypeChecker
+            self.add_function(
+                func=func_,
+                takes_ctx=None,
+                name=name,
+                description=description,
+                retries=retries,
+                prepare=prepare,
+                docstring_format=docstring_format,
+                require_parameter_descriptions=require_parameter_descriptions,
+                schema_generator=schema_generator,
+                strict=strict,
+                sequential=sequential,
+                requires_approval=requires_approval,
+                metadata=metadata,
+                timeout=timeout,
+            )
+            return func_
+
+        return tool_decorator if func is None else tool_decorator(func)
+
+# pydantic_graph/pydantic_graph/exceptions.py:59-62
+    def check(cls, status: 'SnapshotStatus') -> None:
+        """Check if the status is valid."""
+        if status not in {'created', 'pending'}:
+            raise cls(status)
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py:129-156
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        """Make a streaming model request.
+
+        When inside a Prefect flow, the stream is consumed within a task and
+        a non-streaming response is returned. When not in a flow, behaves normally.
+        """
+        # Check if we're in a flow context
+        flow_run_context = FlowRunContext.get()
+
+        # If not in a flow, just call the wrapped request_stream method
+        if flow_run_context is None:
+            async with super().request_stream(
+                messages, model_settings, model_request_parameters, run_context
+            ) as streamed_response:
+                yield streamed_response
+                return
+
+        # If in a flow, consume the stream in a task and return the final response
+        response = await self._wrapped_request_stream.with_options(
+            name=f'Model Request (Streaming): {self.wrapped.model_name}', **self.task_config
+        )(messages, model_settings, model_request_parameters, run_context)
+        yield PrefectStreamedResponse(model_request_parameters, response)
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_agent.py:44-120
+    def __init__(
+        self,
+        wrapped: AbstractAgent[AgentDepsT, OutputDataT],
+        *,
+        name: str | None = None,
+        event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+        mcp_task_config: TaskConfig | None = None,
+        model_task_config: TaskConfig | None = None,
+        tool_task_config: TaskConfig | None = None,
+        tool_task_config_by_name: dict[str, TaskConfig | None] | None = None,
+        event_stream_handler_task_config: TaskConfig | None = None,
+        prefectify_toolset_func: Callable[
+            [AbstractToolset[AgentDepsT], TaskConfig, TaskConfig, dict[str, TaskConfig | None]],
+            AbstractToolset[AgentDepsT],
+        ] = prefectify_toolset,
+    ):
+        """Wrap an agent to enable it with Prefect durable flows, by automatically offloading model requests, tool calls, and MCP server communication to Prefect tasks.
+
+        After wrapping, the original agent can still be used as normal outside of the Prefect flow.
+
+        Args:
+            wrapped: The agent to wrap.
+            name: Optional unique agent name to use as the Prefect flow name prefix. If not provided, the agent's `name` will be used.
+            event_stream_handler: Optional event stream handler to use instead of the one set on the wrapped agent.
+            mcp_task_config: The base Prefect task config to use for MCP server tasks. If no config is provided, use the default settings of Prefect.
+            model_task_config: The Prefect task config to use for model request tasks. If no config is provided, use the default settings of Prefect.
+            tool_task_config: The default Prefect task config to use for tool calls. If no config is provided, use the default settings of Prefect.
+            tool_task_config_by_name: Per-tool task configuration. Keys are tool names, values are TaskConfig or None (None disables task wrapping for that tool).
+            event_stream_handler_task_config: The Prefect task config to use for the event stream handler task. If no config is provided, use the default settings of Prefect.
+            prefectify_toolset_func: Optional function to use to prepare toolsets for Prefect by wrapping them in a `PrefectWrapperToolset` that moves methods that require IO to Prefect tasks.
+                If not provided, only `FunctionToolset` and `MCPServer` will be prepared for Prefect.
+                The function takes the toolset, the task config, the tool-specific task config, and the tool-specific task config by name.
+        """
+        super().__init__(wrapped)
+
+        self._name = name or wrapped.name
+        self._event_stream_handler = event_stream_handler
+        if self._name is None:
+            raise UserError(
+                "An agent needs to have a unique `name` in order to be used with Prefect. The name will be used to identify the agent's flows and tasks."
+            )
+
+        # Merge the config with the default Prefect config
+        self._mcp_task_config = default_task_config | (mcp_task_config or {})
+        self._model_task_config = default_task_config | (model_task_config or {})
+        self._tool_task_config = default_task_config | (tool_task_config or {})
+        self._tool_task_config_by_name = tool_task_config_by_name or {}
+        self._event_stream_handler_task_config = default_task_config | (event_stream_handler_task_config or {})
+
+        if not isinstance(wrapped.model, Model):
+            raise UserError(
+                'An agent needs to have a `model` in order to be used with Prefect, it cannot be set at agent run time.'
+            )
+
+        prefect_model = PrefectModel(
+            wrapped.model,
+            task_config=self._model_task_config,
+            event_stream_handler=self.event_stream_handler,
+        )
+        self._model = prefect_model
+
+        def _prefectify_toolset(toolset: AbstractToolset[AgentDepsT]) -> AbstractToolset[AgentDepsT]:
+            """Convert a toolset to its Prefect equivalent."""
+            return prefectify_toolset_func(
+                toolset,
+                self._mcp_task_config,
+                self._tool_task_config,
+                self._tool_task_config_by_name,
+            )
+
+        prefect_toolsets = [toolset.visit_and_replace(_prefectify_toolset) for toolset in wrapped.toolsets]
+        self._toolsets = prefect_toolsets
+
+        # Context variable to track when we're inside this agent's Prefect flow
+        self._in_prefect_agent_flow: ContextVar[bool] = ContextVar(
+            f'_in_prefect_agent_flow_{self._name}', default=False
+        )
+
+# pydantic_evals/pydantic_evals/_utils.py:37-46
+def is_set(t_or_unset: T | Unset) -> TypeIs[T]:
+    """Check if a value is set (not the UNSET singleton).
+
+    Args:
+        t_or_unset: The value to check, which may be the UNSET singleton or a regular value.
+
+    Returns:
+        True if the value is not UNSET, narrowing the type to T in a type-aware way.
+    """
+    return t_or_unset is not UNSET
+
+# pydantic_graph/pydantic_graph/beta/util.py:58-67
+class Some(Generic[T]):
+    """Container for explicitly present values in Maybe type pattern.
+
+    This class represents a value that is definitely present, as opposed to None.
+    It's part of the Maybe pattern, similar to Option/Maybe in functional programming,
+    allowing distinction between "no value" (None) and "value is None" (Some(None)).
+    """
+
+    value: T
+    """The wrapped value."""
+
+# pydantic_evals/pydantic_evals/dataset.py:969-1048
+async def _run_task(
+    task: Callable[[InputsT], Awaitable[OutputT] | OutputT],
+    case: Case[InputsT, OutputT, MetadataT],
+    retry: RetryConfig | None = None,
+) -> EvaluatorContext[InputsT, OutputT, MetadataT]:
+    """Run a task on a case and return the context for evaluators.
+
+    Args:
+        task: The task to run.
+        case: The case to run the task on.
+        retry: The retry config to use.
+
+    Returns:
+        An EvaluatorContext containing the inputs, actual output, expected output, and metadata.
+
+    Raises:
+        Exception: Any exception raised by the task.
+    """
+
+    async def _run_once():
+        task_run_ = _TaskRun()
+        if _CURRENT_TASK_RUN.get() is not None:  # pragma: no cover
+            raise RuntimeError('A task run has already been entered. Task runs should not be nested')
+
+        token = _CURRENT_TASK_RUN.set(task_run_)
+        try:
+            with (
+                logfire_span('execute {task}', task=get_unwrapped_function_name(task)) as task_span,
+                context_subtree() as span_tree_,
+            ):
+                t0 = time.perf_counter()
+                if iscoroutinefunction(task):
+                    task_output_ = cast(OutputT, await task(case.inputs))
+                else:
+                    task_output_ = cast(OutputT, await to_thread.run_sync(task, case.inputs))
+                fallback_duration = time.perf_counter() - t0
+            duration_ = _get_span_duration(task_span, fallback_duration)
+            return task_run_, task_output_, duration_, span_tree_
+        finally:
+            _CURRENT_TASK_RUN.reset(token)
+
+    if retry:
+        # import from pydantic_ai.retries to trigger more descriptive import error if tenacity is missing
+        from pydantic_ai.retries import retry as tenacity_retry
+
+        _run_once = tenacity_retry(**retry)(_run_once)
+
+    task_run, task_output, duration, span_tree = await _run_once()
+
+    if isinstance(span_tree, SpanTree):  # pragma: no branch
+        # Idea for making this more configurable: replace the following logic with a call to a user-provided function
+        #   of type Callable[[_TaskRun, SpanTree], None] or similar, (maybe no _TaskRun and just use the public APIs).
+        #   That way users can customize this logic. We'd default to a function that does the current thing but also
+        #   allow `None` to disable it entirely.
+        for node in span_tree:
+            if 'gen_ai.request.model' not in node.attributes:
+                continue  # we only want to count the below specifically for the individual LLM requests, not agent runs
+            for k, v in node.attributes.items():
+                if k == 'gen_ai.operation.name' and v == 'chat':
+                    task_run.increment_metric('requests', 1)
+                elif not isinstance(v, int | float):
+                    continue
+                elif k == 'operation.cost':
+                    task_run.increment_metric('cost', v)
+                elif k.startswith('gen_ai.usage.details.'):
+                    task_run.increment_metric(k.removeprefix('gen_ai.usage.details.'), v)
+                elif k.startswith('gen_ai.usage.'):
+                    task_run.increment_metric(k.removeprefix('gen_ai.usage.'), v)
+
+    return EvaluatorContext[InputsT, OutputT, MetadataT](
+        name=case.name,
+        inputs=case.inputs,
+        metadata=case.metadata,
+        expected_output=case.expected_output,
+        output=task_output,
+        duration=duration,
+        _span_tree=span_tree,
+        attributes=task_run.attributes,
+        metrics=task_run.metrics,
+    )
+
+# pydantic_evals/pydantic_evals/evaluators/context.py:86-102
+    def span_tree(self) -> SpanTree:
+        """Get the `SpanTree` for this task execution.
+
+        The span tree is a graph where each node corresponds to an OpenTelemetry span recorded during the task
+        execution, including timing information and any custom spans created during execution.
+
+        Returns:
+            The span tree for the task execution.
+
+        Raises:
+            SpanTreeRecordingError: If spans were not captured during execution of the task, e.g. due to not having
+                the necessary dependencies installed.
+        """
+        if isinstance(self._span_tree, SpanTreeRecordingError):
+            # In this case, there was a reason we couldn't record the SpanTree. We raise that now
+            raise self._span_tree
+        return self._span_tree
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py:26-64
+class PrefectStreamedResponse(StreamedResponse):
+    """A non-streaming response wrapper for Prefect tasks.
+
+    When a model request is executed inside a Prefect flow, the entire stream
+    is consumed within the task, and this wrapper is returned containing the
+    final response.
+    """
+
+    def __init__(self, model_request_parameters: ModelRequestParameters, response: ModelResponse):
+        super().__init__(model_request_parameters)
+        self.response = response
+
+    async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        """Return an empty iterator since the stream has already been consumed."""
+        return
+        # noinspection PyUnreachableCode
+        yield
+
+    def get(self) -> ModelResponse:
+        return self.response
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+    @property
+    def model_name(self) -> str:
+        return self.response.model_name or ''  # pragma: no cover
+
+    @property
+    def provider_name(self) -> str:
+        return self.response.provider_name or ''  # pragma: no cover
+
+    @property
+    def provider_url(self) -> str | None:
+        return self.response.provider_url  # pragma: no cover
+
+    @property
+    def timestamp(self) -> datetime:
+        return self.response.timestamp  # pragma: no cover
+
+# pydantic_graph/pydantic_graph/beta/graph.py:500-506
+    def next_task(self) -> EndMarker[OutputT] | Sequence[GraphTask]:
+        """Get the next task(s) to be executed.
+
+        Returns:
+            The next execution item, or the initial task if none is set
+        """
+        return self._next or [self._first_task]
+
+# pydantic_evals/pydantic_evals/evaluators/spec.py:124-142
+    def enforce_one_key(cls, value: str | dict[str, Any]) -> Any:
+        """Enforce that the root value has exactly one key (the evaluator name) when it is a dict.
+
+        Args:
+            value: The value to validate.
+
+        Returns:
+            The validated value.
+
+        Raises:
+            ValueError: If the value is a dict with multiple keys.
+        """
+        if isinstance(value, str):
+            return value
+        if len(value) != 1:
+            raise ValueError(
+                f'Expected a single key containing the Evaluator class name, found keys {list(value.keys())}'
+            )
+        return value
+
+# pydantic_evals/pydantic_evals/evaluators/common.py:63-128
+class Contains(Evaluator[object, object, object]):
+    """Check if the output contains the expected output.
+
+    For strings, checks if expected_output is a substring of output.
+    For lists/tuples, checks if expected_output is in output.
+    For dicts, checks if all key-value pairs in expected_output are in output.
+
+    Note: case_sensitive only applies when both the value and output are strings.
+    """
+
+    value: Any
+    case_sensitive: bool = True
+    as_strings: bool = False
+    evaluation_name: str | None = field(default=None)
+
+    def evaluate(
+        self,
+        ctx: EvaluatorContext[object, object, object],
+    ) -> EvaluationReason:
+        # Convert objects to strings if requested
+        failure_reason: str | None = None
+        as_strings = self.as_strings or (isinstance(self.value, str) and isinstance(ctx.output, str))
+        if as_strings:
+            output_str = str(ctx.output)
+            expected_str = str(self.value)
+
+            if not self.case_sensitive:
+                output_str = output_str.lower()
+                expected_str = expected_str.lower()
+
+            failure_reason: str | None = None
+            if expected_str not in output_str:
+                output_trunc = _truncated_repr(output_str, max_length=100)
+                expected_trunc = _truncated_repr(expected_str, max_length=100)
+                failure_reason = f'Output string {output_trunc} does not contain expected string {expected_trunc}'
+            return EvaluationReason(value=failure_reason is None, reason=failure_reason)
+
+        try:
+            # Handle different collection types
+            if isinstance(ctx.output, dict):
+                if isinstance(self.value, dict):
+                    # Cast to Any to avoid type checking issues
+                    output_dict = cast(dict[Any, Any], ctx.output)  # pyright: ignore[reportUnknownMemberType]
+                    expected_dict = cast(dict[Any, Any], self.value)  # pyright: ignore[reportUnknownMemberType]
+                    for k in expected_dict:
+                        if k not in output_dict:
+                            k_trunc = _truncated_repr(k, max_length=30)
+                            failure_reason = f'Output dictionary does not contain expected key {k_trunc}'
+                            break
+                        elif output_dict[k] != expected_dict[k]:
+                            k_trunc = _truncated_repr(k, max_length=30)
+                            output_v_trunc = _truncated_repr(output_dict[k], max_length=100)
+                            expected_v_trunc = _truncated_repr(expected_dict[k], max_length=100)
+                            failure_reason = f'Output dictionary has different value for key {k_trunc}: {output_v_trunc} != {expected_v_trunc}'
+                            break
+                else:
+                    if self.value not in ctx.output:  # pyright: ignore[reportUnknownMemberType]
+                        output_trunc = _truncated_repr(ctx.output, max_length=200)  # pyright: ignore[reportUnknownMemberType]
+                        failure_reason = f'Output {output_trunc} does not contain provided value as a key'
+            elif self.value not in ctx.output:  # pyright: ignore[reportOperatorIssue]  # will be handled by except block
+                output_trunc = _truncated_repr(ctx.output, max_length=200)
+                failure_reason = f'Output {output_trunc} does not contain provided value'
+        except (TypeError, ValueError) as e:
+            failure_reason = f'Containment check failed: {e}'
+
+        return EvaluationReason(value=failure_reason is None, reason=failure_reason)
+
+# tests/models/test_openai.py:4120-4132
+async def test_openai_response_filter_with_partial_content(allow_model_requests: None):
+    """Test that NO exception is raised if content is returned, even if finish_reason is content_filter."""
+    c = completion_message(
+        ChatCompletionMessage(content='Partial', role='assistant'),
+    )
+    c.choices[0].finish_reason = 'content_filter'
+
+    mock_client = MockOpenAI.create_mock(c)
+    m = OpenAIChatModel('gpt-5-mini', provider=OpenAIProvider(openai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('hello')
+    assert result.output == 'Partial'
+
+# pydantic_ai_slim/pydantic_ai/_output.py:18-18
+from . import _function_schema, _utils, messages as _messages
+
+# pydantic_ai_slim/pydantic_ai/_run_context.py:15-15
+from . import _utils, messages as _messages
+
+# pydantic_ai_slim/pydantic_ai/_system_prompt.py:8-8
+from . import _utils
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:9-9
+from pydantic_ai import _utils

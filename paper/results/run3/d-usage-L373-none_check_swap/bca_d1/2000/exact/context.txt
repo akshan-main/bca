@@ -1,0 +1,197 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/embeddings/cohere.py
+
+def _map_usage(response: EmbedByTypeResponse, provider: str, provider_url: str, model: str) -> RequestUsage:
+    u = response.meta
+    if u is None or u.billed_units is None:
+        return RequestUsage()  # pragma: no cover
+    usage_data = {
+        k: int(v)
+        for k, v in u.billed_units.model_dump(exclude_none=True).items()
+        if isinstance(v, int | float) and v > 0
+    }
+    details = {k: int(v) for k, v in usage_data.items() if k != 'input_tokens' and isinstance(v, int | float) and v > 0}
+    response_data = dict(model=model, meta=dict(billed_units=usage_data))
+
+    return RequestUsage.extract(
+        response_data,
+        provider=provider,
+        provider_url=provider_url,
+        provider_fallback='cohere',
+        api_flavor='embeddings',
+        details=details,
+    )
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far. This will not be the final usage until the stream is exhausted."""
+        return self._usage
+
+## pydantic_ai_slim/pydantic_ai/models/bedrock.py
+
+    def _map_usage(self, metadata: ConverseStreamMetadataEventTypeDef) -> usage.RequestUsage:
+        input_tokens = metadata['usage']['inputTokens']
+        output_tokens = metadata['usage']['outputTokens']
+        cache_read_tokens = metadata['usage'].get('cacheReadInputTokens', 0)
+        cache_write_tokens = metadata['usage'].get('cacheWriteInputTokens', 0)
+        return usage.RequestUsage(
+            input_tokens=input_tokens + cache_write_tokens + cache_read_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+        )
+
+## pydantic_ai_slim/pydantic_ai/models/openai.py
+
+    def _map_usage(self, response: chat.ChatCompletion) -> usage.RequestUsage:
+        return _map_usage(response, self._provider.name, self._provider.base_url, self.model_name)
+
+    def _map_usage(self, response: ChatCompletionChunk) -> usage.RequestUsage:
+        return _map_usage(response, self._provider_name, self._provider_url, self.model_name)
+
+    def _map_usage(self, response: responses.Response) -> usage.RequestUsage:
+        return _map_usage(response, self._provider_name, self._provider_url, self.model_name)
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._initial_run_ctx_usage + self._raw_stream_response.usage()
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._streamed_run_result.usage()
+
+def _get_usage_checking_stream_response(
+    stream_response: models.StreamedResponse,
+    limits: UsageLimits | None,
+    get_usage: Callable[[], RunUsage],
+) -> AsyncIterator[ModelResponseStreamEvent]:
+    if limits is not None and limits.has_token_limits():
+
+        async def _usage_checking_iterator():
+            async for item in stream_response:
+                limits.check_tokens(get_usage())
+                yield item
+
+        return _usage_checking_iterator()
+    else:
+        return aiter(stream_response)
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def usage(self) -> _usage.RunUsage:
+        """Get usage statistics for the run so far, including token usage, model requests, and so on."""
+        return self._graph_run.state.usage
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    def total_tokens(self) -> int:
+        """Sum of `input_tokens + output_tokens`."""
+        return self.input_tokens + self.output_tokens
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+    def incr(self, incr_usage: RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        return _incr_usage_tokens(self, incr_usage)
+
+    def incr(self, incr_usage: RunUsage | RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        if isinstance(incr_usage, RunUsage):
+            self.requests += incr_usage.requests
+            self.tool_calls += incr_usage.tool_calls
+        return _incr_usage_tokens(self, incr_usage)
+
+def _incr_usage_tokens(slf: RunUsage | RequestUsage, incr_usage: RunUsage | RequestUsage) -> None:
+    """Increment the usage in place.
+
+    Args:
+        slf: The usage to increment.
+        incr_usage: The usage to increment by.
+    """
+    slf.input_tokens += incr_usage.input_tokens
+    slf.cache_write_tokens += incr_usage.cache_write_tokens
+    slf.cache_read_tokens += incr_usage.cache_read_tokens
+    slf.input_audio_tokens += incr_usage.input_audio_tokens
+    slf.cache_audio_read_tokens += incr_usage.cache_audio_read_tokens
+    slf.output_tokens += incr_usage.output_tokens
+
+    for key, value in incr_usage.details.items():
+        # Note: value can be None at runtime from model responses despite the type annotation
+        if isinstance(value, (int, float)):
+            slf.details[key] = slf.details.get(key, 0) + value
+
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+        # deprecated:
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+    ):
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit if input_tokens_limit is not None else request_tokens_limit
+        self.output_tokens_limit = output_tokens_limit if output_tokens_limit is not None else response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    def check_tokens(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the usage exceeds any of the token limits."""
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})')
+
+        output_tokens = usage.output_tokens
+        if self.output_tokens_limit is not None and output_tokens > self.output_tokens_limit:
+            raise UsageLimitExceeded(
+                f'Exceeded the output_tokens_limit of {self.output_tokens_limit} ({output_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})')
+
+## pydantic_evals/pydantic_evals/otel/span_tree.py
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None

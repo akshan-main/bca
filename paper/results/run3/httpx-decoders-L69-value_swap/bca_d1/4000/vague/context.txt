@@ -1,0 +1,477 @@
+## httpx/_auth.py
+
+class Auth:
+    """
+    Base class for all authentication schemes.
+
+    To implement a custom authentication scheme, subclass `Auth` and override
+    the `.auth_flow()` method.
+
+    If the authentication scheme does I/O such as disk access or network calls, or uses
+    synchronization primitives such as locks, you should override `.sync_auth_flow()`
+    and/or `.async_auth_flow()` instead of `.auth_flow()` to provide specialized
+    implementations that will be used by `Client` and `AsyncClient` respectively.
+    """
+
+    requires_request_body = False
+    requires_response_body = False
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow.
+
+        To dispatch a request, `yield` it:
+
+        ```
+        yield request
+        ```
+
+        The client will `.send()` the response back into the flow generator. You can
+        access it like so:
+
+        ```
+        response = yield request
+        ```
+
+        A `return` (or reaching the end of the generator) will result in the
+        client returning the last response obtained from the server.
+
+        You can dispatch as many requests as is necessary.
+        """
+        yield request
+
+    def sync_auth_flow(
+        self, request: Request
+    ) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow synchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            request.read()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                response.read()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+    async def async_auth_flow(
+        self, request: Request
+    ) -> typing.AsyncGenerator[Request, Response]:
+        """
+        Execute the authentication flow asynchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            await request.aread()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                await response.aread()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+class FunctionAuth(Auth):
+    """
+    Allows the 'auth' argument to be passed as a simple callable function,
+    that takes the request, and returns a new, modified request.
+    """
+
+    def __init__(self, func: typing.Callable[[Request], Request]) -> None:
+        self._func = func
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        yield self._func(request)
+
+    def __init__(self, func: typing.Callable[[Request], Request]) -> None:
+        self._func = func
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        yield self._func(request)
+
+## httpx/_client.py
+
+    def _build_auth(self, auth: AuthTypes | None) -> Auth | None:
+        if auth is None:
+            return None
+        elif isinstance(auth, tuple):
+            return BasicAuth(username=auth[0], password=auth[1])
+        elif isinstance(auth, Auth):
+            return auth
+        elif callable(auth):
+            return FunctionAuth(func=auth)
+        else:
+            raise TypeError(f'Invalid "auth" argument: {auth!r}')
+
+## httpx/_models.py
+
+def _parse_header_links(value: str) -> list[dict[str, str]]:
+    """
+    Returns a list of parsed link headers, for more info see:
+    https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Link
+    The generic syntax of those is:
+    Link: < uri-reference >; param1=value1; param2="value2"
+    So for instance:
+    Link; '<http:/.../front.jpeg>; type="image/jpeg",<http://.../back.jpeg>;'
+    would return
+        [
+            {"url": "http:/.../front.jpeg", "type": "image/jpeg"},
+            {"url": "http://.../back.jpeg"},
+        ]
+    :param value: HTTP Link entity-header field
+    :return: list of parsed link headers
+    """
+    links: list[dict[str, str]] = []
+    replace_chars = " '\""
+    value = value.strip(replace_chars)
+    if not value:
+        return links
+    for val in re.split(", *<", value):
+        try:
+            url, params = val.split(";", 1)
+        except ValueError:
+            url, params = val, ""
+        link = {"url": url.strip("<> '\"")}
+        for param in params.split(";"):
+            try:
+                key, value = param.split("=")
+            except ValueError:
+                break
+            link[key.strip(replace_chars)] = value.strip(replace_chars)
+        links.append(link)
+    return links
+
+    def raw(self) -> list[tuple[bytes, bytes]]:
+        """
+        Returns a list of the raw header items, as byte pairs.
+        """
+        return [(raw_key, value) for raw_key, _, value in self._list]
+
+    def get_list(self, key: str, split_commas: bool = False) -> list[str]:
+        """
+        Return a list of all header values for a given key.
+        If `split_commas=True` is passed, then any comma separated header
+        values are split into multiple return strings.
+        """
+        get_header_key = key.lower().encode(self.encoding)
+
+        values = [
+            item_value.decode(self.encoding)
+            for _, item_key, item_value in self._list
+            if item_key.lower() == get_header_key
+        ]
+
+        if not split_commas:
+            return values
+
+        split_values = []
+        for value in values:
+            split_values.extend([item.strip() for item in value.split(",")])
+        return split_values
+
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+    def is_informational(self) -> bool:
+        """
+        A property which is `True` for 1xx status codes, `False` otherwise.
+        """
+        return codes.is_informational(self.status_code)
+
+    def is_success(self) -> bool:
+        """
+        A property which is `True` for 2xx status codes, `False` otherwise.
+        """
+        return codes.is_success(self.status_code)
+
+    def is_redirect(self) -> bool:
+        """
+        A property which is `True` for 3xx status codes, `False` otherwise.
+
+        Note that not all responses with a 3xx status code indicate a URL redirect.
+
+        Use `response.has_redirect_location` to determine responses with a properly
+        formed URL redirection.
+        """
+        return codes.is_redirect(self.status_code)
+
+    def is_client_error(self) -> bool:
+        """
+        A property which is `True` for 4xx status codes, `False` otherwise.
+        """
+        return codes.is_client_error(self.status_code)
+
+    def is_server_error(self) -> bool:
+        """
+        A property which is `True` for 5xx status codes, `False` otherwise.
+        """
+        return codes.is_server_error(self.status_code)
+
+    def is_error(self) -> bool:
+        """
+        A property which is `True` for 4xx and 5xx status codes, `False` otherwise.
+        """
+        return codes.is_error(self.status_code)
+
+    def links(self) -> dict[str | None, dict[str, str]]:
+        """
+        Returns the parsed header links of the response, if any
+        """
+        header = self.headers.get("link")
+        if header is None:
+            return {}
+
+        return {
+            (link.get("rel") or link.get("url")): link
+            for link in _parse_header_links(header)
+        }
+
+## httpx/_status_codes.py
+
+    def is_informational(cls, value: int) -> bool:
+        """
+        Returns `True` for 1xx status codes, `False` otherwise.
+        """
+        return 100 <= value <= 199
+
+    def is_success(cls, value: int) -> bool:
+        """
+        Returns `True` for 2xx status codes, `False` otherwise.
+        """
+        return 200 <= value <= 299
+
+    def is_redirect(cls, value: int) -> bool:
+        """
+        Returns `True` for 3xx status codes, `False` otherwise.
+        """
+        return 300 <= value <= 399
+
+    def is_client_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 499
+
+    def is_server_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 5xx status codes, `False` otherwise.
+        """
+        return 500 <= value <= 599
+
+    def is_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx or 5xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 599
+
+## httpx/_urls.py
+
+    def values(self) -> typing.ValuesView[str]:
+        """
+        Return all the values in the query params. If a key occurs more than once
+        only the first item for that key is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.values()) == ["123", "789"]
+        """
+        return {k: v[0] for k, v in self._dict.items()}.values()
+
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return all items in the query params. If a key occurs more than once
+        only the first item for that key is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.items()) == [("a", "123"), ("b", "789")]
+        """
+        return {k: v[0] for k, v in self._dict.items()}.items()
+
+    def get(self, key: typing.Any, default: typing.Any = None) -> typing.Any:
+        """
+        Get a value from the query param for a given key. If the key occurs
+        more than once, then only the first value is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get("a") == "123"
+        """
+        if key in self._dict:
+            return self._dict[str(key)][0]
+        return default
+
+## tests/client/test_auth.py
+
+async def test_digest_auth_returns_no_auth_if_no_digest_header_in_response() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+def test_digest_auth_returns_no_auth_if_alternate_auth_scheme() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    auth_header = "Token ..."
+    app = App(auth_header=auth_header, status_code=401)
+
+    client = httpx.Client(transport=httpx.MockTransport(app))
+    response = client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+async def test_digest_auth_qop_including_spaces_and_auth_returns_auth(qop: str) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop=qop)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+## tests/concurrency.py
+
+async def sleep(seconds: float) -> None:
+    if sniffio.current_async_library() == "trio":
+        await trio.sleep(seconds)  # pragma: no cover
+    else:
+        await asyncio.sleep(seconds)
+
+## tests/conftest.py
+
+from uvicorn.server import Server
+
+async def slow_response(scope: Scope, receive: Receive, send: Send) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [[b"content-type", b"text/plain"]],
+        }
+    )
+    await sleep(1.0)  # Allow triggering a read timeout.
+    await send({"type": "http.response.body", "body": b"Hello, world!"})
+
+class TestServer(Server):
+    @property
+    def url(self) -> httpx.URL:
+        protocol = "https" if self.config.is_ssl else "http"
+        return httpx.URL(f"{protocol}://{self.config.host}:{self.config.port}/")
+
+    def install_signal_handlers(self) -> None:
+        # Disable the default installation of handlers for signals such as SIGTERM,
+        # because it can only be done in the main thread.
+        pass  # pragma: nocover
+
+    async def serve(self, sockets=None):
+        self.restart_requested = asyncio.Event()
+
+        loop = asyncio.get_event_loop()
+        tasks = {
+            loop.create_task(super().serve(sockets=sockets)),
+            loop.create_task(self.watch_restarts()),
+        }
+        await asyncio.wait(tasks)
+
+    async def restart(self) -> None:  # pragma: no cover
+        # This coroutine may be called from a different thread than the one the
+        # server is running on, and from an async environment that's not asyncio.
+        # For this reason, we use an event to coordinate with the server
+        # instead of calling shutdown()/startup() directly, and should not make
+        # any asyncio-specific operations.
+        self.started = False
+        self.restart_requested.set()
+        while not self.started:
+            await sleep(0.2)
+
+    async def watch_restarts(self) -> None:  # pragma: no cover
+        while True:
+            if self.should_exit:
+                return
+
+            try:
+                await asyncio.wait_for(self.restart_requested.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+            self.restart_requested.clear()
+            await self.shutdown()
+            await self.startup()
+
+    async def restart(self) -> None:  # pragma: no cover
+        # This coroutine may be called from a different thread than the one the
+        # server is running on, and from an async environment that's not asyncio.
+        # For this reason, we use an event to coordinate with the server
+        # instead of calling shutdown()/startup() directly, and should not make
+        # any asyncio-specific operations.
+        self.started = False
+        self.restart_requested.set()
+        while not self.started:
+            await sleep(0.2)
+
+## tests/models/test_responses.py
+
+def test_iter_raw_doesnt_return_empty_chunks():
+    def streaming_body_with_empty_chunks() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b""
+        yield b"world!"
+        yield b""
+
+    response = httpx.Response(200, content=streaming_body_with_empty_chunks())
+
+    parts = list(response.iter_raw())
+    assert parts == [b"Hello, ", b"world!"]
+
+def test_iter_bytes_doesnt_return_empty_chunks():
+    def streaming_body_with_empty_chunks() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b""
+        yield b"world!"
+        yield b""
+
+    response = httpx.Response(200, content=streaming_body_with_empty_chunks())
+
+    parts = list(response.iter_bytes())
+    assert parts == [b"Hello, ", b"world!"]
+
+## tests/test_content.py
+
+def test_response_invalid_argument():
+    with pytest.raises(TypeError):
+        httpx.Response(200, content=123)  # type: ignore

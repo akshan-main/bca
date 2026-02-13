@@ -1,0 +1,205 @@
+## tests/test_agent.py
+
+def test_result_pydantic_model_retry():
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        if len(messages) == 1:
+            args_json = '{"a": "wrong", "b": "foo"}'
+        else:
+            args_json = '{"a": 42, "b": "foo"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=Foo)
+
+    assert agent.name is None
+
+    result = agent.run_sync('Hello')
+    assert agent.name == 'agent'
+    assert isinstance(result.output, Foo)
+    assert result.output.model_dump() == {'a': 42, 'b': 'foo'}
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='final_result', args='{"a": "wrong", "b": "foo"}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=51, output_tokens=7),
+                model_name='function:return_model:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        tool_name='final_result',
+                        content=[
+                            ErrorDetails(
+                                type='int_parsing',
+                                loc=('a',),
+                                msg='Input should be a valid integer, unable to parse string as an integer',
+                                input='wrong',
+                            )
+                        ],
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='final_result', args='{"a": 42, "b": "foo"}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=89, output_tokens=14),
+                model_name='function:return_model:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.all_messages_json().startswith(b'[{"parts":[{"content":"Hello",')
+
+def test_output_type_text_output_function_with_retry():
+    class Weather(BaseModel):
+        temperature: float
+        description: str
+
+    def get_weather(ctx: RunContext[None], city: str) -> Weather:
+        assert ctx is not None
+        if city != 'Mexico City':
+            raise ModelRetry('City not found, I only know Mexico City')
+        return Weather(temperature=28.7, description='sunny')
+
+    def call_tool(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+
+        if len(messages) == 1:
+            city = 'New York City'
+        else:
+            city = 'Mexico City'
+
+        return ModelResponse(parts=[TextPart(content=city)])
+
+    agent = Agent(FunctionModel(call_tool), output_type=TextOutput(get_weather))
+    result = agent.run_sync('New York City')
+    assert result.output == snapshot(Weather(temperature=28.7, description='sunny'))
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='New York City',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='New York City')],
+                usage=RequestUsage(input_tokens=53, output_tokens=3),
+                model_name='function:call_tool:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='City not found, I only know Mexico City',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Mexico City')],
+                usage=RequestUsage(input_tokens=70, output_tokens=5),
+                model_name='function:call_tool:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+class OutputType(BaseModel):
+    """Result type used by multiple tests."""
+
+    value: str
+
+def test_heterogeneous_responses_non_streaming() -> None:
+    """Indicates that tool calls are prioritized over text in heterogeneous responses."""
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        parts: list[ModelResponsePart] = []
+        if len(messages) == 1:
+            parts = [TextPart(content='foo'), ToolCallPart('get_location', {'loc_name': 'London'})]
+        else:
+            parts = [TextPart(content='final response')]
+        return ModelResponse(parts=parts)
+
+    agent = Agent(FunctionModel(return_model))
+
+    @agent.tool_plain
+    async def get_location(loc_name: str) -> str:
+        if loc_name == 'London':
+            return json.dumps({'lat': 51, 'lng': 0})
+        else:
+            raise ModelRetry('Wrong location, please try again')  # pragma: no cover
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'final response'
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(content='foo'),
+                    ToolCallPart(tool_name='get_location', args={'loc_name': 'London'}, tool_call_id=IsStr()),
+                ],
+                usage=RequestUsage(input_tokens=51, output_tokens=6),
+                model_name='function:return_model:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='get_location',
+                        content='{"lat": 51, "lng": 0}',
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='final response')],
+                usage=RequestUsage(input_tokens=56, output_tokens=8),
+                model_name='function:return_model:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )

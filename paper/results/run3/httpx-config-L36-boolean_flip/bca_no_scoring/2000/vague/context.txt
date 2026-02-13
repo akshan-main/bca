@@ -1,0 +1,241 @@
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+## tests/client/test_auth.py
+
+async def test_digest_auth_qop_must_be_auth_or_auth_int() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="not-auth")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+async def test_async_digest_auth_raises_protocol_error_on_malformed_header(
+    auth_header: str,
+) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App(auth_header=auth_header, status_code=401)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+def test_sync_auth_history() -> None:
+    """
+    Test that intermediate requests sent as part of an authentication flow
+    are recorded in the response history.
+    """
+    url = "https://example.org/"
+    auth = RepeatAuth(repeat=2)
+    app = App(auth_header="abc")
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Repeat abc.abc"}
+
+    assert len(response.history) == 2
+    resp1, resp2 = response.history
+    assert resp1.json() == {"auth": "Repeat 0"}
+    assert resp2.json() == {"auth": "Repeat 1"}
+
+    assert len(resp2.history) == 1
+    assert resp2.history == [resp1]
+
+    assert len(resp1.history) == 0
+
+class ConsumeBodyTransport(httpx.MockTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.AsyncByteStream)
+        [_ async for _ in request.stream]
+        return self.handler(request)  # type: ignore[return-value]
+
+## tests/client/test_client.py
+
+def test_context_managed_transport():
+    class Transport(httpx.BaseTransport):
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def close(self):
+            # The base implementation of httpx.BaseTransport just
+            # calls into `.close`, so simple transport cases can just override
+            # this method for any cleanup, where more complex cases
+            # might want to additionally override `__enter__`/`__exit__`.
+            self.events.append("transport.close")
+
+        def __enter__(self):
+            super().__enter__()
+            self.events.append("transport.__enter__")
+
+        def __exit__(self, *args):
+            super().__exit__(*args)
+            self.events.append("transport.__exit__")
+
+    transport = Transport()
+    with httpx.Client(transport=transport):
+        pass
+
+    assert transport.events == [
+        "transport.__enter__",
+        "transport.close",
+        "transport.__exit__",
+    ]
+
+def hello_world(request):
+    return httpx.Response(200, text="Hello, world!")
+
+def test_all_mounted_transport():
+    mounts = {"all://": httpx.MockTransport(mounted)}
+
+    client = httpx.Client(mounts=mounts)
+
+    response = client.get("https://www.example.com")
+    assert response.status_code == 200
+    assert response.json() == {"app": "mounted"}
+
+## tests/client/test_proxies.py
+
+def test_transport_for_request(url, proxies, expected):
+    mounts = {key: httpx.HTTPTransport(proxy=value) for key, value in proxies.items()}
+    client = httpx.Client(mounts=mounts)
+
+    transport = client._transport_for_url(httpx.URL(url))
+
+    if expected is None:
+        assert transport is client._transport
+    else:
+        assert isinstance(transport, httpx.HTTPTransport)
+        assert isinstance(transport._pool, httpcore.HTTPProxy)
+        assert transport._pool._proxy_url == url_to_origin(expected)
+
+def test_unsupported_proxy_scheme():
+    with pytest.raises(ValueError):
+        httpx.Client(proxy="ftp://127.0.0.1")
+
+## tests/client/test_redirects.py
+
+def test_malformed_redirect():
+    # https://github.com/encode/httpx/issues/771
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "http://example.org/malformed_redirect", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org:443/"
+    assert len(response.history) == 1
+
+## tests/conftest.py
+
+def cert_authority():
+    return trustme.CA()
+
+## tests/models/test_responses.py
+
+def test_response_force_encoding():
+    response = httpx.Response(
+        200,
+        content="Snowman: ☃".encode("utf-8"),
+    )
+    response.encoding = "iso-8859-1"
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+    assert response.text == "Snowman: â\x98\x83"
+    assert response.encoding == "iso-8859-1"
+
+def test_response_force_encoding_after_text_accessed():
+    response = httpx.Response(
+        200,
+        content=b"Hello, world!",
+    )
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+    assert response.text == "Hello, world!"
+    assert response.encoding == "utf-8"
+
+    with pytest.raises(ValueError):
+        response.encoding = "UTF8"
+
+    with pytest.raises(ValueError):
+        response.encoding = "iso-8859-1"
+
+## tests/models/test_url.py
+
+def test_resolution_error_1833():
+    """
+    See https://github.com/encode/httpx/issues/1833
+    """
+    url = httpx.URL("https://example.com/?[]")
+    assert url.join("/") == "https://example.com/"
+
+## tests/test_config.py
+
+def test_load_ssl_config_cert_and_key_invalid_password(
+    cert_pem_file, cert_encrypted_private_key_file
+):
+    with pytest.raises(ssl.SSLError):
+        context = httpx.create_ssl_context()
+        context.load_cert_chain(
+            cert_pem_file, cert_encrypted_private_key_file, "password1"
+        )
+
+## tests/test_content.py
+
+async def test_response_aiterator_content():
+    async def hello_world() -> typing.AsyncIterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    response = httpx.Response(200, content=hello_world())
+    assert not isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {"Transfer-Encoding": "chunked"}
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        [part async for part in response.stream]
+
+## tests/test_multipart.py
+
+def test_multipart_encode_files_guesses_correct_content_type(
+    file_name: str, expected_content_type: str
+) -> None:
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": (file_name, io.BytesIO(b"<file content>"))}
+
+    request = httpx.Request("POST", url, headers=headers, data={}, files=files)
+    request.read()
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Content-Length": str(len(request.content)),
+    }
+    assert request.content == (
+        f'--BOUNDARY\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{file_name}"\r\nContent-Type: '
+        f"{expected_content_type}\r\n\r\n<file content>\r\n--BOUNDARY--\r\n"
+        "".encode("ascii")
+    )
+
+## tests/test_wsgi.py
+
+def test_wsgi_generator_empty():
+    output = [b"", b"", b"", b""]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == ""

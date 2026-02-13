@@ -1,0 +1,211 @@
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+def _function_call_part_from_call(tool: ToolCallPart) -> _GeminiFunctionCallPart:
+    return _GeminiFunctionCallPart(function_call=_GeminiFunctionCall(name=tool.tool_name, args=tool.args_as_dict()))
+
+## tests/test_concurrency.py
+
+logfire_installed = importlib.util.find_spec('logfire') is not None
+
+class AsyncBarrier:
+    """A simple asyncio.Barrier-like implementation compatible with Python 3.10 using anyio."""
+
+    def __init__(self, parties: int):
+        self._parties = parties
+        self._count = 0
+        self._lock = anyio.Lock()
+        self._event = anyio.Event()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            self._count += 1
+            if self._count >= self._parties:
+                self._event.set()
+        await self._event.wait()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            self._count += 1
+            if self._count >= self._parties:
+                self._event.set()
+        await self._event.wait()
+
+    async def test_backpressure_raises(self):
+        """Test that exceeding max_queued raises ConcurrencyLimitExceeded."""
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=2)
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                await hold.wait()
+
+        async with anyio.create_task_group() as tg:
+            # Fill the running slot
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            # Fill the queue (2 allowed)
+            tg.start_soon(holder)
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            # This should raise - queue is full
+            with pytest.raises(ConcurrencyLimitExceeded):
+                async with get_concurrency_context(limiter, 'test'):
+                    pass
+
+            hold.set()
+
+    async def test_backpressure_race_condition(self):
+        """Test that max_queued is enforced atomically under concurrent load.
+
+        This test verifies the fix for a race condition where multiple tasks could
+        simultaneously pass the max_queued check before any of them actually started
+        waiting on the limiter.
+        """
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=1)
+        hold = anyio.Event()
+        started = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'holder'):
+                started.set()
+                await hold.wait()
+
+        # Now launch multiple tasks simultaneously that all try to queue.
+        # With max_queued=1, exactly one should succeed in queuing.
+        num_concurrent = 5
+        results: list[str] = []
+        barrier = AsyncBarrier(num_concurrent)
+
+        async def try_acquire(idx: int):
+            # Use barrier to ensure all tasks try to acquire at the same time
+            await barrier.wait()
+            try:
+                async with get_concurrency_context(limiter, f'task-{idx}'):
+                    results.append(f'acquired-{idx}')
+            except ConcurrencyLimitExceeded:
+                results.append(f'rejected-{idx}')
+
+        async with anyio.create_task_group() as tg:
+            # Fill the running slot and wait for it to be held
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Launch all tasks simultaneously
+            for i in range(num_concurrent):
+                tg.start_soon(try_acquire, i)
+            await anyio.sleep(0.1)  # Give tasks time to hit the barrier and try to acquire
+
+            # Release the holder
+            hold.set()
+
+        # Verify: exactly one task should have been allowed to queue and acquire
+        # The rest should have been rejected
+        acquired = [r for r in results if r.startswith('acquired-')]
+        rejected = [r for r in results if r.startswith('rejected-')]
+        assert len(acquired) == 1, f'Expected exactly 1 acquired, got {len(acquired)}: {acquired}'
+        assert len(rejected) == num_concurrent - 1, f'Expected {num_concurrent - 1} rejected, got {len(rejected)}'
+
+class TestAgentConcurrency:
+    """Tests for agent-level concurrency limiting."""
+
+    async def test_agent_concurrency_limit(self):
+        """Test that agent respects max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=2)
+        running = 0
+        max_running = 0
+        lock = anyio.Lock()
+
+        @agent.tool_plain
+        async def slow_tool() -> str:
+            nonlocal running, max_running
+            async with lock:
+                running += 1
+                max_running = max(max_running, running)
+            await anyio.sleep(0.1)
+            async with lock:
+                running -= 1
+            return 'done'
+
+        results: list[Any] = []
+
+        async def run_agent():
+            result = await agent.run('call slow_tool', model=TestModel(call_tools=['slow_tool']))
+            results.append(result)
+
+        async with anyio.create_task_group() as tg:
+            for _ in range(5):
+                tg.start_soon(run_agent)
+
+        assert max_running <= 2
+        assert len(results) == 5
+
+    async def test_agent_concurrency_backpressure(self):
+        """Test that agent raises when queue exceeds max_queued."""
+        agent = Agent(TestModel(), max_concurrency=ConcurrencyLimit(max_running=1, max_queued=1))
+        hold = anyio.Event()
+
+        @agent.tool_plain
+        async def hold_tool() -> str:
+            await hold.wait()
+            return 'done'
+
+        async def run_agent():
+            await agent.run('x', model=TestModel(call_tools=['hold_tool']))
+
+        async with anyio.create_task_group() as tg:
+            # Start 2 runs (1 running + 1 queued = at limit)
+            tg.start_soon(run_agent)
+            tg.start_soon(run_agent)
+            await anyio.sleep(0.05)
+
+            # Third should raise
+            with pytest.raises(ConcurrencyLimitExceeded):
+                await agent.run('x', model=TestModel(call_tools=['hold_tool']))
+
+            hold.set()
+
+    async def test_agent_no_limit_by_default(self):
+        """Test that agents have no concurrency limit by default."""
+        agent = Agent(TestModel())
+        assert agent._concurrency_limiter is None
+
+    async def test_agent_with_int_concurrency(self):
+        """Test that agent accepts int for max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=5)
+        assert agent._concurrency_limiter is not None
+        assert agent._concurrency_limiter.max_running == 5
+        assert agent._concurrency_limiter._max_queued is None
+
+    async def test_agent_with_limiter_concurrency(self):
+        """Test that agent accepts ConcurrencyLimit for max_concurrency."""
+        agent = Agent(TestModel(), max_concurrency=ConcurrencyLimit(max_running=5, max_queued=10))
+        assert agent._concurrency_limiter is not None
+        assert agent._concurrency_limiter.max_running == 5
+        assert agent._concurrency_limiter._max_queued == 10
+
+    async def test_agent_concurrency_backpressure(self):
+        """Test that agent raises when queue exceeds max_queued."""
+        agent = Agent(TestModel(), max_concurrency=ConcurrencyLimit(max_running=1, max_queued=1))
+        hold = anyio.Event()
+
+        @agent.tool_plain
+        async def hold_tool() -> str:
+            await hold.wait()
+            return 'done'
+
+        async def run_agent():
+            await agent.run('x', model=TestModel(call_tools=['hold_tool']))
+
+        async with anyio.create_task_group() as tg:
+            # Start 2 runs (1 running + 1 queued = at limit)
+            tg.start_soon(run_agent)
+            tg.start_soon(run_agent)
+            await anyio.sleep(0.05)
+
+            # Third should raise
+            with pytest.raises(ConcurrencyLimitExceeded):
+                await agent.run('x', model=TestModel(call_tools=['hold_tool']))
+
+            hold.set()

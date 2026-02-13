@@ -1,0 +1,747 @@
+## pydantic_ai_slim/pydantic_ai/_function_schema.py
+
+def function_schema(  # noqa: C901
+    function: Callable[..., Any],
+    schema_generator: type[GenerateJsonSchema],
+    takes_ctx: bool | None = None,
+    docstring_format: DocstringFormat = 'auto',
+    require_parameter_descriptions: bool = False,
+) -> FunctionSchema:
+    """Build a Pydantic validator and JSON schema from a tool function.
+
+    Args:
+        function: The function to build a validator and JSON schema for.
+        takes_ctx: Whether the function takes a `RunContext` first argument.
+        docstring_format: The docstring format to use.
+        require_parameter_descriptions: Whether to require descriptions for all tool function parameters.
+        schema_generator: The JSON schema generator class to use.
+
+    Returns:
+        A `FunctionSchema` instance.
+    """
+    config = ConfigDict(title=function.__name__, use_attribute_docstrings=True)
+    config_wrapper = ConfigWrapper(config)
+    gen_schema = _generate_schema.GenerateSchema(config_wrapper)
+    errors: list[str] = []
+
+    try:
+        sig = signature(function)
+    except ValueError as e:
+        errors.append(str(e))
+        sig = signature(lambda: None)
+    original_func = function.func if isinstance(function, partial) else function
+    function = cast(Callable[..., Any], function)  # cope with pyright changing the type from the isinstance() check.
+
+    type_hints = get_type_hints(original_func, include_extras=True)
+
+    var_kwargs_schema: core_schema.CoreSchema | None = None
+    fields: dict[str, core_schema.TypedDictField] = {}
+    positional_fields: list[str] = []
+    var_positional_field: str | None = None
+    decorators = _decorators.DecoratorInfos()
+
+    description, field_descriptions = doc_descriptions(original_func, sig, docstring_format=docstring_format)
+    missing_param_descriptions: set[str] = set()
+
+    for index, (name, p) in enumerate(sig.parameters.items()):
+        if index == 0 and takes_ctx is None:
+            takes_ctx = p.annotation is not sig.empty and _is_call_ctx(type_hints[name])
+
+        if p.annotation is sig.empty:
+            if takes_ctx and index == 0:
+                # should be the `context` argument, skip
+                continue
+            # TODO warn?
+            annotation = Any
+        else:
+            annotation = type_hints[name]
+
+            if index == 0 and takes_ctx:
+                if not _is_call_ctx(annotation):
+                    errors.append('First parameter of tools that take context must be annotated with RunContext[...]')
+                continue
+            elif not takes_ctx and _is_call_ctx(annotation):
+                errors.append('RunContext annotations can only be used with tools that take context')
+                continue
+            elif index != 0 and _is_call_ctx(annotation):
+                errors.append('RunContext annotations can only be used as the first argument')
+                continue
+
+        field_name = p.name
+
+        if require_parameter_descriptions and field_name not in field_descriptions:
+            missing_param_descriptions.add(field_name)
+
+        if p.kind == Parameter.VAR_KEYWORD:
+            var_kwargs_schema = gen_schema.generate_schema(annotation)
+        else:
+            if p.kind == Parameter.VAR_POSITIONAL:
+                annotation = list[annotation]
+
+            required = p.default is Parameter.empty
+            # FieldInfo.from_annotated_attribute expects a type, `annotation` is Any
+            annotation = cast(type[Any], annotation)
+            if required:
+                field_info = FieldInfo.from_annotation(annotation)
+            else:
+                field_info = FieldInfo.from_annotated_attribute(annotation, p.default)
+            if field_info.description is None:
+                field_info.description = field_descriptions.get(field_name)
+
+            fields[field_name] = td_schema = gen_schema._generate_td_field_schema(  # pyright: ignore[reportPrivateUsage]
+                field_name,
+                field_info,
+                decorators,
+                required=required,
+            )
+            # noinspection PyTypeChecker
+            td_schema.setdefault('metadata', {})['is_model_like'] = is_model_like(annotation)
+
+            if p.kind == Parameter.POSITIONAL_ONLY:
+                positional_fields.append(field_name)
+            elif p.kind == Parameter.VAR_POSITIONAL:
+                var_positional_field = field_name
+
+    if missing_param_descriptions:
+        errors.append(f'Missing parameter descriptions for {", ".join(missing_param_descriptions)}')
+
+    if errors:
+        from .exceptions import UserError
+
+        error_details = '\n  '.join(errors)
+        raise UserError(f'Error generating schema for {function.__qualname__}:\n  {error_details}')
+
+    core_config = config_wrapper.core_config(None)
+    # noinspection PyTypedDict
+    core_config['extra_fields_behavior'] = 'allow' if var_kwargs_schema else 'forbid'
+
+    schema, single_arg_name = _build_schema(fields, var_kwargs_schema, gen_schema, core_config)
+    schema = gen_schema.clean_schema(schema)
+    # noinspection PyUnresolvedReferences
+    schema_validator = create_schema_validator(
+        schema,
+        function,
+        function.__module__,
+        function.__qualname__,
+        'validate_call',
+        core_config,
+        config_wrapper.plugin_settings,
+    )
+    # PluggableSchemaValidator is api compatible with SchemaValidator
+    schema_validator = cast(SchemaValidator, schema_validator)
+    json_schema = schema_generator().generate(schema)
+
+    # workaround for https://github.com/pydantic/pydantic/issues/10785
+    # if we build a custom TypedDict schema (matches when `single_arg_name is None`), we manually set
+    # `additionalProperties` in the JSON Schema
+    if single_arg_name is not None and not description:
+        # if the tool description is not set, and we have a single parameter, take the description from that
+        # and set it on the tool
+        description = json_schema.pop('description', None)
+
+    return FunctionSchema(
+        description=description,
+        validator=schema_validator,
+        json_schema=check_object_json_schema(json_schema),
+        single_arg_name=single_arg_name,
+        positional_fields=positional_fields,
+        var_positional_field=var_positional_field,
+        takes_ctx=bool(takes_ctx),
+        is_async=is_async_callable(function),
+        function=function,
+    )
+
+def _takes_ctx(callable_obj: TargetCallable[P, R]) -> TypeIs[WithCtx[P, R]]:  # pyright: ignore[reportUnusedFunction]
+    """Check if a callable takes a `RunContext` first argument.
+
+    Args:
+        callable_obj: The callable to check.
+
+    Returns:
+        `True` if the callable takes a `RunContext` as first argument, `False` otherwise.
+    """
+    try:
+        sig = signature(callable_obj)
+    except ValueError:
+        return False
+    try:
+        first_param_name = next(iter(sig.parameters.keys()))
+    except StopIteration:
+        return False
+    else:
+        # See https://github.com/pydantic/pydantic/pull/11451 for a similar implementation in Pydantic
+        if not isinstance(callable_obj, _decorators._function_like):  # pyright: ignore[reportPrivateUsage]
+            call_func = getattr(type(callable_obj), '__call__', None)
+            if call_func is not None:
+                callable_obj = call_func
+            else:
+                return False  # pragma: no cover
+
+        type_hints = _typing_extra.get_function_type_hints(_decorators.unwrap_wrapped_function(callable_obj))
+        annotation = type_hints.get(first_param_name)
+        if annotation is None:
+            return False
+        return True is not sig.empty and _is_call_ctx(annotation)
+
+def _is_call_ctx(annotation: Any) -> bool:
+    """Return whether the annotation is the `RunContext` class, parameterized or not."""
+    return annotation is RunContext or get_origin(annotation) is RunContext
+
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+def is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address is in a private/internal range.
+
+    Handles both IPv4 and IPv6 addresses, including IPv4-mapped IPv6 addresses.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:192.168.1.1)
+        if isinstance(ip, ipaddress.IPv6Address) and not ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        return any(ip in network for network in _PRIVATE_NETWORKS)
+    except ValueError:
+        # Invalid IP address, treat as potentially dangerous
+        return True
+
+def validate_url_protocol(url: str) -> tuple[str, bool]:
+    """Validate that the URL uses an allowed protocol (http or https).
+
+    Args:
+        url: The URL to validate.
+
+    Returns:
+        Tuple of (scheme, is_https).
+
+    Raises:
+        ValueError: If the protocol is not http or https.
+    """
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+
+    if scheme not in ('http', 'https'):
+        raise ValueError(f'URL protocol "{scheme}" is not allowed. Only http:// and https:// are supported.')
+
+    return scheme, scheme == 'https'
+
+async def validate_and_resolve_url(url: str, allow_local: bool) -> ResolvedUrl:
+    """Validate URL and resolve hostname to IP addresses.
+
+    Performs protocol validation, DNS resolution, and IP validation.
+
+    Args:
+        url: The URL to validate.
+        allow_local: Whether to allow private/internal IP addresses.
+
+    Returns:
+        ResolvedUrl with all the information needed to make the request.
+
+    Raises:
+        ValueError: If the URL fails validation.
+    """
+    hostname, path, port, is_https = extract_host_and_port(url)
+
+    # Check if hostname is already an IP address
+    try:
+        # Handle IPv6 addresses in brackets
+        ip_str = hostname.strip('[]')
+        ipaddress.ip_address(ip_str)
+        ips = [ip_str]
+    except ValueError:
+        # It's a hostname, resolve it
+        ips = await resolve_hostname(hostname)
+
+    # Validate all resolved IPs
+    for ip in ips:
+        # Cloud metadata IPs are always blocked
+        if is_cloud_metadata_ip(ip):
+            raise ValueError(f'Access to cloud metadata service ({ip}) is blocked for security reasons.')
+
+        # Private IPs are blocked unless allow_local is True
+        if not allow_local and is_private_ip(ip):
+            raise ValueError(
+                f'Access to private/internal IP address ({ip}) is blocked. '
+                f'Use force_download="allow-local" to allow local network access.'
+            )
+
+    # Use the first resolved IP
+    return ResolvedUrl(
+        resolved_ip=ips[0],
+        hostname=hostname,
+        port=port,
+        is_https=is_https,
+        path=path,
+    )
+
+## pydantic_ai_slim/pydantic_ai/builtin_tools.py
+
+    blocked_domains: list[str] | None = None
+
+    blocked_domains: list[str] | None = None
+
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+class ResourceAnnotations:
+    """Additional properties describing MCP entities.
+
+    See the [resource annotations in the MCP specification](https://modelcontextprotocol.io/specification/2025-06-18/server/resources#annotations).
+    """
+
+    audience: list[mcp_types.Role] | None = None
+    """Intended audience for this entity."""
+
+    priority: Annotated[float, Field(ge=0.0, le=1.0)] | None = None
+    """Priority level for this entity, ranging from 0.0 to 1.0."""
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    @classmethod
+    def from_mcp_sdk(cls, mcp_annotations: mcp_types.Annotations) -> ResourceAnnotations:
+        """Convert from MCP SDK Annotations to ResourceAnnotations.
+
+        Args:
+            mcp_annotations: The MCP SDK annotations object.
+        """
+        return cls(audience=mcp_annotations.audience, priority=mcp_annotations.priority)
+
+    def from_mcp_sdk(cls, mcp_annotations: mcp_types.Annotations) -> ResourceAnnotations:
+        """Convert from MCP SDK Annotations to ResourceAnnotations.
+
+        Args:
+            mcp_annotations: The MCP SDK annotations object.
+        """
+        return cls(audience=mcp_annotations.audience, priority=mcp_annotations.priority)
+
+    annotations: ResourceAnnotations | None = None
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+    blocked: NotRequired[bool]
+
+## pydantic_ai_slim/pydantic_ai/models/openai.py
+
+    openai_include_raw_annotations: bool
+
+responses_output_text_annotations_ta = TypeAdapter(list[responses.response_output_text.Annotation])
+
+## pydantic_ai_slim/pydantic_ai/models/openrouter.py
+
+class _OpenRouterFileAnnotation(BaseModel, frozen=True):
+    """File annotation from OpenRouter.
+
+    OpenRouter can return file annotations when processing uploaded files like PDFs.
+    The schema is flexible since OpenRouter doesn't document the exact fields.
+    """
+
+    type: Literal['file']
+    file: dict[str, Any] | None = None
+
+    type: Literal['file']
+
+    file: dict[str, Any] | None = None
+
+_OpenRouterAnnotation: TypeAlias = _OpenAIAnnotation | _OpenRouterFileAnnotation
+
+    annotations: list[_OpenRouterAnnotation] | None = None  # type: ignore[reportIncompatibleVariableOverride]
+
+    annotations: list[_OpenRouterAnnotation] | None = None
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class _WrappedTextOutput:
+    """A private wrapper class to tag an output that came from the custom_output_text field."""
+
+    value: str | None
+
+## pydantic_graph/pydantic_graph/nodes.py
+
+class Edge:
+    """Annotation to apply a label to an edge in a graph."""
+
+    label: str | None
+    """Label for the edge."""
+
+## tests/conftest.py
+
+class TestEnv:
+    __test__ = False
+
+    def __init__(self):
+        self.envars: dict[str, str | None] = {}
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+    def reset(self) -> None:
+        for name, value in self.envars.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value  # pragma: lax no cover
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+def disable_ssrf_protection_for_vcr():
+    """Disable SSRF protection for VCR compatibility.
+
+    VCR cassettes record requests with the original hostname. Since SSRF protection
+    resolves hostnames to IPs before making requests, we need to disable the validation
+    for VCR tests to match the pre-recorded cassettes.
+
+    This fixture patches validate_and_resolve_url to return the hostname in place
+    of the resolved IP, allowing the request URL to use the original hostname.
+    """
+    from unittest.mock import patch
+
+    from pydantic_ai._ssrf import ResolvedUrl, extract_host_and_port
+
+    async def mock_validate_and_resolve(url: str, allow_local: bool) -> ResolvedUrl:
+        hostname, path, port, is_https = extract_host_and_port(url)
+        # Return hostname in place of resolved IP - this allows VCR matching
+        return ResolvedUrl(resolved_ip=hostname, hostname=hostname, port=port, is_https=is_https, path=path)
+
+    with patch('pydantic_ai._ssrf.validate_and_resolve_url', mock_validate_and_resolve):
+        yield
+
+## tests/graph/test_mermaid.py
+
+def test_docstring_notes_classvar():
+    assert Spam.docstring_notes is True
+    assert repr(Spam()) == 'Spam()'
+
+## tests/models/test_openai.py
+
+def test_model_profile_strict_not_supported():
+    my_tool = ToolDefinition(
+        name='my_tool',
+        description='This is my tool',
+        parameters_json_schema={'type': 'object', 'title': 'Result', 'properties': {'spam': {'type': 'number'}}},
+        strict=True,
+    )
+
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key='foobar'))
+    tool_param = m._map_tool_definition(my_tool)  # type: ignore[reportPrivateUsage]
+
+    assert tool_param == snapshot(
+        {
+            'type': 'function',
+            'function': {
+                'name': 'my_tool',
+                'description': 'This is my tool',
+                'parameters': {'type': 'object', 'title': 'Result', 'properties': {'spam': {'type': 'number'}}},
+                'strict': True,
+            },
+        }
+    )
+
+    # Some models don't support strict tool definitions
+    m = OpenAIChatModel(
+        'gpt-4o',
+        provider=OpenAIProvider(api_key='foobar'),
+        profile=OpenAIModelProfile(openai_supports_strict_tool_definition=False).update(openai_model_profile('gpt-4o')),
+    )
+    tool_param = m._map_tool_definition(my_tool)  # type: ignore[reportPrivateUsage]
+
+    assert tool_param == snapshot(
+        {
+            'type': 'function',
+            'function': {
+                'name': 'my_tool',
+                'description': 'This is my tool',
+                'parameters': {'type': 'object', 'title': 'Result', 'properties': {'spam': {'type': 'number'}}},
+            },
+        }
+    )
+
+## tests/models/test_openrouter.py
+
+async def test_openrouter_url_citation_annotation_validation(openrouter_api_key: str) -> None:
+    """Test that url_citation annotations from OpenRouter are correctly validated."""
+    from openai.types.chat.chat_completion_message import ChatCompletionMessage
+
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('openai/gpt-4.1-mini', provider=provider)
+
+    message = ChatCompletionMessage.model_construct(
+        role='assistant',
+        content='According to the source, this is the answer.',
+        annotations=[
+            {
+                'type': 'url_citation',
+                'url_citation': {'url': 'https://example.com', 'title': 'Example', 'start_index': 0, 'end_index': 10},
+            },
+        ],
+    )
+    choice = Choice.model_construct(index=0, message=message, finish_reason='stop', native_finish_reason='stop')
+    response = ChatCompletion.model_construct(
+        id='test', choices=[choice], created=0, object='chat.completion', model='test', provider='test'
+    )
+
+    # This should not raise a validation error
+    result = model._process_response(response)  # type: ignore[reportPrivateUsage]
+    text_part = cast(TextPart, result.parts[0])
+    assert text_part.content == 'According to the source, this is the answer.'
+
+## tests/models/test_xai.py
+
+async def test_xai_video_url_not_supported(allow_model_requests: None):
+    """Test that VideoUrl raises NotImplementedError."""
+    response = create_response(content='This should not be reached')
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    video_url = VideoUrl(url='https://example.com/video.mp4')
+
+    with pytest.raises(NotImplementedError, match='VideoUrl is not supported by xAI SDK'):
+        await agent.run(['What is in this video?', video_url])
+
+## tests/test_agent.py
+
+def test_model_requests_blocked(env: TestEnv):
+    try:
+        env.set('GEMINI_API_KEY', 'foobar')
+        agent = Agent('google-gla:gemini-3-flash-preview', output_type=tuple[str, str], defer_model_check=True)
+
+        with pytest.raises(RuntimeError, match='Model requests are not allowed, since ALLOW_MODEL_REQUESTS is False'):
+            agent.run_sync('Hello')
+    except ImportError:  # pragma: lax no cover
+        pytest.skip('google-genai not installed')
+
+## tests/test_builtin_tools.py
+
+async def test_builtin_tools_not_supported_file_search_stream(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[FileSearchTool(file_store_ids=['test-id'])])
+
+    with pytest.raises(UserError):
+        async with agent.run_stream('Search my files'):
+            ...  # pragma: no cover
+
+## tests/test_format_as_xml.py
+
+    FOO = 1
+
+## tests/test_function_schema.py
+
+def test_function_no_annotations():
+    """Test function with no type annotations."""
+
+    def func_no_annotations(ctx, x):  # type: ignore
+        ...  # pragma: no cover
+
+    # Without annotations, _takes_ctx should return False
+    assert _takes_ctx(func_no_annotations) is False  # type: ignore
+
+def test_function_wrong_annotation_type():
+    """Test function with wrong annotation type for first parameter."""
+
+    def func_wrong_annotation(ctx: str, x: int) -> str: ...  # pragma: no cover
+
+    assert _takes_ctx(func_wrong_annotation) is False
+
+## tests/test_mcp.py
+
+async def test_agent_with_server_not_running(agent: Agent, allow_model_requests: None):
+    result = await agent.run('What is 0 degrees Celsius in Fahrenheit?')
+    assert result.output == snapshot('0 degrees Celsius is 32.0 degrees Fahrenheit.')
+
+## tests/test_ssrf.py
+
+    def test_ipv4_mapped_ipv6_private(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+    def test_ipv4_mapped_ipv6_public(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+    def test_blocked_protocols(self, url: str, protocol: str) -> None:
+        with pytest.raises(ValueError, match=f'URL protocol "{protocol}" is not allowed'):
+            validate_url_protocol(url)
+
+class TestValidateAndResolveUrl:
+    """Tests for validate_and_resolve_url function."""
+
+    async def test_public_ip_allowed(self) -> None:
+        """Test that public IPs are allowed."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+            resolved = await validate_and_resolve_url('https://example.com/path', allow_local=False)
+            assert resolved.resolved_ip == '93.184.215.14'
+            assert resolved.hostname == 'example.com'
+            assert resolved.port == 443
+            assert resolved.is_https is True
+            assert resolved.path == '/path'
+
+    async def test_private_ip_blocked_by_default(self) -> None:
+        """Test that private IPs are blocked by default."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('192.168.1.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://internal.local/path', allow_local=False)
+
+    async def test_private_ip_allowed_with_allow_local(self) -> None:
+        """Test that private IPs are allowed with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('192.168.1.1', 0))]
+            resolved = await validate_and_resolve_url('http://internal.local/path', allow_local=True)
+            assert resolved.resolved_ip == '192.168.1.1'
+
+    async def test_cloud_metadata_always_blocked(self) -> None:
+        """Test that cloud metadata IPs are always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('169.254.169.254', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.google.internal/path', allow_local=True)
+
+    async def test_alibaba_cloud_metadata_always_blocked(self) -> None:
+        """Test that Alibaba Cloud metadata IP is always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.100.100.200', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.aliyun.internal/path', allow_local=True)
+
+    async def test_literal_ip_address_in_url(self) -> None:
+        """Test handling of literal IP addresses in URLs."""
+        # Public IP - should work
+        resolved = await validate_and_resolve_url('http://8.8.8.8/path', allow_local=False)
+        assert resolved.resolved_ip == '8.8.8.8'
+        assert resolved.hostname == '8.8.8.8'
+
+    async def test_literal_private_ip_blocked(self) -> None:
+        """Test that literal private IPs in URLs are blocked."""
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://192.168.1.1/path', allow_local=False)
+
+    async def test_any_private_ip_blocks_request(self) -> None:
+        """Test that if any resolved IP is private, the request is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Return both public and private IPs
+            mock_executor.return_value = [
+                (2, 1, 6, '', ('93.184.215.14', 0)),
+                (2, 1, 6, '', ('192.168.1.1', 0)),
+            ]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://example.com/path', allow_local=False)
+
+    async def test_6to4_address_blocked(self) -> None:
+        """Test that 6to4 addresses (which can embed private IPv4) are blocked."""
+        # 2002:c0a8:0101::1 embeds 192.168.1.1
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://[2002:c0a8:0101::1]/path', allow_local=False)
+
+    async def test_cgnat_range_blocked(self) -> None:
+        """Test that CGNAT range (100.64.0.0/10) is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.64.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://cgnat-host.internal/path', allow_local=False)
+
+    async def test_private_ip_blocked_by_default(self) -> None:
+        """Test that private IPs are blocked by default."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('192.168.1.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://internal.local/path', allow_local=False)
+
+    async def test_cloud_metadata_always_blocked(self) -> None:
+        """Test that cloud metadata IPs are always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('169.254.169.254', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.google.internal/path', allow_local=True)
+
+    async def test_literal_private_ip_blocked(self) -> None:
+        """Test that literal private IPs in URLs are blocked."""
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://192.168.1.1/path', allow_local=False)
+
+    async def test_6to4_address_blocked(self) -> None:
+        """Test that 6to4 addresses (which can embed private IPv4) are blocked."""
+        # 2002:c0a8:0101::1 embeds 192.168.1.1
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://[2002:c0a8:0101::1]/path', allow_local=False)
+
+    async def test_cgnat_range_blocked(self) -> None:
+        """Test that CGNAT range (100.64.0.0/10) is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.64.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://cgnat-host.internal/path', allow_local=False)
+
+    async def test_redirect_to_private_ip_blocked(self) -> None:
+        """Test that redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'http://internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com (public), second for internal.local (private)
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_protocol_relative_redirect_to_private_blocked(self) -> None:
+        """Test that protocol-relative redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_hostname_resolving_to_private_ip_blocked(self) -> None:
+        """Test that a hostname resolving to a private IP is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Attacker's DNS returns private IP
+            mock_executor.return_value = [(2, 1, 6, '', ('127.0.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=False)
+
+    async def test_multiple_ips_with_any_private_blocked(self) -> None:
+        """Test that if any IP in the resolution is private, request is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # DNS returns multiple IPs, one of which is private
+            mock_executor.return_value = [
+                (2, 1, 6, '', ('8.8.8.8', 0)),  # Public
+                (10, 1, 6, '', ('::1', 0)),  # Private IPv6 loopback
+            ]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=False)
+
+## tests/test_tools.py
+
+async def tool_without_return_annotation_in_docstring() -> str:  # pragma: no cover
+    """A tool that documents what it returns but doesn't have a return annotation in the docstring."""
+
+    return ''

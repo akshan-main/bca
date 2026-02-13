@@ -1,0 +1,1414 @@
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:421-423
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the instrumentation options for all agents where `instrument` is not set."""
+        Agent._instrument_default = instrument
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:140-143
+class Some(Generic[T]):
+    """Analogous to Rust's `Option::Some` type."""
+
+    value: T
+
+# tests/test_usage_limits.py:258-284
+def test_add_usages_with_none_detail_value():
+    """Test that None values in details are skipped when incrementing usage."""
+    usage = RunUsage(
+        requests=1,
+        input_tokens=10,
+        output_tokens=20,
+        details={'reasoning_tokens': 5},
+    )
+
+    # Create a usage with None in details (simulating model response with missing detail)
+    incr_usage = RunUsage(
+        requests=1,
+        input_tokens=5,
+        output_tokens=10,
+    )
+    # Manually set a None value in details to simulate edge case from model responses
+    incr_usage.details = {'reasoning_tokens': None, 'other_tokens': 10}  # type: ignore[dict-item]
+
+    result = usage + incr_usage
+    assert result == snapshot(
+        RunUsage(
+            requests=2,
+            input_tokens=15,
+            output_tokens=30,
+            details={'reasoning_tokens': 5, 'other_tokens': 10},
+        )
+    )
+
+# tests/test_direct.py:206-213
+def set_instrument_default(value: bool):
+    """Context manager to temporarily set the default instrumentation value."""
+    initial_value = Agent._instrument_default  # pyright: ignore[reportPrivateUsage]
+    try:
+        Agent._instrument_default = value  # pyright: ignore[reportPrivateUsage]
+        yield
+    finally:
+        Agent._instrument_default = initial_value  # pyright: ignore[reportPrivateUsage]
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:427-520
+    def _instrument(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> Iterator[Callable[[ModelResponse, ModelRequestParameters], None]]:
+        operation = 'chat'
+        span_name = f'{operation} {self.model_name}'
+        # TODO Missing attributes:
+        #  - error.type: unclear if we should do something here or just always rely on span exceptions
+        #  - gen_ai.request.stop_sequences/top_k: model_settings doesn't include these
+        attributes: dict[str, AttributeValue] = {
+            'gen_ai.operation.name': operation,
+            **self.model_attributes(self.wrapped),
+            **self.model_request_parameters_attributes(model_request_parameters),
+            'logfire.json_schema': json.dumps(
+                {
+                    'type': 'object',
+                    'properties': {'model_request_parameters': {'type': 'object'}},
+                }
+            ),
+        }
+
+        tool_definitions = _build_tool_definitions(model_request_parameters)
+        if tool_definitions:
+            attributes['gen_ai.tool.definitions'] = json.dumps(tool_definitions)
+
+        if model_settings:
+            for key in MODEL_SETTING_ATTRIBUTES:
+                if isinstance(value := model_settings.get(key), float | int):
+                    attributes[f'gen_ai.request.{key}'] = value
+
+        record_metrics: Callable[[], None] | None = None
+        try:
+            with self.instrumentation_settings.tracer.start_as_current_span(
+                span_name, attributes=attributes, kind=SpanKind.CLIENT
+            ) as span:
+
+                def finish(response: ModelResponse, parameters: ModelRequestParameters):
+                    # FallbackModel updates these span attributes.
+                    attributes.update(getattr(span, 'attributes', {}))
+                    request_model = attributes[GEN_AI_REQUEST_MODEL_ATTRIBUTE]
+                    system = cast(str, attributes[GEN_AI_SYSTEM_ATTRIBUTE])
+
+                    response_model = response.model_name or request_model
+                    price_calculation = None
+
+                    def _record_metrics():
+                        metric_attributes = {
+                            GEN_AI_PROVIDER_NAME_ATTRIBUTE: system,  # New OTel standard attribute
+                            GEN_AI_SYSTEM_ATTRIBUTE: system,  # Preserved for backward compatibility (deprecated)
+                            'gen_ai.operation.name': operation,
+                            'gen_ai.request.model': request_model,
+                            'gen_ai.response.model': response_model,
+                        }
+                        self.instrumentation_settings.record_metrics(response, price_calculation, metric_attributes)
+
+                    nonlocal record_metrics
+                    record_metrics = _record_metrics
+
+                    if not span.is_recording():
+                        return
+
+                    self.instrumentation_settings.handle_messages(messages, response, system, span, parameters)
+
+                    attributes_to_set = {
+                        **response.usage.opentelemetry_attributes(),
+                        'gen_ai.response.model': response_model,
+                    }
+                    try:
+                        price_calculation = response.cost()
+                    except LookupError:
+                        # The cost of this provider/model is unknown, which is common.
+                        pass
+                    except Exception as e:
+                        warnings.warn(
+                            f'Failed to get cost from response: {type(e).__name__}: {e}', CostCalculationFailedWarning
+                        )
+                    else:
+                        attributes_to_set['operation.cost'] = float(price_calculation.total_price)
+
+                    if response.provider_response_id is not None:
+                        attributes_to_set['gen_ai.response.id'] = response.provider_response_id
+                    if response.finish_reason is not None:
+                        attributes_to_set['gen_ai.response.finish_reasons'] = [response.finish_reason]
+                    span.set_attributes(attributes_to_set)
+                    span.update_name(f'{operation} {request_model}')
+
+                yield finish
+        finally:
+            if record_metrics:
+                # We only want to record metrics after the span is finished,
+                # to prevent them from being redundantly recorded in the span itself by logfire.
+                record_metrics()
+
+# tests/test_tools.py:2665-2675
+def test_tool_timeout_default_none():
+    """Test that timeout defaults to None when not specified."""
+    agent = Agent(TestModel())
+
+    @agent.tool_plain
+    def tool_without_timeout() -> str:
+        return 'done'  # pragma: no cover
+
+    tool = agent._function_toolset.tools['tool_without_timeout']
+    assert tool.timeout is None
+    assert tool.tool_def.timeout is None
+
+# tests/models/test_instrumented.py:366-383
+async def test_instrumented_model_not_recording():
+    model = InstrumentedModel(
+        MyModel(),
+        InstrumentationSettings(tracer_provider=NoOpTracerProvider(), logger_provider=NoOpLoggerProvider()),
+    )
+
+    messages: list[ModelMessage] = [ModelRequest(parts=[SystemPromptPart('system_prompt')], timestamp=IsDatetime())]
+    await model.request(
+        messages,
+        model_settings=ModelSettings(temperature=1),
+        model_request_parameters=ModelRequestParameters(
+            function_tools=[],
+            allow_text_output=True,
+            output_tools=[],
+            output_mode='text',
+            output_object=None,
+        ),
+    )
+
+# pydantic_ai_slim/pydantic_ai/embeddings/instrumented.py:69-176
+    def _instrument(
+        self,
+        inputs: list[str],
+        input_type: EmbedInputType,
+        settings: EmbeddingSettings | None,
+    ) -> Iterator[Callable[[EmbeddingResult], None]]:
+        operation = 'embeddings'
+        span_name = f'{operation} {self.model_name}'
+
+        inputs_count = len(inputs)
+
+        attributes: dict[str, AttributeValue] = {
+            'gen_ai.operation.name': operation,
+            **self.model_attributes(self.wrapped),
+            'input_type': input_type,
+            'inputs_count': inputs_count,
+        }
+
+        if settings:
+            attributes['embedding_settings'] = json.dumps(self.serialize_any(settings))
+
+        if self.instrumentation_settings.include_content:
+            attributes['inputs'] = json.dumps(inputs)
+
+        attributes['logfire.json_schema'] = json.dumps(
+            {
+                'type': 'object',
+                'properties': {
+                    'input_type': {'type': 'string'},
+                    'inputs_count': {'type': 'integer'},
+                    'embedding_settings': {'type': 'object'},
+                    **(
+                        {'inputs': {'type': ['array']}, 'embeddings': {'type': 'array'}}
+                        if self.instrumentation_settings.include_content
+                        else {}
+                    ),
+                },
+            }
+        )
+
+        record_metrics: Callable[[], None] | None = None
+        try:
+            with self.instrumentation_settings.tracer.start_as_current_span(span_name, attributes=attributes) as span:
+
+                def finish(result: EmbeddingResult):
+                    # Prepare metric recording closure first so metrics are recorded
+                    # even if the span is not recording.
+                    provider_name = attributes[GEN_AI_PROVIDER_NAME_ATTRIBUTE]
+                    request_model = attributes[GEN_AI_REQUEST_MODEL_ATTRIBUTE]
+                    response_model = result.model_name or request_model
+                    price_calculation = None
+
+                    def _record_metrics():
+                        token_attributes = {
+                            GEN_AI_PROVIDER_NAME_ATTRIBUTE: provider_name,
+                            'gen_ai.operation.name': operation,
+                            GEN_AI_REQUEST_MODEL_ATTRIBUTE: request_model,
+                            'gen_ai.response.model': response_model,
+                            'gen_ai.token.type': 'input',
+                        }
+                        tokens = result.usage.input_tokens or 0
+                        if tokens:  # pragma: no branch
+                            self.instrumentation_settings.tokens_histogram.record(tokens, token_attributes)
+                            if price_calculation is not None:
+                                self.instrumentation_settings.cost_histogram.record(
+                                    float(getattr(price_calculation, 'input_price', 0.0)),
+                                    token_attributes,
+                                )
+
+                    nonlocal record_metrics
+                    record_metrics = _record_metrics
+
+                    if not span.is_recording():
+                        return  # pragma: lax no cover
+
+                    attributes_to_set: dict[str, AttributeValue] = {
+                        **result.usage.opentelemetry_attributes(),
+                        'gen_ai.response.model': response_model,
+                    }
+
+                    try:
+                        price_calculation = result.cost()
+                    except LookupError:
+                        # The cost of this provider/model is unknown, which is common.
+                        pass
+                    except Exception as e:  # pragma: no cover
+                        warnings.warn(
+                            f'Failed to get cost from response: {type(e).__name__}: {e}', CostCalculationFailedWarning
+                        )
+                    else:
+                        attributes_to_set['operation.cost'] = float(price_calculation.total_price)
+
+                    embeddings = result.embeddings
+                    if embeddings:  # pragma: no branch
+                        attributes_to_set['gen_ai.embeddings.dimension.count'] = len(embeddings[0])
+                        if self.instrumentation_settings.include_content:
+                            attributes['embeddings'] = json.dumps(embeddings)
+
+                    if result.provider_response_id is not None:
+                        attributes_to_set['gen_ai.response.id'] = result.provider_response_id
+
+                    span.set_attributes(attributes_to_set)
+
+                yield finish
+        finally:
+            if record_metrics:  # pragma: no branch
+                # Record metrics after the span finishes to avoid duplication.
+                record_metrics()
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:144-144
+    instrument: InstrumentationSettings | bool | None
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:3-3
+from types import NoneType
+
+# tests/mcp_server.py:164-165
+async def get_none():
+    return None
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:157-157
+    instrument: InstrumentationSettings | bool | None
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/format_prompt.py:84-84
+    none_str: str
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:377-377
+    instrumentation_settings: InstrumentationSettings
+
+# pydantic_graph/pydantic_graph/beta/graph.py:138-138
+    auto_instrument: bool
+
+# pydantic_graph/pydantic_graph/beta/graph.py:138-138
+    auto_instrument: bool
+
+# pydantic_ai_slim/pydantic_ai/direct.py:23-23
+from .models import StreamedResponse, instrumented as instrumented_models
+
+# tests/test_embeddings.py:1463-1498
+async def test_instrument_all():
+    model = TestEmbeddingModel()
+    embedder = Embedder(model)
+
+    def get_model():
+        return embedder._get_model()  # pyright: ignore[reportPrivateUsage]
+
+    Embedder.instrument_all(False)
+    assert get_model() is model
+
+    Embedder.instrument_all()
+    m = get_model()
+    assert isinstance(m, InstrumentedEmbeddingModel)
+    assert m.wrapped is model
+    assert m.instrumentation_settings.event_mode == InstrumentationSettings().event_mode
+
+    assert m.model_name == model.model_name
+    assert m.system == model.system
+    assert m.base_url == model.base_url
+    assert m.settings == model.settings
+
+    assert (await m.embed('Hello, world!', input_type='query')).embeddings == (
+        await model.embed('Hello, world!', input_type='query')
+    ).embeddings
+    assert await m.max_input_tokens() == await model.max_input_tokens()
+    assert await m.count_tokens('Hello, world!') == await model.count_tokens('Hello, world!')
+
+    options = InstrumentationSettings(version=1, event_mode='logs')
+    Embedder.instrument_all(options)
+    m = get_model()
+    assert isinstance(m, InstrumentedEmbeddingModel)
+    assert m.wrapped is model
+    assert m.instrumentation_settings is options
+
+    Embedder.instrument_all(False)
+    assert get_model() is model
+
+# tests/test_embeddings.py:1463-1498
+async def test_instrument_all():
+    model = TestEmbeddingModel()
+    embedder = Embedder(model)
+
+    def get_model():
+        return embedder._get_model()  # pyright: ignore[reportPrivateUsage]
+
+    Embedder.instrument_all(False)
+    assert get_model() is model
+
+    Embedder.instrument_all()
+    m = get_model()
+    assert isinstance(m, InstrumentedEmbeddingModel)
+    assert m.wrapped is model
+    assert m.instrumentation_settings.event_mode == InstrumentationSettings().event_mode
+
+    assert m.model_name == model.model_name
+    assert m.system == model.system
+    assert m.base_url == model.base_url
+    assert m.settings == model.settings
+
+    assert (await m.embed('Hello, world!', input_type='query')).embeddings == (
+        await model.embed('Hello, world!', input_type='query')
+    ).embeddings
+    assert await m.max_input_tokens() == await model.max_input_tokens()
+    assert await m.count_tokens('Hello, world!') == await model.count_tokens('Hello, world!')
+
+    options = InstrumentationSettings(version=1, event_mode='logs')
+    Embedder.instrument_all(options)
+    m = get_model()
+    assert isinstance(m, InstrumentedEmbeddingModel)
+    assert m.wrapped is model
+    assert m.instrumentation_settings is options
+
+    Embedder.instrument_all(False)
+    assert get_model() is model
+
+# tests/models/test_model_function.py:279-296
+def test_deps_none():
+    agent = Agent(FunctionModel(call_tool))
+
+    @agent.tool
+    async def get_none(ctx: RunContext[None]):
+        nonlocal called
+
+        called = True
+        assert ctx.deps is None
+        return ''
+
+    called = False
+    agent.run_sync('Hello')
+    assert called
+
+    called = False
+    agent.run_sync('Hello')
+    assert called
+
+# pydantic_ai_slim/pydantic_ai/_instrumentation.py:14-95
+class InstrumentationNames:
+    """Configuration for instrumentation span names and attributes based on version."""
+
+    # Agent run span configuration
+    agent_run_span_name: str
+    agent_name_attr: str
+
+    # Tool execution span configuration
+    tool_span_name: str
+    tool_arguments_attr: str
+    tool_result_attr: str
+
+    # Output Tool execution span configuration
+    output_tool_span_name: str
+
+    @classmethod
+    def for_version(cls, version: int) -> Self:
+        """Create instrumentation configuration for a specific version.
+
+        Args:
+            version: The instrumentation version (1, 2, or 3+)
+
+        Returns:
+            InstrumentationConfig instance with version-appropriate settings
+        """
+        if version <= 2:
+            return cls(
+                agent_run_span_name='agent run',
+                agent_name_attr='agent_name',
+                tool_span_name='running tool',
+                tool_arguments_attr='tool_arguments',
+                tool_result_attr='tool_response',
+                output_tool_span_name='running output function',
+            )
+        else:
+            return cls(
+                agent_run_span_name='invoke_agent',
+                agent_name_attr='gen_ai.agent.name',
+                tool_span_name='execute_tool',  # Will be formatted with tool name
+                tool_arguments_attr='gen_ai.tool.call.arguments',
+                tool_result_attr='gen_ai.tool.call.result',
+                output_tool_span_name='execute_tool',
+            )
+
+    def get_agent_run_span_name(self, agent_name: str) -> str:
+        """Get the formatted agent span name.
+
+        Args:
+            agent_name: Name of the agent being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.agent_run_span_name == 'invoke_agent':
+            return f'invoke_agent {agent_name}'
+        return self.agent_run_span_name
+
+    def get_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.tool_span_name
+
+    def get_output_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted output tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.output_tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.output_tool_span_name
+
+# pydantic_ai_slim/pydantic_ai/_instrumentation.py:14-95
+class InstrumentationNames:
+    """Configuration for instrumentation span names and attributes based on version."""
+
+    # Agent run span configuration
+    agent_run_span_name: str
+    agent_name_attr: str
+
+    # Tool execution span configuration
+    tool_span_name: str
+    tool_arguments_attr: str
+    tool_result_attr: str
+
+    # Output Tool execution span configuration
+    output_tool_span_name: str
+
+    @classmethod
+    def for_version(cls, version: int) -> Self:
+        """Create instrumentation configuration for a specific version.
+
+        Args:
+            version: The instrumentation version (1, 2, or 3+)
+
+        Returns:
+            InstrumentationConfig instance with version-appropriate settings
+        """
+        if version <= 2:
+            return cls(
+                agent_run_span_name='agent run',
+                agent_name_attr='agent_name',
+                tool_span_name='running tool',
+                tool_arguments_attr='tool_arguments',
+                tool_result_attr='tool_response',
+                output_tool_span_name='running output function',
+            )
+        else:
+            return cls(
+                agent_run_span_name='invoke_agent',
+                agent_name_attr='gen_ai.agent.name',
+                tool_span_name='execute_tool',  # Will be formatted with tool name
+                tool_arguments_attr='gen_ai.tool.call.arguments',
+                tool_result_attr='gen_ai.tool.call.result',
+                output_tool_span_name='execute_tool',
+            )
+
+    def get_agent_run_span_name(self, agent_name: str) -> str:
+        """Get the formatted agent span name.
+
+        Args:
+            agent_name: Name of the agent being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.agent_run_span_name == 'invoke_agent':
+            return f'invoke_agent {agent_name}'
+        return self.agent_run_span_name
+
+    def get_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.tool_span_name
+
+    def get_output_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted output tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.output_tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.output_tool_span_name
+
+# pydantic_ai_slim/pydantic_ai/_instrumentation.py:14-95
+class InstrumentationNames:
+    """Configuration for instrumentation span names and attributes based on version."""
+
+    # Agent run span configuration
+    agent_run_span_name: str
+    agent_name_attr: str
+
+    # Tool execution span configuration
+    tool_span_name: str
+    tool_arguments_attr: str
+    tool_result_attr: str
+
+    # Output Tool execution span configuration
+    output_tool_span_name: str
+
+    @classmethod
+    def for_version(cls, version: int) -> Self:
+        """Create instrumentation configuration for a specific version.
+
+        Args:
+            version: The instrumentation version (1, 2, or 3+)
+
+        Returns:
+            InstrumentationConfig instance with version-appropriate settings
+        """
+        if version <= 2:
+            return cls(
+                agent_run_span_name='agent run',
+                agent_name_attr='agent_name',
+                tool_span_name='running tool',
+                tool_arguments_attr='tool_arguments',
+                tool_result_attr='tool_response',
+                output_tool_span_name='running output function',
+            )
+        else:
+            return cls(
+                agent_run_span_name='invoke_agent',
+                agent_name_attr='gen_ai.agent.name',
+                tool_span_name='execute_tool',  # Will be formatted with tool name
+                tool_arguments_attr='gen_ai.tool.call.arguments',
+                tool_result_attr='gen_ai.tool.call.result',
+                output_tool_span_name='execute_tool',
+            )
+
+    def get_agent_run_span_name(self, agent_name: str) -> str:
+        """Get the formatted agent span name.
+
+        Args:
+            agent_name: Name of the agent being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.agent_run_span_name == 'invoke_agent':
+            return f'invoke_agent {agent_name}'
+        return self.agent_run_span_name
+
+    def get_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.tool_span_name
+
+    def get_output_tool_span_name(self, tool_name: str) -> str:
+        """Get the formatted output tool span name.
+
+        Args:
+            tool_name: Name of the tool being executed
+
+        Returns:
+            Formatted span name
+        """
+        if self.output_tool_span_name == 'execute_tool':
+            return f'execute_tool {tool_name}'
+        return self.output_tool_span_name
+
+# tests/models/test_openai.py:808-822
+async def test_none_delta(allow_model_requests: None):
+    stream = [
+        none_delta_chunk(),
+        text_chunk('hello '),
+        text_chunk('world'),
+    ]
+    mock_client = MockOpenAI.create_mock_stream(stream)
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(openai_client=mock_client))
+    agent = Agent(m)
+
+    async with agent.run_stream('') as result:
+        assert not result.is_complete
+        assert [c async for c in result.stream_text(debounce_by=None)] == snapshot(['hello ', 'hello world'])
+        assert result.is_complete
+        assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=6, output_tokens=3))
+
+# tests/typed_deps.py:53-54
+async def my_prepare_none(ctx: RunContext, tool_defn: ToolDefinition) -> None:
+    pass
+
+# pydantic_ai_slim/pydantic_ai/embeddings/instrumented.py:48-48
+    instrumentation_settings: InstrumentationSettings
+
+# pydantic_graph/pydantic_graph/beta/graph_builder.py:94-94
+    auto_instrument: bool
+
+# tests/models/test_openai.py:794-805
+def none_delta_chunk(finish_reason: FinishReason | None = None) -> chat.ChatCompletionChunk:
+    choice = ChunkChoice(index=0, delta=ChoiceDelta())
+    # When using Azure OpenAI and an async content filter is enabled, the openai SDK can return None deltas.
+    choice.delta = None  # pyright: ignore[reportAttributeAccessIssue]
+    return chat.ChatCompletionChunk(
+        id='123',
+        choices=[choice],
+        created=1704067200,  # 2024-01-01
+        model='gpt-4o-123',
+        object='chat.completion.chunk',
+        usage=CompletionUsage(completion_tokens=1, prompt_tokens=2, total_tokens=3),
+    )
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:43-43
+from ..models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:147-147
+    _instrument_default: ClassVar[InstrumentationSettings | bool] = False
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:3-11
+from .agent import (
+    Agent,
+    CallToolsNode,
+    EndStrategy,
+    InstrumentationSettings,
+    ModelRequestNode,
+    UserPromptNode,
+    capture_run_messages,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:3-11
+from .agent import (
+    Agent,
+    CallToolsNode,
+    EndStrategy,
+    InstrumentationSettings,
+    ModelRequestNode,
+    UserPromptNode,
+    capture_run_messages,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:3-11
+from .agent import (
+    Agent,
+    CallToolsNode,
+    EndStrategy,
+    InstrumentationSettings,
+    ModelRequestNode,
+    UserPromptNode,
+    capture_run_messages,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:3-11
+from .agent import (
+    Agent,
+    CallToolsNode,
+    EndStrategy,
+    InstrumentationSettings,
+    ModelRequestNode,
+    UserPromptNode,
+    capture_run_messages,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:3-11
+from .agent import (
+    Agent,
+    CallToolsNode,
+    EndStrategy,
+    InstrumentationSettings,
+    ModelRequestNode,
+    UserPromptNode,
+    capture_run_messages,
+)
+
+# tests/models/test_instrumented.py:145-363
+async def test_instrumented_model(capfire: CaptureLogfire):
+    model = InstrumentedModel(MyModel(), InstrumentationSettings(version=1, event_mode='logs'))
+    assert model.system == 'openai'
+    assert model.model_name == 'gpt-4o'
+
+    messages = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart('system_prompt'),
+                UserPromptPart('user_prompt'),
+                ToolReturnPart('tool3', 'tool_return_content', 'tool_call_3'),
+                RetryPromptPart('retry_prompt1', tool_name='tool4', tool_call_id='tool_call_4'),
+                RetryPromptPart('retry_prompt2'),
+                {},  # test unexpected parts  # type: ignore
+            ],
+            timestamp=IsDatetime(),
+        ),
+        ModelResponse(parts=[TextPart('text3')]),
+    ]
+    await model.request(
+        messages,
+        model_settings=ModelSettings(temperature=1),
+        model_request_parameters=ModelRequestParameters(
+            function_tools=[],
+            allow_text_output=True,
+            output_tools=[],
+            output_mode='text',
+            output_object=None,
+        ),
+    )
+
+    assert capfire.exporter.exported_spans_as_dict(parse_json_attributes=True) == snapshot(
+        [
+            {
+                'name': 'chat gpt-4o',
+                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'parent': None,
+                'start_time': 1000000000,
+                'end_time': 16000000000,
+                'attributes': {
+                    'gen_ai.operation.name': 'chat',
+                    'gen_ai.provider.name': 'openai',
+                    'gen_ai.system': 'openai',
+                    'gen_ai.request.model': 'gpt-4o',
+                    'server.address': 'example.com',
+                    'server.port': 8000,
+                    'model_request_parameters': {
+                        'function_tools': [],
+                        'builtin_tools': [],
+                        'output_mode': 'text',
+                        'output_object': None,
+                        'output_tools': [],
+                        'prompted_output_template': None,
+                        'allow_text_output': True,
+                        'allow_image_output': False,
+                    },
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {'model_request_parameters': {'type': 'object'}},
+                    },
+                    'gen_ai.request.temperature': 1,
+                    'logfire.msg': 'chat gpt-4o',
+                    'logfire.span_type': 'span',
+                    'gen_ai.response.model': 'gpt-4o-2024-11-20',
+                    'gen_ai.response.id': 'response_id',
+                    'gen_ai.usage.details.reasoning_tokens': 30,
+                    'gen_ai.usage.details.cache_write_tokens': 10,
+                    'gen_ai.usage.details.cache_read_tokens': 20,
+                    'gen_ai.usage.details.input_audio_tokens': 10,
+                    'gen_ai.usage.details.cache_audio_read_tokens': 5,
+                    'gen_ai.usage.details.output_audio_tokens': 30,
+                    'gen_ai.usage.input_tokens': 100,
+                    'gen_ai.usage.output_tokens': 200,
+                    'operation.cost': 0.00188125,
+                },
+            },
+        ]
+    )
+
+    assert capfire.log_exporter.exported_logs_as_dicts() == snapshot(
+        [
+            {
+                'body': {'role': 'system', 'content': 'system_prompt'},
+                'severity_number': None,
+                'severity_text': None,
+                'attributes': {
+                    'gen_ai.system': 'openai',
+                    'gen_ai.message.index': 0,
+                    'event.name': 'gen_ai.system.message',
+                },
+                'timestamp': 2000000000,
+                'observed_timestamp': 3000000000,
+                'trace_id': 1,
+                'span_id': 1,
+                'trace_flags': 1,
+            },
+            {
+                'body': {'content': 'user_prompt', 'role': 'user'},
+                'severity_number': None,
+                'severity_text': None,
+                'attributes': {
+                    'gen_ai.system': 'openai',
+                    'gen_ai.message.index': 0,
+                    'event.name': 'gen_ai.user.message',
+                },
+                'timestamp': 4000000000,
+                'observed_timestamp': 5000000000,
+                'trace_id': 1,
+                'span_id': 1,
+                'trace_flags': 1,
+            },
+            {
+                'body': {'content': 'tool_return_content', 'role': 'tool', 'id': 'tool_call_3', 'name': 'tool3'},
+                'severity_number': None,
+                'severity_text': None,
+                'attributes': {
+                    'gen_ai.system': 'openai',
+                    'gen_ai.message.index': 0,
+                    'event.name': 'gen_ai.tool.message',
+                },
+                'timestamp': 6000000000,
+                'observed_timestamp': 7000000000,
+                'trace_id': 1,
+                'span_id': 1,
+                'trace_flags': 1,
+            },
+            {
+                'body': {
+                    'content': """\
+retry_prompt1
+
+Fix the errors and try again.\
+""",
+                    'role': 'tool',
+                    'id': 'tool_call_4',
+                    'name': 'tool4',
+                },
+                'severity_number': None,
+                'severity_text': None,
+                'attributes': {
+                    'gen_ai.system': 'openai',
+                    'gen_ai.message.index': 0,
+                    'event.name': 'gen_ai.tool.message',
+                },
+                'timestamp': 8000000000,
+                'observed_timestamp': 9000000000,
+                'trace_id': 1,
+                'span_id': 1,
+                'trace_flags': 1,
+            },
+            {
+                'body': {
+                    'content': """\
+Validation feedback:
+retry_prompt2
+
+Fix the errors and try again.\
+""",
+                    'role': 'user',
+                },
+                'severity_number': None,
+                'severity_text': None,
+                'attributes': {
+                    'gen_ai.system': 'openai',
+                    'gen_ai.message.index': 0,
+                    'event.name': 'gen_ai.user.message',
+                },
+                'timestamp': 10000000000,
+                'observed_timestamp': 11000000000,
+                'trace_id': 1,
+                'span_id': 1,
+                'trace_flags': 1,
+            },
+            {
+                'body': {'role': 'assistant', 'content': 'text3'},
+                'severity_number': None,
+                'severity_text': None,
+                'attributes': {
+                    'gen_ai.system': 'openai',
+                    'gen_ai.message.index': 1,
+                    'event.name': 'gen_ai.assistant.message',
+                },
+                'timestamp': 12000000000,
+                'observed_timestamp': 13000000000,
+                'trace_id': 1,
+                'span_id': 1,
+                'trace_flags': 1,
+            },
+            {
+                'body': {
+                    'index': 0,
+                    'message': {
+                        'role': 'assistant',
+                        'content': [{'kind': 'text', 'text': 'text1'}, {'kind': 'text', 'text': 'text2'}],
+                        'tool_calls': [
+                            {
+                                'id': 'tool_call_1',
+                                'type': 'function',
+                                'function': {'name': 'tool1', 'arguments': 'args1'},
+                            },
+                            {
+                                'id': 'tool_call_2',
+                                'type': 'function',
+                                'function': {'name': 'tool2', 'arguments': {'args2': 3}},
+                            },
+                        ],
+                    },
+                },
+                'severity_number': None,
+                'severity_text': None,
+                'attributes': {'gen_ai.system': 'openai', 'event.name': 'gen_ai.choice'},
+                'timestamp': 14000000000,
+                'observed_timestamp': 15000000000,
+                'trace_id': 1,
+                'span_id': 1,
+                'trace_flags': 1,
+            },
+        ]
+    )
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:3-11
+from .agent import (
+    Agent,
+    CallToolsNode,
+    EndStrategy,
+    InstrumentationSettings,
+    ModelRequestNode,
+    UserPromptNode,
+    capture_run_messages,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:3-11
+from .agent import (
+    Agent,
+    CallToolsNode,
+    EndStrategy,
+    InstrumentationSettings,
+    ModelRequestNode,
+    UserPromptNode,
+    capture_run_messages,
+)
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:168-168
+    _instrument_default: ClassVar[InstrumentationSettings | bool] = False
+
+# tests/test_temporal.py:149-153
+def uninstrument_pydantic_ai() -> Iterator[None]:
+    try:
+        yield
+    finally:
+        Agent.instrument_all(False)
+
+# tests/models/test_xai.py:989-1003
+async def test_xai_none_delta(allow_model_requests: None):
+    # Test handling of chunks without deltas
+    stream = [
+        get_grok_text_chunk('hello '),
+        get_grok_text_chunk('world'),
+    ]
+    mock_client = MockXai.create_mock_stream([stream])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    async with agent.run_stream('') as result:
+        assert not result.is_complete
+        assert [c async for c in result.stream_text(debounce_by=None)] == snapshot(['hello ', 'hello world'])
+        assert result.is_complete
+        assert result.usage() == snapshot(RunUsage(input_tokens=2, output_tokens=1, requests=1))
+
+# tests/test_agent.py:4821-4850
+def test_dynamic_system_prompt_none_return():
+    """Test dynamic system prompts with None return values."""
+    agent = Agent('test')
+
+    dynamic_values = [None, 'DYNAMIC']
+
+    @agent.system_prompt(dynamic=True)
+    def dynamic_sys() -> str | None:
+        return dynamic_values.pop(0)
+
+    with capture_run_messages() as base_messages:
+        agent.run_sync('Hi', model=TestModel(custom_output_text='baseline'))
+
+    base_req = base_messages[0]
+    assert isinstance(base_req, ModelRequest)
+    sys_texts = [p.content for p in base_req.parts if isinstance(p, SystemPromptPart)]
+    # The None value should have a '' placeholder due to keeping a reference to the dynamic prompt
+    assert '' in sys_texts
+    assert 'DYNAMIC' not in sys_texts
+
+    # Run a second time to capture the updated system prompt
+    with capture_run_messages() as messages:
+        agent.run_sync('Hi', model=TestModel(custom_output_text='baseline'))
+
+    req = messages[0]
+    assert isinstance(req, ModelRequest)
+    sys_texts = [p.content for p in req.parts if isinstance(p, SystemPromptPart)]
+    # The None value should have a '' placeholder due to keep a reference to the dynamic prompt
+    assert '' not in sys_texts
+    assert 'DYNAMIC' in sys_texts
+
+# tests/test_embeddings.py:203-312
+    async def test_instrumentation(self, openai_api_key: str, capfire: CaptureLogfire):
+        model = OpenAIEmbeddingModel('text-embedding-3-small', provider=OpenAIProvider(api_key=openai_api_key))
+        embedder = Embedder(model, instrument=True)
+        await embedder.embed_query('Hello, world!', settings={'dimensions': 128})
+
+        spans = capfire.exporter.exported_spans_as_dict(parse_json_attributes=True)
+        span = next(span for span in spans if 'embeddings' in span['name'])
+
+        assert span == snapshot(
+            {
+                'name': 'embeddings text-embedding-3-small',
+                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'parent': None,
+                'start_time': IsInt(),
+                'end_time': IsInt(),
+                'attributes': {
+                    'gen_ai.operation.name': 'embeddings',
+                    'gen_ai.provider.name': 'openai',
+                    'gen_ai.request.model': 'text-embedding-3-small',
+                    'input_type': 'query',
+                    'server.address': 'api.openai.com',
+                    'inputs_count': 1,
+                    'embedding_settings': {'dimensions': 128},
+                    'inputs': ['Hello, world!'],
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {
+                            'input_type': {'type': 'string'},
+                            'inputs_count': {'type': 'integer'},
+                            'embedding_settings': {'type': 'object'},
+                            'inputs': {'type': ['array']},
+                            'embeddings': {'type': 'array'},
+                        },
+                    },
+                    'logfire.span_type': 'span',
+                    'logfire.msg': 'embeddings text-embedding-3-small',
+                    'gen_ai.usage.input_tokens': 4,
+                    'operation.cost': 8e-08,
+                    'gen_ai.response.model': 'text-embedding-3-small',
+                    'gen_ai.embeddings.dimension.count': 128,
+                },
+            }
+        )
+
+        assert capfire.get_collected_metrics() == snapshot(
+            [
+                {
+                    'name': 'gen_ai.client.token.usage',
+                    'description': 'Measures number of input and output tokens used',
+                    'unit': '{token}',
+                    'data': {
+                        'data_points': [
+                            {
+                                'attributes': {
+                                    'gen_ai.provider.name': 'openai',
+                                    'gen_ai.operation.name': 'embeddings',
+                                    'gen_ai.request.model': 'text-embedding-3-small',
+                                    'gen_ai.response.model': 'text-embedding-3-small',
+                                    'gen_ai.token.type': 'input',
+                                },
+                                'start_time_unix_nano': IsInt(),
+                                'time_unix_nano': IsInt(),
+                                'count': 1,
+                                'sum': 4,
+                                'scale': 20,
+                                'zero_count': 0,
+                                'positive': {'offset': 2097151, 'bucket_counts': [1]},
+                                'negative': {'offset': 0, 'bucket_counts': [0]},
+                                'flags': 0,
+                                'min': 4,
+                                'max': 4,
+                                'exemplars': [],
+                            }
+                        ],
+                        'aggregation_temporality': 1,
+                    },
+                },
+                {
+                    'name': 'operation.cost',
+                    'description': 'Monetary cost',
+                    'unit': '{USD}',
+                    'data': {
+                        'data_points': [
+                            {
+                                'attributes': {
+                                    'gen_ai.provider.name': 'openai',
+                                    'gen_ai.operation.name': 'embeddings',
+                                    'gen_ai.request.model': 'text-embedding-3-small',
+                                    'gen_ai.response.model': 'text-embedding-3-small',
+                                    'gen_ai.token.type': 'input',
+                                },
+                                'start_time_unix_nano': IsInt(),
+                                'time_unix_nano': IsInt(),
+                                'count': 1,
+                                'sum': 8e-08,
+                                'scale': 20,
+                                'zero_count': 0,
+                                'positive': {'offset': -24720625, 'bucket_counts': [1]},
+                                'negative': {'offset': 0, 'bucket_counts': [0]},
+                                'flags': 0,
+                                'min': 8e-08,
+                                'max': 8e-08,
+                                'exemplars': [],
+                            }
+                        ],
+                        'aggregation_temporality': 1,
+                    },
+                },
+            ]
+        )
+
+# tests/test_embeddings.py:1320-1361
+    async def test_instrumentation(self, gemini_api_key: str, capfire: CaptureLogfire):
+        model = GoogleEmbeddingModel('gemini-embedding-001', provider=GoogleProvider(api_key=gemini_api_key))
+        embedder = Embedder(model, instrument=True)
+        await embedder.embed_query('Hello, world!', settings={'dimensions': 768})
+
+        spans = capfire.exporter.exported_spans_as_dict(parse_json_attributes=True)
+        span = next(span for span in spans if 'embeddings' in span['name'])
+
+        assert span == snapshot(
+            {
+                'name': 'embeddings gemini-embedding-001',
+                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'parent': None,
+                'start_time': IsInt(),
+                'end_time': IsInt(),
+                'attributes': {
+                    'gen_ai.operation.name': 'embeddings',
+                    'gen_ai.provider.name': 'google-gla',
+                    'gen_ai.request.model': 'gemini-embedding-001',
+                    'input_type': 'query',
+                    'server.address': 'generativelanguage.googleapis.com',
+                    'inputs_count': 1,
+                    'embedding_settings': {'dimensions': 768},
+                    'inputs': ['Hello, world!'],
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {
+                            'input_type': {'type': 'string'},
+                            'inputs_count': {'type': 'integer'},
+                            'embedding_settings': {'type': 'object'},
+                            'inputs': {'type': ['array']},
+                            'embeddings': {'type': 'array'},
+                        },
+                    },
+                    'logfire.span_type': 'span',
+                    'logfire.msg': 'embeddings gemini-embedding-001',
+                    'gen_ai.response.model': 'gemini-embedding-001',
+                    'operation.cost': 0.0,
+                    'gen_ai.embeddings.dimension.count': 768,
+                },
+            }
+        )
+
+# tests/test_vercel_ai.py:4409-4434
+    async def test_dump_provider_metadata_filters_none_values(self):
+        """Test that dump_provider_metadata only includes non-None values."""
+
+        # All None - should return None
+        result = dump_provider_metadata(id=None, provider_name=None, provider_details=None)
+        assert result is None
+
+        # Some values
+        result = dump_provider_metadata(id='test_id', provider_name=None, provider_details={'key': 'val'})
+        assert result == {'pydantic_ai': {'id': 'test_id', 'provider_details': {'key': 'val'}}}
+
+        # All values
+        result = dump_provider_metadata(
+            id='full_id',
+            signature='sig',
+            provider_name='provider',
+            provider_details={'detail': 1},
+        )
+        assert result == {
+            'pydantic_ai': {
+                'id': 'full_id',
+                'signature': 'sig',
+                'provider_name': 'provider',
+                'provider_details': {'detail': 1},
+            }
+        }
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:16-16
+from .instrumented import InstrumentedEmbeddingModel, instrument_embedding_model
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:16-16
+from .instrumented import InstrumentedEmbeddingModel, instrument_embedding_model
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:16-16
+from .instrumented import InstrumentedEmbeddingModel, instrument_embedding_model
+
+# tests/test_embeddings.py:1139-1180
+    async def test_instrumentation(self, bedrock_provider: BedrockProvider, capfire: CaptureLogfire):
+        model = BedrockEmbeddingModel('amazon.titan-embed-text-v2:0', provider=bedrock_provider)
+        embedder = Embedder(model, instrument=True)
+        await embedder.embed_query('Hello, world!', settings={'dimensions': 256})
+
+        spans = capfire.exporter.exported_spans_as_dict(parse_json_attributes=True)
+        span = next(span for span in spans if 'embeddings' in span['name'])
+
+        assert span == snapshot(
+            {
+                'name': 'embeddings amazon.titan-embed-text-v2:0',
+                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'parent': None,
+                'start_time': IsInt(),
+                'end_time': IsInt(),
+                'attributes': {
+                    'gen_ai.operation.name': 'embeddings',
+                    'gen_ai.provider.name': 'bedrock',
+                    'gen_ai.request.model': 'amazon.titan-embed-text-v2:0',
+                    'input_type': 'query',
+                    'server.address': 'bedrock-runtime.us-east-1.amazonaws.com',
+                    'inputs_count': 1,
+                    'embedding_settings': {'dimensions': 256},
+                    'inputs': ['Hello, world!'],
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {
+                            'input_type': {'type': 'string'},
+                            'inputs_count': {'type': 'integer'},
+                            'embedding_settings': {'type': 'object'},
+                            'inputs': {'type': ['array']},
+                            'embeddings': {'type': 'array'},
+                        },
+                    },
+                    'logfire.span_type': 'span',
+                    'logfire.msg': 'embeddings amazon.titan-embed-text-v2:0',
+                    'gen_ai.usage.input_tokens': 5,
+                    'gen_ai.response.model': 'amazon.titan-embed-text-v2:0',
+                    'gen_ai.embeddings.dimension.count': 256,
+                },
+            }
+        )
+
+# tests/graph/beta/test_edge_cases.py:60-80
+async def test_step_with_zero_value():
+    """Test handling of zero values (ensure they're not confused with None/falsy)."""
+    g = GraphBuilder(state_type=EdgeCaseState, output_type=int)
+
+    @g.step
+    async def return_zero(ctx: StepContext[EdgeCaseState, None, None]) -> int:
+        return 0
+
+    @g.step
+    async def process_zero(ctx: StepContext[EdgeCaseState, None, int]) -> int:
+        return ctx.inputs + 1
+
+    g.add(
+        g.edge_from(g.start_node).to(return_zero),
+        g.edge_from(return_zero).to(process_zero),
+        g.edge_from(process_zero).to(g.end_node),
+    )
+
+    graph = g.build()
+    result = await graph.run(state=EdgeCaseState())
+    assert result == 1
+
+# tests/test_concurrency.py:216-219
+    async def test_returns_null_context_when_none(self):
+        """Test that get_concurrency_context returns a no-op context when None."""
+        async with get_concurrency_context(None, 'test'):
+            pass  # Should be a no-op
+
+# tests/graph/beta/test_edge_cases.py:34-57
+async def test_step_returning_none():
+    """Test steps that return None."""
+    g = GraphBuilder(state_type=EdgeCaseState)
+
+    @g.step
+    async def do_nothing(ctx: StepContext[EdgeCaseState, None, None]) -> None:
+        ctx.state.value = 99
+        return None
+
+    @g.step
+    async def return_none(ctx: StepContext[EdgeCaseState, None, None]) -> None:
+        return None
+
+    g.add(
+        g.edge_from(g.start_node).to(do_nothing),
+        g.edge_from(do_nothing).to(return_none),
+        g.edge_from(return_none).to(g.end_node),
+    )
+
+    graph = g.build()
+    state = EdgeCaseState()
+    result = await graph.run(state=state)
+    assert result is None
+    assert state.value == 99
+
+# pydantic_ai_slim/pydantic_ai/_run_context.py:49-49
+    instrumentation_version: int = DEFAULT_INSTRUMENTATION_VERSION
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:20-20
+from pydantic_ai._instrumentation import DEFAULT_INSTRUMENTATION_VERSION
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:20-20
+from pydantic_ai._instrumentation import DEFAULT_INSTRUMENTATION_VERSION

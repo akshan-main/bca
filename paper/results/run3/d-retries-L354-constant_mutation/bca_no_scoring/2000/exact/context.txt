@@ -1,0 +1,178 @@
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    def increment_retries(
+        self,
+        max_result_retries: int,
+        error: BaseException | None = None,
+        model_settings: ModelSettings | None = None,
+    ) -> None:
+        self.retries += 1
+        if self.retries > max_result_retries:
+            if (
+                self.message_history
+                and isinstance(model_response := self.message_history[-1], _messages.ModelResponse)
+                and model_response.finish_reason == 'length'
+                and model_response.parts
+                and isinstance(tool_call := model_response.parts[-1], _messages.ToolCallPart)
+            ):
+                try:
+                    tool_call.args_as_dict()
+                except Exception:
+                    max_tokens = model_settings.get('max_tokens') if model_settings else None
+                    raise exceptions.IncompleteToolCall(
+                        f'Model token limit ({max_tokens or "provider default"}) exceeded while generating a tool call, resulting in incomplete arguments. Increase the `max_tokens` model setting, or simplify the prompt to result in a shorter response that will fit within the limit.'
+                    )
+            message = f'Exceeded maximum retries ({max_result_retries}) for output validation'
+            if error:
+                if isinstance(error, exceptions.UnexpectedModelBehavior) and error.__cause__ is not None:
+                    error = error.__cause__
+                raise exceptions.UnexpectedModelBehavior(message) from error
+            else:
+                raise exceptions.UnexpectedModelBehavior(message)
+
+## tests/models/test_xai.py
+
+async def test_xai_model_retries(allow_model_requests: None):
+    """Test xAI model with retries."""
+    # Create error response then success
+    success_response = create_response(content='Success after retry')
+
+    mock_client = MockXai.create_mock([success_response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+    result = await agent.run('hello')
+    assert result.output == 'Success after retry'
+
+## tests/test_agent.py
+
+def test_output_validator_retries():
+    """Test that ctx.retry and ctx.max_retries are correctly tracked in RunContext for output validators."""
+    retries_log: list[int] = []
+    max_retries_log: list[int] = []
+    target_retries = 3
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        # Always return the same value, let the validator control retries
+        args_json = '{"a": 1, "b": "foo"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=Foo, output_retries=target_retries)
+
+    @agent.output_validator
+    def validate_output(ctx: RunContext[None], o: Foo) -> Foo:
+        retries_log.append(ctx.retry)
+        max_retries_log.append(ctx.max_retries)
+        # Succeed on the last retry
+        if ctx.retry == target_retries:
+            return o
+        else:
+            raise ModelRetry(f'Retry {ctx.retry}')
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, Foo)
+
+    # Should have been called target_retries + 1 times (0, 1, 2, 3)
+    assert retries_log == [0, 1, 2, 3]
+    assert max_retries_log == [target_retries] * (target_retries + 1)
+
+def test_output_function_retries():
+    """Test that ctx.retry and ctx.max_retries are correctly tracked in RunContext for output functions."""
+    retries_log: list[int] = []
+    max_retries_log: list[int] = []
+    target_retries = 3
+
+    def get_weather(ctx: RunContext[None], text: str) -> str:
+        retries_log.append(ctx.retry)
+        max_retries_log.append(ctx.max_retries)
+        if ctx.retry == target_retries:
+            return f'Weather: {text}'
+        else:
+            raise ModelRetry(f'Retry {ctx.retry}')
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content='sunny')])
+
+    agent = Agent(FunctionModel(return_model), output_type=TextOutput(get_weather), output_retries=target_retries)
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'Weather: sunny'
+
+    # Should have been called target_retries + 1 times (0, 1, 2, 3)
+    assert retries_log == [0, 1, 2, 3]
+    assert max_retries_log == [target_retries] * (target_retries + 1)
+
+def test_tool_output_function_retries():
+    """Test that ctx.retry and ctx.max_retries are correctly tracked in RunContext for tool output functions."""
+    retries_log: list[int] = []
+    max_retries_log: list[int] = []
+    target_retries = 3
+
+    def get_weather(ctx: RunContext[None], city: str) -> str:
+        retries_log.append(ctx.retry)
+        max_retries_log.append(ctx.max_retries)
+        if ctx.retry == target_retries:
+            return f'Weather in {city}'
+        else:
+            raise ModelRetry(f'Retry {ctx.retry}')
+
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        args_json = '{"city": "Mexico City"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=get_weather, output_retries=target_retries)
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'Weather in Mexico City'
+
+    # Should have been called target_retries + 1 times (0, 1, 2, 3)
+    assert retries_log == [0, 1, 2, 3]
+    assert max_retries_log == [target_retries] * (target_retries + 1)
+
+## tests/test_tools.py
+
+def test_tool_retries():
+    prepare_tools_retries: list[int] = []
+    prepare_retries: list[int] = []
+    prepare_max_retries: list[int] = []
+    prepare_last_attempt: list[bool] = []
+    call_retries: list[int] = []
+    call_max_retries: list[int] = []
+    call_last_attempt: list[bool] = []
+
+    async def prepare_tool_defs(ctx: RunContext[None], tool_defs: list[ToolDefinition]) -> list[ToolDefinition] | None:
+        nonlocal prepare_tools_retries
+        retry = ctx.retries.get('infinite_retry_tool', 0)
+        prepare_tools_retries.append(retry)
+        return tool_defs
+
+    agent = Agent(TestModel(), retries=3, prepare_tools=prepare_tool_defs)
+
+    async def prepare_tool_def(ctx: RunContext[None], tool_def: ToolDefinition) -> ToolDefinition | None:
+        nonlocal prepare_retries
+        prepare_retries.append(ctx.retry)
+        prepare_max_retries.append(ctx.max_retries)
+        prepare_last_attempt.append(ctx.last_attempt)
+        return tool_def
+
+    @agent.tool(retries=5, prepare=prepare_tool_def)
+    def infinite_retry_tool(ctx: RunContext[None]) -> int:
+        nonlocal call_retries
+        call_retries.append(ctx.retry)
+        call_max_retries.append(ctx.max_retries)
+        call_last_attempt.append(ctx.last_attempt)
+        raise ModelRetry('Please try again.')
+
+    with pytest.raises(UnexpectedModelBehavior, match="Tool 'infinite_retry_tool' exceeded max retries count of 5"):
+        agent.run_sync('Begin infinite retry loop!')
+
+    assert prepare_tools_retries == snapshot([0, 1, 2, 3, 4, 5])
+
+    assert prepare_retries == snapshot([0, 1, 2, 3, 4, 5])
+    assert prepare_max_retries == snapshot([5, 5, 5, 5, 5, 5])
+    assert prepare_last_attempt == snapshot([False, False, False, False, False, True])
+
+    assert call_retries == snapshot([0, 1, 2, 3, 4, 5])
+    assert call_max_retries == snapshot([5, 5, 5, 5, 5, 5])
+    assert call_last_attempt == snapshot([False, False, False, False, False, True])

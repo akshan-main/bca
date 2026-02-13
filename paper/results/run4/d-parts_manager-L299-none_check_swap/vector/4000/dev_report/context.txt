@@ -1,0 +1,445 @@
+# pydantic_ai_slim/pydantic_ai/_parts_manager.py:258-350
+    def handle_tool_call_delta(
+        self,
+        *,
+        vendor_part_id: Hashable | None,
+        tool_name: str | None = None,
+        args: str | dict[str, Any] | None = None,
+        tool_call_id: str | None = None,
+        provider_name: str | None = None,
+        provider_details: dict[str, Any] | None = None,
+    ) -> ModelResponseStreamEvent | None:
+        """Handle or update a tool call, creating or updating a `ToolCallPart`, `BuiltinToolCallPart`, or `ToolCallPartDelta`.
+
+        Managed items remain as `ToolCallPartDelta`s until they have at least a tool_name, at which
+        point they are upgraded to `ToolCallPart`s.
+
+        If `vendor_part_id` is None, updates the latest matching ToolCallPart (or ToolCallPartDelta)
+        if any. Otherwise, a new part (or delta) may be created.
+
+        Args:
+            vendor_part_id: The ID the vendor uses for this tool call.
+                If None, the latest matching tool call may be updated.
+            tool_name: The name of the tool. If None, the manager does not enforce
+                a name match when `vendor_part_id` is None.
+            args: Arguments for the tool call, either as a string, a dictionary of key-value pairs, or None.
+            tool_call_id: An optional string representing an identifier for this tool call.
+            provider_name: An optional provider name for the tool call part.
+            provider_details: An optional dictionary of provider-specific details for the tool call part.
+
+        Returns:
+            - A `PartStartEvent` if a new ToolCallPart or BuiltinToolCallPart is created.
+            - A `PartDeltaEvent` if an existing part is updated.
+            - `None` if no new event is emitted (e.g., the part is still incomplete).
+
+        Raises:
+            UnexpectedModelBehavior: If attempting to apply a tool call delta to a part that is not
+                a ToolCallPart, BuiltinToolCallPart, or ToolCallPartDelta.
+        """
+        existing_matching_part_and_index: tuple[ToolCallPartDelta | ToolCallPart | BuiltinToolCallPart, int] | None = (
+            None
+        )
+
+        if vendor_part_id is not None:
+            # vendor_part_id is None, so check if the latest part is a matching tool call or delta to update
+            # When the vendor_part_id is None, if the tool_name is _not_ None, assume this should be a new part rather
+            # than a delta on an existing one. We can change this behavior in the future if necessary for some model.
+            if tool_name is None:
+                existing_matching_part_and_index = self._latest_part_if_of_type(
+                    ToolCallPart, BuiltinToolCallPart, ToolCallPartDelta
+                )
+        else:
+            # vendor_part_id is provided, so look up the corresponding part or delta
+            part_index = self._vendor_id_to_part_index.get(vendor_part_id)
+            if part_index is not None:
+                existing_part = self._parts[part_index]
+                if not isinstance(existing_part, ToolCallPartDelta | ToolCallPart | BuiltinToolCallPart):
+                    raise UnexpectedModelBehavior(f'Cannot apply a tool call delta to {existing_part=}')
+                existing_matching_part_and_index = existing_part, part_index
+
+        if existing_matching_part_and_index is None:
+            # No matching part/delta was found, so create a new ToolCallPartDelta (or ToolCallPart if fully formed)
+            delta = ToolCallPartDelta(
+                tool_name_delta=tool_name,
+                args_delta=args,
+                tool_call_id=tool_call_id,
+                provider_name=provider_name,
+                provider_details=provider_details,
+            )
+            part = delta.as_part() or delta
+            new_part_index = self._append_part(part, vendor_part_id)
+            # Only emit a PartStartEvent if we have enough information to produce a full ToolCallPart
+            if isinstance(part, ToolCallPart | BuiltinToolCallPart):
+                return PartStartEvent(index=new_part_index, part=part)
+        else:
+            # Update the existing part or delta with the new information
+            existing_part, part_index = existing_matching_part_and_index
+            delta = ToolCallPartDelta(
+                tool_name_delta=tool_name,
+                args_delta=args,
+                tool_call_id=tool_call_id,
+                provider_name=self._resolve_provider_name(existing_part, provider_name),
+                provider_details=provider_details,
+            )
+            updated_part = delta.apply(existing_part)
+            self._parts[part_index] = updated_part
+            if isinstance(updated_part, ToolCallPart | BuiltinToolCallPart):
+                if isinstance(existing_part, ToolCallPartDelta):
+                    # We just upgraded a delta to a full part, so emit a PartStartEvent
+                    return PartStartEvent(index=part_index, part=updated_part)
+                else:
+                    # We updated an existing part, so emit a PartDeltaEvent
+                    if updated_part.tool_call_id and not delta.tool_call_id:
+                        delta = replace(delta, tool_call_id=updated_part.tool_call_id)
+                    return PartDeltaEvent(index=part_index, delta=delta)
+
+# pydantic_ai_slim/pydantic_ai/_parts_manager.py:352-401
+    def handle_tool_call_part(
+        self,
+        *,
+        vendor_part_id: Hashable | None,
+        tool_name: str,
+        args: str | dict[str, Any] | None,
+        tool_call_id: str | None = None,
+        id: str | None = None,
+        provider_name: str | None = None,
+        provider_details: dict[str, Any] | None = None,
+    ) -> ModelResponseStreamEvent:
+        """Immediately create or fully-overwrite a ToolCallPart with the given information.
+
+        This does not apply a delta; it directly sets the tool call part contents.
+
+        Args:
+            vendor_part_id: The vendor's ID for this tool call part. If not
+                None and an existing part is found, that part is overwritten.
+            tool_name: The name of the tool being invoked.
+            args: The arguments for the tool call, either as a string, a dictionary, or None.
+            tool_call_id: An optional string identifier for this tool call.
+            id: An optional identifier for this tool call part.
+            provider_name: An optional provider name for the tool call part.
+            provider_details: An optional dictionary of provider-specific details for the tool call part.
+
+        Returns:
+            ModelResponseStreamEvent: A `PartStartEvent` indicating that a new tool call part
+            has been added to the manager, or replaced an existing part.
+        """
+        new_part = ToolCallPart(
+            tool_name=tool_name,
+            args=args,
+            tool_call_id=tool_call_id or _generate_tool_call_id(),
+            id=id,
+            provider_name=provider_name,
+            provider_details=provider_details,
+        )
+        if vendor_part_id is None:
+            # vendor_part_id is None, so we unconditionally append a new ToolCallPart to the end of the list
+            new_part_index = self._append_part(new_part)
+        else:
+            # vendor_part_id is provided, so find and overwrite or create a new ToolCallPart.
+            maybe_part_index = self._vendor_id_to_part_index.get(vendor_part_id)
+            if maybe_part_index is not None and isinstance(self._parts[maybe_part_index], ToolCallPart):
+                new_part_index = maybe_part_index
+                self._parts[new_part_index] = new_part
+            else:
+                new_part_index = self._append_part(new_part)
+            self._vendor_id_to_part_index[vendor_part_id] = new_part_index
+        return PartStartEvent(index=new_part_index, part=new_part)
+
+# tests/models/test_model_test.py:13-13
+from anyio import Event
+
+# tests/test_parts_manager.py:165-265
+def test_handle_tool_call_deltas():
+    manager = ModelResponsePartsManager()
+
+    event = manager.handle_tool_call_delta(vendor_part_id='first', tool_name=None, args='{"arg1":', tool_call_id=None)
+    # Not enough information to produce a part, so no event and no part
+    assert event == snapshot(None)
+    assert manager.get_parts() == snapshot([])
+
+    # Now that we have a tool name, we can produce a part:
+    event = manager.handle_tool_call_delta(
+        vendor_part_id='first',
+        tool_name='tool',
+        args=None,
+        tool_call_id='call',
+        provider_name='test_provider',
+        provider_details={'foo': 'bar'},
+    )
+    assert event == snapshot(
+        PartStartEvent(
+            index=0,
+            part=ToolCallPart(
+                tool_name='tool',
+                args='{"arg1":',
+                tool_call_id='call',
+                provider_name='test_provider',
+                part_kind='tool-call',
+                provider_details={'foo': 'bar'},
+            ),
+            event_kind='part_start',
+        )
+    )
+    assert manager.get_parts() == snapshot(
+        [
+            ToolCallPart(
+                tool_name='tool',
+                args='{"arg1":',
+                tool_call_id='call',
+                provider_name='test_provider',
+                part_kind='tool-call',
+                provider_details={'foo': 'bar'},
+            ),
+        ]
+    )
+
+    event = manager.handle_tool_call_delta(
+        vendor_part_id='first',
+        tool_name='1',
+        args=None,
+        tool_call_id=None,
+        provider_name='updated_provider',
+        provider_details={'baz': 'qux'},
+    )
+    assert event == snapshot(
+        PartDeltaEvent(
+            index=0,
+            delta=ToolCallPartDelta(
+                tool_name_delta='1',
+                args_delta=None,
+                provider_name='updated_provider',
+                tool_call_id='call',
+                part_delta_kind='tool_call',
+                provider_details={'baz': 'qux'},
+            ),
+            event_kind='part_delta',
+        )
+    )
+    assert manager.get_parts() == snapshot(
+        [
+            ToolCallPart(
+                tool_name='tool1',
+                args='{"arg1":',
+                tool_call_id='call',
+                provider_name='updated_provider',
+                part_kind='tool-call',
+                provider_details={'foo': 'bar', 'baz': 'qux'},
+            ),
+        ]
+    )
+
+    event = manager.handle_tool_call_delta(vendor_part_id='first', tool_name=None, args='"value1"}', tool_call_id=None)
+    assert event == snapshot(
+        PartDeltaEvent(
+            index=0,
+            delta=ToolCallPartDelta(
+                tool_name_delta=None, args_delta='"value1"}', tool_call_id='call', part_delta_kind='tool_call'
+            ),
+            event_kind='part_delta',
+        )
+    )
+    assert manager.get_parts() == snapshot(
+        [
+            ToolCallPart(
+                tool_name='tool1',
+                args='{"arg1":"value1"}',
+                tool_call_id='call',
+                provider_name='updated_provider',
+                provider_details={'foo': 'bar', 'baz': 'qux'},
+                part_kind='tool-call',
+            )
+        ]
+    )
+
+# pydantic_ai_slim/pydantic_ai/_parts_manager.py:403-432
+    def handle_part(
+        self,
+        *,
+        vendor_part_id: Hashable | None,
+        part: ModelResponsePart,
+    ) -> ModelResponseStreamEvent:
+        """Create or overwrite a ModelResponsePart.
+
+        Args:
+            vendor_part_id: The vendor's ID for this tool call part. If not
+                None and an existing part is found, that part is overwritten.
+            part: The ModelResponsePart.
+
+        Returns:
+            ModelResponseStreamEvent: A `PartStartEvent` indicating that a new part
+            has been added to the manager, or replaced an existing part.
+        """
+        if vendor_part_id is None:
+            # vendor_part_id is None, so we unconditionally append a new part to the end of the list
+            new_part_index = self._append_part(part)
+        else:
+            # vendor_part_id is provided, so find and overwrite or create a new part.
+            maybe_part_index = self._vendor_id_to_part_index.get(vendor_part_id)
+            if maybe_part_index is not None and isinstance(self._parts[maybe_part_index], type(part)):
+                new_part_index = maybe_part_index
+                self._parts[new_part_index] = part
+            else:
+                new_part_index = self._append_part(part)
+            self._vendor_id_to_part_index[vendor_part_id] = new_part_index
+        return PartStartEvent(index=new_part_index, part=part)
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py:51-51
+    event: _messages.AgentStreamEvent
+
+# pydantic_ai_slim/pydantic_ai/messages.py:1898-1898
+    part: ModelResponsePart
+
+# tests/test_agent.py:150-150
+    a: int
+
+# tests/test_agent_output_schemas.py:24-24
+    a: list[Bar]
+
+# tests/test_streaming.py:65-65
+    a: int
+
+# tests/typed_agent.py:154-154
+    a: int
+
+# tests/graph/test_mermaid.py:39-41
+class Bar(BaseNode[None, None, None]):
+    async def run(self, ctx: GraphRunContext) -> End[None]:
+        return End(None)
+
+# tests/graph/test_persistence.py:45-48
+class Bar(BaseNode[MyState, None, int]):
+    async def run(self, ctx: GraphRunContext[MyState]) -> End[int]:
+        ctx.state.y += 'y'
+        return End(ctx.state.x * 2)
+
+# tests/test_agent.py:4922-4924
+class Bar(BaseModel):
+    c: int
+    d: str
+
+# tests/test_agent_output_schemas.py:19-20
+class Bar(BaseModel):
+    answer: str
+
+# tests/typed_agent.py:158-159
+class Bar:
+    b: str
+
+# pydantic_ai_slim/pydantic_ai/_parts_manager.py:87-173
+    def handle_text_delta(
+        self,
+        *,
+        vendor_part_id: VendorId | None,
+        content: str,
+        id: str | None = None,
+        provider_name: str | None = None,
+        provider_details: dict[str, Any] | None = None,
+        thinking_tags: tuple[str, str] | None = None,
+        ignore_leading_whitespace: bool = False,
+    ) -> Iterator[ModelResponseStreamEvent]:
+        """Handle incoming text content, creating or updating a TextPart in the manager as appropriate.
+
+        When `vendor_part_id` is None, the latest part is updated if it exists and is a TextPart;
+        otherwise, a new TextPart is created. When a non-None ID is specified, the TextPart corresponding
+        to that vendor ID is either created or updated.
+
+        Args:
+            vendor_part_id: The ID the vendor uses to identify this piece
+                of text. If None, a new part will be created unless the latest part is already
+                a TextPart.
+            content: The text content to append to the appropriate TextPart.
+            id: An optional id for the text part.
+            provider_name: An optional provider name for the text part.
+            provider_details: An optional dictionary of provider-specific details for the text part.
+            thinking_tags: If provided, will handle content between the thinking tags as thinking parts.
+            ignore_leading_whitespace: If True, will ignore leading whitespace in the content.
+
+        Yields:
+            A `PartStartEvent` if a new part was created, or a `PartDeltaEvent` if an existing part was updated.
+            Yields nothing if no event should be emitted (e.g., the first text part was all whitespace).
+
+        Raises:
+            UnexpectedModelBehavior: If attempting to apply text content to a part that is not a TextPart.
+        """
+        existing_text_part_and_index: tuple[TextPart, int] | None = None
+
+        if vendor_part_id is None:
+            # If the vendor_part_id is None, check if the latest part is a TextPart to update
+            existing_text_part_and_index = self._latest_part_if_of_type(TextPart)
+        else:
+            # Otherwise, attempt to look up an existing TextPart by vendor_part_id
+            part_index = self._vendor_id_to_part_index.get(vendor_part_id)
+            if part_index is not None:
+                existing_part = self._parts[part_index]
+
+                if thinking_tags and isinstance(existing_part, ThinkingPart):
+                    # We may be building a thinking part instead of a text part if we had previously seen a thinking tag
+                    if content == thinking_tags[1]:
+                        # When we see the thinking end tag, we're done with the thinking part and the next text delta will need a new part
+                        self._handle_embedded_thinking_end(vendor_part_id)
+                        return
+                    yield from self._handle_embedded_thinking_content(
+                        existing_part, part_index, content, provider_name, provider_details
+                    )
+                    return
+                elif isinstance(existing_part, TextPart):
+                    existing_text_part_and_index = existing_part, part_index
+                else:
+                    raise UnexpectedModelBehavior(f'Cannot apply a text delta to {existing_part=}')
+
+        if thinking_tags and content == thinking_tags[0]:
+            # When we see a thinking start tag (which is a single token), we'll build a new thinking part instead
+            yield from self._handle_embedded_thinking_start(vendor_part_id, provider_name, provider_details)
+            return
+
+        if existing_text_part_and_index is None:
+            # This is a workaround for models that emit `<think>\n</think>\n\n` or an empty text part ahead of tool calls (e.g. Ollama + Qwen3),
+            # which we don't want to end up treating as a final result when using `run_stream` with `str` a valid `output_type`.
+            if ignore_leading_whitespace and (len(content) == 0 or content.isspace()):
+                return
+
+            # There is no existing text part that should be updated, so create a new one
+            part = TextPart(content=content, id=id, provider_name=provider_name, provider_details=provider_details)
+            new_part_index = self._append_part(part, vendor_part_id)
+            yield PartStartEvent(index=new_part_index, part=part)
+        else:
+            # Update the existing TextPart with the new content delta
+            existing_text_part, part_index = existing_text_part_and_index
+
+            part_delta = TextPartDelta(
+                content_delta=content,
+                provider_name=self._resolve_provider_name(existing_text_part, provider_name),
+                provider_details=provider_details,
+            )
+            self._parts[part_index] = part_delta.apply(existing_text_part)
+            yield PartDeltaEvent(index=part_index, delta=part_delta)
+
+# tests/graph/test_mermaid.py:33-35
+class Foo(BaseNode):
+    async def run(self, ctx: GraphRunContext) -> Bar:
+        return Bar()
+
+# tests/graph/test_persistence.py:38-41
+class Foo(BaseNode[MyState]):
+    async def run(self, ctx: GraphRunContext[MyState]) -> Bar:
+        ctx.state.x += 1
+        return Bar()
+
+# tests/models/test_model_function.py:503-504
+class Foo(BaseModel):
+    x: int
+
+# tests/test_agent.py:149-151
+class Foo(BaseModel):
+    a: int
+    b: str
+
+# tests/test_agent_output_schemas.py:23-25
+class Foo(BaseModel):
+    a: list[Bar]
+    b: int
+
+# tests/test_streaming.py:64-66
+class Foo(BaseModel):
+    a: int
+    b: str

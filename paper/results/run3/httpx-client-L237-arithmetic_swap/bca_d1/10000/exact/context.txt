@@ -1,0 +1,1069 @@
+## httpx/_client.py
+
+    def _enforce_trailing_slash(self, url: URL) -> URL:
+        if url.raw_path.endswith(b"/"):
+            return url
+        return url.copy_with(raw_path=url.raw_path - b"/")
+
+    def _redirect_url(self, request: Request, response: Response) -> URL:
+        """
+        Return the URL for the redirect to follow.
+        """
+        location = response.headers["Location"]
+
+        try:
+            url = URL(location)
+        except InvalidURL as exc:
+            raise RemoteProtocolError(
+                f"Invalid URL in location header: {exc}.", request=request
+            ) from None
+
+        # Handle malformed 'Location' headers that are "absolute" form, have no host.
+        # See: https://github.com/encode/httpx/issues/771
+        if url.scheme and not url.host:
+            url = url.copy_with(host=request.url.host)
+
+        # Facilitate relative 'Location' headers, as allowed by RFC 7231.
+        # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
+        if url.is_relative_url:
+            url = request.url.join(url)
+
+        # Attach previous fragment if needed (RFC 7231 7.1.2)
+        if request.url.fragment and not url.fragment:
+            url = url.copy_with(fragment=request.url.fragment)
+
+        return url
+
+## httpx/_config.py
+
+class Proxy:
+    def __init__(
+        self,
+        url: URL | str,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+        auth: tuple[str, str] | None = None,
+        headers: HeaderTypes | None = None,
+    ) -> None:
+        url = URL(url)
+        headers = Headers(headers)
+
+        if url.scheme not in ("http", "https", "socks5", "socks5h"):
+            raise ValueError(f"Unknown scheme for proxy URL {url!r}")
+
+        if url.username or url.password:
+            # Remove any auth credentials from the URL.
+            auth = (url.username, url.password)
+            url = url.copy_with(username=None, password=None)
+
+        self.url = url
+        self.auth = auth
+        self.headers = headers
+        self.ssl_context = ssl_context
+
+    @property
+    def raw_auth(self) -> tuple[bytes, bytes] | None:
+        # The proxy authentication as raw bytes.
+        return (
+            None
+            if self.auth is None
+            else (self.auth[0].encode("utf-8"), self.auth[1].encode("utf-8"))
+        )
+
+    def __repr__(self) -> str:
+        # The authentication is represented with the password component masked.
+        auth = (self.auth[0], "********") if self.auth else None
+
+        # Build a nice concise representation.
+        url_str = f"{str(self.url)!r}"
+        auth_str = f", auth={auth!r}" if auth else ""
+        headers_str = f", headers={dict(self.headers)!r}" if self.headers else ""
+        return f"Proxy({url_str}{auth_str}{headers_str})"
+
+    def __init__(
+        self,
+        url: URL | str,
+        *,
+        ssl_context: ssl.SSLContext | None = None,
+        auth: tuple[str, str] | None = None,
+        headers: HeaderTypes | None = None,
+    ) -> None:
+        url = URL(url)
+        headers = Headers(headers)
+
+        if url.scheme not in ("http", "https", "socks5", "socks5h"):
+            raise ValueError(f"Unknown scheme for proxy URL {url!r}")
+
+        if url.username or url.password:
+            # Remove any auth credentials from the URL.
+            auth = (url.username, url.password)
+            url = url.copy_with(username=None, password=None)
+
+        self.url = url
+        self.auth = auth
+        self.headers = headers
+        self.ssl_context = ssl_context
+
+## httpx/_models.py
+
+class Headers(typing.MutableMapping[str, str]):
+    """
+    HTTP headers, as a case-insensitive multi-dict.
+    """
+
+    def __init__(
+        self,
+        headers: HeaderTypes | None = None,
+        encoding: str | None = None,
+    ) -> None:
+        self._list = []  # type: typing.List[typing.Tuple[bytes, bytes, bytes]]
+
+        if isinstance(headers, Headers):
+            self._list = list(headers._list)
+        elif isinstance(headers, Mapping):
+            for k, v in headers.items():
+                bytes_key = _normalize_header_key(k, encoding)
+                bytes_value = _normalize_header_value(v, encoding)
+                self._list.append((bytes_key, bytes_key.lower(), bytes_value))
+        elif headers is not None:
+            for k, v in headers:
+                bytes_key = _normalize_header_key(k, encoding)
+                bytes_value = _normalize_header_value(v, encoding)
+                self._list.append((bytes_key, bytes_key.lower(), bytes_value))
+
+        self._encoding = encoding
+
+    @property
+    def encoding(self) -> str:
+        """
+        Header encoding is mandated as ascii, but we allow fallbacks to utf-8
+        or iso-8859-1.
+        """
+        if self._encoding is None:
+            for encoding in ["ascii", "utf-8"]:
+                for key, value in self.raw:
+                    try:
+                        key.decode(encoding)
+                        value.decode(encoding)
+                    except UnicodeDecodeError:
+                        break
+                else:
+                    # The else block runs if 'break' did not occur, meaning
+                    # all values fitted the encoding.
+                    self._encoding = encoding
+                    break
+            else:
+                # The ISO-8859-1 encoding covers all 256 code points in a byte,
+                # so will never raise decode errors.
+                self._encoding = "iso-8859-1"
+        return self._encoding
+
+    @encoding.setter
+    def encoding(self, value: str) -> None:
+        self._encoding = value
+
+    @property
+    def raw(self) -> list[tuple[bytes, bytes]]:
+        """
+        Returns a list of the raw header items, as byte pairs.
+        """
+        return [(raw_key, value) for raw_key, _, value in self._list]
+
+    def keys(self) -> typing.KeysView[str]:
+        return {key.decode(self.encoding): None for _, key, value in self._list}.keys()
+
+    def values(self) -> typing.ValuesView[str]:
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.values()
+
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return `(key, value)` items of headers. Concatenate headers
+        into a single comma separated value when a key occurs multiple times.
+        """
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.items()
+
+    def multi_items(self) -> list[tuple[str, str]]:
+        """
+        Return a list of `(key, value)` pairs of headers. Allow multiple
+        occurrences of the same key without concatenating into a single
+        comma separated value.
+        """
+        return [
+            (key.decode(self.encoding), value.decode(self.encoding))
+            for _, key, value in self._list
+        ]
+
+    def get(self, key: str, default: typing.Any = None) -> typing.Any:
+        """
+        Return a header value. If multiple occurrences of the header occur
+        then concatenate them together with commas.
+        """
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def get_list(self, key: str, split_commas: bool = False) -> list[str]:
+        """
+        Return a list of all header values for a given key.
+        If `split_commas=True` is passed, then any comma separated header
+        values are split into multiple return strings.
+        """
+        get_header_key = key.lower().encode(self.encoding)
+
+        values = [
+            item_value.decode(self.encoding)
+            for _, item_key, item_value in self._list
+            if item_key.lower() == get_header_key
+        ]
+
+        if not split_commas:
+            return values
+
+        split_values = []
+        for value in values:
+            split_values.extend([item.strip() for item in value.split(",")])
+        return split_values
+
+    def update(self, headers: HeaderTypes | None = None) -> None:  # type: ignore
+        headers = Headers(headers)
+        for key in headers.keys():
+            if key in self:
+                self.pop(key)
+        self._list.extend(headers._list)
+
+    def copy(self) -> Headers:
+        return Headers(self, encoding=self.encoding)
+
+    def __getitem__(self, key: str) -> str:
+        """
+        Return a single header value.
+
+        If there are multiple headers with the same key, then we concatenate
+        them with commas. See: https://tools.ietf.org/html/rfc7230#section-3.2.2
+        """
+        normalized_key = key.lower().encode(self.encoding)
+
+        items = [
+            header_value.decode(self.encoding)
+            for _, header_key, header_value in self._list
+            if header_key == normalized_key
+        ]
+
+        if items:
+            return ", ".join(items)
+
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, value: str) -> None:
+        """
+        Set the header `key` to `value`, removing any duplicate entries.
+        Retains insertion order.
+        """
+        set_key = key.encode(self._encoding or "utf-8")
+        set_value = value.encode(self._encoding or "utf-8")
+        lookup_key = set_key.lower()
+
+        found_indexes = [
+            idx
+            for idx, (_, item_key, _) in enumerate(self._list)
+            if item_key == lookup_key
+        ]
+
+        for idx in reversed(found_indexes[1:]):
+            del self._list[idx]
+
+        if found_indexes:
+            idx = found_indexes[0]
+            self._list[idx] = (set_key, lookup_key, set_value)
+        else:
+            self._list.append((set_key, lookup_key, set_value))
+
+    def __delitem__(self, key: str) -> None:
+        """
+        Remove the header `key`.
+        """
+        del_key = key.lower().encode(self.encoding)
+
+        pop_indexes = [
+            idx
+            for idx, (_, item_key, _) in enumerate(self._list)
+            if item_key.lower() == del_key
+        ]
+
+        if not pop_indexes:
+            raise KeyError(key)
+
+        for idx in reversed(pop_indexes):
+            del self._list[idx]
+
+    def __contains__(self, key: typing.Any) -> bool:
+        header_key = key.lower().encode(self.encoding)
+        return header_key in [key for _, key, _ in self._list]
+
+    def __iter__(self) -> typing.Iterator[typing.Any]:
+        return iter(self.keys())
+
+    def __len__(self) -> int:
+        return len(self._list)
+
+    def __eq__(self, other: typing.Any) -> bool:
+        try:
+            other_headers = Headers(other)
+        except ValueError:
+            return False
+
+        self_list = [(key, value) for _, key, value in self._list]
+        other_list = [(key, value) for _, key, value in other_headers._list]
+        return sorted(self_list) == sorted(other_list)
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+
+        encoding_str = ""
+        if self.encoding != "ascii":
+            encoding_str = f", encoding={self.encoding!r}"
+
+        as_list = list(_obfuscate_sensitive_headers(self.multi_items()))
+        as_dict = dict(as_list)
+
+        no_duplicate_keys = len(as_dict) == len(as_list)
+        if no_duplicate_keys:
+            return f"{class_name}({as_dict!r}{encoding_str})"
+        return f"{class_name}({as_list!r}{encoding_str})"
+
+    def update(self, headers: HeaderTypes | None = None) -> None:  # type: ignore
+        headers = Headers(headers)
+        for key in headers.keys():
+            if key in self:
+                self.pop(key)
+        self._list.extend(headers._list)
+
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+## httpx/_urlparse.py
+
+class ParseResult(typing.NamedTuple):
+    scheme: str
+    userinfo: str
+    host: str
+    port: int | None
+    path: str
+    query: str | None
+    fragment: str | None
+
+    @property
+    def authority(self) -> str:
+        return "".join(
+            [
+                f"{self.userinfo}@" if self.userinfo else "",
+                f"[{self.host}]" if ":" in self.host else self.host,
+                f":{self.port}" if self.port is not None else "",
+            ]
+        )
+
+    @property
+    def netloc(self) -> str:
+        return "".join(
+            [
+                f"[{self.host}]" if ":" in self.host else self.host,
+                f":{self.port}" if self.port is not None else "",
+            ]
+        )
+
+    def copy_with(self, **kwargs: str | None) -> ParseResult:
+        if not kwargs:
+            return self
+
+        defaults = {
+            "scheme": self.scheme,
+            "authority": self.authority,
+            "path": self.path,
+            "query": self.query,
+            "fragment": self.fragment,
+        }
+        defaults.update(kwargs)
+        return urlparse("", **defaults)
+
+    def __str__(self) -> str:
+        authority = self.authority
+        return "".join(
+            [
+                f"{self.scheme}:" if self.scheme else "",
+                f"//{authority}" if authority else "",
+                self.path,
+                f"?{self.query}" if self.query is not None else "",
+                f"#{self.fragment}" if self.fragment is not None else "",
+            ]
+        )
+
+    def copy_with(self, **kwargs: str | None) -> ParseResult:
+        if not kwargs:
+            return self
+
+        defaults = {
+            "scheme": self.scheme,
+            "authority": self.authority,
+            "path": self.path,
+            "query": self.query,
+            "fragment": self.fragment,
+        }
+        defaults.update(kwargs)
+        return urlparse("", **defaults)
+
+def urlparse(url: str = "", **kwargs: str | None) -> ParseResult:
+    # Initial basic checks on allowable URLs.
+    # ---------------------------------------
+
+    # Hard limit the maximum allowable URL length.
+    if len(url) > MAX_URL_LENGTH:
+        raise InvalidURL("URL too long")
+
+    # If a URL includes any ASCII control characters including \t, \r, \n,
+    # then treat it as invalid.
+    if any(char.isascii() and not char.isprintable() for char in url):
+        char = next(char for char in url if char.isascii() and not char.isprintable())
+        idx = url.find(char)
+        error = (
+            f"Invalid non-printable ASCII character in URL, {char!r} at position {idx}."
+        )
+        raise InvalidURL(error)
+
+    # Some keyword arguments require special handling.
+    # ------------------------------------------------
+
+    # Coerce "port" to a string, if it is provided as an integer.
+    if "port" in kwargs:
+        port = kwargs["port"]
+        kwargs["port"] = str(port) if isinstance(port, int) else port
+
+    # Replace "netloc" with "host and "port".
+    if "netloc" in kwargs:
+        netloc = kwargs.pop("netloc") or ""
+        kwargs["host"], _, kwargs["port"] = netloc.partition(":")
+
+    # Replace "username" and/or "password" with "userinfo".
+    if "username" in kwargs or "password" in kwargs:
+        username = quote(kwargs.pop("username", "") or "", safe=USERNAME_SAFE)
+        password = quote(kwargs.pop("password", "") or "", safe=PASSWORD_SAFE)
+        kwargs["userinfo"] = f"{username}:{password}" if password else username
+
+    # Replace "raw_path" with "path" and "query".
+    if "raw_path" in kwargs:
+        raw_path = kwargs.pop("raw_path") or ""
+        kwargs["path"], seperator, kwargs["query"] = raw_path.partition("?")
+        if not seperator:
+            kwargs["query"] = None
+
+    # Ensure that IPv6 "host" addresses are always escaped with "[...]".
+    if "host" in kwargs:
+        host = kwargs.get("host") or ""
+        if ":" in host and not (host.startswith("[") and host.endswith("]")):
+            kwargs["host"] = f"[{host}]"
+
+    # If any keyword arguments are provided, ensure they are valid.
+    # -------------------------------------------------------------
+
+    for key, value in kwargs.items():
+        if value is not None:
+            if len(value) > MAX_URL_LENGTH:
+                raise InvalidURL(f"URL component '{key}' too long")
+
+            # If a component includes any ASCII control characters including \t, \r, \n,
+            # then treat it as invalid.
+            if any(char.isascii() and not char.isprintable() for char in value):
+                char = next(
+                    char for char in value if char.isascii() and not char.isprintable()
+                )
+                idx = value.find(char)
+                error = (
+                    f"Invalid non-printable ASCII character in URL {key} component, "
+                    f"{char!r} at position {idx}."
+                )
+                raise InvalidURL(error)
+
+            # Ensure that keyword arguments match as a valid regex.
+            if not COMPONENT_REGEX[key].fullmatch(value):
+                raise InvalidURL(f"Invalid URL component '{key}'")
+
+    # The URL_REGEX will always match, but may have empty components.
+    url_match = URL_REGEX.match(url)
+    assert url_match is not None
+    url_dict = url_match.groupdict()
+
+    # * 'scheme', 'authority', and 'path' may be empty strings.
+    # * 'query' may be 'None', indicating no trailing "?" portion.
+    #   Any string including the empty string, indicates a trailing "?".
+    # * 'fragment' may be 'None', indicating no trailing "#" portion.
+    #   Any string including the empty string, indicates a trailing "#".
+    scheme = kwargs.get("scheme", url_dict["scheme"]) or ""
+    authority = kwargs.get("authority", url_dict["authority"]) or ""
+    path = kwargs.get("path", url_dict["path"]) or ""
+    query = kwargs.get("query", url_dict["query"])
+    frag = kwargs.get("fragment", url_dict["fragment"])
+
+    # The AUTHORITY_REGEX will always match, but may have empty components.
+    authority_match = AUTHORITY_REGEX.match(authority)
+    assert authority_match is not None
+    authority_dict = authority_match.groupdict()
+
+    # * 'userinfo' and 'host' may be empty strings.
+    # * 'port' may be 'None'.
+    userinfo = kwargs.get("userinfo", authority_dict["userinfo"]) or ""
+    host = kwargs.get("host", authority_dict["host"]) or ""
+    port = kwargs.get("port", authority_dict["port"])
+
+    # Normalize and validate each component.
+    # We end up with a parsed representation of the URL,
+    # with components that are plain ASCII bytestrings.
+    parsed_scheme: str = scheme.lower()
+    parsed_userinfo: str = quote(userinfo, safe=USERINFO_SAFE)
+    parsed_host: str = encode_host(host)
+    parsed_port: int | None = normalize_port(port, scheme)
+
+    has_scheme = parsed_scheme != ""
+    has_authority = (
+        parsed_userinfo != "" or parsed_host != "" or parsed_port is not None
+    )
+    validate_path(path, has_scheme=has_scheme, has_authority=has_authority)
+    if has_scheme or has_authority:
+        path = normalize_path(path)
+
+    parsed_path: str = quote(path, safe=PATH_SAFE)
+    parsed_query: str | None = None if query is None else quote(query, safe=QUERY_SAFE)
+    parsed_frag: str | None = None if frag is None else quote(frag, safe=FRAG_SAFE)
+
+    # The parsed ASCII bytestrings are our canonical form.
+    # All properties of the URL are derived from these.
+    return ParseResult(
+        parsed_scheme,
+        parsed_userinfo,
+        parsed_host,
+        parsed_port,
+        parsed_path,
+        parsed_query,
+        parsed_frag,
+    )
+
+## httpx/_urls.py
+
+    def __init__(self, url: URL | str = "", **kwargs: typing.Any) -> None:
+        if kwargs:
+            allowed = {
+                "scheme": str,
+                "username": str,
+                "password": str,
+                "userinfo": bytes,
+                "host": str,
+                "port": int,
+                "netloc": bytes,
+                "path": str,
+                "query": bytes,
+                "raw_path": bytes,
+                "fragment": str,
+                "params": object,
+            }
+
+            # Perform type checking for all supported keyword arguments.
+            for key, value in kwargs.items():
+                if key not in allowed:
+                    message = f"{key!r} is an invalid keyword argument for URL()"
+                    raise TypeError(message)
+                if value is not None and not isinstance(value, allowed[key]):
+                    expected = allowed[key].__name__
+                    seen = type(value).__name__
+                    message = f"Argument {key!r} must be {expected} but got {seen}"
+                    raise TypeError(message)
+                if isinstance(value, bytes):
+                    kwargs[key] = value.decode("ascii")
+
+            if "params" in kwargs:
+                # Replace any "params" keyword with the raw "query" instead.
+                #
+                # Ensure that empty params use `kwargs["query"] = None` rather
+                # than `kwargs["query"] = ""`, so that generated URLs do not
+                # include an empty trailing "?".
+                params = kwargs.pop("params")
+                kwargs["query"] = None if not params else str(QueryParams(params))
+
+        if isinstance(url, str):
+            self._uri_reference = urlparse(url, **kwargs)
+        elif isinstance(url, URL):
+            self._uri_reference = url._uri_reference.copy_with(**kwargs)
+        else:
+            raise TypeError(
+                "Invalid type for url.  Expected str or httpx.URL,"
+                f" got {type(url)}: {url!r}"
+            )
+
+    def raw_path(self) -> bytes:
+        """
+        The complete URL path and query string as raw bytes.
+        Used as the target when constructing HTTP requests.
+
+        For example:
+
+        GET /users?search=some%20text HTTP/1.1
+        Host: www.example.org
+        Connection: close
+        """
+        path = self._uri_reference.path or "/"
+        if self._uri_reference.query is not None:
+            path += "?" + self._uri_reference.query
+        return path.encode("ascii")
+
+    def copy_with(self, **kwargs: typing.Any) -> URL:
+        """
+        Copy this URL, returning a new URL with some components altered.
+        Accepts the same set of parameters as the components that are made
+        available via properties on the `URL` class.
+
+        For example:
+
+        url = httpx.URL("https://www.example.com").copy_with(
+            username="jo@gmail.com", password="a secret"
+        )
+        assert url == "https://jo%40email.com:a%20secret@www.example.com"
+        """
+        return URL(self, **kwargs)
+
+    def copy_set_param(self, key: str, value: typing.Any = None) -> URL:
+        return self.copy_with(params=self.params.set(key, value))
+
+    def copy_add_param(self, key: str, value: typing.Any = None) -> URL:
+        return self.copy_with(params=self.params.add(key, value))
+
+    def copy_remove_param(self, key: str) -> URL:
+        return self.copy_with(params=self.params.remove(key))
+
+    def copy_merge_params(self, params: QueryParamTypes) -> URL:
+        return self.copy_with(params=self.params.merge(params))
+
+## tests/client/test_async_client.py
+
+async def test_build_request(server):
+    url = server.url.copy_with(path="/echo_headers")
+    headers = {"Custom-header": "value"}
+    async with httpx.AsyncClient() as client:
+        request = client.build_request("GET", url)
+        request.headers.update(headers)
+        response = await client.send(request)
+
+    assert response.status_code == 200
+    assert response.url == url
+
+    assert response.json()["Custom-header"] == "value"
+
+async def test_raise_for_status(server):
+    async with httpx.AsyncClient() as client:
+        for status_code in (200, 400, 404, 500, 505):
+            response = await client.request(
+                "GET", server.url.copy_with(path=f"/status/{status_code}")
+            )
+
+            if 400 <= status_code < 600:
+                with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                    response.raise_for_status()
+                assert exc_info.value.response == response
+            else:
+                assert response.raise_for_status() is response
+
+async def test_100_continue(server):
+    headers = {"Expect": "100-continue"}
+    content = b"Echo request body"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            server.url.copy_with(path="/echo_body"), headers=headers, content=content
+        )
+
+    assert response.status_code == 200
+    assert response.content == content
+
+## tests/client/test_auth.py
+
+async def test_digest_auth_returns_no_auth_if_no_digest_header_in_response() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+async def test_digest_auth_qop_including_spaces_and_auth_returns_auth(qop: str) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop=qop)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+## tests/client/test_client.py
+
+def test_build_request(server):
+    url = server.url.copy_with(path="/echo_headers")
+    headers = {"Custom-header": "value"}
+
+    with httpx.Client() as client:
+        request = client.build_request("GET", url)
+        request.headers.update(headers)
+        response = client.send(request)
+
+    assert response.status_code == 200
+    assert response.url == url
+
+    assert response.json()["Custom-header"] == "value"
+
+def test_build_post_request(server):
+    url = server.url.copy_with(path="/echo_headers")
+    headers = {"Custom-header": "value"}
+
+    with httpx.Client() as client:
+        request = client.build_request("POST", url)
+        request.headers.update(headers)
+        response = client.send(request)
+
+    assert response.status_code == 200
+    assert response.url == url
+
+    assert response.json()["Content-length"] == "0"
+    assert response.json()["Custom-header"] == "value"
+
+def test_raise_for_status(server):
+    with httpx.Client() as client:
+        for status_code in (200, 400, 404, 500, 505):
+            response = client.request(
+                "GET", server.url.copy_with(path=f"/status/{status_code}")
+            )
+            if 400 <= status_code < 600:
+                with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                    response.raise_for_status()
+                assert exc_info.value.response == response
+                assert exc_info.value.request.url.path == f"/status/{status_code}"
+            else:
+                assert response.raise_for_status() is response
+
+def test_server_extensions(server):
+    url = server.url.copy_with(path="/http_version_2")
+    with httpx.Client(http2=True) as client:
+        response = client.get(url)
+    assert response.status_code == 200
+    assert response.extensions["http_version"] == b"HTTP/1.1"
+
+## tests/conftest.py
+
+    def url(self) -> httpx.URL:
+        protocol = "https" if self.config.is_ssl else "http"
+        return httpx.URL(f"{protocol}://{self.config.host}:{self.config.port}/")
+
+## tests/models/test_responses.py
+
+def test_iter_raw_doesnt_return_empty_chunks():
+    def streaming_body_with_empty_chunks() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b""
+        yield b"world!"
+        yield b""
+
+    response = httpx.Response(200, content=streaming_body_with_empty_chunks())
+
+    parts = list(response.iter_raw())
+    assert parts == [b"Hello, ", b"world!"]
+
+## tests/models/test_url.py
+
+def test_copy_with():
+    url = httpx.URL("https://www.example.com/")
+    assert str(url) == "https://www.example.com/"
+
+    url = url.copy_with()
+    assert str(url) == "https://www.example.com/"
+
+    url = url.copy_with(scheme="http")
+    assert str(url) == "http://www.example.com/"
+
+    url = url.copy_with(netloc=b"example.com")
+    assert str(url) == "http://example.com/"
+
+    url = url.copy_with(path="/abc")
+    assert str(url) == "http://example.com/abc"
+
+def test_url_copywith_authority_subcomponents():
+    copy_with_kwargs = {
+        "username": "username",
+        "password": "password",
+        "port": 444,
+        "host": "example.net",
+    }
+    url = httpx.URL("https://example.org")
+    new = url.copy_with(**copy_with_kwargs)
+    assert str(new) == "https://username:password@example.net:444"
+
+def test_url_copywith_netloc():
+    copy_with_kwargs = {
+        "netloc": b"example.net:444",
+    }
+    url = httpx.URL("https://example.org")
+    new = url.copy_with(**copy_with_kwargs)
+    assert str(new) == "https://example.net:444"
+
+def test_url_copywith_userinfo_subcomponents():
+    copy_with_kwargs = {
+        "username": "tom@example.org",
+        "password": "abc123@ %",
+    }
+    url = httpx.URL("https://example.org")
+    new = url.copy_with(**copy_with_kwargs)
+    assert str(new) == "https://tom%40example.org:abc123%40%20%@example.org"
+    assert new.username == "tom@example.org"
+    assert new.password == "abc123@ %"
+    assert new.userinfo == b"tom%40example.org:abc123%40%20%"
+
+def test_url_copywith_invalid_component():
+    url = httpx.URL("https://example.org")
+    with pytest.raises(TypeError):
+        url.copy_with(pathh="/incorrect-spelling")
+    with pytest.raises(TypeError):
+        url.copy_with(userinfo="should be bytes")
+
+def test_url_copywith_urlencoded_path():
+    url = httpx.URL("https://example.org")
+    url = url.copy_with(path="/path to somewhere")
+    assert url.path == "/path to somewhere"
+    assert url.query == b""
+    assert url.raw_path == b"/path%20to%20somewhere"
+
+def test_url_copywith_query():
+    url = httpx.URL("https://example.org")
+    url = url.copy_with(query=b"a=123")
+    assert url.path == "/"
+    assert url.query == b"a=123"
+    assert url.raw_path == b"/?a=123"
+
+def test_url_copywith_raw_path():
+    url = httpx.URL("https://example.org")
+    url = url.copy_with(raw_path=b"/some/path")
+    assert url.path == "/some/path"
+    assert url.query == b""
+    assert url.raw_path == b"/some/path"
+
+    url = httpx.URL("https://example.org")
+    url = url.copy_with(raw_path=b"/some/path?")
+    assert url.path == "/some/path"
+    assert url.query == b""
+    assert url.raw_path == b"/some/path?"
+
+    url = httpx.URL("https://example.org")
+    url = url.copy_with(raw_path=b"/some/path?a=123")
+    assert url.path == "/some/path"
+    assert url.query == b"a=123"
+    assert url.raw_path == b"/some/path?a=123"
+
+def test_url_copywith_security():
+    """
+    Prevent unexpected changes on URL after calling copy_with (CVE-2021-41945)
+    """
+    with pytest.raises(httpx.InvalidURL):
+        httpx.URL("https://u:p@[invalid!]//evilHost/path?t=w#tw")
+
+    url = httpx.URL("https://example.com/path?t=w#tw")
+    bad = "https://xxxx:xxxx@xxxxxxx/xxxxx/xxx?x=x#xxxxx"
+    with pytest.raises(httpx.InvalidURL):
+        url.copy_with(scheme=bad)
+
+def test_ipv6_url_copy_with_host(url_str, new_host):
+    url = httpx.URL(url_str).copy_with(host=new_host)
+
+    assert url.host == "::ffff:192.168.0.1"
+    assert url.netloc == b"[::ffff:192.168.0.1]:1234"
+    assert str(url) == "http://[::ffff:192.168.0.1]:1234"
+
+## tests/test_asgi.py
+
+async def test_asgi_urlencoded_path():
+    transport = httpx.ASGITransport(app=echo_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"path": "/user@example.org"}
+
+async def test_asgi_raw_path():
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/user@example.org"}
+
+## tests/test_exceptions.py
+
+def test_httpcore_exception_mapping(server: TestServer) -> None:
+    """
+    HTTPCore exception mapping works as expected.
+    """
+    impossible_port = 123456
+    with pytest.raises(httpx.ConnectError):
+        httpx.get(server.url.copy_with(port=impossible_port))
+
+    with pytest.raises(httpx.ReadTimeout):
+        httpx.get(
+            server.url.copy_with(path="/slow_response"),
+            timeout=httpx.Timeout(5, read=0.01),
+        )
+
+## tests/test_main.py
+
+def test_json(server):
+    url = str(server.url.copy_with(path="/json"))
+    runner = CliRunner()
+    result = runner.invoke(httpx.main, [url])
+    assert result.exit_code == 0
+    assert remove_date_header(splitlines(result.output)) == [
+        "HTTP/1.1 200 OK",
+        "server: uvicorn",
+        "content-type: application/json",
+        "Transfer-Encoding: chunked",
+        "",
+        "{",
+        '"Hello": "world!"',
+        "}",
+    ]
+
+def test_binary(server):
+    url = str(server.url.copy_with(path="/echo_binary"))
+    runner = CliRunner()
+    content = "Hello, world!"
+    result = runner.invoke(httpx.main, [url, "-c", content])
+    assert result.exit_code == 0
+    assert remove_date_header(splitlines(result.output)) == [
+        "HTTP/1.1 200 OK",
+        "server: uvicorn",
+        "content-type: application/octet-stream",
+        "Transfer-Encoding: chunked",
+        "",
+        f"<{len(content)} bytes of binary data>",
+    ]
+
+def test_redirects(server):
+    url = str(server.url.copy_with(path="/redirect_301"))
+    runner = CliRunner()
+    result = runner.invoke(httpx.main, [url])
+    assert result.exit_code == 1
+    assert remove_date_header(splitlines(result.output)) == [
+        "HTTP/1.1 301 Moved Permanently",
+        "server: uvicorn",
+        "location: /",
+        "Transfer-Encoding: chunked",
+        "",
+    ]
+
+def test_follow_redirects(server):
+    url = str(server.url.copy_with(path="/redirect_301"))
+    runner = CliRunner()
+    result = runner.invoke(httpx.main, [url, "--follow-redirects"])
+    assert result.exit_code == 0
+    assert remove_date_header(splitlines(result.output)) == [
+        "HTTP/1.1 301 Moved Permanently",
+        "server: uvicorn",
+        "location: /",
+        "Transfer-Encoding: chunked",
+        "",
+        "HTTP/1.1 200 OK",
+        "server: uvicorn",
+        "content-type: text/plain",
+        "Transfer-Encoding: chunked",
+        "",
+        "Hello, world!",
+    ]
+
+def test_post(server):
+    url = str(server.url.copy_with(path="/echo_body"))
+    runner = CliRunner()
+    result = runner.invoke(httpx.main, [url, "-m", "POST", "-j", '{"hello": "world"}'])
+    assert result.exit_code == 0
+    assert remove_date_header(splitlines(result.output)) == [
+        "HTTP/1.1 200 OK",
+        "server: uvicorn",
+        "content-type: text/plain",
+        "Transfer-Encoding: chunked",
+        "",
+        '{"hello":"world"}',
+    ]
+
+## tests/test_timeouts.py
+
+async def test_read_timeout(server):
+    timeout = httpx.Timeout(None, read=1e-6)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with pytest.raises(httpx.ReadTimeout):
+            await client.get(server.url.copy_with(path="/slow_response"))
+
+async def test_write_timeout(server):
+    timeout = httpx.Timeout(None, write=1e-6)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with pytest.raises(httpx.WriteTimeout):
+            data = b"*" * 1024 * 1024 * 100
+            await client.put(server.url.copy_with(path="/slow_response"), content=data)
+
+async def test_async_client_new_request_send_timeout(server):
+    timeout = httpx.Timeout(1e-6)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        with pytest.raises(httpx.TimeoutException):
+            await client.send(
+                httpx.Request("GET", server.url.copy_with(path="/slow_response"))
+            )
+
+## tests/test_utils.py
+
+def test_logging_redirect_chain(server, caplog):
+    caplog.set_level(logging.INFO)
+    with httpx.Client(follow_redirects=True) as client:
+        response = client.get(server.url.copy_with(path="/redirect_301"))
+        assert response.status_code == 200
+
+    assert caplog.record_tuples == [
+        (
+            "httpx",
+            logging.INFO,
+            "HTTP Request: GET http://127.0.0.1:8000/redirect_301"
+            ' "HTTP/1.1 301 Moved Permanently"',
+        ),
+        (
+            "httpx",
+            logging.INFO,
+            'HTTP Request: GET http://127.0.0.1:8000/ "HTTP/1.1 200 OK"',
+        ),
+    ]

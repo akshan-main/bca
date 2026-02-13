@@ -1,0 +1,922 @@
+# tests/test_main.py:9-10
+def splitlines(output: str) -> typing.Iterable[str]:
+    return [line.strip() for line in output.splitlines()]
+
+# httpx/_models.py:252-272
+    def get_list(self, key: str, split_commas: bool = False) -> list[str]:
+        """
+        Return a list of all header values for a given key.
+        If `split_commas=True` is passed, then any comma separated header
+        values are split into multiple return strings.
+        """
+        get_header_key = key.lower().encode(self.encoding)
+
+        values = [
+            item_value.decode(self.encoding)
+            for _, item_key, item_value in self._list
+            if item_key.lower() == get_header_key
+        ]
+
+        if not split_commas:
+            return values
+
+        split_values = []
+        for value in values:
+            split_values.extend([item.strip() for item in value.split(",")])
+        return split_values
+
+# httpx/_multipart.py:70-112
+class DataField:
+    """
+    A single form field item, within a multipart form field.
+    """
+
+    def __init__(self, name: str, value: str | bytes | int | float | None) -> None:
+        if not isinstance(name, str):
+            raise TypeError(
+                f"Invalid type for name. Expected str, got {type(name)}: {name!r}"
+            )
+        if value is not None and not isinstance(value, (str, bytes, int, float)):
+            raise TypeError(
+                "Invalid type for value. Expected primitive type,"
+                f" got {type(value)}: {value!r}"
+            )
+        self.name = name
+        self.value: str | bytes = (
+            value if isinstance(value, bytes) else primitive_value_to_str(value)
+        )
+
+    def render_headers(self) -> bytes:
+        if not hasattr(self, "_headers"):
+            name = _format_form_param("name", self.name)
+            self._headers = b"".join(
+                [b"Content-Disposition: form-data; ", name, b"\r\n\r\n"]
+            )
+
+        return self._headers
+
+    def render_data(self) -> bytes:
+        if not hasattr(self, "_data"):
+            self._data = to_bytes(self.value)
+
+        return self._data
+
+    def get_length(self) -> int:
+        headers = self.render_headers()
+        data = self.render_data()
+        return len(headers) + len(data)
+
+    def render(self) -> typing.Iterator[bytes]:
+        yield self.render_headers()
+        yield self.render_data()
+
+# httpx/_multipart.py:115-221
+class FileField:
+    """
+    A single file field item, within a multipart form field.
+    """
+
+    CHUNK_SIZE = 64 * 1024
+
+    def __init__(self, name: str, value: FileTypes) -> None:
+        self.name = name
+
+        fileobj: FileContent
+
+        headers: dict[str, str] = {}
+        content_type: str | None = None
+
+        # This large tuple based API largely mirror's requests' API
+        # It would be good to think of better APIs for this that we could
+        # include in httpx 2.0 since variable length tuples(especially of 4 elements)
+        # are quite unwieldly
+        if isinstance(value, tuple):
+            if len(value) == 2:
+                # neither the 3rd parameter (content_type) nor the 4th (headers)
+                # was included
+                filename, fileobj = value
+            elif len(value) == 3:
+                filename, fileobj, content_type = value
+            else:
+                # all 4 parameters included
+                filename, fileobj, content_type, headers = value  # type: ignore
+        else:
+            filename = Path(str(getattr(value, "name", "upload"))).name
+            fileobj = value
+
+        if content_type is None:
+            content_type = _guess_content_type(filename)
+
+        has_content_type_header = any("content-type" in key.lower() for key in headers)
+        if content_type is not None and not has_content_type_header:
+            # note that unlike requests, we ignore the content_type provided in the 3rd
+            # tuple element if it is also included in the headers requests does
+            # the opposite (it overwrites the headerwith the 3rd tuple element)
+            headers["Content-Type"] = content_type
+
+        if isinstance(fileobj, io.StringIO):
+            raise TypeError(
+                "Multipart file uploads require 'io.BytesIO', not 'io.StringIO'."
+            )
+        if isinstance(fileobj, io.TextIOBase):
+            raise TypeError(
+                "Multipart file uploads must be opened in binary mode, not text mode."
+            )
+
+        self.filename = filename
+        self.file = fileobj
+        self.headers = headers
+
+    def get_length(self) -> int | None:
+        headers = self.render_headers()
+
+        if isinstance(self.file, (str, bytes)):
+            return len(headers) + len(to_bytes(self.file))
+
+        file_length = peek_filelike_length(self.file)
+
+        # If we can't determine the filesize without reading it into memory,
+        # then return `None` here, to indicate an unknown file length.
+        if file_length is None:
+            return None
+
+        return len(headers) + file_length
+
+    def render_headers(self) -> bytes:
+        if not hasattr(self, "_headers"):
+            parts = [
+                b"Content-Disposition: form-data; ",
+                _format_form_param("name", self.name),
+            ]
+            if self.filename:
+                filename = _format_form_param("filename", self.filename)
+                parts.extend([b"; ", filename])
+            for header_name, header_value in self.headers.items():
+                key, val = f"\r\n{header_name}: ".encode(), header_value.encode()
+                parts.extend([key, val])
+            parts.append(b"\r\n\r\n")
+            self._headers = b"".join(parts)
+
+        return self._headers
+
+    def render_data(self) -> typing.Iterator[bytes]:
+        if isinstance(self.file, (str, bytes)):
+            yield to_bytes(self.file)
+            return
+
+        if hasattr(self.file, "seek"):
+            try:
+                self.file.seek(0)
+            except io.UnsupportedOperation:
+                pass
+
+        chunk = self.file.read(self.CHUNK_SIZE)
+        while chunk:
+            yield to_bytes(chunk)
+            chunk = self.file.read(self.CHUNK_SIZE)
+
+    def render(self) -> typing.Iterator[bytes]:
+        yield self.render_headers()
+        yield from self.render_data()
+
+# httpx/_multipart.py:244-256
+    def _iter_fields(
+        self, data: RequestData, files: RequestFiles
+    ) -> typing.Iterator[FileField | DataField]:
+        for name, value in data.items():
+            if isinstance(value, (tuple, list)):
+                for item in value:
+                    yield DataField(name=name, value=item)
+            else:
+                yield DataField(name=name, value=value)
+
+        file_items = files.items() if isinstance(files, typing.Mapping) else files
+        for name, value in file_items:
+            yield FileField(name=name, value=value)
+
+# httpx/_models.py:216-229
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return `(key, value)` items of headers. Concatenate headers
+        into a single comma separated value when a key occurs multiple times.
+        """
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.items()
+
+# tests/test_config.py:136-138
+def test_timeout_from_one_value_and_default():
+    timeout = httpx.Timeout(5.0, pool=60.0)
+    assert timeout == httpx.Timeout(timeout=(5.0, 5.0, 5.0, 60.0))
+
+# httpx/_models.py:202-203
+    def keys(self) -> typing.KeysView[str]:
+        return {key.decode(self.encoding): None for _, key, value in self._list}.keys()
+
+# httpx/_multipart.py:110-112
+    def render(self) -> typing.Iterator[bytes]:
+        yield self.render_headers()
+        yield self.render_data()
+
+# httpx/_multipart.py:219-221
+    def render(self) -> typing.Iterator[bytes]:
+        yield self.render_headers()
+        yield from self.render_data()
+
+# httpx/_status_codes.py:143-143
+    REQUEST_HEADER_FIELDS_TOO_LARGE = 431, "Request Header Fields Too Large"
+
+# httpx/_models.py:205-214
+    def values(self) -> typing.ValuesView[str]:
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.values()
+
+# httpx/_urls.py:474-484
+    def values(self) -> typing.ValuesView[str]:
+        """
+        Return all the values in the query params. If a key occurs more than once
+        only the first item for that key is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.values()) == ["123", "789"]
+        """
+        return {k: v[0] for k, v in self._dict.items()}.values()
+
+# httpx/_multipart.py:75-88
+    def __init__(self, name: str, value: str | bytes | int | float | None) -> None:
+        if not isinstance(name, str):
+            raise TypeError(
+                f"Invalid type for name. Expected str, got {type(name)}: {name!r}"
+            )
+        if value is not None and not isinstance(value, (str, bytes, int, float)):
+            raise TypeError(
+                "Invalid type for value. Expected primitive type,"
+                f" got {type(value)}: {value!r}"
+            )
+        self.name = name
+        self.value: str | bytes = (
+            value if isinstance(value, bytes) else primitive_value_to_str(value)
+        )
+
+# httpx/_multipart.py:122-169
+    def __init__(self, name: str, value: FileTypes) -> None:
+        self.name = name
+
+        fileobj: FileContent
+
+        headers: dict[str, str] = {}
+        content_type: str | None = None
+
+        # This large tuple based API largely mirror's requests' API
+        # It would be good to think of better APIs for this that we could
+        # include in httpx 2.0 since variable length tuples(especially of 4 elements)
+        # are quite unwieldly
+        if isinstance(value, tuple):
+            if len(value) == 2:
+                # neither the 3rd parameter (content_type) nor the 4th (headers)
+                # was included
+                filename, fileobj = value
+            elif len(value) == 3:
+                filename, fileobj, content_type = value
+            else:
+                # all 4 parameters included
+                filename, fileobj, content_type, headers = value  # type: ignore
+        else:
+            filename = Path(str(getattr(value, "name", "upload"))).name
+            fileobj = value
+
+        if content_type is None:
+            content_type = _guess_content_type(filename)
+
+        has_content_type_header = any("content-type" in key.lower() for key in headers)
+        if content_type is not None and not has_content_type_header:
+            # note that unlike requests, we ignore the content_type provided in the 3rd
+            # tuple element if it is also included in the headers requests does
+            # the opposite (it overwrites the headerwith the 3rd tuple element)
+            headers["Content-Type"] = content_type
+
+        if isinstance(fileobj, io.StringIO):
+            raise TypeError(
+                "Multipart file uploads require 'io.BytesIO', not 'io.StringIO'."
+            )
+        if isinstance(fileobj, io.TextIOBase):
+            raise TypeError(
+                "Multipart file uploads must be opened in binary mode, not text mode."
+            )
+
+        self.filename = filename
+        self.file = fileobj
+        self.headers = headers
+
+# httpx/_models.py:231-240
+    def multi_items(self) -> list[tuple[str, str]]:
+        """
+        Return a list of `(key, value)` pairs of headers. Allow multiple
+        occurrences of the same key without concatenating into a single
+        comma separated value.
+        """
+        return [
+            (key.decode(self.encoding), value.decode(self.encoding))
+            for _, key, value in self._list
+        ]
+
+# httpx/_multipart.py:105-108
+    def get_length(self) -> int:
+        headers = self.render_headers()
+        data = self.render_data()
+        return len(headers) + len(data)
+
+# httpx/_multipart.py:120-120
+    CHUNK_SIZE = 64 * 1024
+
+# httpx/_multipart.py:171-184
+    def get_length(self) -> int | None:
+        headers = self.render_headers()
+
+        if isinstance(self.file, (str, bytes)):
+            return len(headers) + len(to_bytes(self.file))
+
+        file_length = peek_filelike_length(self.file)
+
+        # If we can't determine the filesize without reading it into memory,
+        # then return `None` here, to indicate an unknown file length.
+        if file_length is None:
+            return None
+
+        return len(headers) + file_length
+
+# httpx/_multipart.py:99-103
+    def render_data(self) -> bytes:
+        if not hasattr(self, "_data"):
+            self._data = to_bytes(self.value)
+
+        return self._data
+
+# httpx/_multipart.py:203-217
+    def render_data(self) -> typing.Iterator[bytes]:
+        if isinstance(self.file, (str, bytes)):
+            yield to_bytes(self.file)
+            return
+
+        if hasattr(self.file, "seek"):
+            try:
+                self.file.seek(0)
+            except io.UnsupportedOperation:
+                pass
+
+        chunk = self.file.read(self.CHUNK_SIZE)
+        while chunk:
+            yield to_bytes(chunk)
+            chunk = self.file.read(self.CHUNK_SIZE)
+
+# tests/conftest.py:11-16
+from cryptography.hazmat.primitives.serialization import (
+    BestAvailableEncryption,
+    Encoding,
+    PrivateFormat,
+    load_pem_private_key,
+)
+
+# tests/models/test_headers.py:158-166
+def test_multiple_headers():
+    """
+    `Headers.get_list` should support both split_commas=False and split_commas=True.
+    """
+    h = httpx.Headers([("set-cookie", "a, b"), ("set-cookie", "c")])
+    assert h.get_list("Set-Cookie") == ["a, b", "c"]
+
+    h = httpx.Headers([("vary", "a, b"), ("vary", "c")])
+    assert h.get_list("Vary", split_commas=True) == ["a", "b", "c"]
+
+# tests/client/test_auth.py:516-523
+async def test_digest_auth_qop_must_be_auth_or_auth_int() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="not-auth")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+# tests/conftest.py:202-204
+def cert_private_key_file(localhost_cert):
+    with localhost_cert.private_key_pem.tempfile() as tmp:
+        yield tmp
+
+# tests/test_main.py:145-168
+def test_auth(server):
+    url = str(server.url)
+    runner = CliRunner()
+    result = runner.invoke(httpx.main, [url, "-v", "--auth", "username", "password"])
+    print(result.output)
+    assert result.exit_code == 0
+    assert remove_date_header(splitlines(result.output)) == [
+        "* Connecting to '127.0.0.1'",
+        "* Connected to '127.0.0.1' on port 8000",
+        "GET / HTTP/1.1",
+        f"Host: {server.url.netloc.decode('ascii')}",
+        "Accept: */*",
+        "Accept-Encoding: gzip, deflate, br, zstd",
+        "Connection: keep-alive",
+        f"User-Agent: python-httpx/{httpx.__version__}",
+        "Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+        "",
+        "HTTP/1.1 200 OK",
+        "server: uvicorn",
+        "content-type: text/plain",
+        "Transfer-Encoding: chunked",
+        "",
+        "Hello, world!",
+    ]
+
+# httpx/_multipart.py:90-97
+    def render_headers(self) -> bytes:
+        if not hasattr(self, "_headers"):
+            name = _format_form_param("name", self.name)
+            self._headers = b"".join(
+                [b"Content-Disposition: form-data; ", name, b"\r\n\r\n"]
+            )
+
+        return self._headers
+
+# httpx/_multipart.py:186-201
+    def render_headers(self) -> bytes:
+        if not hasattr(self, "_headers"):
+            parts = [
+                b"Content-Disposition: form-data; ",
+                _format_form_param("name", self.name),
+            ]
+            if self.filename:
+                filename = _format_form_param("filename", self.filename)
+                parts.extend([b"; ", filename])
+            for header_name, header_value in self.headers.items():
+                key, val = f"\r\n{header_name}: ".encode(), header_value.encode()
+                parts.extend([key, val])
+            parts.append(b"\r\n\r\n")
+            self._headers = b"".join(parts)
+
+        return self._headers
+
+# httpx/_content.py:26-26
+from ._utils import peek_filelike_length, primitive_value_to_str
+
+# httpx/_content.py:26-26
+from ._utils import peek_filelike_length, primitive_value_to_str
+
+# httpx/_content.py:26-26
+from ._utils import peek_filelike_length, primitive_value_to_str
+
+# httpx/_auth.py:311-327
+    def _get_header_value(self, header_fields: dict[str, bytes]) -> str:
+        NON_QUOTED_FIELDS = ("algorithm", "qop", "nc")
+        QUOTED_TEMPLATE = '{}="{}"'
+        NON_QUOTED_TEMPLATE = "{}={}"
+
+        header_value = ""
+        for i, (field, value) in enumerate(header_fields.items()):
+            if i > 0:
+                header_value += ", "
+            template = (
+                QUOTED_TEMPLATE
+                if field not in NON_QUOTED_FIELDS
+                else NON_QUOTED_TEMPLATE
+            )
+            header_value += template.format(field, to_str(value))
+
+        return header_value
+
+# httpx/_config.py:227-233
+    def raw_auth(self) -> tuple[bytes, bytes] | None:
+        # The proxy authentication as raw bytes.
+        return (
+            None
+            if self.auth is None
+            else (self.auth[0].encode("utf-8"), self.auth[1].encode("utf-8"))
+        )
+
+# tests/test_config.py:23-26
+def test_load_ssl_with_keylog(monkeypatch: typing.Any) -> None:
+    monkeypatch.setenv("SSLKEYLOGFILE", "test")
+    context = httpx.create_ssl_context()
+    assert context.keylog_filename == "test"
+
+# tests/client/test_auth.py:370-381
+def test_digest_auth_returns_no_auth_if_alternate_auth_scheme() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    auth_header = "Token ..."
+    app = App(auth_header=auth_header, status_code=401)
+
+    client = httpx.Client(transport=httpx.MockTransport(app))
+    response = client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+# tests/client/test_auth.py:492-501
+async def test_digest_auth_qop_including_spaces_and_auth_returns_auth(qop: str) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop=qop)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+# tests/test_multipart.py:98-110
+def test_multipart_invalid_key(key):
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    data = {key: "abc"}
+    files = {"file": io.BytesIO(b"<file content>")}
+    with pytest.raises(TypeError) as e:
+        client.post(
+            "http://127.0.0.1:8000/",
+            data=data,
+            files=files,
+        )
+    assert "Invalid type for name" in str(e.value)
+    assert repr(key) in str(e.value)
+
+# httpx/_main.py:287-298
+def validate_auth(
+    ctx: click.Context,
+    param: click.Option | click.Parameter,
+    value: typing.Any,
+) -> typing.Any:
+    if value == (None, None):
+        return None
+
+    username, password = value
+    if password == "-":  # pragma: no cover
+        password = click.prompt("Password", hide_input=True)
+    return (username, password)
+
+# tests/conftest.py:186-187
+def cert_authority():
+    return trustme.CA()
+
+# tests/test_config.py:131-133
+def test_timeout_from_one_value():
+    timeout = httpx.Timeout(None, read=5.0)
+    assert timeout == httpx.Timeout(timeout=(None, 5.0, None, None))
+
+# tests/client/test_auth.py:163-172
+async def test_basic_auth() -> None:
+    url = "https://example.org/"
+    auth = ("user", "password123")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+# tests/client/test_auth.py:163-172
+async def test_basic_auth() -> None:
+    url = "https://example.org/"
+    auth = ("user", "password123")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+# tests/test_multipart.py:114-121
+def test_multipart_invalid_value(value):
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    data = {"text": value}
+    files = {"file": io.BytesIO(b"<file content>")}
+    with pytest.raises(TypeError) as e:
+        client.post("http://127.0.0.1:8000/", data=data, files=files)
+    assert "Invalid type for value" in str(e.value)
+
+# httpx/_models.py:67-71
+def _normalize_header_key(key: str | bytes, encoding: str | None = None) -> bytes:
+    """
+    Coerce str/bytes into a strictly byte-wise HTTP header key.
+    """
+    return key if isinstance(key, bytes) else key.encode(encoding or "ascii")
+
+# httpx/_urls.py:512-524
+    def get(self, key: typing.Any, default: typing.Any = None) -> typing.Any:
+        """
+        Get a value from the query param for a given key. If the key occurs
+        more than once, then only the first value is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get("a") == "123"
+        """
+        if key in self._dict:
+            return self._dict[str(key)][0]
+        return default
+
+# tests/test_status_codes.py:10-11
+def test_status_code_value_lookup():
+    assert httpx.codes(404) == 404
+
+# tests/client/test_auth.py:222-234
+async def test_custom_auth() -> None:
+    url = "https://example.org/"
+    app = App()
+
+    def auth(request: httpx.Request) -> httpx.Request:
+        request.headers["Authorization"] = "Token 123"
+        return request
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Token 123"}
+
+# tests/client/test_auth.py:427-456
+async def test_digest_auth(
+    algorithm: str, expected_hash_length: int, expected_response_length: int
+) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(algorithm=algorithm)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+    authorization = typing.cast(typing.Dict[str, typing.Any], response.json())["auth"]
+    scheme, _, fields = authorization.partition(" ")
+    assert scheme == "Digest"
+
+    response_fields = [field.strip() for field in fields.split(",")]
+    digest_data = dict(field.split("=") for field in response_fields)
+
+    assert digest_data["username"] == '"user"'
+    assert digest_data["realm"] == '"httpx@example.org"'
+    assert "nonce" in digest_data
+    assert digest_data["uri"] == '"/"'
+    assert len(digest_data["response"]) == expected_response_length + 2  # extra quotes
+    assert len(digest_data["opaque"]) == expected_hash_length + 2
+    assert digest_data["algorithm"] == algorithm
+    assert digest_data["qop"] == "auth"
+    assert digest_data["nc"] == "00000001"
+    assert len(digest_data["cnonce"]) == 16 + 2
+
+# tests/conftest.py:208-221
+def cert_encrypted_private_key_file(localhost_cert):
+    # Deserialize the private key and then reserialize with a password
+    private_key = load_pem_private_key(
+        localhost_cert.private_key_pem.bytes(), password=None, backend=default_backend()
+    )
+    encrypted_private_key_pem = trustme.Blob(
+        private_key.private_bytes(
+            Encoding.PEM,
+            PrivateFormat.TraditionalOpenSSL,
+            BestAvailableEncryption(password=b"password"),
+        )
+    )
+    with encrypted_private_key_pem.tempfile() as tmp:
+        yield tmp
+
+# httpx/_client.py:445-455
+    def _build_auth(self, auth: AuthTypes | None) -> Auth | None:
+        if auth is None:
+            return None
+        elif isinstance(auth, tuple):
+            return BasicAuth(username=auth[0], password=auth[1])
+        elif isinstance(auth, Auth):
+            return auth
+        elif callable(auth):
+            return FunctionAuth(func=auth)
+        else:
+            raise TypeError(f'Invalid "auth" argument: {auth!r}')
+
+# tests/client/test_auth.py:505-512
+async def test_digest_auth_qop_auth_int_not_implemented() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="auth-int")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(NotImplementedError):
+            await client.get(url, auth=auth)
+
+# tests/client/test_auth.py:323-335
+async def test_auth_property() -> None:
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        assert client.auth is None
+
+        client.auth = ("user", "password123")
+        assert isinstance(client.auth, httpx.BasicAuth)
+
+        url = "https://example.org/"
+        response = await client.get(url)
+        assert response.status_code == 200
+        assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+# tests/test_config.py:43-47
+def test_load_ssl_config_cert_and_key(cert_pem_file, cert_private_key_file):
+    context = httpx.create_ssl_context()
+    context.load_cert_chain(cert_pem_file, cert_private_key_file)
+    assert context.verify_mode == ssl.VerifyMode.CERT_REQUIRED
+    assert context.check_hostname is True
+
+# httpx/_models.py:74-82
+def _normalize_header_value(value: str | bytes, encoding: str | None = None) -> bytes:
+    """
+    Coerce str/bytes into a strictly byte-wise HTTP header value.
+    """
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise TypeError(f"Header value must be str or bytes, not {type(value)}")
+    return value.encode(encoding or "ascii")
+
+# tests/client/test_headers.py:180-185
+def test_header_with_incorrect_value():
+    with pytest.raises(
+        TypeError,
+        match=f"Header value must be str or bytes, not {type(None)}",
+    ):
+        httpx.Headers({"foo": None})  # type: ignore
+
+# tests/models/test_responses.py:909-913
+def test_value_error_without_request(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    broken_compressed_body = b"xxxxxxxxxxxxxx"
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(200, headers=headers, content=broken_compressed_body)
+
+# tests/test_config.py:126-128
+def test_timeout_from_one_none_value():
+    timeout = httpx.Timeout(None, read=None)
+    assert timeout == httpx.Timeout(None)
+
+# tests/client/test_auth.py:303-307
+def test_auth_hidden_url() -> None:
+    url = "http://example-username:example-password@example.org/"
+    expected = "URL('http://example-username:[secure]@example.org/')"
+    assert url == httpx.URL(url)
+    assert expected == repr(httpx.URL(url))
+
+# tests/models/test_url.py:63-67
+def test_url_no_authority():
+    url = httpx.URL("http://")
+    assert url.scheme == "http"
+    assert url.host == ""
+    assert url.path == "/"
+
+# httpx/_models.py:304-326
+    def __setitem__(self, key: str, value: str) -> None:
+        """
+        Set the header `key` to `value`, removing any duplicate entries.
+        Retains insertion order.
+        """
+        set_key = key.encode(self._encoding or "utf-8")
+        set_value = value.encode(self._encoding or "utf-8")
+        lookup_key = set_key.lower()
+
+        found_indexes = [
+            idx
+            for idx, (_, item_key, _) in enumerate(self._list)
+            if item_key == lookup_key
+        ]
+
+        for idx in reversed(found_indexes[1:]):
+            del self._list[idx]
+
+        if found_indexes:
+            idx = found_indexes[0]
+            self._list[idx] = (set_key, lookup_key, set_value)
+        else:
+            self._list.append((set_key, lookup_key, set_value))
+
+# httpx/_urls.py:463-472
+    def keys(self) -> typing.KeysView[str]:
+        """
+        Return all the keys in the query params.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.keys()) == ["a", "b"]
+        """
+        return self._dict.keys()
+
+# tests/client/test_auth.py:147-152
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+# tests/client/test_auth.py:195-203
+async def test_basic_auth_in_url() -> None:
+    url = "https://user:password123@example.org/"
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Basic dXNlcjpwYXNzd29yZDEyMw=="}
+
+# tests/client/test_auth.py:339-353
+async def test_auth_invalid_type() -> None:
+    app = App()
+
+    with pytest.raises(TypeError):
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(app),
+            auth="not a tuple, not a callable",  # type: ignore
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(TypeError):
+            await client.get(auth="not a tuple, not a callable")  # type: ignore
+
+        with pytest.raises(TypeError):
+            client.auth = "not a tuple, not a callable"  # type: ignore
+
+# tests/client/test_auth.py:400-410
+async def test_digest_auth_401_response_without_digest_auth_header() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App(auth_header="", status_code=401)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+# httpx/_content.py:26-26
+from ._utils import peek_filelike_length, primitive_value_to_str
+
+# httpx/_auth.py:139-142
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
+# httpx/_auth.py:169-172
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
+# tests/client/test_auth.py:154-159
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.AsyncGenerator[httpx.Request, httpx.Response]:
+        async with self._async_lock:
+            request.headers["Authorization"] = "async-auth"
+        yield request
+
+# tests/client/test_auth.py:311-319
+async def test_auth_hidden_header() -> None:
+    url = "https://example.org/"
+    auth = ("example-username", "example-password")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert "'authorization': '[secure]'" in str(response.request.headers)
+
+# tests/test_config.py:51-57
+def test_load_ssl_config_cert_and_encrypted_key(
+    cert_pem_file, cert_encrypted_private_key_file, password
+):
+    context = httpx.create_ssl_context()
+    context.load_cert_chain(cert_pem_file, cert_encrypted_private_key_file, password)
+    assert context.verify_mode == ssl.VerifyMode.CERT_REQUIRED
+    assert context.check_hostname is True

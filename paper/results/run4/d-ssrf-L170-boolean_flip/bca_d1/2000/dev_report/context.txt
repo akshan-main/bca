@@ -1,0 +1,174 @@
+## tests/test_ssrf.py
+
+class TestIsPrivateIp:
+    """Tests for is_private_ip function."""
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # IPv4 loopback
+            '127.0.0.1',
+            '127.0.0.2',
+            '127.255.255.255',
+            # IPv4 private class A
+            '10.0.0.1',
+            '10.255.255.255',
+            # IPv4 private class B
+            '172.16.0.1',
+            '172.31.255.255',
+            # IPv4 private class C
+            '192.168.0.1',
+            '192.168.255.255',
+            # IPv4 link-local
+            '169.254.0.1',
+            '169.254.255.255',
+            # IPv4 "this" network
+            '0.0.0.0',
+            '0.255.255.255',
+            # IPv4 CGNAT (RFC 6598)
+            '100.64.0.1',
+            '100.127.255.255',
+            '100.100.100.200',  # Alibaba Cloud metadata
+            # IPv6 loopback
+            '::1',
+            # IPv6 link-local
+            'fe80::1',
+            'fe80::ffff:ffff:ffff:ffff',
+            # IPv6 unique local
+            'fc00::1',
+            'fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff',
+            # IPv6 6to4 (can embed private IPv4)
+            '2002::1',
+            '2002:c0a8:0101::1',  # Embeds 192.168.1.1
+            '2002:0a00:0001::1',  # Embeds 10.0.0.1
+        ],
+    )
+    def test_private_ips_detected(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # Public IPv4
+            '8.8.8.8',
+            '1.1.1.1',
+            '203.0.113.50',
+            '198.51.100.1',
+            # Public IPv6
+            '2001:4860:4860::8888',
+            '2606:4700:4700::1111',
+        ],
+    )
+    def test_public_ips_allowed(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # IPv4-mapped IPv6 private addresses
+            '::ffff:127.0.0.1',
+            '::ffff:10.0.0.1',
+            '::ffff:192.168.1.1',
+            '::ffff:172.16.0.1',
+        ],
+    )
+    def test_ipv4_mapped_ipv6_private(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            # IPv4-mapped IPv6 public addresses
+            '::ffff:8.8.8.8',
+            '::ffff:1.1.1.1',
+        ],
+    )
+    def test_ipv4_mapped_ipv6_public(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+    def test_invalid_ip_treated_as_private(self) -> None:
+        """Invalid IP addresses should be treated as potentially dangerous."""
+        assert is_private_ip('not-an-ip') is True
+        assert is_private_ip('') is True
+
+    def test_invalid_url_no_hostname(self) -> None:
+        with pytest.raises(ValueError, match='Invalid URL: no hostname found'):
+            extract_host_and_port('http://')
+
+class TestValidateAndResolveUrl:
+    """Tests for validate_and_resolve_url function."""
+
+    async def test_public_ip_allowed(self) -> None:
+        """Test that public IPs are allowed."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+            resolved = await validate_and_resolve_url('https://example.com/path', allow_local=False)
+            assert resolved.resolved_ip == '93.184.215.14'
+            assert resolved.hostname == 'example.com'
+            assert resolved.port == 443
+            assert resolved.is_https is True
+            assert resolved.path == '/path'
+
+    async def test_private_ip_blocked_by_default(self) -> None:
+        """Test that private IPs are blocked by default."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('192.168.1.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://internal.local/path', allow_local=False)
+
+    async def test_private_ip_allowed_with_allow_local(self) -> None:
+        """Test that private IPs are allowed with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('192.168.1.1', 0))]
+            resolved = await validate_and_resolve_url('http://internal.local/path', allow_local=True)
+            assert resolved.resolved_ip == '192.168.1.1'
+
+    async def test_cloud_metadata_always_blocked(self) -> None:
+        """Test that cloud metadata IPs are always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('169.254.169.254', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.google.internal/path', allow_local=True)
+
+    async def test_alibaba_cloud_metadata_always_blocked(self) -> None:
+        """Test that Alibaba Cloud metadata IP is always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.100.100.200', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.aliyun.internal/path', allow_local=True)
+
+    async def test_literal_ip_address_in_url(self) -> None:
+        """Test handling of literal IP addresses in URLs."""
+        # Public IP - should work
+        resolved = await validate_and_resolve_url('http://8.8.8.8/path', allow_local=False)
+        assert resolved.resolved_ip == '8.8.8.8'
+        assert resolved.hostname == '8.8.8.8'
+
+    async def test_literal_private_ip_blocked(self) -> None:
+        """Test that literal private IPs in URLs are blocked."""
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://192.168.1.1/path', allow_local=False)
+
+    async def test_any_private_ip_blocks_request(self) -> None:
+        """Test that if any resolved IP is private, the request is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Return both public and private IPs
+            mock_executor.return_value = [
+                (2, 1, 6, '', ('93.184.215.14', 0)),
+                (2, 1, 6, '', ('192.168.1.1', 0)),
+            ]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://example.com/path', allow_local=False)
+
+    async def test_6to4_address_blocked(self) -> None:
+        """Test that 6to4 addresses (which can embed private IPv4) are blocked."""
+        # 2002:c0a8:0101::1 embeds 192.168.1.1
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://[2002:c0a8:0101::1]/path', allow_local=False)
+
+    async def test_cgnat_range_blocked(self) -> None:
+        """Test that CGNAT range (100.64.0.0/10) is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.64.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://cgnat-host.internal/path', allow_local=False)

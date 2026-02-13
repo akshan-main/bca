@@ -1,0 +1,393 @@
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+def load_mcp_servers(config_path: str | Path) -> list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE]:
+    """Load MCP servers from a configuration file.
+
+    Environment variables can be referenced in the configuration file using:
+    - `${VAR_NAME}` syntax - expands to the value of VAR_NAME, raises error if not defined
+    - `${VAR_NAME:-default}` syntax - expands to VAR_NAME if set, otherwise uses the default value
+
+    Args:
+        config_path: The path to the configuration file.
+
+    Returns:
+        A list of MCP servers.
+
+    Raises:
+        FileNotFoundError: If the configuration file does not exist.
+        ValidationError: If the configuration file does not match the schema.
+        ValueError: If an environment variable referenced in the configuration is not defined and no default value is provided.
+    """
+    config_path = Path(config_path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f'Config file {config_path} not found')
+
+    config_data = pydantic_core.from_json(config_path.read_bytes())
+    expanded_config_data = _expand_env_vars(config_data)
+    config = MCPServerConfig.model_validate(expanded_config_data)
+
+    servers: list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE] = []
+    for name, server in config.mcp_servers.items():
+        server.id = name
+        server.tool_prefix = name
+        servers.append(server)
+
+    return servers
+
+## pydantic_ai_slim/pydantic_ai/providers/google_vertex.py
+
+    def __init__(
+        self,
+        *,
+        service_account_file: Path | str | None = None,
+        service_account_info: Mapping[str, str] | None = None,
+        project_id: str | None = None,
+        region: VertexAiRegion = 'us-central1',
+        model_publisher: str = 'google',
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        """Create a new Vertex AI provider.
+
+        Args:
+            service_account_file: Path to a service account file.
+                If not provided, the service_account_info or default environment credentials will be used.
+            service_account_info: The loaded service_account_file contents.
+                If not provided, the service_account_file or default environment credentials will be used.
+            project_id: The project ID to use, if not provided it will be taken from the credentials.
+            region: The region to make requests to.
+            model_publisher: The model publisher to use, I couldn't find a good list of available publishers,
+                and from trial and error it seems non-google models don't work with the `generateContent` and
+                `streamGenerateContent` functions, hence only `google` is currently supported.
+                Please create an issue or PR if you know how to use other publishers.
+            http_client: An existing `httpx.AsyncClient` to use for making HTTP requests.
+        """
+        if service_account_file and service_account_info:
+            raise ValueError('Only one of `service_account_file` or `service_account_info` can be provided.')
+
+        self._client = http_client or cached_async_http_client(provider='google-vertex')
+        self.service_account_file = service_account_file
+        self.service_account_info = service_account_info
+        self.project_id = project_id
+        self.region = region
+        self.model_publisher = model_publisher
+
+        self._client.auth = _VertexAIAuth(service_account_file, service_account_info, project_id, region)
+        self._client.base_url = self.base_url
+
+class _VertexAIAuth(httpx.Auth):
+    """Auth class for Vertex AI API."""
+
+    _refresh_lock: Lock = Lock()
+
+    credentials: BaseCredentials | ServiceAccountCredentials | None
+
+    def __init__(
+        self,
+        service_account_file: Path | str | None = None,
+        service_account_info: Mapping[str, str] | None = None,
+        project_id: str | None = None,
+        region: VertexAiRegion = 'us-central1',
+    ) -> None:
+        self.service_account_file = service_account_file
+        self.service_account_info = service_account_info
+        self.project_id = project_id
+        self.region = region
+
+        self.credentials = None
+
+    async def async_auth_flow(self, request: httpx.Request) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        if self.credentials is None:  # pragma: no branch
+            self.credentials = await self._get_credentials()
+        if self.credentials.token is None:  # type: ignore[reportUnknownMemberType]
+            await self._refresh_token()
+        request.headers['Authorization'] = f'Bearer {self.credentials.token}'  # type: ignore[reportUnknownMemberType]
+        # NOTE: This workaround is in place because we might get the project_id from the credentials.
+        request.url = httpx.URL(str(request.url).replace('projects/None', f'projects/{self.project_id}'))
+        response = yield request
+
+        if response.status_code == 401:
+            await self._refresh_token()
+            request.headers['Authorization'] = f'Bearer {self.credentials.token}'  # type: ignore[reportUnknownMemberType]
+            yield request
+
+    async def _get_credentials(self) -> BaseCredentials | ServiceAccountCredentials:
+        if self.service_account_file is not None:
+            creds = await _creds_from_file(self.service_account_file)
+            assert creds.project_id is None or isinstance(creds.project_id, str)  # type: ignore[reportUnknownMemberType]
+            creds_project_id: str | None = creds.project_id
+            creds_source = 'service account file'
+        elif self.service_account_info is not None:
+            creds = await _creds_from_info(self.service_account_info)
+            assert creds.project_id is None or isinstance(creds.project_id, str)  # type: ignore[reportUnknownMemberType]
+            creds_project_id: str | None = creds.project_id
+            creds_source = 'service account info'
+        else:
+            creds, creds_project_id = await _async_google_auth()
+            creds_source = '`google.auth.default()`'
+
+        if self.project_id is None:  # pragma: no branch
+            if creds_project_id is None:
+                raise UserError(f'No project_id provided and none found in {creds_source}')  # pragma: no cover
+            self.project_id = creds_project_id
+        return creds
+
+    async def _refresh_token(self) -> str:  # pragma: no cover
+        async with self._refresh_lock:
+            assert self.credentials is not None
+            await anyio.to_thread.run_sync(self.credentials.refresh, Request())  # type: ignore[reportUnknownMemberType]
+            assert isinstance(self.credentials.token, str), (  # type: ignore[reportUnknownMemberType]
+                f'Expected token to be a string, got {self.credentials.token}'  # type: ignore[reportUnknownMemberType]
+            )
+            return self.credentials.token
+
+async def _creds_from_file(service_account_file: str | Path) -> ServiceAccountCredentials:
+    service_account_credentials_from_file = functools.partial(
+        ServiceAccountCredentials.from_service_account_file,  # type: ignore[reportUnknownMemberType]
+        scopes=['https://www.googleapis.com/auth/cloud-platform'],
+    )
+    return await anyio.to_thread.run_sync(service_account_credentials_from_file, str(service_account_file))
+
+async def _creds_from_info(service_account_info: Mapping[str, str]) -> ServiceAccountCredentials:
+    service_account_credentials_from_string = functools.partial(
+        ServiceAccountCredentials.from_service_account_info,  # type: ignore[reportUnknownMemberType]
+        scopes=['https://www.googleapis.com/auth/cloud-platform'],
+    )
+    return await anyio.to_thread.run_sync(service_account_credentials_from_string, service_account_info)
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+class RetryConfig(TypedDict, total=False):
+    """The configuration for tenacity-based retrying.
+
+    These are precisely the arguments to the tenacity `retry` decorator, and they are generally
+    used internally by passing them to that decorator via `@retry(**config)` or similar.
+
+    All fields are optional, and if not provided, the default values from the `tenacity.retry` decorator will be used.
+    """
+
+    sleep: Callable[[int | float], None | Awaitable[None]]
+    """A sleep strategy to use for sleeping between retries.
+
+    Tenacity's default for this argument is `tenacity.nap.sleep`."""
+
+    stop: StopBaseT
+    """
+    A stop strategy to determine when to stop retrying.
+
+    Tenacity's default for this argument is `tenacity.stop.stop_never`."""
+
+    wait: WaitBaseT
+    """
+    A wait strategy to determine how long to wait between retries.
+
+    Tenacity's default for this argument is `tenacity.wait.wait_none`."""
+
+    retry: SyncRetryBaseT | RetryBaseT
+    """A retry strategy to determine which exceptions should trigger a retry.
+
+    Tenacity's default for this argument is `tenacity.retry.retry_if_exception_type()`."""
+
+    before: Callable[[RetryCallState], None | Awaitable[None]]
+    """
+    A callable that is called before each retry attempt.
+
+    Tenacity's default for this argument is `tenacity.before.before_nothing`."""
+
+    after: Callable[[RetryCallState], None | Awaitable[None]]
+    """
+    A callable that is called after each retry attempt.
+
+    Tenacity's default for this argument is `tenacity.after.after_nothing`."""
+
+    before_sleep: Callable[[RetryCallState], None | Awaitable[None]] | None
+    """
+    An optional callable that is called before sleeping between retries.
+
+    Tenacity's default for this argument is `None`."""
+
+    reraise: bool
+    """Whether to reraise the last exception if the retry attempts are exhausted, or raise a RetryError instead.
+
+    Tenacity's default for this argument is `False`."""
+
+    retry_error_cls: type[RetryError]
+    """The exception class to raise when the retry attempts are exhausted and `reraise` is False.
+
+    Tenacity's default for this argument is `tenacity.RetryError`."""
+
+    retry_error_callback: Callable[[RetryCallState], Any | Awaitable[Any]] | None
+    """An optional callable that is called when the retry attempts are exhausted and `reraise` is False.
+
+    Tenacity's default for this argument is `None`."""
+
+## pydantic_ai_slim/pydantic_ai/ui/_event_stream.py
+
+    async def _turn_to(self, to_turn: Literal['request', 'response'] | None) -> AsyncIterator[EventT]:
+        """Fire hooks when turning from request to response or vice versa."""
+        if to_turn == self._turn:
+            return
+
+        if self._turn == 'request':
+            async for e in self.after_request():
+                yield e
+        elif self._turn == 'response':
+            async for e in self.after_response():
+                yield e
+
+        self._turn = to_turn
+
+        if to_turn == 'request':
+            async for e in self.before_request():
+                yield e
+        elif to_turn == 'response':
+            async for e in self.before_response():
+                yield e
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+## tests/conftest.py
+
+def _(value: datetime):  # pragma: no cover
+    """Use IsDatetime() for datetime values in snapshots."""
+    return 'IsDatetime()'
+
+## tests/example_modules/weather_service.py
+
+class WeatherService:
+    def get_historic_weather(self, location: str, forecast_date: date) -> str:
+        return 'Sunny with a chance of rain'
+
+    def get_forecast(self, location: str, forecast_date: date) -> str:
+        return 'Rainy with a chance of sun'
+
+    async def __aenter__(self) -> WeatherService:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        pass
+
+## tests/providers/test_google_vertex.py
+
+async def test_google_vertex_provider_service_account_xor(allow_model_requests: None):
+    with pytest.raises(
+        ValueError, match='Only one of `service_account_file` or `service_account_info` can be provided'
+    ):
+        GoogleVertexProvider(  # type: ignore[reportCallIssue]
+            service_account_file='path/to/service-account.json',
+            service_account_info=prepare_service_account_contents('my-project-id'),
+        )
+
+def save_service_account(service_account_path: Path, project_id: str) -> None:
+    service_account = prepare_service_account_contents(project_id)
+
+    service_account_path.write_text(json.dumps(service_account, indent=2), encoding='utf-8')
+
+## tests/test_ag_ui.py
+
+def simple_result() -> Any:
+    return snapshot(
+        [
+            {
+                'type': 'RUN_STARTED',
+                'timestamp': IsInt(),
+                'threadId': (thread_id := IsSameStr()),
+                'runId': (run_id := IsSameStr()),
+            },
+            {
+                'type': 'TEXT_MESSAGE_START',
+                'timestamp': IsInt(),
+                'messageId': (message_id := IsSameStr()),
+                'role': 'assistant',
+            },
+            {'type': 'TEXT_MESSAGE_CONTENT', 'timestamp': IsInt(), 'messageId': message_id, 'delta': 'success '},
+            {
+                'type': 'TEXT_MESSAGE_CONTENT',
+                'timestamp': IsInt(),
+                'messageId': message_id,
+                'delta': '(no tool calls)',
+            },
+            {'type': 'TEXT_MESSAGE_END', 'timestamp': IsInt(), 'messageId': message_id},
+            {
+                'type': 'RUN_FINISHED',
+                'timestamp': IsInt(),
+                'threadId': thread_id,
+                'runId': run_id,
+            },
+        ]
+    )
+
+async def run_and_collect_events(
+    agent: Agent[AgentDepsT, OutputDataT],
+    *run_inputs: RunAgentInput,
+    deps: AgentDepsT = None,
+    on_complete: OnCompleteFunc[BaseEvent] | None = None,
+) -> list[dict[str, Any]]:
+    events = list[dict[str, Any]]()
+    for run_input in run_inputs:
+        async for event in run_ag_ui(agent, run_input, deps=deps, on_complete=on_complete):
+            events.append(json.loads(event.removeprefix('data: ')))
+    return events
+
+def create_input(
+    *messages: Message, tools: list[Tool] | None = None, thread_id: str | None = None, state: Any = None
+) -> RunAgentInput:
+    """Create a RunAgentInput for testing."""
+    thread_id = thread_id or uuid_str()
+    return RunAgentInput(
+        thread_id=thread_id,
+        run_id=uuid_str(),
+        messages=list(messages),
+        state=dict(state) if state else {},
+        context=[],
+        tools=tools or [],
+        forwarded_props=None,
+    )
+
+async def test_messages_with_history() -> None:
+    """Test with multiple user messages (conversation history)."""
+    agent = Agent(
+        model=FunctionModel(stream_function=simple_stream),
+    )
+
+    run_input = create_input(
+        UserMessage(
+            id='msg_1',
+            content='First message',
+        ),
+        UserMessage(
+            id='msg_2',
+            content='Second message',
+        ),
+    )
+
+    events = await run_and_collect_events(agent, run_input)
+
+    assert events == simple_result()
+
+## tests/test_mcp.py
+
+def test_load_mcp_servers_with_non_string_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test that non-string primitive values (int, bool, null) in nested structures are passed through unchanged."""
+    config = tmp_path / 'mcp.json'
+
+    # Create a config with environment variables and extra fields containing primitives
+    # The extra fields will be ignored during validation but go through _expand_env_vars
+    monkeypatch.setenv('PYTHON_CMD', 'python')
+    config.write_text(
+        '{"mcpServers": {"my_server": {"command": "${PYTHON_CMD}", "args": ["-m", "tests.mcp_server"], '
+        '"metadata": {"count": 42, "enabled": true, "value": null}}}}',
+        encoding='utf-8',
+    )
+
+    # This should successfully expand env vars and ignore the metadata field
+    servers = load_mcp_servers(config)
+
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == 'python'

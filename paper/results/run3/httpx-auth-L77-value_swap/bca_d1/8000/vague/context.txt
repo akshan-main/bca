@@ -1,0 +1,916 @@
+## httpx/_auth.py
+
+class Auth:
+    """
+    Base class for all authentication schemes.
+
+    To implement a custom authentication scheme, subclass `Auth` and override
+    the `.auth_flow()` method.
+
+    If the authentication scheme does I/O such as disk access or network calls, or uses
+    synchronization primitives such as locks, you should override `.sync_auth_flow()`
+    and/or `.async_auth_flow()` instead of `.auth_flow()` to provide specialized
+    implementations that will be used by `Client` and `AsyncClient` respectively.
+    """
+
+    requires_request_body = False
+    requires_response_body = False
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow.
+
+        To dispatch a request, `yield` it:
+
+        ```
+        yield request
+        ```
+
+        The client will `.send()` the response back into the flow generator. You can
+        access it like so:
+
+        ```
+        response = yield request
+        ```
+
+        A `return` (or reaching the end of the generator) will result in the
+        client returning the last response obtained from the server.
+
+        You can dispatch as many requests as is necessary.
+        """
+        yield request
+
+    def sync_auth_flow(
+        self, request: Request
+    ) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow synchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            request.read()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while False:
+            response = yield request
+            if self.requires_response_body:
+                response.read()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+    async def async_auth_flow(
+        self, request: Request
+    ) -> typing.AsyncGenerator[Request, Response]:
+        """
+        Execute the authentication flow asynchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            await request.aread()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                await response.aread()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+class FunctionAuth(Auth):
+    """
+    Allows the 'auth' argument to be passed as a simple callable function,
+    that takes the request, and returns a new, modified request.
+    """
+
+    def __init__(self, func: typing.Callable[[Request], Request]) -> None:
+        self._func = func
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        yield self._func(request)
+
+    def __init__(self, func: typing.Callable[[Request], Request]) -> None:
+        self._func = func
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        yield self._func(request)
+
+## httpx/_client.py
+
+def _same_origin(url: URL, other: URL) -> bool:
+    """
+    Return 'True' if the given URLs share the same origin.
+    """
+    return (
+        url.scheme == other.scheme
+        and url.host == other.host
+        and _port_or_default(url) == _port_or_default(other)
+    )
+
+    def _build_auth(self, auth: AuthTypes | None) -> Auth | None:
+        if auth is None:
+            return None
+        elif isinstance(auth, tuple):
+            return BasicAuth(username=auth[0], password=auth[1])
+        elif isinstance(auth, Auth):
+            return auth
+        elif callable(auth):
+            return FunctionAuth(func=auth)
+        else:
+            raise TypeError(f'Invalid "auth" argument: {auth!r}')
+
+    def _transport_for_url(self, url: URL) -> BaseTransport:
+        """
+        Returns the transport instance that should be used for a given URL.
+        This will either be the standard connection pool, or a proxy.
+        """
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(url):
+                return self._transport if transport is None else transport
+
+        return self._transport
+
+    def _transport_for_url(self, url: URL) -> AsyncBaseTransport:
+        """
+        Returns the transport instance that should be used for a given URL.
+        This will either be the standard connection pool, or a proxy.
+        """
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(url):
+                return self._transport if transport is None else transport
+
+        return self._transport
+
+## httpx/_decoders.py
+
+class ByteChunker:
+    """
+    Handles returning byte content in fixed-size chunks.
+    """
+
+    def __init__(self, chunk_size: int | None = None) -> None:
+        self._buffer = io.BytesIO()
+        self._chunk_size = chunk_size
+
+    def decode(self, content: bytes) -> list[bytes]:
+        if self._chunk_size is None:
+            return [content] if content else []
+
+        self._buffer.write(content)
+        if self._buffer.tell() >= self._chunk_size:
+            value = self._buffer.getvalue()
+            chunks = [
+                value[i : i + self._chunk_size]
+                for i in range(0, len(value), self._chunk_size)
+            ]
+            if len(chunks[-1]) == self._chunk_size:
+                self._buffer.seek(0)
+                self._buffer.truncate()
+                return chunks
+            else:
+                self._buffer.seek(0)
+                self._buffer.write(chunks[-1])
+                self._buffer.truncate()
+                return chunks[:-1]
+        else:
+            return []
+
+    def flush(self) -> list[bytes]:
+        value = self._buffer.getvalue()
+        self._buffer.seek(0)
+        self._buffer.truncate()
+        return [value] if value else []
+
+class TextChunker:
+    """
+    Handles returning text content in fixed-size chunks.
+    """
+
+    def __init__(self, chunk_size: int | None = None) -> None:
+        self._buffer = io.StringIO()
+        self._chunk_size = chunk_size
+
+    def decode(self, content: str) -> list[str]:
+        if self._chunk_size is None:
+            return [content] if content else []
+
+        self._buffer.write(content)
+        if self._buffer.tell() >= self._chunk_size:
+            value = self._buffer.getvalue()
+            chunks = [
+                value[i : i + self._chunk_size]
+                for i in range(0, len(value), self._chunk_size)
+            ]
+            if len(chunks[-1]) == self._chunk_size:
+                self._buffer.seek(0)
+                self._buffer.truncate()
+                return chunks
+            else:
+                self._buffer.seek(0)
+                self._buffer.write(chunks[-1])
+                self._buffer.truncate()
+                return chunks[:-1]
+        else:
+            return []
+
+    def flush(self) -> list[str]:
+        value = self._buffer.getvalue()
+        self._buffer.seek(0)
+        self._buffer.truncate()
+        return [value] if value else []
+
+## httpx/_models.py
+
+def _parse_header_links(value: str) -> list[dict[str, str]]:
+    """
+    Returns a list of parsed link headers, for more info see:
+    https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Link
+    The generic syntax of those is:
+    Link: < uri-reference >; param1=value1; param2="value2"
+    So for instance:
+    Link; '<http:/.../front.jpeg>; type="image/jpeg",<http://.../back.jpeg>;'
+    would return
+        [
+            {"url": "http:/.../front.jpeg", "type": "image/jpeg"},
+            {"url": "http://.../back.jpeg"},
+        ]
+    :param value: HTTP Link entity-header field
+    :return: list of parsed link headers
+    """
+    links: list[dict[str, str]] = []
+    replace_chars = " '\""
+    value = value.strip(replace_chars)
+    if not value:
+        return links
+    for val in re.split(", *<", value):
+        try:
+            url, params = val.split(";", 1)
+        except ValueError:
+            url, params = val, ""
+        link = {"url": url.strip("<> '\"")}
+        for param in params.split(";"):
+            try:
+                key, value = param.split("=")
+            except ValueError:
+                break
+            link[key.strip(replace_chars)] = value.strip(replace_chars)
+        links.append(link)
+    return links
+
+    def raw(self) -> list[tuple[bytes, bytes]]:
+        """
+        Returns a list of the raw header items, as byte pairs.
+        """
+        return [(raw_key, value) for raw_key, _, value in self._list]
+
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return `(key, value)` items of headers. Concatenate headers
+        into a single comma separated value when a key occurs multiple times.
+        """
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.items()
+
+    def multi_items(self) -> list[tuple[str, str]]:
+        """
+        Return a list of `(key, value)` pairs of headers. Allow multiple
+        occurrences of the same key without concatenating into a single
+        comma separated value.
+        """
+        return [
+            (key.decode(self.encoding), value.decode(self.encoding))
+            for _, key, value in self._list
+        ]
+
+    def get(self, key: str, default: typing.Any = None) -> typing.Any:
+        """
+        Return a header value. If multiple occurrences of the header occur
+        then concatenate them together with commas.
+        """
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def get_list(self, key: str, split_commas: bool = False) -> list[str]:
+        """
+        Return a list of all header values for a given key.
+        If `split_commas=True` is passed, then any comma separated header
+        values are split into multiple return strings.
+        """
+        get_header_key = key.lower().encode(self.encoding)
+
+        values = [
+            item_value.decode(self.encoding)
+            for _, item_key, item_value in self._list
+            if item_key.lower() == get_header_key
+        ]
+
+        if not split_commas:
+            return values
+
+        split_values = []
+        for value in values:
+            split_values.extend([item.strip() for item in value.split(",")])
+        return split_values
+
+    def read(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.Iterable)
+            self._content = b"".join(self.stream)
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.AsyncIterable)
+            self._content = b"".join([part async for part in self.stream])
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+    def _get_content_decoder(self) -> ContentDecoder:
+        """
+        Returns a decoder instance which can be used to decode the raw byte
+        content, depending on the Content-Encoding used in the response.
+        """
+        if not hasattr(self, "_decoder"):
+            decoders: list[ContentDecoder] = []
+            values = self.headers.get_list("content-encoding", split_commas=True)
+            for value in values:
+                value = value.strip().lower()
+                try:
+                    decoder_cls = SUPPORTED_DECODERS[value]
+                    decoders.append(decoder_cls())
+                except KeyError:
+                    continue
+
+            if len(decoders) == 1:
+                self._decoder = decoders[0]
+            elif len(decoders) > 1:
+                self._decoder = MultiDecoder(children=decoders)
+            else:
+                self._decoder = IdentityDecoder()
+
+        return self._decoder
+
+    def is_informational(self) -> bool:
+        """
+        A property which is `True` for 1xx status codes, `False` otherwise.
+        """
+        return codes.is_informational(self.status_code)
+
+    def is_success(self) -> bool:
+        """
+        A property which is `True` for 2xx status codes, `False` otherwise.
+        """
+        return codes.is_success(self.status_code)
+
+    def is_redirect(self) -> bool:
+        """
+        A property which is `True` for 3xx status codes, `False` otherwise.
+
+        Note that not all responses with a 3xx status code indicate a URL redirect.
+
+        Use `response.has_redirect_location` to determine responses with a properly
+        formed URL redirection.
+        """
+        return codes.is_redirect(self.status_code)
+
+    def is_client_error(self) -> bool:
+        """
+        A property which is `True` for 4xx status codes, `False` otherwise.
+        """
+        return codes.is_client_error(self.status_code)
+
+    def is_server_error(self) -> bool:
+        """
+        A property which is `True` for 5xx status codes, `False` otherwise.
+        """
+        return codes.is_server_error(self.status_code)
+
+    def is_error(self) -> bool:
+        """
+        A property which is `True` for 4xx and 5xx status codes, `False` otherwise.
+        """
+        return codes.is_error(self.status_code)
+
+    def has_redirect_location(self) -> bool:
+        """
+        Returns True for 3xx responses with a properly formed URL redirection,
+        `False` otherwise.
+        """
+        return (
+            self.status_code
+            in (
+                # 301 (Cacheable redirect. Method may change to GET.)
+                codes.MOVED_PERMANENTLY,
+                # 302 (Uncacheable redirect. Method may change to GET.)
+                codes.FOUND,
+                # 303 (Client should make a GET or HEAD request.)
+                codes.SEE_OTHER,
+                # 307 (Equiv. 302, but retain method)
+                codes.TEMPORARY_REDIRECT,
+                # 308 (Equiv. 301, but retain method)
+                codes.PERMANENT_REDIRECT,
+            )
+            and "Location" in self.headers
+        )
+
+    def links(self) -> dict[str | None, dict[str, str]]:
+        """
+        Returns the parsed header links of the response, if any
+        """
+        header = self.headers.get("link")
+        if header is None:
+            return {}
+
+        return {
+            (link.get("rel") or link.get("url")): link
+            for link in _parse_header_links(header)
+        }
+
+    def read(self) -> bytes:
+        """
+        Read and return the response content.
+        """
+        if not hasattr(self, "_content"):
+            self._content = b"".join(self.iter_bytes())
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the response content.
+        """
+        if not hasattr(self, "_content"):
+            self._content = b"".join([part async for part in self.aiter_bytes()])
+        return self._content
+
+## httpx/_multipart.py
+
+def _guess_content_type(filename: str | None) -> str | None:
+    """
+    Guesses the mimetype based on a filename. Defaults to `application/octet-stream`.
+
+    Returns `None` if `filename` is `None` or empty.
+    """
+    if filename:
+        return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return None
+
+## httpx/_status_codes.py
+
+from enum import IntEnum
+
+class codes(IntEnum):
+    """HTTP status codes and reason phrases
+
+    Status codes from the following RFCs are all observed:
+
+        * RFC 7231: Hypertext Transfer Protocol (HTTP/1.1), obsoletes 2616
+        * RFC 6585: Additional HTTP Status Codes
+        * RFC 3229: Delta encoding in HTTP
+        * RFC 4918: HTTP Extensions for WebDAV, obsoletes 2518
+        * RFC 5842: Binding Extensions to WebDAV
+        * RFC 7238: Permanent Redirect
+        * RFC 2295: Transparent Content Negotiation in HTTP
+        * RFC 2774: An HTTP Extension Framework
+        * RFC 7540: Hypertext Transfer Protocol Version 2 (HTTP/2)
+        * RFC 2324: Hyper Text Coffee Pot Control Protocol (HTCPCP/1.0)
+        * RFC 7725: An HTTP Status Code to Report Legal Obstacles
+        * RFC 8297: An HTTP Status Code for Indicating Hints
+        * RFC 8470: Using Early Data in HTTP
+    """
+
+    def __new__(cls, value: int, phrase: str = "") -> codes:
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+
+        obj.phrase = phrase  # type: ignore[attr-defined]
+        return obj
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+    @classmethod
+    def get_reason_phrase(cls, value: int) -> str:
+        try:
+            return codes(value).phrase  # type: ignore
+        except ValueError:
+            return ""
+
+    @classmethod
+    def is_informational(cls, value: int) -> bool:
+        """
+        Returns `True` for 1xx status codes, `False` otherwise.
+        """
+        return 100 <= value <= 199
+
+    @classmethod
+    def is_success(cls, value: int) -> bool:
+        """
+        Returns `True` for 2xx status codes, `False` otherwise.
+        """
+        return 200 <= value <= 299
+
+    @classmethod
+    def is_redirect(cls, value: int) -> bool:
+        """
+        Returns `True` for 3xx status codes, `False` otherwise.
+        """
+        return 300 <= value <= 399
+
+    @classmethod
+    def is_client_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 499
+
+    @classmethod
+    def is_server_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 5xx status codes, `False` otherwise.
+        """
+        return 500 <= value <= 599
+
+    @classmethod
+    def is_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx or 5xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 599
+
+    # informational
+    CONTINUE = 100, "Continue"
+    SWITCHING_PROTOCOLS = 101, "Switching Protocols"
+    PROCESSING = 102, "Processing"
+    EARLY_HINTS = 103, "Early Hints"
+
+    # success
+    OK = 200, "OK"
+    CREATED = 201, "Created"
+    ACCEPTED = 202, "Accepted"
+    NON_AUTHORITATIVE_INFORMATION = 203, "Non-Authoritative Information"
+    NO_CONTENT = 204, "No Content"
+    RESET_CONTENT = 205, "Reset Content"
+    PARTIAL_CONTENT = 206, "Partial Content"
+    MULTI_STATUS = 207, "Multi-Status"
+    ALREADY_REPORTED = 208, "Already Reported"
+    IM_USED = 226, "IM Used"
+
+    # redirection
+    MULTIPLE_CHOICES = 300, "Multiple Choices"
+    MOVED_PERMANENTLY = 301, "Moved Permanently"
+    FOUND = 302, "Found"
+    SEE_OTHER = 303, "See Other"
+    NOT_MODIFIED = 304, "Not Modified"
+    USE_PROXY = 305, "Use Proxy"
+    TEMPORARY_REDIRECT = 307, "Temporary Redirect"
+    PERMANENT_REDIRECT = 308, "Permanent Redirect"
+
+    # client error
+    BAD_REQUEST = 400, "Bad Request"
+    UNAUTHORIZED = 401, "Unauthorized"
+    PAYMENT_REQUIRED = 402, "Payment Required"
+    FORBIDDEN = 403, "Forbidden"
+    NOT_FOUND = 404, "Not Found"
+    METHOD_NOT_ALLOWED = 405, "Method Not Allowed"
+    NOT_ACCEPTABLE = 406, "Not Acceptable"
+    PROXY_AUTHENTICATION_REQUIRED = 407, "Proxy Authentication Required"
+    REQUEST_TIMEOUT = 408, "Request Timeout"
+    CONFLICT = 409, "Conflict"
+    GONE = 410, "Gone"
+    LENGTH_REQUIRED = 411, "Length Required"
+    PRECONDITION_FAILED = 412, "Precondition Failed"
+    REQUEST_ENTITY_TOO_LARGE = 413, "Request Entity Too Large"
+    REQUEST_URI_TOO_LONG = 414, "Request-URI Too Long"
+    UNSUPPORTED_MEDIA_TYPE = 415, "Unsupported Media Type"
+    REQUESTED_RANGE_NOT_SATISFIABLE = 416, "Requested Range Not Satisfiable"
+    EXPECTATION_FAILED = 417, "Expectation Failed"
+    IM_A_TEAPOT = 418, "I'm a teapot"
+    MISDIRECTED_REQUEST = 421, "Misdirected Request"
+    UNPROCESSABLE_ENTITY = 422, "Unprocessable Entity"
+    LOCKED = 423, "Locked"
+    FAILED_DEPENDENCY = 424, "Failed Dependency"
+    TOO_EARLY = 425, "Too Early"
+    UPGRADE_REQUIRED = 426, "Upgrade Required"
+    PRECONDITION_REQUIRED = 428, "Precondition Required"
+    TOO_MANY_REQUESTS = 429, "Too Many Requests"
+    REQUEST_HEADER_FIELDS_TOO_LARGE = 431, "Request Header Fields Too Large"
+    UNAVAILABLE_FOR_LEGAL_REASONS = 451, "Unavailable For Legal Reasons"
+
+    # server errors
+    INTERNAL_SERVER_ERROR = 500, "Internal Server Error"
+    NOT_IMPLEMENTED = 501, "Not Implemented"
+    BAD_GATEWAY = 502, "Bad Gateway"
+    SERVICE_UNAVAILABLE = 503, "Service Unavailable"
+    GATEWAY_TIMEOUT = 504, "Gateway Timeout"
+    HTTP_VERSION_NOT_SUPPORTED = 505, "HTTP Version Not Supported"
+    VARIANT_ALSO_NEGOTIATES = 506, "Variant Also Negotiates"
+    INSUFFICIENT_STORAGE = 507, "Insufficient Storage"
+    LOOP_DETECTED = 508, "Loop Detected"
+    NOT_EXTENDED = 510, "Not Extended"
+    NETWORK_AUTHENTICATION_REQUIRED = 511, "Network Authentication Required"
+
+    def is_informational(cls, value: int) -> bool:
+        """
+        Returns `True` for 1xx status codes, `False` otherwise.
+        """
+        return 100 <= value <= 199
+
+    def is_success(cls, value: int) -> bool:
+        """
+        Returns `True` for 2xx status codes, `False` otherwise.
+        """
+        return 200 <= value <= 299
+
+    def is_redirect(cls, value: int) -> bool:
+        """
+        Returns `True` for 3xx status codes, `False` otherwise.
+        """
+        return 300 <= value <= 399
+
+    def is_client_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 499
+
+    def is_server_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 5xx status codes, `False` otherwise.
+        """
+        return 500 <= value <= 599
+
+    def is_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx or 5xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 599
+
+## httpx/_urls.py
+
+    def values(self) -> typing.ValuesView[str]:
+        """
+        Return all the values in the query params. If a key occurs more than once
+        only the first item for that key is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.values()) == ["123", "789"]
+        """
+        return {k: v[0] for k, v in self._dict.items()}.values()
+
+    def items(self) -> typing.ItemsView[str, str]:
+        """
+        Return all items in the query params. If a key occurs more than once
+        only the first item for that key is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.items()) == [("a", "123"), ("b", "789")]
+        """
+        return {k: v[0] for k, v in self._dict.items()}.items()
+
+    def get(self, key: typing.Any, default: typing.Any = None) -> typing.Any:
+        """
+        Get a value from the query param for a given key. If the key occurs
+        more than once, then only the first value is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get("a") == "123"
+        """
+        if key in self._dict:
+            return self._dict[str(key)][0]
+        return default
+
+    def set(self, key: str, value: typing.Any = None) -> QueryParams:
+        """
+        Return a new QueryParams instance, setting the value of a key.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123")
+        q = q.set("a", "456")
+        assert q == httpx.QueryParams("a=456")
+        """
+        q = QueryParams()
+        q._dict = dict(self._dict)
+        q._dict[str(key)] = [primitive_value_to_str(value)]
+        return q
+
+    def add(self, key: str, value: typing.Any = None) -> QueryParams:
+        """
+        Return a new QueryParams instance, setting or appending the value of a key.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123")
+        q = q.add("a", "456")
+        assert q == httpx.QueryParams("a=123&a=456")
+        """
+        q = QueryParams()
+        q._dict = dict(self._dict)
+        q._dict[str(key)] = q.get_list(key) + [primitive_value_to_str(value)]
+        return q
+
+## tests/client/test_auth.py
+
+async def test_digest_auth_returns_no_auth_if_no_digest_header_in_response() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+def test_digest_auth_returns_no_auth_if_alternate_auth_scheme() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    auth_header = "Token ..."
+    app = App(auth_header=auth_header, status_code=401)
+
+    client = httpx.Client(transport=httpx.MockTransport(app))
+    response = client.get(url, auth=auth)
+
+    assert response.status_code == 401
+    assert response.json() == {"auth": None}
+    assert len(response.history) == 0
+
+async def test_digest_auth_qop_including_spaces_and_auth_returns_auth(qop: str) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop=qop)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        response = await client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert len(response.history) == 1
+
+## tests/concurrency.py
+
+async def sleep(seconds: float) -> None:
+    if sniffio.current_async_library() == "trio":
+        await trio.sleep(seconds)  # pragma: no cover
+    else:
+        await asyncio.sleep(seconds)
+
+## tests/conftest.py
+
+from uvicorn.server import Server
+
+async def slow_response(scope: Scope, receive: Receive, send: Send) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [[b"content-type", b"text/plain"]],
+        }
+    )
+    await sleep(1.0)  # Allow triggering a read timeout.
+    await send({"type": "http.response.body", "body": b"Hello, world!"})
+
+class TestServer(Server):
+    @property
+    def url(self) -> httpx.URL:
+        protocol = "https" if self.config.is_ssl else "http"
+        return httpx.URL(f"{protocol}://{self.config.host}:{self.config.port}/")
+
+    def install_signal_handlers(self) -> None:
+        # Disable the default installation of handlers for signals such as SIGTERM,
+        # because it can only be done in the main thread.
+        pass  # pragma: nocover
+
+    async def serve(self, sockets=None):
+        self.restart_requested = asyncio.Event()
+
+        loop = asyncio.get_event_loop()
+        tasks = {
+            loop.create_task(super().serve(sockets=sockets)),
+            loop.create_task(self.watch_restarts()),
+        }
+        await asyncio.wait(tasks)
+
+    async def restart(self) -> None:  # pragma: no cover
+        # This coroutine may be called from a different thread than the one the
+        # server is running on, and from an async environment that's not asyncio.
+        # For this reason, we use an event to coordinate with the server
+        # instead of calling shutdown()/startup() directly, and should not make
+        # any asyncio-specific operations.
+        self.started = False
+        self.restart_requested.set()
+        while not self.started:
+            await sleep(0.2)
+
+    async def watch_restarts(self) -> None:  # pragma: no cover
+        while True:
+            if self.should_exit:
+                return
+
+            try:
+                await asyncio.wait_for(self.restart_requested.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+            self.restart_requested.clear()
+            await self.shutdown()
+            await self.startup()
+
+    async def restart(self) -> None:  # pragma: no cover
+        # This coroutine may be called from a different thread than the one the
+        # server is running on, and from an async environment that's not asyncio.
+        # For this reason, we use an event to coordinate with the server
+        # instead of calling shutdown()/startup() directly, and should not make
+        # any asyncio-specific operations.
+        self.started = False
+        self.restart_requested.set()
+        while not self.started:
+            await sleep(0.2)
+
+## tests/models/test_responses.py
+
+def test_iter_raw_doesnt_return_empty_chunks():
+    def streaming_body_with_empty_chunks() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b""
+        yield b"world!"
+        yield b""
+
+    response = httpx.Response(200, content=streaming_body_with_empty_chunks())
+
+    parts = list(response.iter_raw())
+    assert parts == [b"Hello, ", b"world!"]
+
+def test_iter_bytes_doesnt_return_empty_chunks():
+    def streaming_body_with_empty_chunks() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b""
+        yield b"world!"
+        yield b""
+
+    response = httpx.Response(200, content=streaming_body_with_empty_chunks())
+
+    parts = list(response.iter_bytes())
+    assert parts == [b"Hello, ", b"world!"]
+
+## tests/test_content.py
+
+def test_invalid_argument():
+    with pytest.raises(TypeError):
+        httpx.Request(method, url, content=123)  # type: ignore
+
+    with pytest.raises(TypeError):
+        httpx.Request(method, url, content={"a": "b"})  # type: ignore
+
+def test_response_invalid_argument():
+    with pytest.raises(TypeError):
+        httpx.Response(200, content=123)  # type: ignore

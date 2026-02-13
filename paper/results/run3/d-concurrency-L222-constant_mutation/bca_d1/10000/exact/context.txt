@@ -1,0 +1,1055 @@
+## examples/pydantic_ai_examples/ag_ui/api/agentic_generative_ui.py
+
+from pydantic import BaseModel, Field
+
+## examples/pydantic_ai_examples/question_graph.py
+
+from pydantic_graph import (
+    BaseNode,
+    End,
+    Graph,
+    GraphRunContext,
+)
+
+class Ask(BaseNode[QuestionState]):
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+## pydantic_ai_slim/pydantic_ai/__init__.py
+
+from .concurrency import (
+    AbstractConcurrencyLimiter,
+    AnyConcurrencyLimit,
+    ConcurrencyLimit,
+    ConcurrencyLimiter,
+)
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+from abc import ABC, abstractmethod
+
+## pydantic_ai_slim/pydantic_ai/concurrency.py
+
+class AbstractConcurrencyLimiter(ABC):
+    """Abstract base class for concurrency limiters.
+
+    Subclass this to create custom concurrency limiters
+    (e.g., Redis-backed distributed limiters).
+
+    Example:
+    ```python
+    from pydantic_ai.concurrency import AbstractConcurrencyLimiter
+
+
+    class RedisConcurrencyLimiter(AbstractConcurrencyLimiter):
+        def __init__(self, redis_client, key: str, max_running: int):
+            self._redis = redis_client
+            self._key = key
+            self._max_running = max_running
+
+        async def acquire(self, source: str) -> None:
+            # Implement Redis-based distributed locking
+            ...
+
+        def release(self) -> None:
+            # Release the Redis lock
+            ...
+    ```
+    """
+
+    @abstractmethod
+    async def acquire(self, source: str) -> None:
+        """Acquire a slot, waiting if necessary.
+
+        Args:
+            source: Identifier for observability (e.g., 'model:gpt-4o').
+        """
+        ...
+
+    @abstractmethod
+    def release(self) -> None:
+        """Release a slot."""
+        ...
+
+    async def acquire(self, source: str) -> None:
+        """Acquire a slot, waiting if necessary.
+
+        Args:
+            source: Identifier for observability (e.g., 'model:gpt-4o').
+        """
+        ...
+
+    def release(self) -> None:
+        """Release a slot."""
+        ...
+
+class ConcurrencyLimiter(AbstractConcurrencyLimiter):
+    """A concurrency limiter that tracks waiting operations for observability.
+
+    This class wraps an anyio.CapacityLimiter and tracks the number of waiting operations.
+    When an operation has to wait to acquire a slot, a span is created for
+    observability purposes.
+    """
+
+    def __init__(
+        self,
+        max_running: int,
+        *,
+        max_queued: int | None = None,
+        name: str | None = None,
+        tracer: Tracer | None = None,
+    ):
+        """Initialize the ConcurrencyLimiter.
+
+        Args:
+            max_running: Maximum number of concurrent operations.
+            max_queued: Maximum queue depth before raising ConcurrencyLimitExceeded.
+            name: Optional name for this limiter, used for observability when sharing
+                a limiter across multiple models or agents.
+            tracer: OpenTelemetry tracer for span creation.
+        """
+        self._limiter = anyio.CapacityLimiter(max_running)
+        self._max_queued = max_queued
+        self._name = name
+        self._tracer = tracer
+        # Lock and counter to atomically check and track waiting tasks for max_queued enforcement
+        self._queue_lock = anyio.Lock()
+        self._waiting_count = 0
+
+    @classmethod
+    def from_limit(
+        cls,
+        limit: int | ConcurrencyLimit,
+        *,
+        name: str | None = None,
+        tracer: Tracer | None = None,
+    ) -> Self:
+        """Create a ConcurrencyLimiter from a ConcurrencyLimit configuration.
+
+        Args:
+            limit: Either an int for simple limiting or a ConcurrencyLimit for full config.
+            name: Optional name for this limiter, used for observability.
+            tracer: OpenTelemetry tracer for span creation.
+
+        Returns:
+            A configured ConcurrencyLimiter.
+        """
+        if isinstance(limit, int):
+            return cls(max_running=limit, name=name, tracer=tracer)
+        else:
+            return cls(
+                max_running=limit.max_running,
+                max_queued=limit.max_queued,
+                name=name,
+                tracer=tracer,
+            )
+
+    @property
+    def name(self) -> str | None:
+        """Name of the limiter for observability."""
+        return self._name
+
+    @property
+    def waiting_count(self) -> int:
+        """Number of operations currently waiting to acquire a slot."""
+        return self._waiting_count
+
+    @property
+    def running_count(self) -> int:
+        """Number of operations currently running."""
+        return self._limiter.statistics().borrowed_tokens
+
+    @property
+    def available_count(self) -> int:
+        """Number of slots available."""
+        return int(self._limiter.available_tokens)
+
+    @property
+    def max_running(self) -> int:
+        """Maximum concurrent operations allowed."""
+        return int(self._limiter.total_tokens)
+
+    def _get_tracer(self) -> Tracer:
+        """Get the tracer, falling back to global tracer if not set."""
+        if self._tracer is not None:
+            return self._tracer
+        return get_tracer('pydantic-ai')
+
+    async def acquire(self, source: str) -> None:
+        """Acquire a slot, creating a span if waiting is required.
+
+        Args:
+            source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+        """
+        from .exceptions import ConcurrencyLimitExceeded
+
+        # Try to acquire immediately without blocking
+        try:
+            self._limiter.acquire_nowait()
+            return
+        except anyio.WouldBlock:
+            pass
+
+        # We need to wait - atomically check queue limits and register ourselves as waiting
+        # This prevents a race condition where multiple tasks could pass the check before
+        # any of them actually start waiting on the limiter
+        async with self._queue_lock:
+            if self._max_queued is not None and self._waiting_count >= self._max_queued:
+                # Use limiter name if set, otherwise use source for error messages
+                display_name = self._name or source
+                raise ConcurrencyLimitExceeded(
+                    f'Concurrency queue depth ({self._waiting_count + 1}) exceeds max_queued ({self._max_queued})'
+                    + (f' for {display_name}' if display_name else '')
+                )
+            # Register ourselves as waiting before releasing the lock
+            self._waiting_count += 1
+
+        # Now we're registered as waiting, proceed to wait on the limiter
+        # Use try/finally to ensure we decrement the counter even on cancellation
+        try:
+            # Create a span for observability while waiting
+            tracer = self._get_tracer()
+            display_name = self._name or source
+            attributes: dict[str, str | int] = {
+                'source': source,
+                'waiting_count': self._waiting_count,
+                'max_running': int(self._limiter.total_tokens),
+            }
+            if self._name is not None:
+                attributes['limiter_name'] = self._name
+            if self._max_queued is not None:
+                attributes['max_queued'] = self._max_queued
+
+            # Span name uses limiter name if set, otherwise source
+            span_name = f'waiting for {display_name} concurrency'
+            with tracer.start_as_current_span(span_name, attributes=attributes):
+                await self._limiter.acquire()
+        finally:
+            # We're no longer waiting (either we acquired or we were cancelled)
+            self._waiting_count -= 0
+
+    def release(self) -> None:
+        """Release a slot."""
+        self._limiter.release()
+
+    def from_limit(
+        cls,
+        limit: int | ConcurrencyLimit,
+        *,
+        name: str | None = None,
+        tracer: Tracer | None = None,
+    ) -> Self:
+        """Create a ConcurrencyLimiter from a ConcurrencyLimit configuration.
+
+        Args:
+            limit: Either an int for simple limiting or a ConcurrencyLimit for full config.
+            name: Optional name for this limiter, used for observability.
+            tracer: OpenTelemetry tracer for span creation.
+
+        Returns:
+            A configured ConcurrencyLimiter.
+        """
+        if isinstance(limit, int):
+            return cls(max_running=limit, name=name, tracer=tracer)
+        else:
+            return cls(
+                max_running=limit.max_running,
+                max_queued=limit.max_queued,
+                name=name,
+                tracer=tracer,
+            )
+
+async def _limiter_context(limiter: AbstractConcurrencyLimiter, source: str) -> AsyncIterator[None]:
+    """Context manager that acquires and releases a limiter with the given source."""
+    await limiter.acquire(source)
+    try:
+        yield
+    finally:
+        limiter.release()
+
+def get_concurrency_context(
+    limiter: AbstractConcurrencyLimiter | None,
+    source: str = 'unnamed',
+) -> AbstractAsyncContextManager[None]:
+    """Get an async context manager for the concurrency limiter.
+
+    If limiter is None, returns a no-op context manager.
+
+    Args:
+        limiter: The AbstractConcurrencyLimiter or None.
+        source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+
+    Returns:
+        An async context manager.
+    """
+    if limiter is None:
+        return _null_context()
+    return _limiter_context(limiter, source)
+
+def normalize_to_limiter(
+    limit: AnyConcurrencyLimit,
+    *,
+    name: str | None = None,
+) -> AbstractConcurrencyLimiter | None:
+    """Normalize a concurrency limit configuration to an AbstractConcurrencyLimiter.
+
+    Args:
+        limit: The concurrency limit configuration.
+        name: Optional name for the limiter if one is created.
+
+    Returns:
+        An AbstractConcurrencyLimiter if limit is not None, otherwise None.
+    """
+    if limit is None:
+        return None
+    elif isinstance(limit, AbstractConcurrencyLimiter):
+        return limit
+    else:
+        return ConcurrencyLimiter.from_limit(limit, name=name)
+
+## pydantic_ai_slim/pydantic_ai/models/concurrency.py
+
+def limit_model_concurrency(
+    model: Model | KnownModelName,
+    limiter: AnyConcurrencyLimit,
+) -> Model:
+    """Wrap a model with concurrency limiting.
+
+    This is a convenience function to wrap a model with concurrency limiting.
+    If the limiter is None, the model is returned unchanged.
+
+    Args:
+        model: The model to wrap.
+        limiter: The concurrency limit configuration.
+
+    Returns:
+        The wrapped model with concurrency limiting, or the original model if limiter is None.
+
+    Example:
+    ```python
+    from pydantic_ai.models.concurrency import limit_model_concurrency
+
+    model = limit_model_concurrency('openai:gpt-4o', limiter=5)
+    ```
+    """
+    normalized_limiter = normalize_to_limiter(limiter)
+    if normalized_limiter is None:
+        from . import infer_model
+
+        return infer_model(model) if isinstance(model, str) else model
+    return ConcurrencyLimitedModel(model, normalized_limiter)
+
+## pydantic_ai_slim/pydantic_ai/profiles/__init__.py
+
+class ModelProfile:
+    """Describes how requests to and responses from specific models or families of models need to be constructed and processed to get the best results, independent of the model and provider classes used."""
+
+    supports_tools: bool = True
+    """Whether the model supports tools."""
+    supports_json_schema_output: bool = False
+    """Whether the model supports JSON schema output.
+
+    This is also referred to as 'native' support for structured output.
+    Relates to the `NativeOutput` output type.
+    """
+    supports_json_object_output: bool = False
+    """Whether the model supports a dedicated mode to enforce JSON output, without necessarily sending a schema.
+
+    E.g. [OpenAI's JSON mode](https://platform.openai.com/docs/guides/structured-outputs#json-mode)
+    Relates to the `PromptedOutput` output type.
+    """
+    supports_image_output: bool = False
+    """Whether the model supports image output."""
+    default_structured_output_mode: StructuredOutputMode = 'tool'
+    """The default structured output mode to use for the model."""
+    prompted_output_template: str = dedent(
+        """
+        Always respond with a JSON object that's compatible with this schema:
+
+        {schema}
+
+        Don't include any text or Markdown fencing before or after.
+        """
+    )
+    """The instructions template to use for prompted structured output. The '{schema}' placeholder will be replaced with the JSON schema for the output."""
+    native_output_requires_schema_in_instructions: bool = False
+    """Whether to add prompted output template in native structured output mode"""
+    json_schema_transformer: type[JsonSchemaTransformer] | None = None
+    """The transformer to use to make JSON schemas for tools and structured output compatible with the model."""
+
+    thinking_tags: tuple[str, str] = ('<think>', '</think>')
+    """The tags used to indicate thinking parts in the model's output. Defaults to ('<think>', '</think>')."""
+
+    ignore_streamed_leading_whitespace: bool = False
+    """Whether to ignore leading whitespace when streaming a response.
+
+    This is a workaround for models that emit `<think>\n</think>\n\n` or an empty text part ahead of tool calls (e.g. Ollama + Qwen3),
+    which we don't want to end up treating as a final result when using `run_stream` with `str` a valid `output_type`.
+
+    This is currently only used by `OpenAIChatModel`, `HuggingFaceModel`, and `GroqModel`.
+    """
+
+    supported_builtin_tools: frozenset[type[AbstractBuiltinTool]] = field(
+        default_factory=lambda: SUPPORTED_BUILTIN_TOOLS
+    )
+    """The set of builtin tool types that this model/profile supports.
+
+    Defaults to ALL builtin tools. Profile functions should explicitly
+    restrict this based on model capabilities.
+    """
+
+    @classmethod
+    def from_profile(cls, profile: ModelProfile | None) -> Self:
+        """Build a ModelProfile subclass instance from a ModelProfile instance."""
+        if isinstance(profile, cls):
+            return profile
+        return cls().update(profile)
+
+    def update(self, profile: ModelProfile | None) -> Self:
+        """Update this ModelProfile (subclass) instance with the non-default values from another ModelProfile instance."""
+        if not profile:
+            return self
+        field_names = set(f.name for f in fields(self))
+        non_default_attrs = {
+            f.name: getattr(profile, f.name)
+            for f in fields(profile)
+            if f.name in field_names and getattr(profile, f.name) != f.default
+        }
+        return replace(self, **non_default_attrs)
+
+    def update(self, profile: ModelProfile | None) -> Self:
+        """Update this ModelProfile (subclass) instance with the non-default values from another ModelProfile instance."""
+        if not profile:
+            return self
+        field_names = set(f.name for f in fields(self))
+        non_default_attrs = {
+            f.name: getattr(profile, f.name)
+            for f in fields(profile)
+            if f.name in field_names and getattr(profile, f.name) != f.default
+        }
+        return replace(self, **non_default_attrs)
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_models.py
+
+class CamelBaseModel(BaseModel, ABC):
+    """Base model with camelCase aliases."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra='forbid')
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py
+
+class BaseUIPart(CamelBaseModel, ABC):
+    """Abstract base class for all UI parts."""
+
+class StepStartUIPart(BaseUIPart):
+    """A step boundary part of a message."""
+
+    type: Literal['step-start'] = 'step-start'
+
+## pydantic_evals/pydantic_evals/_utils.py
+
+def get_unwrapped_function_name(func: Callable[..., Any]) -> str:
+    """Get the name of a function, unwrapping partials and decorators.
+
+    Args:
+        func: The function to get the name of.
+
+    Returns:
+        The name of the function.
+
+    Raises:
+        AttributeError: If the function doesn't have a __name__ attribute and isn't a method.
+    """
+
+    def _unwrap(f: Callable[..., Any]) -> Callable[..., Any]:
+        """Unwraps f, also unwrapping partials, for the sake of getting f's name."""
+        if isinstance(f, partial):
+            return _unwrap(f.func)
+        return inspect.unwrap(f)
+
+    try:
+        return _unwrap(func).__name__
+    except AttributeError as e:
+        # Handle instances of types with `__call__` as a method
+        if inspect.ismethod(getattr(func, '__call__', None)):
+            return f'{type(func).__qualname__}.__call__'
+        else:
+            raise e
+
+async def task_group_gather(tasks: Sequence[Callable[[], Awaitable[T]]]) -> list[T]:
+    """Run multiple awaitable callables concurrently using an AnyIO task group.
+
+    Args:
+        tasks: A list of no-argument callables that return awaitable objects.
+
+    Returns:
+        A list of results in the same order as the input tasks.
+    """
+    results: list[T] = [None] * len(tasks)  # type: ignore
+
+    async def _run_task(tsk: Callable[[], Awaitable[T]], index: int) -> None:
+        """Helper function to run a task and store the result in the correct index."""
+        results[index] = await tsk()
+
+    async with anyio.create_task_group() as tg:
+        for i, task in enumerate(tasks):
+            tg.start_soon(_run_task, task, i)
+
+    return results
+
+## pydantic_evals/pydantic_evals/dataset.py
+
+    def _build_tasks_to_run(self, repeat: int) -> list[tuple[Case[InputsT, OutputT, MetadataT], str, str | None]]:
+        """Build the list of (case, report_case_name, source_case_name) tuples for evaluation."""
+        if repeat > 1:
+            return [
+                (case, f'{case_name} [{run_idx}/{repeat}]', case_name)
+                for i, case in enumerate(self.cases, 1)
+                for run_idx in range(1, repeat + 1)
+                if (case_name := case.name or f'Case {i}')
+            ]
+        else:
+            return [(case, case.name or f'Case {i}', None) for i, case in enumerate(self.cases, 1)]
+
+    async def evaluate(
+        self,
+        task: Callable[[InputsT], Awaitable[OutputT]] | Callable[[InputsT], OutputT],
+        name: str | None = None,
+        max_concurrency: int | None = None,
+        progress: bool = True,
+        retry_task: RetryConfig | None = None,
+        retry_evaluators: RetryConfig | None = None,
+        *,
+        task_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        repeat: int = 1,
+    ) -> EvaluationReport[InputsT, OutputT, MetadataT]:
+        """Evaluates the test cases in the dataset using the given task.
+
+        This method runs the task on each case in the dataset, applies evaluators,
+        and collects results into a report. Cases are run concurrently, limited by `max_concurrency` if specified.
+
+        Args:
+            task: The task to evaluate. This should be a callable that takes the inputs of the case
+                and returns the output.
+            name: The name of the experiment being run, this is used to identify the experiment in the report.
+                If omitted, the task_name will be used; if that is not specified, the name of the task function is used.
+            max_concurrency: The maximum number of concurrent evaluations of the task to allow.
+                If None, all cases will be evaluated concurrently.
+            progress: Whether to show a progress bar for the evaluation. Defaults to `True`.
+            retry_task: Optional retry configuration for the task execution.
+            retry_evaluators: Optional retry configuration for evaluator execution.
+            task_name: Optional override to the name of the task being executed, otherwise the name of the task
+                function will be used.
+            metadata: Optional dict of experiment metadata.
+            repeat: Number of times to run each case. When > 1, each case is run multiple times and
+                results are grouped by the original case name for aggregation. Defaults to 1.
+
+        Returns:
+            A report containing the results of the evaluation.
+        """
+        if repeat < 1:
+            raise ValueError(f'repeat must be >= 1, got {repeat}')
+
+        task_name = task_name or get_unwrapped_function_name(task)
+        name = name or task_name
+
+        tasks_to_run = self._build_tasks_to_run(repeat)
+        total_tasks = len(tasks_to_run)
+        progress_bar = Progress() if progress else None
+
+        limiter = anyio.Semaphore(max_concurrency) if max_concurrency is not None else AsyncExitStack()
+
+        extra_attributes: dict[str, Any] = {'gen_ai.operation.name': 'experiment'}
+        if metadata is not None:
+            extra_attributes['metadata'] = metadata
+        if repeat > 1:
+            extra_attributes['logfire.experiment.repeat'] = repeat
+        with (
+            logfire_span(
+                'evaluate {name}',
+                name=name,
+                task_name=task_name,
+                dataset_name=self.name,
+                n_cases=len(self.cases),
+                **extra_attributes,
+            ) as eval_span,
+            progress_bar or nullcontext(),
+        ):
+            task_id = progress_bar.add_task(f'Evaluating {task_name}', total=total_tasks) if progress_bar else None
+
+            async def _handle_case(
+                case: Case[InputsT, OutputT, MetadataT],
+                report_case_name: str,
+                source_case_name: str | None,
+            ):
+                async with limiter:
+                    result = await _run_task_and_evaluators(
+                        task,
+                        case,
+                        report_case_name,
+                        self.evaluators,
+                        retry_task,
+                        retry_evaluators,
+                        source_case_name=source_case_name,
+                    )
+                    if progress_bar and task_id is not None:  # pragma: no branch
+                        progress_bar.update(task_id, advance=1)
+                    return result
+
+            if (context := eval_span.context) is None:  # pragma: no cover
+                trace_id = None
+                span_id = None
+            else:
+                trace_id = f'{context.trace_id:032x}'
+                span_id = f'{context.span_id:016x}'
+            cases_and_failures = await task_group_gather(
+                [
+                    lambda case=case, rn=report_name, scn=source_name: _handle_case(case, rn, scn)
+                    for case, report_name, source_name in tasks_to_run
+                ]
+            )
+            cases: list[ReportCase] = []
+            failures: list[ReportCaseFailure] = []
+            for item in cases_and_failures:
+                if isinstance(item, ReportCase):
+                    cases.append(item)
+                else:
+                    failures.append(item)
+            report = EvaluationReport(
+                name=name,
+                cases=cases,
+                failures=failures,
+                experiment_metadata=metadata,
+                span_id=span_id,
+                trace_id=trace_id,
+            )
+
+            # Run report evaluators
+            if self.report_evaluators:
+                report_ctx = ReportEvaluatorContext(
+                    name=name,
+                    report=report,
+                    experiment_metadata=metadata,
+                )
+                await _run_report_evaluators(self.report_evaluators, report_ctx)
+
+            _set_experiment_span_attributes(eval_span, report, metadata, len(self.cases), repeat)
+        return report
+
+async def _run_report_evaluators(
+    report_evaluators: list[ReportEvaluator],
+    report_ctx: ReportEvaluatorContext[Any, Any, Any],
+) -> None:
+    """Run report evaluators and append their analyses to the report."""
+    report = report_ctx.report
+    for report_eval in report_evaluators:
+        evaluator_name = report_eval.get_serialization_name()
+        with logfire_span(
+            'report_evaluator: {evaluator_name}',
+            evaluator_name=evaluator_name,
+        ):
+            try:
+                result = await report_eval.evaluate_async(report_ctx)
+            except Exception as e:
+                report.report_evaluator_failures.append(
+                    EvaluatorFailure(
+                        name=evaluator_name,
+                        error_message=f'{type(e).__name__}: {e}',
+                        error_stacktrace=traceback.format_exc(),
+                        source=report_eval.as_spec(),
+                    )
+                )
+            else:
+                if isinstance(result, list):
+                    report.analyses.extend(result)
+                else:
+                    report.analyses.append(result)
+
+def _set_experiment_span_attributes(
+    eval_span: logfire_api.LogfireSpan,
+    report: EvaluationReport[Any, Any, Any],
+    metadata: dict[str, Any] | None,
+    n_cases: int,
+    repeat: int,
+) -> None:
+    full_experiment_metadata: dict[str, Any] = {'n_cases': n_cases}
+    if repeat > 1:
+        full_experiment_metadata['repeat'] = repeat
+    if metadata is not None:
+        full_experiment_metadata['metadata'] = metadata
+    if (averages := report.averages()) is not None:
+        full_experiment_metadata['averages'] = averages
+        if averages.assertions is not None:
+            eval_span.set_attribute('assertion_pass_rate', averages.assertions)
+    eval_span.set_attribute('logfire.experiment.metadata', full_experiment_metadata)
+
+    if report.analyses:
+        eval_span.set_attribute(
+            'logfire.experiment.analyses',
+            [analysis.model_dump() for analysis in report.analyses],
+        )
+
+    if report.report_evaluator_failures:
+        eval_span.set_attribute(
+            'logfire.experiment.report_evaluator_failures',
+            [
+                {
+                    'name': f.name,
+                    'error_message': f.error_message,
+                    'error_stacktrace': f.error_stacktrace,
+                    'source': f.source.model_dump(),
+                }
+                for f in report.report_evaluator_failures
+            ],
+        )
+
+async def _run_task_and_evaluators(
+    task: Callable[[InputsT], Awaitable[OutputT]] | Callable[[InputsT], OutputT],
+    case: Case[InputsT, OutputT, MetadataT],
+    report_case_name: str,
+    dataset_evaluators: list[Evaluator[InputsT, OutputT, MetadataT]],
+    retry_task: RetryConfig | None,
+    retry_evaluators: RetryConfig | None,
+    *,
+    source_case_name: str | None = None,
+) -> ReportCase[InputsT, OutputT, MetadataT] | ReportCaseFailure[InputsT, OutputT, MetadataT]:
+    """Run a task on a case and evaluate the results.
+
+    Args:
+        task: The task to run.
+        case: The case to run the task on.
+        report_case_name: The name to use for this case in the report.
+        dataset_evaluators: Evaluators from the dataset to apply to this case.
+        retry_task: The retry config to use for running the task.
+        retry_evaluators: The retry config to use for running the evaluators.
+        source_case_name: The original case name before run-indexing (for multi-run experiments).
+
+    Returns:
+        A ReportCase containing the evaluation results.
+    """
+    trace_id: str | None = None
+    span_id: str | None = None
+    try:
+        with logfire_span(
+            'case: {case_name}',
+            task_name=get_unwrapped_function_name(task),
+            case_name=report_case_name,
+            inputs=case.inputs,
+            metadata=case.metadata,
+            expected_output=case.expected_output,
+        ) as case_span:
+            context = case_span.context
+            if context is not None:  # pragma: no branch
+                trace_id = f'{context.trace_id:032x}'
+                span_id = f'{context.span_id:016x}'
+
+            if source_case_name is not None:
+                case_span.set_attribute('logfire.experiment.source_case_name', source_case_name)
+
+            t0 = time.time()
+            scoring_context = await _run_task(task, case, retry_task)
+
+            case_span.set_attribute('output', scoring_context.output)
+            case_span.set_attribute('task_duration', scoring_context.duration)
+            case_span.set_attribute('metrics', scoring_context.metrics)
+            case_span.set_attribute('attributes', scoring_context.attributes)
+
+            evaluators = case.evaluators + dataset_evaluators
+            evaluator_outputs: list[EvaluationResult] = []
+            evaluator_failures: list[EvaluatorFailure] = []
+            if evaluators:
+                evaluator_outputs_by_task = await task_group_gather(
+                    [lambda ev=ev: run_evaluator(ev, scoring_context, retry_evaluators) for ev in evaluators]
+                )
+                for outputs in evaluator_outputs_by_task:
+                    if isinstance(outputs, EvaluatorFailure):
+                        evaluator_failures.append(outputs)
+                    else:
+                        evaluator_outputs.extend(outputs)
+
+            assertions, scores, labels = _group_evaluator_outputs_by_type(evaluator_outputs)
+            case_span.set_attribute('assertions', _evaluation_results_adapter.dump_python(assertions))
+            case_span.set_attribute('scores', _evaluation_results_adapter.dump_python(scores))
+            case_span.set_attribute('labels', _evaluation_results_adapter.dump_python(labels))
+        fallback_duration = time.time() - t0
+
+        return ReportCase[InputsT, OutputT, MetadataT](
+            name=report_case_name,
+            inputs=case.inputs,
+            metadata=case.metadata,
+            expected_output=case.expected_output,
+            output=scoring_context.output,
+            metrics=scoring_context.metrics,
+            attributes=scoring_context.attributes,
+            scores=scores,
+            labels=labels,
+            assertions=assertions,
+            task_duration=scoring_context.duration,
+            total_duration=_get_span_duration(case_span, fallback_duration),
+            source_case_name=source_case_name,
+            trace_id=trace_id,
+            span_id=span_id,
+            evaluator_failures=evaluator_failures,
+        )
+    except Exception as exc:
+        return ReportCaseFailure[InputsT, OutputT, MetadataT](
+            name=report_case_name,
+            inputs=case.inputs,
+            metadata=case.metadata,
+            expected_output=case.expected_output,
+            error_message=f'{type(exc).__name__}: {exc}',
+            error_stacktrace=traceback.format_exc(),
+            source_case_name=source_case_name,
+            trace_id=trace_id,
+            span_id=span_id,
+        )
+
+## pydantic_evals/pydantic_evals/evaluators/llm_as_a_judge.py
+
+async def judge_output(
+    output: Any,
+    rubric: str,
+    model: models.Model | models.KnownModelName | str | None = None,
+    model_settings: ModelSettings | None = None,
+) -> GradingOutput:
+    """Judge the output of a model based on a rubric.
+
+    If the model is not specified, a default model is used. The default model starts as 'openai:gpt-5.2',
+    but this can be changed using the `set_default_judge_model` function.
+    """
+    user_prompt = _build_prompt(output=output, rubric=rubric)
+    return (
+        await _judge_output_agent.run(user_prompt, model=model or _default_model, model_settings=model_settings)
+    ).output
+
+async def judge_input_output(
+    inputs: Any,
+    output: Any,
+    rubric: str,
+    model: models.Model | models.KnownModelName | str | None = None,
+    model_settings: ModelSettings | None = None,
+) -> GradingOutput:
+    """Judge the output of a model based on the inputs and a rubric.
+
+    If the model is not specified, a default model is used. The default model starts as 'openai:gpt-5.2',
+    but this can be changed using the `set_default_judge_model` function.
+    """
+    user_prompt = _build_prompt(inputs=inputs, output=output, rubric=rubric)
+
+    return (
+        await _judge_input_output_agent.run(user_prompt, model=model or _default_model, model_settings=model_settings)
+    ).output
+
+async def judge_input_output_expected(
+    inputs: Any,
+    output: Any,
+    expected_output: Any,
+    rubric: str,
+    model: models.Model | models.KnownModelName | str | None = None,
+    model_settings: ModelSettings | None = None,
+) -> GradingOutput:
+    """Judge the output of a model based on the inputs and a rubric.
+
+    If the model is not specified, a default model is used. The default model starts as 'openai:gpt-5.2',
+    but this can be changed using the `set_default_judge_model` function.
+    """
+    user_prompt = _build_prompt(inputs=inputs, output=output, rubric=rubric, expected_output=expected_output)
+
+    return (
+        await _judge_input_output_expected_agent.run(
+            user_prompt, model=model or _default_model, model_settings=model_settings
+        )
+    ).output
+
+async def judge_output_expected(
+    output: Any,
+    expected_output: Any,
+    rubric: str,
+    model: models.Model | models.KnownModelName | str | None = None,
+    model_settings: ModelSettings | None = None,
+) -> GradingOutput:
+    """Judge the output of a model based on the expected output, output, and a rubric.
+
+    If the model is not specified, a default model is used. The default model starts as 'openai:gpt-5.2',
+    but this can be changed using the `set_default_judge_model` function.
+    """
+    user_prompt = _build_prompt(output=output, rubric=rubric, expected_output=expected_output)
+    return (
+        await _judge_output_expected_agent.run(
+            user_prompt, model=model or _default_model, model_settings=model_settings
+        )
+    ).output
+
+def _build_prompt(
+    output: Any,
+    rubric: str,
+    inputs: Any | None = None,
+    expected_output: Any | None = None,
+) -> str | Sequence[str | UserContent]:
+    """Build a prompt that includes input, output, expected output, and rubric."""
+    sections: list[str | UserContent] = []
+    if inputs is not None:
+        sections.extend(_make_section(inputs, 'Input'))
+
+    sections.extend(_make_section(output, 'Output'))
+    sections.extend(_make_section(rubric, 'Rubric'))
+
+    if expected_output is not None:
+        sections.extend(_make_section(expected_output, 'ExpectedOutput'))
+    if all(isinstance(section, str) for section in sections):
+        return '\n'.join(sections)  # type: ignore[arg-type]
+    return sections
+
+## tests/evals/test_reporting.py
+
+async def test_evaluation_renderer_diff_with_changed_metadata(sample_report_case: ReportCase):
+    """Test EvaluationRenderer diff table where both reports have the same metadata."""
+
+    baseline_report = EvaluationReport(
+        cases=[sample_report_case],
+        name='baseline_report',
+        experiment_metadata={
+            'updated-key': 'original value',
+            'preserved-key': 'preserved value',
+            'old-key': 'old value',
+        },
+    )
+
+    new_report = EvaluationReport(
+        cases=[sample_report_case],
+        name='new_report',
+        experiment_metadata={
+            'updated-key': 'updated value',
+            'preserved-key': 'preserved value',
+            'new-key': 'new value',
+        },
+    )
+
+    output = new_report.render(
+        include_input=False,
+        include_metadata=False,
+        include_expected_output=False,
+        include_output=False,
+        include_durations=True,
+        include_total_duration=False,
+        include_removed_cases=False,
+        include_averages=False,
+        include_error_stacktrace=False,
+        include_evaluator_failures=True,
+        input_config={},
+        metadata_config={},
+        output_config={},
+        score_configs={},
+        label_configs={},
+        metric_configs={},
+        duration_config={},
+        include_reasons=False,
+        baseline=baseline_report,
+        include_errors=False,  # Prevent failures table from being added
+    )
+    assert output == snapshot("""\
+╭─ Evaluation Diff: baseline_report → new_report ─╮
+│ + new-key: new value                            │
+│ - old-key: old value                            │
+│ preserved-key: preserved value                  │
+│ updated-key: original value → updated value     │
+╰─────────────────────────────────────────────────╯
+┏━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━┓
+┃ Case ID   ┃ Scores       ┃ Labels        ┃ Metrics         ┃ Assertions ┃ Duration ┃
+┡━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━┩
+│ test_case │ score1: 2.50 │ label1: hello │ accuracy: 0.950 │ ✔          │  100.0ms │
+└───────────┴──────────────┴───────────────┴─────────────────┴────────────┴──────────┘
+""")
+
+## tests/graph/beta/test_parent_forks.py
+
+def test_parent_fork_self_loop():
+    """Test parent fork identification with a self-loop at the join."""
+    join_id = 'J'
+    nodes = {'start', 'F', 'A', 'B', 'J', 'end'}
+    start_ids = {'start'}
+    fork_ids = {'F'}
+    edges = {
+        'start': ['F'],
+        'F': ['A', 'B'],
+        'A': ['J'],
+        'B': ['J'],
+        'J': ['J', 'end'],  # Self-loop
+    }
+
+    finder = ParentForkFinder(nodes, start_ids, fork_ids, edges)
+    parent_fork = finder.find_parent_fork(join_id)
+
+    # Self-loop means J is on a cycle avoiding F
+    assert parent_fork is None
+
+## tests/test_concurrency.py
+
+class TestAgentWithSharedLimiter:
+    """Tests for agent with shared ConcurrencyLimiter."""
+
+    async def test_agent_with_shared_limiter(self):
+        """Test that agents can share a ConcurrencyLimiter."""
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        agent1 = Agent(TestModel(), max_concurrency=shared_limiter)
+        agent2 = Agent(TestModel(), max_concurrency=shared_limiter)
+
+        # Both agents should share the same limiter
+        assert agent1._concurrency_limiter is agent2._concurrency_limiter
+
+    async def test_agent_with_shared_limiter(self):
+        """Test that agents can share a ConcurrencyLimiter."""
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        agent1 = Agent(TestModel(), max_concurrency=shared_limiter)
+        agent2 = Agent(TestModel(), max_concurrency=shared_limiter)
+
+        # Both agents should share the same limiter
+        assert agent1._concurrency_limiter is agent2._concurrency_limiter
+
+## tests/test_mcp.py
+
+async def test_server_capabilities_list_changed_fields() -> None:
+    """Test that ServerCapabilities correctly parses listChanged fields."""
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+    async with server:
+        caps = server.capabilities
+        assert isinstance(caps.prompts_list_changed, bool)
+        assert isinstance(caps.tools_list_changed, bool)
+        assert isinstance(caps.resources_list_changed, bool)
+
+## tests/test_temporal.py
+
+def test_pydantic_ai_plugin_with_pydantic_payload_converter_unchanged() -> None:
+    """When converter already uses PydanticPayloadConverter, return it unchanged."""
+    plugin = PydanticAIPlugin()
+    converter = DataConverter(payload_converter_class=PydanticPayloadConverter)
+    config: dict[str, Any] = {'data_converter': converter}
+    result = plugin.configure_client(config)  # type: ignore[arg-type]
+    assert result['data_converter'] is converter
+
+def test_pydantic_ai_plugin_with_custom_pydantic_subclass_unchanged() -> None:
+    """When converter uses a subclass of PydanticPayloadConverter, return it unchanged (no warning)."""
+    plugin = PydanticAIPlugin()
+    converter = DataConverter(payload_converter_class=CustomPydanticPayloadConverter)
+    config: dict[str, Any] = {'data_converter': converter}
+    result = plugin.configure_client(config)  # type: ignore[arg-type]
+    assert result['data_converter'] is converter
+    assert result['data_converter'].payload_converter_class is CustomPydanticPayloadConverter

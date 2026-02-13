@@ -1,0 +1,203 @@
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def validate_empty_kwargs(_kwargs: dict[str, Any]) -> None:
+    """Validate that no unknown kwargs remain after processing.
+
+    Args:
+        _kwargs: Dictionary of remaining kwargs after specific ones have been processed.
+
+    Raises:
+        UserError: If any unknown kwargs remain.
+    """
+    if _kwargs:
+        unknown_kwargs = ', '.join(f'`{k}`' for k in _kwargs.keys())
+        raise exceptions.UserError(f'Unknown keyword arguments: {unknown_kwargs}')
+
+## pydantic_ai_slim/pydantic_ai/exceptions.py
+
+class CallDeferred(Exception):
+    """Exception to raise when a tool call should be deferred.
+
+    See [tools docs](../deferred-tools.md#deferred-tools) for more information.
+
+    Args:
+        metadata: Optional dictionary of metadata to attach to the deferred tool call.
+            This metadata will be available in `DeferredToolRequests.metadata` keyed by `tool_call_id`.
+    """
+
+    def __init__(self, metadata: dict[str, Any] | None = None):
+        self.metadata = metadata
+        super().__init__()
+
+class ApprovalRequired(Exception):
+    """Exception to raise when a tool call requires human-in-the-loop approval.
+
+    See [tools docs](../deferred-tools.md#human-in-the-loop-tool-approval) for more information.
+
+    Args:
+        metadata: Optional dictionary of metadata to attach to the deferred tool call.
+            This metadata will be available in `DeferredToolRequests.metadata` keyed by `tool_call_id`.
+    """
+
+    def __init__(self, metadata: dict[str, Any] | None = None):
+        self.metadata = metadata
+        super().__init__()
+
+## pydantic_ai_slim/pydantic_ai/models/google.py
+
+    def _build_image_config(self, tool: ImageGenerationTool) -> ImageConfigDict:
+        """Build ImageConfigDict from ImageGenerationTool with validation."""
+        image_config = ImageConfigDict()
+
+        if tool.aspect_ratio is not None:
+            image_config['aspect_ratio'] = tool.aspect_ratio
+
+        if tool.size is not None:
+            if tool.size not in _GOOGLE_IMAGE_SIZES:
+                raise UserError(
+                    f'Google image generation only supports `size` values: {_GOOGLE_IMAGE_SIZES}. '
+                    f'Got: {tool.size!r}. Omit `size` to use the default (1K).'
+                )
+            image_config['image_size'] = tool.size
+
+        if self.system == 'google-vertex':
+            if tool.output_format is not None:
+                if tool.output_format not in _GOOGLE_IMAGE_OUTPUT_FORMATS:
+                    raise UserError(
+                        f'Google image generation only supports `output_format` values: {_GOOGLE_IMAGE_OUTPUT_FORMATS}. '
+                        f'Got: {tool.output_format!r}.'
+                    )
+                image_config['output_mime_type'] = f'image/{tool.output_format}'
+
+            output_compression = tool.output_compression
+            if output_compression is not None:
+                if not (0 <= output_compression <= 100):
+                    raise UserError(
+                        f'Google image generation `output_compression` must be between 0 and 100. '
+                        f'Got: {output_compression}.'
+                    )
+                if tool.output_format not in (None, 'jpeg'):
+                    raise UserError(
+                        f'Google image generation `output_compression` is only supported for JPEG format. '
+                        f'Got format: {tool.output_format!r}. Either set `output_format="jpeg"` or remove `output_compression`.'
+                    )
+                image_config['output_compression_quality'] = output_compression
+                if tool.output_format is None:
+                    image_config['output_mime_type'] = 'image/jpeg'
+
+        return image_config
+
+## pydantic_ai_slim/pydantic_ai/models/openai.py
+
+        def _map_response_builtin_part(self, item: BuiltinToolCallPart | BuiltinToolReturnPart) -> None:
+            """Maps a built-in tool call or return part to the response context.
+
+            This method serves as a hook that can be overridden by subclasses
+            to implement custom logic for handling built-in tool parts.
+            """
+            # OpenAI doesn't return built-in tool calls
+            pass
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_cache_write_and_read(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    """Integration test covering all cache settings using a recorded cassette.
+
+    This test enables all 3 cache settings plus 2 manual CachePoints (5 total),
+    which triggers the _limit_cache_points logic to strip the oldest one (limit is 4).
+    """
+    model = BedrockConverseModel('us.anthropic.claude-sonnet-4-5-20250929-v1:0', provider=bedrock_provider)
+    agent = Agent(
+        model,
+        system_prompt='YOU MUST RESPONSE ONLY WITH SINGLE NUMBER\n' * 50,  # More tokens to activate a cache
+        model_settings=BedrockModelSettings(
+            bedrock_cache_instructions=True,  # 1 cache point
+            bedrock_cache_tool_definitions=True,  # 1 cache point
+            bedrock_cache_messages=True,  # 1 cache point (on last user message)
+        ),
+    )
+
+    @agent.tool_plain
+    def catalog_lookup() -> str:  # pragma: no cover - exercised via agent call
+        return 'catalog-ok'
+
+    @agent.tool_plain
+    def diagnostics() -> str:  # pragma: no cover - exercised via agent call
+        return 'diagnostics-ok'
+
+    long_context = 'Newer response with something except single number\n' * 10
+    document = BinaryContent(data=b'You are a great mathematician', media_type='text/plain')
+    # 2 CachePoints, more that maximum allowed, so will be stripped.
+    run_args = [long_context, CachePoint(), document, CachePoint(), 'What is 10 + 11?']
+
+    first = await agent.run(run_args)
+    assert first.output == snapshot('21')
+    first_usage = first.usage()
+    assert first_usage == snapshot(RunUsage(input_tokens=1324, cache_write_tokens=1322, output_tokens=5, requests=1))
+
+    second = await agent.run(run_args)
+    assert second.output == snapshot('21')
+    second_usage = second.usage()
+    assert second_usage == snapshot(RunUsage(input_tokens=1324, output_tokens=5, cache_read_tokens=1322, requests=1))
+
+## tests/test_streaming.py
+
+async def test_call_tool_wrong_name():
+    async def stream_structured_function(_messages: list[ModelMessage], _: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+        yield {0: DeltaToolCall(name='foobar', json_args='{}')}
+
+    agent = Agent(
+        FunctionModel(stream_function=stream_structured_function),
+        output_type=tuple[str, int],
+        retries=0,
+    )
+
+    @agent.tool_plain
+    async def ret_a(x: str) -> str:  # pragma: no cover
+        return x
+
+    with capture_run_messages() as messages:
+        with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(0\) for output validation'):
+            async with agent.run_stream('hello'):
+                pass
+
+    assert messages == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='foobar', args='{}', tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=50, output_tokens=1),
+                model_name='function::stream_structured_function',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/typed_agent.py
+
+async def prep_ok(ctx: RunContext[MyDeps], tool_def: ToolDefinition) -> ToolDefinition | None:
+    if ctx.deps.foo == 42:
+        return None
+    else:
+        return tool_def
+
+def wrong_tool_prepare(ctx: RunContext[MyDeps], x: int, y: str) -> str:
+    return f'{ctx.deps.foo} {x} {y}'
+
+async def prepare_greet(ctx: RunContext[str], tool_def: ToolDefinition) -> ToolDefinition | None:
+    d = f'Name of the {ctx.deps} to greet.'
+    tool_def.parameters_json_schema['properties']['name']['description'] = d
+    return tool_def
+
+## tests/typed_deps.py
+
+async def my_prepare_none(ctx: RunContext, tool_defn: ToolDefinition) -> None:
+    pass
+
+async def my_prepare_any(ctx: RunContext[Any], tool_defn: ToolDefinition) -> None:
+    pass

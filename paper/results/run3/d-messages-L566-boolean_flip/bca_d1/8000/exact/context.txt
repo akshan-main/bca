@@ -1,0 +1,842 @@
+## examples/pydantic_ai_examples/chat_app.py
+
+async def get_chat(database: Database = Depends(get_db)) -> Response:
+    msgs = await database.get_messages()
+    return Response(
+        b'\n'.join(json.dumps(to_chat_message(m)).encode('utf-8') for m in msgs),
+        media_type='text/plain',
+    )
+
+async def post_chat(
+    prompt: Annotated[str, fastapi.Form()], database: Database = Depends(get_db)
+) -> StreamingResponse:
+    async def stream_messages():
+        """Streams new line delimited JSON `Message`s to the client."""
+        # stream the user prompt so that can be displayed straight away
+        yield (
+            json.dumps(
+                {
+                    'role': 'user',
+                    'timestamp': datetime.now(tz=timezone.utc).isoformat(),
+                    'content': prompt,
+                }
+            ).encode('utf-8')
+            + b'\n'
+        )
+        # get the chat history so far to pass as context to the agent
+        messages = await database.get_messages()
+        # run the agent with the user prompt and the chat history
+        async with agent.run_stream(prompt, message_history=messages) as result:
+            async for text in result.stream_output(debounce_by=0.01):
+                # text here is a `str` and the frontend wants
+                # JSON encoded ModelResponse, so we create one
+                m = ModelResponse(parts=[TextPart(text)], timestamp=result.timestamp())
+                yield json.dumps(to_chat_message(m)).encode('utf-8') + b'\n'
+
+        # add new messages (e.g. the user prompt and the agent response in this case) to the database
+        await database.add_messages(result.new_messages_json())
+
+    return StreamingResponse(stream_messages(), media_type='text/plain')
+
+class Database:
+    """Rudimentary database to store chat messages in SQLite.
+
+    The SQLite standard library package is synchronous, so we
+    use a thread pool executor to run queries asynchronously.
+    """
+
+    con: sqlite3.Connection
+    _loop: asyncio.AbstractEventLoop
+    _executor: ThreadPoolExecutor
+
+    @classmethod
+    @asynccontextmanager
+    async def connect(
+        cls, file: Path = THIS_DIR / '.chat_app_messages.sqlite'
+    ) -> AsyncIterator[Database]:
+        with logfire.span('connect to DB'):
+            loop = asyncio.get_event_loop()
+            executor = ThreadPoolExecutor(max_workers=1)
+            con = await loop.run_in_executor(executor, cls._connect, file)
+            slf = cls(con, loop, executor)
+        try:
+            yield slf
+        finally:
+            await slf._asyncify(con.close)
+
+    @staticmethod
+    def _connect(file: Path) -> sqlite3.Connection:
+        con = sqlite3.connect(str(file))
+        con = logfire.instrument_sqlite3(con)
+        cur = con.cursor()
+        cur.execute(
+            'CREATE TABLE IF NOT EXISTS messages (id INT PRIMARY KEY, message_list TEXT);'
+        )
+        con.commit()
+        return con
+
+    async def add_messages(self, messages: bytes):
+        await self._asyncify(
+            self._execute,
+            'INSERT INTO messages (message_list) VALUES (?);',
+            messages,
+            commit=True,
+        )
+        await self._asyncify(self.con.commit)
+
+    async def get_messages(self) -> list[ModelMessage]:
+        c = await self._asyncify(
+            self._execute, 'SELECT message_list FROM messages order by id'
+        )
+        rows = await self._asyncify(c.fetchall)
+        messages: list[ModelMessage] = []
+        for row in rows:
+            messages.extend(ModelMessagesTypeAdapter.validate_json(row[0]))
+        return messages
+
+    def _execute(
+        self, sql: LiteralString, *args: Any, commit: bool = False
+    ) -> sqlite3.Cursor:
+        cur = self.con.cursor()
+        cur.execute(sql, args)
+        if commit:
+            self.con.commit()
+        return cur
+
+    async def _asyncify(
+        self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
+    ) -> R:
+        return await self._loop.run_in_executor(  # type: ignore
+            self._executor,
+            partial(func, **kwargs),
+            *args,  # type: ignore
+        )
+
+    async def add_messages(self, messages: bytes):
+        await self._asyncify(
+            self._execute,
+            'INSERT INTO messages (message_list) VALUES (?);',
+            messages,
+            commit=True,
+        )
+        await self._asyncify(self.con.commit)
+
+    async def get_messages(self) -> list[ModelMessage]:
+        c = await self._asyncify(
+            self._execute, 'SELECT message_list FROM messages order by id'
+        )
+        rows = await self._asyncify(c.fetchall)
+        messages: list[ModelMessage] = []
+        for row in rows:
+            messages.extend(ModelMessagesTypeAdapter.validate_json(row[0]))
+        return messages
+
+    async def _asyncify(
+        self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs
+    ) -> R:
+        return await self._loop.run_in_executor(  # type: ignore
+            self._executor,
+            partial(func, **kwargs),
+            *args,  # type: ignore
+        )
+
+## examples/pydantic_ai_examples/weather_agent_gradio.py
+
+def undo(chatbot, past_messages: list, undo_data: gr.UndoData):
+    new_history = chatbot[: undo_data.index]
+    past_messages = past_messages[: undo_data.index]
+    return chatbot[undo_data.index]['content'], new_history, past_messages
+
+## pydantic_ai_slim/pydantic_ai/_a2a.py
+
+from typing import Any, Generic, TypeVar
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+from abc import ABC, abstractmethod
+
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+from typing import Any, Protocol
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class _JsonSchemaTestData:
+    """Generate data that matches a JSON schema.
+
+    This tries to generate the minimal viable data for the schema.
+    """
+
+    def __init__(self, schema: _utils.ObjectJsonSchema, seed: int = 0):
+        self.schema = schema
+        self.defs = schema.get('$defs', {})
+        self.seed = seed
+
+    def generate(self) -> dict[str, Any]:
+        """Generate data for the JSON schema."""
+        return self._gen_any(self.schema)
+
+    def _gen_any(self, schema: dict[str, Any]) -> Any:
+        """Generate data for any JSON Schema."""
+        if const := schema.get('const'):
+            return const
+        elif enum := schema.get('enum'):
+            return enum[self.seed % len(enum)]
+        elif examples := schema.get('examples'):
+            return examples[self.seed % len(examples)]
+        elif ref := schema.get('$ref'):
+            key = re.sub(r'^#/\$defs/', '', ref)
+            js_def = self.defs[key]
+            return self._gen_any(js_def)
+        elif any_of := schema.get('anyOf'):
+            return self._gen_any(any_of[self.seed % len(any_of)])
+
+        type_ = schema.get('type')
+        if type_ is None:
+            # if there's no type or ref, we can't generate anything
+            return self._char()
+        elif type_ == 'object':
+            return self._object_gen(schema)
+        elif type_ == 'string':
+            return self._str_gen(schema)
+        elif type_ == 'integer':
+            return self._int_gen(schema)
+        elif type_ == 'number':
+            return float(self._int_gen(schema))
+        elif type_ == 'boolean':
+            return self._bool_gen()
+        elif type_ == 'array':
+            return self._array_gen(schema)
+        elif type_ == 'null':
+            return None
+        else:
+            raise NotImplementedError(f'Unknown type: {type_}, please submit a PR to extend JsonSchemaTestData!')
+
+    def _object_gen(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """Generate data for a JSON Schema object."""
+        required = set(schema.get('required', []))
+
+        data: dict[str, Any] = {}
+        if properties := schema.get('properties'):
+            for key, value in properties.items():
+                if key in required:
+                    data[key] = self._gen_any(value)
+
+        if addition_props := schema.get('additionalProperties'):
+            add_prop_key = 'additionalProperty'
+            while add_prop_key in data:
+                add_prop_key += '_'
+            if addition_props is True:
+                data[add_prop_key] = self._char()
+            else:
+                data[add_prop_key] = self._gen_any(addition_props)
+
+        return data
+
+    def _str_gen(self, schema: dict[str, Any]) -> str:
+        """Generate a string from a JSON Schema string."""
+        min_len = schema.get('minLength')
+        if min_len is not None:
+            return self._char() * min_len
+
+        if schema.get('maxLength') == 0:
+            return ''
+
+        if fmt := schema.get('format'):
+            if fmt == 'date':
+                return (date(2024, 1, 1) + timedelta(days=self.seed)).isoformat()
+
+        return self._char()
+
+    def _int_gen(self, schema: dict[str, Any]) -> int:
+        """Generate an integer from a JSON Schema integer."""
+        maximum = schema.get('maximum')
+        if maximum is None:
+            exc_max = schema.get('exclusiveMaximum')
+            if exc_max is not None:
+                maximum = exc_max - 1
+
+        minimum = schema.get('minimum')
+        if minimum is None:
+            exc_min = schema.get('exclusiveMinimum')
+            if exc_min is not None:
+                minimum = exc_min + 1
+
+        if minimum is not None and maximum is not None:
+            return minimum + self.seed % (maximum - minimum)
+        elif minimum is not None:
+            return minimum + self.seed
+        elif maximum is not None:
+            return maximum - self.seed
+        else:
+            return self.seed
+
+    def _bool_gen(self) -> bool:
+        """Generate a boolean from a JSON Schema boolean."""
+        return bool(self.seed % 2)
+
+    def _array_gen(self, schema: dict[str, Any]) -> list[Any]:
+        """Generate an array from a JSON Schema array."""
+        data: list[Any] = []
+        unique_items = schema.get('uniqueItems')
+        if prefix_items := schema.get('prefixItems'):
+            for item in prefix_items:
+                data.append(self._gen_any(item))
+                if unique_items:
+                    self.seed += 1
+
+        items_schema = schema.get('items', {})
+        min_items = schema.get('minItems', 0)
+        if min_items > len(data):
+            for _ in range(min_items - len(data)):
+                data.append(self._gen_any(items_schema))
+                if unique_items:
+                    self.seed += 1
+        elif items_schema:
+            # if there is an `items` schema, add an item unless it would break `maxItems` rule
+            max_items = schema.get('maxItems')
+            if max_items is None or max_items > len(data):
+                data.append(self._gen_any(items_schema))
+                if unique_items:
+                    self.seed += 1
+
+        return data
+
+    def _char(self) -> str:
+        """Generate a character on the same principle as Excel columns, e.g. a-z, aa-az..."""
+        chars = len(_chars)
+        s = ''
+        rem = self.seed // chars
+        while rem > 0:
+            s += _chars[(rem - 1) % chars]
+            rem //= chars
+        s += _chars[self.seed % chars]
+        return s
+
+    def _gen_any(self, schema: dict[str, Any]) -> Any:
+        """Generate data for any JSON Schema."""
+        if const := schema.get('const'):
+            return const
+        elif enum := schema.get('enum'):
+            return enum[self.seed % len(enum)]
+        elif examples := schema.get('examples'):
+            return examples[self.seed % len(examples)]
+        elif ref := schema.get('$ref'):
+            key = re.sub(r'^#/\$defs/', '', ref)
+            js_def = self.defs[key]
+            return self._gen_any(js_def)
+        elif any_of := schema.get('anyOf'):
+            return self._gen_any(any_of[self.seed % len(any_of)])
+
+        type_ = schema.get('type')
+        if type_ is None:
+            # if there's no type or ref, we can't generate anything
+            return self._char()
+        elif type_ == 'object':
+            return self._object_gen(schema)
+        elif type_ == 'string':
+            return self._str_gen(schema)
+        elif type_ == 'integer':
+            return self._int_gen(schema)
+        elif type_ == 'number':
+            return float(self._int_gen(schema))
+        elif type_ == 'boolean':
+            return self._bool_gen()
+        elif type_ == 'array':
+            return self._array_gen(schema)
+        elif type_ == 'null':
+            return None
+        else:
+            raise NotImplementedError(f'Unknown type: {type_}, please submit a PR to extend JsonSchemaTestData!')
+
+    def _bool_gen(self) -> bool:
+        """Generate a boolean from a JSON Schema boolean."""
+        return bool(self.seed % 2)
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+class SchemaValidatorProt(Protocol):
+    """Protocol for a Pydantic Core `SchemaValidator` or `PluggableSchemaValidator` (which is private but API-compatible)."""
+
+    def validate_json(
+        self,
+        input: str | bytes | bytearray,
+        *,
+        allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
+        **kwargs: Any,
+    ) -> Any: ...
+
+    def validate_python(
+        self, input: Any, *, allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False, **kwargs: Any
+    ) -> Any: ...
+
+    def validate_json(
+        self,
+        input: str | bytes | bytearray,
+        *,
+        allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
+        **kwargs: Any,
+    ) -> Any: ...
+
+## pydantic_ai_slim/pydantic_ai/ui/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the protocol-specific run input."""
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/ui/ag_ui/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the AG-UI run input."""
+        return self.load_messages(self.run_input.messages)
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the Vercel AI run input."""
+        return self.load_messages(self.run_input.messages)
+
+    def dump_messages(
+        cls,
+        messages: Sequence[ModelMessage],
+    ) -> list[UIMessage]:
+        """Transform Pydantic AI messages into Vercel AI messages.
+
+        Args:
+            messages: A sequence of ModelMessage objects to convert
+
+        Returns:
+            A list of UIMessage objects in Vercel AI format
+        """
+        tool_results: dict[str, ToolReturnPart | RetryPromptPart] = {}
+
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                for part in msg.parts:
+                    if isinstance(part, ToolReturnPart):
+                        tool_results[part.tool_call_id] = part
+                    elif isinstance(part, RetryPromptPart) and part.tool_name:
+                        tool_results[part.tool_call_id] = part
+
+        result: list[UIMessage] = []
+
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                system_ui_parts, user_ui_parts = cls._dump_request_message(msg)
+                if system_ui_parts:
+                    result.append(UIMessage(id=str(uuid.uuid4()), role='system', parts=system_ui_parts))
+
+                if user_ui_parts:
+                    result.append(UIMessage(id=str(uuid.uuid4()), role='user', parts=user_ui_parts))
+
+            elif isinstance(  # pragma: no branch
+                msg, ModelResponse
+            ):
+                ui_parts: list[UIMessagePart] = cls._dump_response_message(msg, tool_results)
+                if ui_parts:  # pragma: no branch
+                    result.append(UIMessage(id=str(uuid.uuid4()), role='assistant', parts=ui_parts))
+            else:
+                assert_never(msg)
+
+        return result
+
+## pydantic_graph/pydantic_graph/nodes.py
+
+class BaseNode(ABC, Generic[StateT, DepsT, NodeRunEndT]):
+    """Base class for a node."""
+
+    docstring_notes: ClassVar[bool] = False
+    """Set to `True` to generate mermaid diagram notes from the class's docstring.
+
+    While this can add valuable information to the diagram, it can make diagrams harder to view, hence
+    it is disabled by default. You can also customise notes overriding the
+    [`get_note`][pydantic_graph.nodes.BaseNode.get_note] method.
+    """
+
+    @abstractmethod
+    async def run(self, ctx: GraphRunContext[StateT, DepsT]) -> BaseNode[StateT, DepsT, Any] | End[NodeRunEndT]:
+        """Run the node.
+
+        This is an abstract method that must be implemented by subclasses.
+
+        !!! note "Return types used at runtime"
+            The return type of this method are read by `pydantic_graph` at runtime and used to define which
+            nodes can be called next in the graph. This is displayed in [mermaid diagrams](mermaid.md)
+            and enforced when running the graph.
+
+        Args:
+            ctx: The graph context.
+
+        Returns:
+            The next node to run or [`End`][pydantic_graph.nodes.End] to signal the end of the graph.
+        """
+        ...
+
+    def get_snapshot_id(self) -> str:
+        if snapshot_id := getattr(self, '__snapshot_id', None):
+            return snapshot_id
+        else:
+            snapshot_id = generate_snapshot_id(self.get_node_id())
+            object.__setattr__(self, '__snapshot_id', snapshot_id)
+            return snapshot_id
+
+    def set_snapshot_id(self, snapshot_id: str) -> None:
+        object.__setattr__(self, '__snapshot_id', snapshot_id)
+
+    @classmethod
+    @cache
+    def get_node_id(cls) -> str:
+        """Get the ID of the node."""
+        return cls.__name__
+
+    @classmethod
+    def get_note(cls) -> str | None:
+        """Get a note about the node to render on mermaid charts.
+
+        By default, this returns a note only if [`docstring_notes`][pydantic_graph.nodes.BaseNode.docstring_notes]
+        is `True`. You can override this method to customise the node notes.
+        """
+        if not cls.docstring_notes:
+            return None
+        docstring = cls.__doc__
+        # dataclasses get an automatic docstring which is just their signature, we don't want that
+        if docstring and is_dataclass(cls) and docstring.startswith(f'{cls.__name__}('):
+            docstring = None  # pragma: no cover
+        if docstring:  # pragma: no branch
+            # remove indentation from docstring
+            import inspect
+
+            docstring = inspect.cleandoc(docstring)
+        return docstring
+
+    @classmethod
+    def get_node_def(cls, local_ns: dict[str, Any] | None) -> NodeDef[StateT, DepsT, NodeRunEndT]:
+        """Get the node definition."""
+        type_hints = get_type_hints(cls.run, localns=local_ns, include_extras=True)
+        try:
+            return_hint = type_hints['return']
+        except KeyError as e:
+            raise exceptions.GraphSetupError(f'Node {cls} is missing a return type hint on its `run` method') from e
+
+        next_node_edges: dict[str, Edge] = {}
+        end_edge: Edge | None = None
+        returns_base_node: bool = False
+        for return_type in _utils.get_union_args(return_hint):
+            return_type, annotations = _utils.unpack_annotated(return_type)
+            edge = next((a for a in annotations if isinstance(a, Edge)), Edge(None))
+            return_type_origin = get_origin(return_type) or return_type
+            if return_type_origin is End:
+                end_edge = edge
+            elif return_type_origin is BaseNode:
+                returns_base_node = True
+            elif issubclass(return_type_origin, BaseNode):
+                next_node_edges[return_type.get_node_id()] = edge
+            else:
+                raise exceptions.GraphSetupError(f'Invalid return type: {return_type}')
+
+        return NodeDef(
+            node=cls,
+            node_id=cls.get_node_id(),
+            note=cls.get_note(),
+            next_node_edges=next_node_edges,
+            end_edge=end_edge,
+            returns_base_node=returns_base_node,
+        )
+
+    def deep_copy(self) -> Self:
+        """Returns a deep copy of the node."""
+        return copy.deepcopy(self)
+
+    def get_snapshot_id(self) -> str:
+        if snapshot_id := getattr(self, '__snapshot_id', None):
+            return snapshot_id
+        else:
+            snapshot_id = generate_snapshot_id(self.get_node_id())
+            object.__setattr__(self, '__snapshot_id', snapshot_id)
+            return snapshot_id
+
+    def set_snapshot_id(self, snapshot_id: str) -> None:
+        object.__setattr__(self, '__snapshot_id', snapshot_id)
+
+    def deep_copy_data(self) -> End[RunEndT]:
+        """Returns a deep copy of the end of the run."""
+        if self.data is None:
+            return self
+        else:
+            end = End(copy.deepcopy(self.data))
+            end.set_snapshot_id(self.get_snapshot_id())
+            return end
+
+## tests/models/test_anthropic.py
+
+    def messages(self) -> Any:
+        return type('Messages', (), {'create': self.messages_create, 'count_tokens': self.messages_count_tokens})
+
+## tests/test_ui.py
+
+    def messages(self) -> list[ModelMessage]:
+        return self.load_messages(self.run_input.messages)
+
+## tests/test_vercel_ai.py
+
+async def test_adapter_dump_messages_thinking_with_metadata():
+    """Test dumping and loading messages with ThinkingPart metadata preservation."""
+    original_messages = [
+        ModelResponse(
+            parts=[
+                ThinkingPart(
+                    content='Let me think about this...',
+                    id='thinking_123',
+                    signature='sig_abc',
+                    provider_name='anthropic',
+                    provider_details={'model': 'claude-3'},
+                ),
+                TextPart(content='Here is my answer.'),
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(original_messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'reasoning',
+                        'text': 'Let me think about this...',
+                        'state': 'done',
+                        'provider_metadata': {
+                            'pydantic_ai': {
+                                'id': 'thinking_123',
+                                'signature': 'sig_abc',
+                                'provider_name': 'anthropic',
+                                'provider_details': {'model': 'claude-3'},
+                            }
+                        },
+                    },
+                    {'type': 'text', 'text': 'Here is my answer.', 'state': 'done', 'provider_metadata': None},
+                ],
+            }
+        ]
+    )
+
+    # Test roundtrip - verify metadata is preserved when loading back
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+
+    # Sync timestamps for comparison (ModelResponse always has timestamp)
+    for orig_msg, new_msg in zip(original_messages, reloaded_messages):
+        new_msg.timestamp = orig_msg.timestamp
+
+    assert reloaded_messages == original_messages
+
+async def test_adapter_load_messages_text_with_provider_metadata():
+    """Test loading TextUIPart with provider_metadata preserves metadata on TextPart."""
+    ui_messages = [
+        UIMessage(
+            id='msg1',
+            role='assistant',
+            parts=[
+                TextUIPart(
+                    text='Hello with metadata',
+                    state='done',
+                    provider_metadata={
+                        'pydantic_ai': {
+                            'id': 'text_123',
+                            'provider_name': 'anthropic',
+                            'provider_details': {'model': 'gpt-4', 'tokens': 50},
+                        }
+                    },
+                )
+            ],
+        )
+    ]
+
+    messages = VercelAIAdapter.load_messages(ui_messages)
+    assert messages == snapshot(
+        [
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content='Hello with metadata',
+                        id='text_123',
+                        provider_name='anthropic',
+                        provider_details={'model': 'gpt-4', 'tokens': 50},
+                    )
+                ],
+                timestamp=IsDatetime(),
+            )
+        ]
+    )
+
+async def test_adapter_load_messages_tool_call_with_provider_metadata():
+    """Test loading dynamic tool part with provider_metadata preserves metadata on ToolCallPart."""
+    from pydantic_ai.ui.vercel_ai.request_types import DynamicToolInputAvailablePart
+
+    ui_messages = [
+        UIMessage(
+            id='msg1',
+            role='assistant',
+            parts=[
+                DynamicToolInputAvailablePart(
+                    tool_name='my_tool',
+                    tool_call_id='tc_123',
+                    input='{"key": "value"}',
+                    state='input-available',
+                    call_provider_metadata={
+                        'pydantic_ai': {
+                            'provider_name': 'anthropic',
+                            'provider_details': {'index': 0},
+                        }
+                    },
+                )
+            ],
+        )
+    ]
+
+    messages = VercelAIAdapter.load_messages(ui_messages)
+    assert messages == snapshot(
+        [
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='my_tool',
+                        args={'key': 'value'},
+                        tool_call_id='tc_123',
+                        provider_name='anthropic',
+                        provider_details={'index': 0},
+                    ),
+                ],
+                timestamp=IsDatetime(),
+            )
+        ]
+    )
+
+async def test_adapter_load_messages_file_with_provider_metadata():
+    """Test loading FileUIPart with provider_metadata preserves id, provider_name, and provider_details."""
+    ui_messages = [
+        UIMessage(
+            id='msg1',
+            role='assistant',
+            parts=[
+                FileUIPart(
+                    url='data:image/png;base64,ZmlsZV9kYXRh',
+                    media_type='image/png',
+                    provider_metadata={
+                        'pydantic_ai': {
+                            'id': 'file_456',
+                            'provider_name': 'anthropic',
+                            'provider_details': {'source': 'generated'},
+                        }
+                    },
+                )
+            ],
+        )
+    ]
+
+    messages = VercelAIAdapter.load_messages(ui_messages)
+    assert messages == snapshot(
+        [
+            ModelResponse(
+                parts=[
+                    FilePart(
+                        content=BinaryImage(data=b'file_data', media_type='image/png', _identifier='cdd967'),
+                        id='file_456',
+                        provider_name='anthropic',
+                        provider_details={'source': 'generated'},
+                    )
+                ],
+                timestamp=IsDatetime(),
+            )
+        ]
+    )
+
+async def test_adapter_dump_messages_tool_error_with_provider_metadata():
+    """Test dumping ToolCallPart with RetryPromptPart includes provider metadata with provider_name."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Do task')]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name='failing_tool',
+                    args={'x': 1},
+                    tool_call_id='tc_fail',
+                    id='call_fail_id',
+                    provider_name='google',
+                    provider_details={'attempt': 1},
+                ),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content='Tool execution failed',
+                    tool_name='failing_tool',
+                    tool_call_id='tc_fail',
+                )
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Do task', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'dynamic-tool',
+                        'tool_name': 'failing_tool',
+                        'tool_call_id': 'tc_fail',
+                        'state': 'output-error',
+                        'input': '{"x":1}',
+                        'error_text': """\
+Tool execution failed
+
+Fix the errors and try again.\
+""",
+                        'call_provider_metadata': {
+                            'pydantic_ai': {
+                                'id': 'call_fail_id',
+                                'provider_name': 'google',
+                                'provider_details': {'attempt': 1},
+                            }
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+
+    # Verify roundtrip
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    # Content will have changed for retry prompt part, so we set it back to the original value
+    retry_prompt_part = reloaded_messages[2].parts[0]
+    assert isinstance(retry_prompt_part, RetryPromptPart)
+    assert retry_prompt_part.content == 'Tool execution failed\n\nFix the errors and try again.'
+    retry_prompt_part.content = 'Tool execution failed'
+    _sync_timestamps(messages, reloaded_messages)
+    assert reloaded_messages == messages
+
+def _sync_timestamps(original: list[ModelMessage], new: list[ModelMessage]) -> None:
+    """Utility function to sync timestamps between original and new messages."""
+    for orig_msg, new_msg in zip(original, new):
+        for orig_part, new_part in zip(orig_msg.parts, new_msg.parts):
+            if hasattr(orig_part, 'timestamp') and hasattr(new_part, 'timestamp'):
+                new_part.timestamp = orig_part.timestamp  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+        if hasattr(orig_msg, 'timestamp') and hasattr(new_msg, 'timestamp'):  # pragma: no branch
+            new_msg.timestamp = orig_msg.timestamp  # pyright: ignore[reportAttributeAccessIssue]

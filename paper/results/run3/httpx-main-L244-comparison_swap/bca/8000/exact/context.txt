@@ -1,0 +1,998 @@
+## httpx/_api.py
+
+def get(
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `GET` request.
+
+    **Parameters**: See `httpx.request`.
+
+    Note that the `data`, `files`, `json` and `content` parameters are not available
+    on this function, as `GET` requests should not include a request body.
+    """
+    return request(
+        "GET",
+        url,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+## httpx/_content.py
+
+def encode_urlencoded_data(
+    data: RequestData,
+) -> tuple[dict[str, str], ByteStream]:
+    plain_data = []
+    for key, value in data.items():
+        if isinstance(value, (list, tuple)):
+            plain_data.extend([(key, primitive_value_to_str(item)) for item in value])
+        else:
+            plain_data.append((key, primitive_value_to_str(value)))
+    body = urlencode(plain_data, doseq=True).encode("utf-8")
+    content_length = str(len(body))
+    content_type = "application/x-www-form-urlencoded"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+def encode_text(text: str) -> tuple[dict[str, str], ByteStream]:
+    body = text.encode("utf-8")
+    content_length = str(len(body))
+    content_type = "text/plain; charset=utf-8"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+def encode_html(html: str) -> tuple[dict[str, str], ByteStream]:
+    body = html.encode("utf-8")
+    content_length = str(len(body))
+    content_type = "text/html; charset=utf-8"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+def encode_json(json: Any) -> tuple[dict[str, str], ByteStream]:
+    body = json_dumps(
+        json, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    content_length = str(len(body))
+    content_type = "application/json"
+    headers = {"Content-Length": content_length, "Content-Type": content_type}
+    return headers, ByteStream(body)
+
+## httpx/_decoders.py
+
+class ContentDecoder:
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+class IdentityDecoder(ContentDecoder):
+    """
+    Handle unencoded data.
+    """
+
+    def decode(self, data: bytes) -> bytes:
+        return data
+
+    def flush(self) -> bytes:
+        return b""
+
+class TextDecoder:
+    """
+    Handles incrementally decoding bytes into text
+    """
+
+    def __init__(self, encoding: str = "utf-8") -> None:
+        self.decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+
+    def decode(self, data: bytes) -> str:
+        return self.decoder.decode(data)
+
+    def flush(self) -> str:
+        return self.decoder.decode(b"", True)
+
+## httpx/_exceptions.py
+
+class HTTPError(Exception):
+    """
+    Base class for `RequestError` and `HTTPStatusError`.
+
+    Useful for `try...except` blocks when issuing a request,
+    and then calling `.raise_for_status()`.
+
+    For example:
+
+    ```
+    try:
+        response = httpx.get("https://www.example.com")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        print(f"HTTP Exception for {exc.request.url} - {exc}")
+    ```
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._request: Request | None = None
+
+    @property
+    def request(self) -> Request:
+        if self._request is None:
+            raise RuntimeError("The .request property has not been set.")
+        return self._request
+
+    @request.setter
+    def request(self, request: Request) -> None:
+        self._request = request
+
+class RequestError(HTTPError):
+    """
+    Base class for all exceptions that may occur when issuing a `.request()`.
+    """
+
+    def __init__(self, message: str, *, request: Request | None = None) -> None:
+        super().__init__(message)
+        # At the point an exception is raised we won't typically have a request
+        # instance to associate it with.
+        #
+        # The 'request_context' context manager is used within the Client and
+        # Response methods in order to ensure that any raised exceptions
+        # have a `.request` property set on them.
+        self._request = request
+
+class TransportError(RequestError):
+    """
+    Base class for all exceptions that occur at the level of the Transport API.
+    """
+
+class ProtocolError(TransportError):
+    """
+    The protocol was violated.
+    """
+
+## httpx/_main.py
+
+def format_request_headers(request: httpcore.Request, http2: bool = False) -> str:
+    version = "HTTP/2" if http2 else "HTTP/1.1"
+    headers = [
+        (name.lower() if http2 else name, value) for name, value in request.headers
+    ]
+    method = request.method.decode("ascii")
+    target = request.url.target.decode("ascii")
+    lines = [f"{method} {target} {version}"] + [
+        f"{name.decode('ascii')}: {value.decode('ascii')}" for name, value in headers
+    ]
+    return "\n".join(lines)
+
+def format_response_headers(
+    http_version: bytes,
+    status: int,
+    reason_phrase: bytes | None,
+    headers: list[tuple[bytes, bytes]],
+) -> str:
+    version = http_version.decode("ascii")
+    reason = (
+        codes.get_reason_phrase(status)
+        if reason_phrase is None
+        else reason_phrase.decode("ascii")
+    )
+    lines = [f"{version} {status} {reason}"] + [
+        f"{name.decode('ascii')}: {value.decode('ascii')}" for name, value in headers
+    ]
+    return "\n".join(lines)
+
+## httpx/_models.py
+
+def _is_known_encoding(encoding: str) -> bool:
+    """
+    Return `True` if `encoding` is a known codec.
+    """
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        return False
+    return True
+
+def _parse_content_type_charset(content_type: str) -> str | None:
+    # We used to use `cgi.parse_header()` here, but `cgi` became a dead battery.
+    # See: https://peps.python.org/pep-0594/#cgi
+    msg = email.message.Message()
+    msg["content-type"] = content_type
+    return msg.get_content_charset(failobj=None)
+
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+    def __setitem__(self, name: str, value: str) -> None:
+        return self.set(name, value)
+
+    def __getitem__(self, name: str) -> str:
+        value = self.get(name)
+        if value is None:
+            raise KeyError(name)
+        return value
+
+    def __delitem__(self, name: str) -> None:
+        return self.delete(name)
+
+    class _CookieCompatResponse:
+        """
+        Wraps a `Request` instance up in a compatibility interface suitable
+        for use with `CookieJar` operations.
+        """
+
+        def __init__(self, response: Response) -> None:
+            self.response = response
+
+        def info(self) -> email.message.Message:
+            info = email.message.Message()
+            for key, value in self.response.headers.multi_items():
+                # Note that setting `info[key]` here is an "append" operation,
+                # not a "replace" operation.
+                # https://docs.python.org/3/library/email.compat32-message.html#email.message.Message.__setitem__
+                info[key] = value
+            return info
+
+## httpx/_multipart.py
+
+def _format_form_param(name: str, value: str) -> bytes:
+    """
+    Encode a name/value pair within a multipart form.
+    """
+
+    def replacer(match: typing.Match[str]) -> str:
+        return _HTML5_FORM_ENCODING_REPLACEMENTS[match.group(0)]
+
+    value = _HTML5_FORM_ENCODING_RE.sub(replacer, value)
+    return f'{name}="{value}"'.encode()
+
+def _guess_content_type(filename: str | None) -> str | None:
+    """
+    Guesses the mimetype based on a filename. Defaults to `application/octet-stream`.
+
+    Returns `None` if `filename` is `None` or empty.
+    """
+    if filename:
+        return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return None
+
+## httpx/_status_codes.py
+
+    PRECONDITION_FAILED = 412, "Precondition Failed"
+
+    PRECONDITION_REQUIRED = 428, "Precondition Required"
+
+## httpx/_transports/asgi.py
+
+def create_event() -> Event:
+    if is_running_trio():
+        import trio
+
+        return trio.Event()
+
+    import asyncio
+
+    return asyncio.Event()
+
+## httpx/_types.py
+
+class SyncByteStream:
+    def __iter__(self) -> Iterator[bytes]:
+        raise NotImplementedError(
+            "The '__iter__' method must be implemented."
+        )  # pragma: no cover
+        yield b""  # pragma: no cover
+
+    def close(self) -> None:
+        """
+        Subclasses can override this method to release any network resources
+        after a request/response cycle is complete.
+        """
+
+    def close(self) -> None:
+        """
+        Subclasses can override this method to release any network resources
+        after a request/response cycle is complete.
+        """
+
+class AsyncByteStream:
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        raise NotImplementedError(
+            "The '__aiter__' method must be implemented."
+        )  # pragma: no cover
+        yield b""  # pragma: no cover
+
+    async def aclose(self) -> None:
+        pass
+
+## httpx/_urlparse.py
+
+USERNAME_SAFE = "".join(
+    [
+        chr(i)
+        for i in range(0x20, 0x7F)
+        if i
+        not in (0x20, 0x22, 0x23, 0x3C, 0x3E)
+        + (0x3F, 0x60, 0x7B, 0x7D)
+        + (0x2F, 0x3A, 0x3B, 0x3D, 0x40, 0x5B, 0x5C, 0x5D, 0x5E, 0x7C)
+    ]
+)
+
+IPv4_STYLE_HOSTNAME = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")
+
+IPv6_STYLE_HOSTNAME = re.compile(r"^\[.*\]$")
+
+def PERCENT(string: str) -> str:
+    return "".join([f"%{byte:02X}" for byte in string.encode("utf-8")])
+
+def percent_encoded(string: str, safe: str) -> str:
+    """
+    Use percent-encoding to quote a string.
+    """
+    NON_ESCAPED_CHARS = UNRESERVED_CHARACTERS + safe
+
+    # Fast path for strings that don't need escaping.
+    if not string.rstrip(NON_ESCAPED_CHARS):
+        return string
+
+    return "".join(
+        [char if char in NON_ESCAPED_CHARS else PERCENT(char) for char in string]
+    )
+
+## httpx/_urls.py
+
+    def username(self) -> str:
+        """
+        The URL username as a string, with URL decoding applied.
+        For example: "jo@email.com"
+        """
+        userinfo = self._uri_reference.userinfo
+        return unquote(userinfo.partition(":")[0])
+
+    def raw_path(self) -> bytes:
+        """
+        The complete URL path and query string as raw bytes.
+        Used as the target when constructing HTTP requests.
+
+        For example:
+
+        GET /users?search=some%20text HTTP/1.1
+        Host: www.example.org
+        Connection: close
+        """
+        path = self._uri_reference.path or "/"
+        if self._uri_reference.query is not None:
+            path += "?" + self._uri_reference.query
+        return path.encode("ascii")
+
+    def raw(self) -> tuple[bytes, bytes, int, bytes]:  # pragma: nocover
+        import collections
+        import warnings
+
+        warnings.warn("URL.raw is deprecated.")
+        RawURL = collections.namedtuple(
+            "RawURL", ["raw_scheme", "raw_host", "port", "raw_path"]
+        )
+        return RawURL(
+            raw_scheme=self.raw_scheme,
+            raw_host=self.raw_host,
+            port=self.port,
+            raw_path=self.raw_path,
+        )
+
+## httpx/_utils.py
+
+def is_ipv4_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv4Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+def is_ipv6_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv6Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+## tests/client/test_client.py
+
+def test_stream_response(server):
+    with httpx.Client() as client:
+        with client.stream("GET", server.url) as response:
+            content = response.read()
+    assert response.status_code == 200
+    assert content == b"Hello, world!"
+
+## tests/client/test_event_hooks.py
+
+def app(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/redirect":
+        return httpx.Response(303, headers={"server": "testserver", "location": "/"})
+    elif request.url.path.startswith("/status/"):
+        status_code = int(request.url.path[-3:])
+        return httpx.Response(status_code, headers={"server": "testserver"})
+
+    return httpx.Response(200, headers={"server": "testserver"})
+
+## tests/client/test_headers.py
+
+def echo_repeated_headers_items(request: httpx.Request) -> httpx.Response:
+    data = {"headers": list(request.headers.items())}
+    return httpx.Response(200, json=data)
+
+## tests/client/test_proxies.py
+
+def test_transport_for_request(url, proxies, expected):
+    mounts = {key: httpx.HTTPTransport(proxy=value) for key, value in proxies.items()}
+    client = httpx.Client(mounts=mounts)
+
+    transport = client._transport_for_url(httpx.URL(url))
+
+    if expected is None:
+        assert transport is client._transport
+    else:
+        assert isinstance(transport, httpx.HTTPTransport)
+        assert isinstance(transport._pool, httpcore.HTTPProxy)
+        assert transport._pool._proxy_url == url_to_origin(expected)
+
+def test_proxies_environ(monkeypatch, client_class, url, env, expected):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    client = client_class()
+    transport = client._transport_for_url(httpx.URL(url))
+
+    if expected is None:
+        assert transport == client._transport
+    else:
+        assert transport._pool._proxy_url == url_to_origin(expected)
+
+def test_for_deprecated_proxy_params(proxies, is_valid):
+    mounts = {key: httpx.HTTPTransport(proxy=value) for key, value in proxies.items()}
+
+    if not is_valid:
+        with pytest.raises(ValueError):
+            httpx.Client(mounts=mounts)
+    else:
+        httpx.Client(mounts=mounts)
+
+## tests/concurrency.py
+
+async def sleep(seconds: float) -> None:
+    if sniffio.current_async_library() == "trio":
+        await trio.sleep(seconds)  # pragma: no cover
+    else:
+        await asyncio.sleep(seconds)
+
+## tests/conftest.py
+
+def clean_environ():
+    """Keeps os.environ clean for every test without having to mock os.environ"""
+    original_environ = os.environ.copy()
+    os.environ.clear()
+    os.environ.update(
+        {
+            k: v
+            for k, v in original_environ.items()
+            if k not in ENVIRONMENT_VARIABLES and k.lower() not in ENVIRONMENT_VARIABLES
+        }
+    )
+    yield
+    os.environ.clear()
+    os.environ.update(original_environ)
+
+async def app(scope: Scope, receive: Receive, send: Send) -> None:
+    assert scope["type"] == "http"
+    if scope["path"].startswith("/slow_response"):
+        await slow_response(scope, receive, send)
+    elif scope["path"].startswith("/status"):
+        await status_code(scope, receive, send)
+    elif scope["path"].startswith("/echo_body"):
+        await echo_body(scope, receive, send)
+    elif scope["path"].startswith("/echo_binary"):
+        await echo_binary(scope, receive, send)
+    elif scope["path"].startswith("/echo_headers"):
+        await echo_headers(scope, receive, send)
+    elif scope["path"].startswith("/redirect_301"):
+        await redirect_301(scope, receive, send)
+    elif scope["path"].startswith("/json"):
+        await hello_world_json(scope, receive, send)
+    else:
+        await hello_world(scope, receive, send)
+
+async def slow_response(scope: Scope, receive: Receive, send: Send) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [[b"content-type", b"text/plain"]],
+        }
+    )
+    await sleep(1.0)  # Allow triggering a read timeout.
+    await send({"type": "http.response.body", "body": b"Hello, world!"})
+
+    async def restart(self) -> None:  # pragma: no cover
+        # This coroutine may be called from a different thread than the one the
+        # server is running on, and from an async environment that's not asyncio.
+        # For this reason, we use an event to coordinate with the server
+        # instead of calling shutdown()/startup() directly, and should not make
+        # any asyncio-specific operations.
+        self.started = False
+        self.restart_requested.set()
+        while not self.started:
+            await sleep(0.2)
+
+    async def watch_restarts(self) -> None:  # pragma: no cover
+        while True:
+            if self.should_exit:
+                return
+
+            try:
+                await asyncio.wait_for(self.restart_requested.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+            self.restart_requested.clear()
+            await self.shutdown()
+            await self.startup()
+
+def serve_in_thread(server: TestServer) -> typing.Iterator[TestServer]:
+    thread = threading.Thread(target=server.run)
+    thread.start()
+    try:
+        while not server.started:
+            time.sleep(1e-3)
+        yield server
+    finally:
+        server.should_exit = True
+        thread.join()
+
+def server() -> typing.Iterator[TestServer]:
+    config = Config(app=app, lifespan="off", loop="asyncio")
+    server = TestServer(config=config)
+    yield from serve_in_thread(server)
+
+## tests/models/test_cookies.py
+
+def test_cookies_update():
+    cookies = httpx.Cookies()
+    more_cookies = httpx.Cookies()
+    more_cookies.set("name", "value", domain="example.com")
+
+    cookies.update(more_cookies)
+    assert dict(cookies) == {"name": "value"}
+    assert cookies.get("name", domain="example.com") == "value"
+
+def test_cookies_with_domain():
+    cookies = httpx.Cookies()
+    cookies.set("name", "value", domain="example.com")
+    cookies.set("name", "value", domain="example.org")
+
+    with pytest.raises(httpx.CookieConflict):
+        cookies["name"]
+
+    cookies.clear(domain="example.com")
+    assert len(cookies) == 1
+
+def test_cookies_with_domain_and_path():
+    cookies = httpx.Cookies()
+    cookies.set("name", "value", domain="example.com", path="/subpath/1")
+    cookies.set("name", "value", domain="example.com", path="/subpath/2")
+    cookies.clear(domain="example.com", path="/subpath/1")
+    assert len(cookies) == 1
+    cookies.delete("name", domain="example.com", path="/subpath/2")
+    assert len(cookies) == 0
+
+def test_cookies_can_be_a_list_of_tuples():
+    cookies_val = [("name1", "val1"), ("name2", "val2")]
+
+    cookies = httpx.Cookies(cookies_val)
+
+    assert len(cookies.items()) == 2
+    for k, v in cookies_val:
+        assert cookies[k] == v
+
+def test_cookies_repr():
+    cookies = httpx.Cookies()
+    cookies.set(name="foo", value="bar", domain="http://blah.com")
+    cookies.set(name="fizz", value="buzz", domain="http://hello.com")
+
+    assert repr(cookies) == (
+        "<Cookies[<Cookie foo=bar for http://blah.com />,"
+        " <Cookie fizz=buzz for http://hello.com />]>"
+    )
+
+## tests/models/test_queryparams.py
+
+def test_queryparam_set():
+    q = httpx.QueryParams("a=123")
+    q = q.set("a", "456")
+    assert q == httpx.QueryParams("a=456")
+
+def test_queryparams_are_hashable():
+    params = (
+        httpx.QueryParams("a=123"),
+        httpx.QueryParams({"a": 123}),
+        httpx.QueryParams("b=456"),
+        httpx.QueryParams({"b": 456}),
+    )
+
+    assert len(set(params)) == 2
+
+## tests/models/test_requests.py
+
+def test_url_encoded_data():
+    request = httpx.Request("POST", "http://example.org", data={"test": "123"})
+    request.read()
+
+    assert request.headers["Content-Type"] == "application/x-www-form-urlencoded"
+    assert request.content == b"test=123"
+
+def test_json_encoded_data():
+    request = httpx.Request("POST", "http://example.org", json={"test": 123})
+    request.read()
+
+    assert request.headers["Content-Type"] == "application/json"
+    assert request.content == b'{"test":123}'
+
+def test_read_and_stream_data():
+    # Ensure a request may still be streamed if it has been read.
+    # Needed for cases such as authentication classes that read the request body.
+    request = httpx.Request("POST", "http://example.org", json={"test": 123})
+    request.read()
+    assert request.stream is not None
+    assert isinstance(request.stream, typing.Iterable)
+    content = b"".join(list(request.stream))
+    assert content == request.content
+
+async def test_aread_and_stream_data():
+    # Ensure a request may still be streamed if it has been read.
+    # Needed for cases such as authentication classes that read the request body.
+    request = httpx.Request("POST", "http://example.org", json={"test": 123})
+    await request.aread()
+    assert request.stream is not None
+    assert isinstance(request.stream, typing.AsyncIterable)
+    content = b"".join([part async for part in request.stream])
+    assert content == request.content
+
+## tests/models/test_responses.py
+
+def streaming_body() -> typing.Iterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+def test_empty_read():
+    response = httpx.Response(200)
+
+    assert response.status_code == 200
+    assert response.text == ""
+    assert response.encoding == "utf-8"
+    assert response.is_closed
+
+    content = response.read()
+
+    assert content == b""
+    assert response.content == b""
+    assert response.is_closed
+
+def test_sync_streaming_response():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    assert response.status_code == 200
+    assert not response.is_closed
+
+    content = response.read()
+
+    assert content == b"Hello, world!"
+    assert response.content == b"Hello, world!"
+    assert response.is_closed
+
+def test_cannot_read_after_stream_consumed():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    content = b""
+    for part in response.iter_bytes():
+        content += part
+
+    with pytest.raises(httpx.StreamConsumed):
+        response.read()
+
+def test_cannot_read_after_response_closed():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    response.close()
+    with pytest.raises(httpx.StreamClosed):
+        response.read()
+
+## tests/models/test_url.py
+
+def test_complete_url():
+    url = httpx.URL("https://example.org:123/path/to/somewhere?abc=123#anchor")
+    assert url.scheme == "https"
+    assert url.host == "example.org"
+    assert url.port == 123
+    assert url.path == "/path/to/somewhere"
+    assert url.query == b"abc=123"
+    assert url.raw_path == b"/path/to/somewhere?abc=123"
+    assert url.fragment == "anchor"
+
+    assert str(url) == "https://example.org:123/path/to/somewhere?abc=123#anchor"
+    assert (
+        repr(url) == "URL('https://example.org:123/path/to/somewhere?abc=123#anchor')"
+    )
+
+def test_url_username_and_password(url, userinfo, username, password):
+    url = httpx.URL(url)
+    assert url.userinfo == userinfo
+    assert url.username == username
+    assert url.password == password
+
+def test_url_invalid_hostname():
+    """
+    Ensure that invalid URLs raise an `httpx.InvalidURL` exception.
+    """
+    with pytest.raises(httpx.InvalidURL):
+        httpx.URL("https://😇/")
+
+def test_url_eq_str():
+    """
+    Ensure that `httpx.URL` supports the equality operator.
+    """
+    url = httpx.URL("https://example.org:123/path/to/somewhere?abc=123#anchor")
+    assert url == "https://example.org:123/path/to/somewhere?abc=123#anchor"
+    assert str(url) == url
+
+def test_url_set():
+    """
+    Ensure that `httpx.URL` instances can be used in sets.
+    """
+    urls = (
+        httpx.URL("http://example.org:123/path/to/somewhere"),
+        httpx.URL("http://example.org:123/path/to/somewhere/else"),
+    )
+
+    url_set = set(urls)
+
+    assert all(url in urls for url in url_set)
+
+def test_url_join():
+    """
+    Some basic URL joining tests.
+    """
+    url = httpx.URL("https://example.org:123/path/to/somewhere")
+    assert url.join("/somewhere-else") == "https://example.org:123/somewhere-else"
+    assert (
+        url.join("somewhere-else") == "https://example.org:123/path/to/somewhere-else"
+    )
+    assert (
+        url.join("../somewhere-else") == "https://example.org:123/path/somewhere-else"
+    )
+    assert url.join("../../somewhere-else") == "https://example.org:123/somewhere-else"
+
+def test_relative_url_join():
+    url = httpx.URL("/path/to/somewhere")
+    assert url.join("/somewhere-else") == "/somewhere-else"
+    assert url.join("somewhere-else") == "/path/to/somewhere-else"
+    assert url.join("../somewhere-else") == "/path/somewhere-else"
+    assert url.join("../../somewhere-else") == "/somewhere-else"
+
+def test_resolution_error_1833():
+    """
+    See https://github.com/encode/httpx/issues/1833
+    """
+    url = httpx.URL("https://example.com/?[]")
+    assert url.join("/") == "https://example.com/"
+
+## tests/test_api.py
+
+def test_stream(server):
+    with httpx.stream("GET", server.url) as response:
+        response.read()
+
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+    assert response.text == "Hello, world!"
+    assert response.http_version == "HTTP/1.1"
+
+## tests/test_asgi.py
+
+async def test_asgi_transport():
+    async with httpx.ASGITransport(app=hello_world) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b"Hello, World!"
+
+async def test_asgi_transport_no_body():
+    async with httpx.ASGITransport(app=echo_body) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b""
+
+## tests/test_content.py
+
+async def test_empty_content():
+    request = httpx.Request(method, url)
+    assert isinstance(request.stream, httpx.SyncByteStream)
+    assert isinstance(request.stream, httpx.AsyncByteStream)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "0"}
+    assert sync_content == b""
+    assert async_content == b""
+
+async def test_bytesio_content():
+    request = httpx.Request(method, url, content=io.BytesIO(b"Hello, world!"))
+    assert isinstance(request.stream, typing.Iterable)
+    assert not isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+    assert content == b"Hello, world!"
+
+async def test_empty_request():
+    request = httpx.Request(method, url, data={}, files={})
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "0"}
+    assert sync_content == b""
+    assert async_content == b""
+
+async def test_response_empty_content():
+    response = httpx.Response(200)
+    assert isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(response.stream))
+    async_content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {}
+    assert sync_content == b""
+    assert async_content == b""
+
+async def test_response_bytes_content():
+    response = httpx.Response(200, content=b"Hello, world!")
+    assert isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(response.stream))
+    async_content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {"Content-Length": "13"}
+    assert sync_content == b"Hello, world!"
+    assert async_content == b"Hello, world!"
+
+## tests/test_decoders.py
+
+def test_decoders_empty_cases(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    response = httpx.Response(content=b"", status_code=200, headers=headers)
+    assert response.read() == b""
+
+async def test_text_decoder_known_encoding():
+    async def iterator() -> typing.AsyncIterator[bytes]:
+        yield b"\x83g"
+        yield b"\x83"
+        yield b"\x89\x83x\x83\x8b"
+
+    response = httpx.Response(
+        200,
+        headers=[(b"Content-Type", b"text/html; charset=shift-jis")],
+        content=iterator(),
+    )
+
+    await response.aread()
+    assert "".join(response.text) == "トラベル"
+
+def test_text_decoder_empty_cases():
+    response = httpx.Response(200, content=b"")
+    assert response.text == ""
+
+    response = httpx.Response(200, content=[b""])
+    response.read()
+    assert response.text == ""
+
+## tests/test_main.py
+
+def test_download(server):
+    url = str(server.url)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        runner.invoke(httpx.main, [url, "--download", "index.txt"])
+        assert os.path.exists("index.txt")
+        with open("index.txt", "r") as input_file:
+            assert input_file.read() == "Hello, world!"
+
+## tests/test_multipart.py
+
+def test_multipart_encode_files_allows_filenames_as_none() -> None:
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": (None, io.BytesIO(b"<file content>"))}
+
+    request = httpx.Request("POST", url, headers=headers, data={}, files=files)
+    request.read()
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Content-Length": str(len(request.content)),
+    }
+    assert request.content == (
+        '--BOUNDARY\r\nContent-Disposition: form-data; name="file"\r\n\r\n'
+        "<file content>\r\n--BOUNDARY--\r\n"
+        "".encode("ascii")
+    )
+
+## tests/test_wsgi.py
+
+def echo_body(
+    environ: WSGIEnvironment, start_response: StartResponse
+) -> typing.Iterable[bytes]:
+    status = "200 OK"
+    output = environ["wsgi.input"].read()
+
+    response_headers = [
+        ("Content-type", "text/plain"),
+    ]
+
+    start_response(status, response_headers)
+
+    return [output]
+
+def test_logging():
+    buffer = StringIO()
+    transport = httpx.WSGITransport(app=log_to_wsgi_log_buffer, wsgi_errors=buffer)
+    client = httpx.Client(transport=transport)
+    response = client.post("http://www.example.org/", content=b"example")
+    assert response.status_code == 200  # no errors
+    buffer.seek(0)
+    assert buffer.read() == "test1\ntest2"

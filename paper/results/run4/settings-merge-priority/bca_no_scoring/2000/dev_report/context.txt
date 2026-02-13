@@ -1,0 +1,261 @@
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+    temperature: float
+
+## pydantic_ai_slim/pydantic_ai/settings.py
+
+    temperature: float
+
+## pydantic_evals/pydantic_evals/reporting/__init__.py
+
+    assertions: dict[str, EvaluationResult[bool]]
+
+    assertions: float | None
+
+    include_assertions: bool
+
+## tests/mcp_server.py
+
+async def celsius_to_fahrenheit(celsius: float) -> float:
+    """Convert Celsius to Fahrenheit.
+
+    Args:
+        celsius: Temperature in Celsius
+
+    Returns:
+        Temperature in Fahrenheit
+    """
+    return (celsius * 9 / 5) + 32
+
+## tests/test_agent.py
+
+class Person(BaseModel):
+    name: str
+
+class ResultGeneric(BaseModel, Generic[T]):
+    """A generic result class."""
+
+    value: T
+    success: bool
+
+class StringData(BaseModel):
+    text: str
+
+def test_result_list_of_models_with_stringified_response():
+    def return_list(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        # Simulate providers that return the nested payload as a JSON string under "response"
+        args_json = json.dumps(
+            {
+                'response': json.dumps(
+                    [
+                        {'name': 'John Doe'},
+                        {'name': 'Jane Smith'},
+                    ]
+                )
+            }
+        )
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_list), output_type=list[Person])
+
+    result = agent.run_sync('Hello')
+    assert result.output == snapshot(
+        [
+            Person(name='John Doe'),
+            Person(name='Jane Smith'),
+        ]
+    )
+
+class Foo(BaseModel):
+    a: int
+    b: str
+
+def test_result_pydantic_model():
+    def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        args_json = '{"a": 1, "b": "foo"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(return_model), output_type=Foo)
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, Foo)
+    assert result.output.model_dump() == {'a': 1, 'b': 'foo'}
+
+def test_result_pydantic_model_validation_error():
+    def return_model(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+        if len(messages) == 1:
+            args_json = '{"a": 1, "b": "foo"}'
+        else:
+            args_json = '{"a": 1, "b": "bar"}'
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    class Bar(BaseModel):
+        a: int
+        b: str
+
+        @field_validator('b')
+        def check_b(cls, v: str) -> str:
+            if v == 'foo':
+                raise ValueError('must not be foo')
+            return v
+
+    agent = Agent(FunctionModel(return_model), output_type=Bar)
+
+    result = agent.run_sync('Hello')
+    assert isinstance(result.output, Bar)
+    assert result.output.model_dump() == snapshot({'a': 1, 'b': 'bar'})
+    messages_part_kinds = [(m.kind, [p.part_kind for p in m.parts]) for m in result.all_messages()]
+    assert messages_part_kinds == snapshot(
+        [
+            ('request', ['user-prompt']),
+            ('response', ['tool-call']),
+            ('request', ['retry-prompt']),
+            ('response', ['tool-call']),
+            ('request', ['tool-return']),
+        ]
+    )
+
+    user_retry = result.all_messages()[2]
+    assert isinstance(user_retry, ModelRequest)
+    retry_prompt = user_retry.parts[0]
+    assert isinstance(retry_prompt, RetryPromptPart)
+    assert retry_prompt.model_response() == snapshot("""\
+1 validation error:
+```json
+[
+  {
+    "type": "value_error",
+    "loc": [
+      "b"
+    ],
+    "msg": "Value error, must not be foo",
+    "input": "foo"
+  }
+]
+```
+
+Fix the errors and try again.""")
+
+def test_output_tool_return_content_no_tool():
+    agent = Agent('test', output_type=int)
+
+    result = agent.run_sync('Hello')
+    assert result.output == 0
+    result._output_tool_name = 'wrong'  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(LookupError, match=re.escape("No tool call found with tool name 'wrong'.")):
+        result.all_messages(output_tool_return_content='foobar')
+
+def upcase(text: str) -> str:
+    return text.upper()
+
+def test_output_type_multiple_text_output(output_type: OutputSpec[str]):
+    with pytest.raises(UserError, match='Only one `str` or `TextOutput` is allowed.'):
+        Agent('test', output_type=output_type)
+
+def test_dynamic_false_no_reevaluate():
+    """When dynamic is false (default), the system prompt is not reevaluated
+    i.e: SystemPromptPart(
+            content="A",       <--- Remains the same when `message_history` is passed.
+    )
+    """
+    agent = Agent('test', system_prompt='Foobar')
+
+    dynamic_value = 'A'
+
+    @agent.system_prompt
+    async def func() -> str:
+        return dynamic_value
+
+    res = agent.run_sync('Hello')
+
+    assert res.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(content='Foobar', timestamp=IsNow(tz=timezone.utc)),
+                    SystemPromptPart(content=dynamic_value, timestamp=IsNow(tz=timezone.utc)),
+                    UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc)),
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=53, output_tokens=4),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='response',
+            ),
+        ]
+    )
+
+    dynamic_value = 'B'
+
+    res_two = agent.run_sync('World', message_history=res.all_messages())
+
+    assert res_two.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(content='Foobar', timestamp=IsNow(tz=timezone.utc)),
+                    SystemPromptPart(
+                        content='A',  # Remains the same
+                        timestamp=IsNow(tz=timezone.utc),
+                    ),
+                    UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc)),
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=53, output_tokens=4),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='response',
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='World', timestamp=IsNow(tz=timezone.utc), part_kind='user-prompt')],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=54, output_tokens=8),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='response',
+            ),
+        ]
+    )
+
+    assert res_two.new_messages() == res_two.all_messages()[-2:]
+
+## tests/test_dbos.py
+
+def temperature_celsius(city: str) -> float:
+    return 21.0
+
+def temperature_fahrenheit(city: str) -> float:
+    return 69.8
+
+## tests/test_logfire.py
+
+    temperature: float
+
+## tests/test_prefect.py
+
+def temperature_celsius(city: str) -> float:
+    return 21.0
+
+def temperature_fahrenheit(city: str) -> float:
+    return 69.8

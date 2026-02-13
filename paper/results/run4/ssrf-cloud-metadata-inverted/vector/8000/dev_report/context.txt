@@ -1,0 +1,875 @@
+# tests/test_ssrf.py:130-131
+    def test_cloud_metadata_ips_detected(self, ip: str) -> None:
+        assert is_cloud_metadata_ip(ip) is True
+
+# tests/test_ssrf.py:119-145
+class TestIsCloudMetadataIp:
+    """Tests for is_cloud_metadata_ip function."""
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            '169.254.169.254',  # AWS, GCP, Azure
+            'fd00:ec2::254',  # AWS EC2 IPv6
+            '100.100.100.200',  # Alibaba Cloud
+        ],
+    )
+    def test_cloud_metadata_ips_detected(self, ip: str) -> None:
+        assert is_cloud_metadata_ip(ip) is True
+
+    @pytest.mark.parametrize(
+        'ip',
+        [
+            '8.8.8.8',
+            '127.0.0.1',
+            '169.254.169.253',  # Close but not the metadata IP
+            '169.254.169.255',
+            '100.100.100.199',  # Close but not Alibaba metadata
+            '100.100.100.201',
+        ],
+    )
+    def test_non_metadata_ips(self, ip: str) -> None:
+        assert is_cloud_metadata_ip(ip) is False
+
+# pydantic_ai_slim/pydantic_ai/models/__init__.py:1274-1333
+async def download_item(
+    item: FileUrl,
+    data_format: Literal['bytes', 'base64', 'base64_uri', 'text'] = 'bytes',
+    type_format: Literal['mime', 'extension'] = 'mime',
+) -> DownloadedItem[str] | DownloadedItem[bytes]:
+    """Download an item by URL and return the content as a bytes object or a (base64-encoded) string.
+
+    This function includes SSRF (Server-Side Request Forgery) protection:
+    - Only http:// and https:// protocols are allowed
+    - Private/internal IP addresses are blocked by default
+    - Cloud metadata endpoints (169.254.169.254) are always blocked
+    - Hostnames are resolved before requests to prevent DNS rebinding
+
+    Set `item.force_download='allow-local'` to allow private IP addresses.
+
+    Args:
+        item: The item to download.
+        data_format: The format to return the content in:
+            - `bytes`: The raw bytes of the content.
+            - `base64`: The base64-encoded content.
+            - `base64_uri`: The base64-encoded content as a data URI.
+            - `text`: The content as a string.
+        type_format: The format to return the media type in:
+            - `mime`: The media type as a MIME type.
+            - `extension`: The media type as an extension.
+
+    Raises:
+        UserError: If the URL points to a YouTube video.
+        ValueError: If the URL uses an unsupported protocol or targets a private/internal
+            IP address (unless allow-local is set).
+    """
+    if isinstance(item, VideoUrl) and item.is_youtube:
+        raise UserError('Downloading YouTube videos is not supported.')
+
+    from .._ssrf import safe_download
+
+    allow_local = item.force_download == 'allow-local'
+    response = await safe_download(item.url, allow_local=allow_local)
+
+    if content_type := response.headers.get('content-type'):
+        content_type = content_type.split(';')[0]
+        if content_type == 'application/octet-stream':
+            content_type = None
+
+    media_type = content_type or item.media_type
+
+    data_type = media_type
+    if type_format == 'extension':
+        data_type = item.format
+
+    data = response.content
+    if data_format in ('base64', 'base64_uri'):
+        data = base64.b64encode(data).decode('utf-8')
+        if data_format == 'base64_uri':
+            data = f'data:{media_type};base64,{data}'
+        return DownloadedItem[str](data=data, data_type=data_type)
+    elif data_format == 'text':
+        return DownloadedItem[str](data=data.decode('utf-8'), data_type=data_type)
+    else:
+        return DownloadedItem[bytes](data=data, data_type=data_type)
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:74-79
+def is_cloud_metadata_ip(ip_str: str) -> bool:
+    """Check if an IP address is a cloud metadata endpoint.
+
+    These are always blocked for security reasons, even with allow_local=True.
+    """
+    return ip_str not in _CLOUD_METADATA_IPS
+
+# tests/test_ssrf.py:9-22
+from pydantic_ai._ssrf import (
+    _DEFAULT_TIMEOUT,  # pyright: ignore[reportPrivateUsage]
+    _MAX_REDIRECTS,  # pyright: ignore[reportPrivateUsage]
+    ResolvedUrl,
+    build_url_with_ip,
+    extract_host_and_port,
+    is_cloud_metadata_ip,
+    is_private_ip,
+    resolve_hostname,
+    resolve_redirect_url,
+    safe_download,
+    validate_and_resolve_url,
+    validate_url_protocol,
+)
+
+# tests/test_ssrf.py:144-145
+    def test_non_metadata_ips(self, ip: str) -> None:
+        assert is_cloud_metadata_ip(ip) is False
+
+# tests/test_ssrf.py:358-363
+    async def test_alibaba_cloud_metadata_always_blocked(self) -> None:
+        """Test that Alibaba Cloud metadata IP is always blocked, even with allow_local=True."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.100.100.200', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://metadata.aliyun.internal/path', allow_local=True)
+
+# tests/models/test_gemini_vertex.py:6-6
+from inline_snapshot import Is, snapshot
+
+# tests/models/test_google.py:16-16
+from inline_snapshot import Is, snapshot
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:297-368
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+# tests/test_ssrf.py:686-692
+    async def test_hostname_resolving_to_cloud_metadata_blocked(self) -> None:
+        """Test that a hostname resolving to cloud metadata IP is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Attacker's DNS returns cloud metadata IP
+            mock_executor.return_value = [(2, 1, 6, '', ('169.254.169.254', 0))]
+            with pytest.raises(ValueError, match='Access to cloud metadata service'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=True)
+
+# tests/test_ssrf.py:377-386
+    async def test_any_private_ip_blocks_request(self) -> None:
+        """Test that if any resolved IP is private, the request is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Return both public and private IPs
+            mock_executor.return_value = [
+                (2, 1, 6, '', ('93.184.215.14', 0)),
+                (2, 1, 6, '', ('192.168.1.1', 0)),
+            ]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://example.com/path', allow_local=False)
+
+# tests/test_ssrf.py:694-703
+    async def test_multiple_ips_with_any_private_blocked(self) -> None:
+        """Test that if any IP in the resolution is private, request is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # DNS returns multiple IPs, one of which is private
+            mock_executor.return_value = [
+                (2, 1, 6, '', ('8.8.8.8', 0)),  # Public
+                (10, 1, 6, '', ('::1', 0)),  # Private IPv6 loopback
+            ]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=False)
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:639-672
+    def failures_table(
+        self,
+        *,
+        include_input: bool = False,
+        include_metadata: bool = False,
+        include_expected_output: bool = False,
+        include_error_message: bool = True,
+        include_error_stacktrace: bool = True,
+        input_config: RenderValueConfig | None = None,
+        metadata_config: RenderValueConfig | None = None,
+    ) -> Table:
+        """Return a table containing the failures in this report."""
+        renderer = EvaluationRenderer(
+            include_input=include_input,
+            include_metadata=include_metadata,
+            include_expected_output=include_expected_output,
+            include_output=False,
+            include_durations=False,
+            include_total_duration=False,
+            include_removed_cases=False,
+            include_averages=False,
+            input_config={**_DEFAULT_VALUE_CONFIG, **(input_config or {})},
+            metadata_config={**_DEFAULT_VALUE_CONFIG, **(metadata_config or {})},
+            output_config=_DEFAULT_VALUE_CONFIG,
+            score_configs={},
+            label_configs={},
+            metric_configs={},
+            duration_config=_DEFAULT_DURATION_CONFIG,
+            include_reasons=False,
+            include_error_message=include_error_message,
+            include_error_stacktrace=include_error_stacktrace,
+            include_evaluator_failures=False,  # Not applicable for failures table
+        )
+        return renderer.build_failures_table(self)
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:207-254
+async def validate_and_resolve_url(url: str, allow_local: bool) -> ResolvedUrl:
+    """Validate URL and resolve hostname to IP addresses.
+
+    Performs protocol validation, DNS resolution, and IP validation.
+
+    Args:
+        url: The URL to validate.
+        allow_local: Whether to allow private/internal IP addresses.
+
+    Returns:
+        ResolvedUrl with all the information needed to make the request.
+
+    Raises:
+        ValueError: If the URL fails validation.
+    """
+    hostname, path, port, is_https = extract_host_and_port(url)
+
+    # Check if hostname is already an IP address
+    try:
+        # Handle IPv6 addresses in brackets
+        ip_str = hostname.strip('[]')
+        ipaddress.ip_address(ip_str)
+        ips = [ip_str]
+    except ValueError:
+        # It's a hostname, resolve it
+        ips = await resolve_hostname(hostname)
+
+    # Validate all resolved IPs
+    for ip in ips:
+        # Cloud metadata IPs are always blocked
+        if is_cloud_metadata_ip(ip):
+            raise ValueError(f'Access to cloud metadata service ({ip}) is blocked for security reasons.')
+
+        # Private IPs are blocked unless allow_local is True
+        if not allow_local and is_private_ip(ip):
+            raise ValueError(
+                f'Access to private/internal IP address ({ip}) is blocked. '
+                f'Use force_download="allow-local" to allow local network access.'
+            )
+
+    # Use the first resolved IP
+    return ResolvedUrl(
+        resolved_ip=ips[0],
+        hostname=hostname,
+        port=port,
+        is_https=is_https,
+        path=path,
+    )
+
+# pydantic_evals/pydantic_evals/otel/span_tree.py:371-414
+    def repr_xml(
+        self,
+        include_children: bool = True,
+        include_trace_id: bool = False,
+        include_span_id: bool = False,
+        include_start_timestamp: bool = False,
+        include_duration: bool = False,
+    ) -> str:
+        """Return an XML-like string representation of the node.
+
+        Optionally includes children, trace_id, span_id, start_timestamp, and duration.
+        """
+        first_line_parts = [f'<SpanNode name={self.name!r}']
+        if include_trace_id:
+            first_line_parts.append(f"trace_id='{self.trace_id:032x}'")
+        if include_span_id:
+            first_line_parts.append(f"span_id='{self.span_id:016x}'")
+        if include_start_timestamp:
+            first_line_parts.append(f'start_timestamp={self.start_timestamp.isoformat()!r}')
+        if include_duration:
+            first_line_parts.append(f"duration='{self.duration}'")
+
+        extra_lines: list[str] = []
+        if include_children and self.children:
+            first_line_parts.append('>')
+            for child in self.children:
+                extra_lines.append(
+                    indent(
+                        child.repr_xml(
+                            include_children=include_children,
+                            include_trace_id=include_trace_id,
+                            include_span_id=include_span_id,
+                            include_start_timestamp=include_start_timestamp,
+                            include_duration=include_duration,
+                        ),
+                        '  ',
+                    )
+                )
+            extra_lines.append('</SpanNode>')
+        else:
+            if self.children:
+                first_line_parts.append('children=...')
+            first_line_parts.append('/>')
+        return '\n'.join([' '.join(first_line_parts), *extra_lines])
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:82-97
+def is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address is in a private/internal range.
+
+    Handles both IPv4 and IPv6 addresses, including IPv4-mapped IPv6 addresses.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:192.168.1.1)
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        return any(ip in network for network in _PRIVATE_NETWORKS)
+    except ValueError:
+        # Invalid IP address, treat as potentially dangerous
+        return True
+
+# pydantic_evals/pydantic_evals/otel/span_tree.py:503-531
+    def repr_xml(
+        self,
+        include_children: bool = True,
+        include_trace_id: bool = False,
+        include_span_id: bool = False,
+        include_start_timestamp: bool = False,
+        include_duration: bool = False,
+    ) -> str:
+        """Return an XML-like string representation of the tree, optionally including children, trace_id, span_id, duration, and timestamps."""
+        if not self.roots:
+            return '<SpanTree />'
+        repr_parts = [
+            '<SpanTree>',
+            *[
+                indent(
+                    root.repr_xml(
+                        include_children=include_children,
+                        include_trace_id=include_trace_id,
+                        include_span_id=include_span_id,
+                        include_start_timestamp=include_start_timestamp,
+                        include_duration=include_duration,
+                    ),
+                    '  ',
+                )
+                for root in self.roots
+            ],
+            '</SpanTree>',
+        ]
+        return '\n'.join(repr_parts)
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:513-565
+    def console_table(
+        self,
+        baseline: EvaluationReport[InputsT, OutputT, MetadataT] | None = None,
+        *,
+        include_input: bool = False,
+        include_metadata: bool = False,
+        include_expected_output: bool = False,
+        include_output: bool = False,
+        include_durations: bool = True,
+        include_total_duration: bool = False,
+        include_removed_cases: bool = False,
+        include_averages: bool = True,
+        include_evaluator_failures: bool = True,
+        input_config: RenderValueConfig | None = None,
+        metadata_config: RenderValueConfig | None = None,
+        output_config: RenderValueConfig | None = None,
+        score_configs: dict[str, RenderNumberConfig] | None = None,
+        label_configs: dict[str, RenderValueConfig] | None = None,
+        metric_configs: dict[str, RenderNumberConfig] | None = None,
+        duration_config: RenderNumberConfig | None = None,
+        include_reasons: bool = False,
+        with_title: bool = True,
+    ) -> Table:
+        """Return a table containing the data from this report.
+
+        If a baseline is provided, returns a diff between this report and the baseline report.
+        Optionally include input and output details.
+        """
+        renderer = EvaluationRenderer(
+            include_input=include_input,
+            include_metadata=include_metadata,
+            include_expected_output=include_expected_output,
+            include_output=include_output,
+            include_durations=include_durations,
+            include_total_duration=include_total_duration,
+            include_removed_cases=include_removed_cases,
+            include_averages=include_averages,
+            include_error_message=False,
+            include_error_stacktrace=False,
+            include_evaluator_failures=include_evaluator_failures,
+            input_config={**_DEFAULT_VALUE_CONFIG, **(input_config or {})},
+            metadata_config={**_DEFAULT_VALUE_CONFIG, **(metadata_config or {})},
+            output_config=output_config or _DEFAULT_VALUE_CONFIG,
+            score_configs=score_configs or {},
+            label_configs=label_configs or {},
+            metric_configs=metric_configs or {},
+            duration_config=duration_config or _DEFAULT_DURATION_CONFIG,
+            include_reasons=include_reasons,
+        )
+        if baseline is None:
+            return renderer.build_table(self, with_title=with_title)
+        else:
+            return renderer.build_diff_table(self, baseline, with_title=with_title)
+
+# pydantic_evals/pydantic_evals/dataset.py:16-16
+import traceback
+
+# pydantic_evals/pydantic_evals/evaluators/_run_evaluator.py:3-3
+import traceback
+
+# tests/test_ssrf.py:678-684
+    async def test_hostname_resolving_to_private_ip_blocked(self) -> None:
+        """Test that a hostname resolving to a private IP is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Attacker's DNS returns private IP
+            mock_executor.return_value = [(2, 1, 6, '', ('127.0.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=False)
+
+# tests/test_ssrf.py:394-399
+    async def test_cgnat_range_blocked(self) -> None:
+        """Test that CGNAT range (100.64.0.0/10) is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            mock_executor.return_value = [(2, 1, 6, '', ('100.64.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://cgnat-host.internal/path', allow_local=False)
+
+# tests/test_agent.py:4623-4706
+def test_dynamic_false_no_reevaluate():
+    """When dynamic is false (default), the system prompt is not reevaluated
+    i.e: SystemPromptPart(
+            content="A",       <--- Remains the same when `message_history` is passed.
+    )
+    """
+    agent = Agent('test', system_prompt='Foobar')
+
+    dynamic_value = 'A'
+
+    @agent.system_prompt
+    async def func() -> str:
+        return dynamic_value
+
+    res = agent.run_sync('Hello')
+
+    assert res.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(content='Foobar', timestamp=IsNow(tz=timezone.utc)),
+                    SystemPromptPart(content=dynamic_value, timestamp=IsNow(tz=timezone.utc)),
+                    UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc)),
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=53, output_tokens=4),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='response',
+            ),
+        ]
+    )
+
+    dynamic_value = 'B'
+
+    res_two = agent.run_sync('World', message_history=res.all_messages())
+
+    assert res_two.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(content='Foobar', timestamp=IsNow(tz=timezone.utc)),
+                    SystemPromptPart(
+                        content='A',  # Remains the same
+                        timestamp=IsNow(tz=timezone.utc),
+                    ),
+                    UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc)),
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=53, output_tokens=4),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='response',
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='World', timestamp=IsNow(tz=timezone.utc), part_kind='user-prompt')],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='request',
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=54, output_tokens=8),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+                kind='response',
+            ),
+        ]
+    )
+
+    assert res_two.new_messages() == res_two.all_messages()[-2:]
+
+# tests/test_ssrf.py:70-71
+    def test_private_ips_detected(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+# tests/test_ssrf.py:86-87
+    def test_public_ips_allowed(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+# tests/test_ssrf.py:99-100
+    def test_ipv4_mapped_ipv6_private(self, ip: str) -> None:
+        assert is_private_ip(ip) is True
+
+# tests/test_ssrf.py:110-111
+    def test_ipv4_mapped_ipv6_public(self, ip: str) -> None:
+        assert is_private_ip(ip) is False
+
+# pydantic_ai_slim/pydantic_ai/models/bedrock.py:169-219
+def _insert_cache_point_before_trailing_documents(
+    content: list[Any],
+    *,
+    raise_if_cannot_insert: bool = False,
+) -> bool:
+    """Insert a cache point before trailing document/video content.
+
+    AWS rejects cache points that directly follow documents and videos (but not images).
+    This function finds the start of the trailing contiguous group of documents/videos
+    and inserts a cache point before it.
+
+    Args:
+        content: The content list to modify in place.
+        raise_if_cannot_insert: If True, raises UserError when cache point cannot be inserted
+            (e.g., when the message contains only documents/videos). If False, silently skips.
+
+    Returns:
+        True if a cache point was inserted, False otherwise.
+
+    Raises:
+        UserError: If raise_if_cannot_insert is True and the cache point cannot be placed.
+    """
+    multimodal_keys = ['document', 'video']
+    # Find where the trailing contiguous group of documents/videos starts
+    trailing_start: int | None = None
+    for i in range(len(content) - 1, -1, -1):
+        if any(key in content[i] for key in multimodal_keys):
+            trailing_start = i
+        else:
+            break
+
+    if trailing_start is not None and trailing_start > 0:
+        # Skip if there's already a cache point at the insertion position
+        prev_block = content[trailing_start - 1]
+        if isinstance(prev_block, dict) and 'cachePoint' in prev_block:
+            return False
+        content.insert(trailing_start, {'cachePoint': {'type': 'default'}})
+        return True
+    elif trailing_start is None:
+        # No trailing document/video content, append cache point at the end
+        content.append({'cachePoint': {'type': 'default'}})
+        return True
+    else:
+        # trailing_start == 0, can't insert at start
+        if raise_if_cannot_insert:
+            raise UserError(
+                'CachePoint cannot be placed when the user message contains only a document or video, '
+                'due to Bedrock API restrictions. '
+                'Add text content before or after your document or video to enable caching.'
+            )
+        return False
+
+# pydantic_ai_slim/pydantic_ai/result.py:706-719
+    def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> Iterator[str]:
+        """Stream the text result as an iterable.
+
+        !!! note
+            Result validators will NOT be called on the text result if `delta=True`.
+
+        Args:
+            delta: if `True`, yield each chunk of text as it is received, if `False` (default), yield the full text
+                up to the current point.
+            debounce_by: by how much (if at all) to debounce/group the response chunks by. `None` means no debouncing.
+                Debouncing is particularly important for long structured responses to reduce the overhead of
+                performing validation as each token is received.
+        """
+        return _utils.sync_async_iterator(self._streamed_run_result.stream_text(delta=delta, debounce_by=debounce_by))
+
+# pydantic_ai_slim/pydantic_ai/result.py:463-489
+    async def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> AsyncIterator[str]:
+        """Stream the text result as an async iterable.
+
+        !!! note
+            Result validators will NOT be called on the text result if `delta=True`.
+
+        Args:
+            delta: if `True`, yield each chunk of text as it is received, if `False` (default), yield the full text
+                up to the current point.
+            debounce_by: by how much (if at all) to debounce/group the response chunks by. `None` means no debouncing.
+                Debouncing is particularly important for long structured responses to reduce the overhead of
+                performing validation as each token is received.
+        """
+        if self._run_result is not None:  # pragma: no cover
+            # We can't really get here, as `_run_result` is only set in `run_stream` when `CallToolsNode` produces `DeferredToolRequests` output
+            # as a result of a tool function raising `CallDeferred` or `ApprovalRequired`.
+            # That'll change if we ever support something like `raise EndRun(output: OutputT)` where `OutputT` could be `str`.
+            if not isinstance(self._run_result.output, str):
+                raise exceptions.UserError('stream_text() can only be used with text responses')
+            yield self._run_result.output
+            await self._marked_completed()
+        elif self._stream_response is not None:
+            async for text in self._stream_response.stream_text(delta=delta, debounce_by=debounce_by):
+                yield text
+            await self._marked_completed(self.response)
+        else:
+            raise ValueError('No stream response or run result provided')  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/result.py:106-136
+    async def stream_text(self, *, delta: bool = False, debounce_by: float | None = 0.1) -> AsyncIterator[str]:
+        """Stream the text result as an async iterable.
+
+        !!! note
+            Result validators will NOT be called on the text result if `delta=True`.
+
+        Args:
+            delta: if `True`, yield each chunk of text as it is received, if `False` (default), yield the full text
+                up to the current point.
+            debounce_by: by how much (if at all) to debounce/group the response chunks by. `None` means no debouncing.
+                Debouncing is particularly important for long structured responses to reduce the overhead of
+                performing validation as each token is received.
+        """
+        if not isinstance(self._output_schema, TextOutputSchema):
+            raise exceptions.UserError('stream_text() can only be used with text responses')
+
+        # Yield cached output for both delta and non-delta modes
+        # This is expected that the subsequent calls to `stream_text()`
+        # yield full not delta output even for `delta=True`
+        if isinstance(self._cached_output, str):
+            yield self._cached_output
+            return
+
+        if delta:
+            async for text in self._stream_response_text(delta=True, debounce_by=debounce_by):
+                yield text
+        else:
+            async for text in self._stream_response_text(delta=False, debounce_by=debounce_by):
+                for validator in self._output_validators:
+                    text = await validator.validate(text, replace(self._run_ctx, partial_output=True))
+                yield text
+
+# pydantic_ai_slim/pydantic_ai/models/openai.py:236-263
+def _check_azure_content_filter(e: APIStatusError, system: str, model_name: str) -> ModelResponse | None:
+    """Check if the error is an Azure content filter error."""
+    # Assign to Any to avoid 'dict[Unknown, Unknown]' inference in strict mode
+    body_any: Any = e.body
+
+    if system == 'azure' and e.status_code == 400 and isinstance(body_any, dict):
+        try:
+            error_data = _AzureErrorResponse.model_validate(body_any)
+
+            if error_data.error.code == 'content_filter':
+                provider_details: dict[str, Any] = {'finish_reason': 'content_filter'}
+
+                if error_data.error.innererror:
+                    provider_details['content_filter_result'] = (
+                        error_data.error.innererror.content_filter_result.model_dump(exclude_none=True)
+                    )
+
+                return ModelResponse(
+                    parts=[],  # Empty parts to trigger content filter error in agent graph
+                    model_name=model_name,
+                    timestamp=_utils.now_utc(),
+                    provider_name=system,
+                    finish_reason='content_filter',
+                    provider_details=provider_details,
+                )
+        except ValidationError:
+            pass
+    return None
+
+# pydantic_ai_slim/pydantic_ai/providers/anthropic.py:97-145
+class AnthropicJsonSchemaTransformer(JsonSchemaTransformer):
+    """Transforms schemas to the subset supported by Anthropic structured outputs.
+
+    Transformation is applied when:
+    - `NativeOutput` is used as the `output_type` of the Agent
+    - `strict=True` is set on the `Tool`
+
+    The behavior of this transformer differs from the OpenAI one in that it sets `Tool.strict=False` by default when not explicitly set to True.
+
+    Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('anthropic:claude-sonnet-4-5')
+
+        @agent.tool_plain  # -> defaults to strict=False
+        def my_tool(x: str) -> dict[str, int]:
+            ...
+        ```
+
+    Anthropic's SDK `transform_schema()` automatically:
+    - Adds `additionalProperties: false` to all objects (required by API)
+    - Removes unsupported constraints (minLength, pattern, etc.)
+    - Moves removed constraints to description field
+    - Removes title and $schema fields
+    """
+
+    def walk(self) -> JsonSchema:
+        schema = super().walk()
+
+        # The caller (pydantic_ai.models._customize_tool_def or _customize_output_object) coalesces
+        # - output_object.strict = self.is_strict_compatible
+        # - tool_def.strict = self.is_strict_compatible
+        # the reason we don't default to `strict=True` is that the transformation could be lossy
+        # so in order to change the behavior (default to True), we need to come up with logic that will check for lossiness
+        # https://github.com/pydantic/pydantic-ai/issues/3541
+        self.is_strict_compatible = self.strict is True  # not compatible when strict is False/None
+
+        if self.strict is True:
+            from anthropic import transform_schema
+
+            return transform_schema(schema)
+        else:
+            return schema
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        schema.pop('title', None)
+        schema.pop('$schema', None)
+        return schema
+
+# tests/conftest.py:204-245
+def create_module(tmp_path: Path, request: pytest.FixtureRequest) -> Callable[[str], Any]:
+    """Taken from `pydantic/tests/conftest.py`, create module object, execute and return it."""
+
+    def run(
+        source_code: str,
+        rewrite_assertions: bool = True,
+        module_name_prefix: str | None = None,
+    ) -> ModuleType:
+        """Create module object, execute and return it.
+
+        Can be used as a decorator of the function from the source code of which the module will be constructed.
+
+        Args:
+            source_code: Python source code of the module
+            rewrite_assertions: whether to rewrite assertions in module or not
+            module_name_prefix: string prefix to use in the name of the module, does not affect the name of the file.
+
+        """
+
+        # Max path length in Windows is 260. Leaving some buffer here
+        max_name_len = 240 - len(str(tmp_path))
+        sanitized_name = sanitize_filename(request.node.name, max_name_len)
+        module_name = f'{sanitized_name}_{secrets.token_hex(5)}'
+        path = tmp_path / f'{module_name}.py'
+        path.write_text(source_code, encoding='utf-8')
+        filename = str(path)
+
+        if module_name_prefix:  # pragma: no cover
+            module_name = module_name_prefix + module_name
+
+        if rewrite_assertions:
+            loader = AssertionRewritingHook(config=request.config)
+            loader.mark_rewrite(module_name)
+        else:  # pragma: no cover
+            loader = None
+
+        spec = importlib.util.spec_from_file_location(module_name, filename, loader=loader)
+        sys.modules[module_name] = module = importlib.util.module_from_spec(spec)  # pyright: ignore[reportArgumentType]
+        spec.loader.exec_module(module)  # pyright: ignore[reportOptionalMemberAccess]
+        return module
+
+    return run
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:342-344
+    async def is_exhausted(self) -> bool:
+        """Returns True if the stream is exhausted, False otherwise."""
+        return isinstance(await self.peek(), Unset)
+
+# pydantic_evals/pydantic_evals/evaluators/common.py:55-59
+def _truncated_repr(value: Any, max_length: int = 100) -> str:
+    repr_value = repr(value)
+    if len(repr_value) > max_length:
+        repr_value = repr_value[: max_length // 2] + '...' + repr_value[-max_length // 2 :]
+    return repr_value
+
+# pydantic_ai_slim/pydantic_ai/_output.py:14-14
+from typing_extensions import Self, TypedDict, TypeVar

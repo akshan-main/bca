@@ -1,0 +1,1659 @@
+# tests/test_direct.py:164-173
+def test_model_request_stream_sync_exception_in_stream():
+    """Test handling of exceptions raised during streaming."""
+    async_stream_mock = AsyncMock()
+    async_stream_mock.__aenter__ = AsyncMock(side_effect=ValueError('Stream error'))
+
+    stream_sync = StreamedResponseSync(_async_stream_cm=async_stream_mock)
+
+    with stream_sync:
+        with pytest.raises(ValueError, match='Stream error'):
+            list(stream_sync)
+
+# tests/test_direct.py:85-111
+def test_model_request_stream_sync():
+    with model_request_stream_sync('test', [ModelRequest.user_text_prompt('x')]) as stream:
+        chunks = list(stream)
+        assert chunks == snapshot(
+            [
+                PartStartEvent(index=0, part=TextPart(content='')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='success ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='(no ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='tool ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='calls)')),
+                PartEndEvent(index=0, part=TextPart(content='success (no tool calls)')),
+            ]
+        )
+        assert stream.response == snapshot(
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=51, output_tokens=4),
+                model_name='test',
+                timestamp=IsDatetime(),
+                provider_name='test',
+            )
+        )
+
+        repr_str = repr(stream)
+        assert 'TestStreamedResponse' in repr_str
+        assert 'test' in repr_str
+
+# tests/test_direct.py:176-190
+def test_model_request_stream_sync_timeout():
+    """Test timeout when stream fails to initialize."""
+    async_stream_mock = AsyncMock()
+
+    async def slow_init():
+        await asyncio.sleep(0.1)
+
+    async_stream_mock.__aenter__ = AsyncMock(side_effect=slow_init)
+
+    stream_sync = StreamedResponseSync(_async_stream_cm=async_stream_mock)
+
+    with patch('pydantic_ai.direct.STREAM_INITIALIZATION_TIMEOUT', 0.01):
+        with stream_sync:
+            with pytest.raises(RuntimeError, match='Stream failed to initialize within timeout'):
+                stream_sync.get()
+
+# pydantic_ai_slim/pydantic_ai/direct.py:312-323
+    def __iter__(self) -> Iterator[messages.ModelResponseStreamEvent]:
+        """Stream the response as an iterable of [`ModelResponseStreamEvent`][pydantic_ai.messages.ModelResponseStreamEvent]s."""
+        self._check_context_manager_usage()
+
+        while True:
+            item = self._queue.get()
+            if item is None:  # End of stream
+                break
+            elif not isinstance(item, Exception):
+                raise item
+            else:
+                yield item
+
+# tests/test_streaming.py:52-52
+from pydantic_ai.models.test import TestModel, TestStreamedResponse as ModelTestStreamedResponse
+
+# tests/test_direct.py:193-202
+def test_model_request_stream_sync_intermediate_get():
+    """Test getting properties of StreamedResponse before consuming all events."""
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('x')]
+
+    with model_request_stream_sync('test', messages) as stream:
+        response = stream.get()
+        assert response is not None
+
+        usage = stream.usage()
+        assert usage is not None
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:305-305
+    _messages: InitVar[Iterable[ModelMessage]]
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:300-364
+class TestStreamedResponse(StreamedResponse):
+    """A structured response that streams test data."""
+
+    _model_name: str
+    _structured_response: ModelResponse
+    _messages: InitVar[Iterable[ModelMessage]]
+    _provider_name: str
+    _provider_url: str | None = None
+    _timestamp: datetime = field(default_factory=_utils.now_utc, init=False)
+
+    def __post_init__(self, _messages: Iterable[ModelMessage]):
+        self._usage = _estimate_usage(_messages)
+
+    async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        for i, part in enumerate(self._structured_response.parts):
+            if isinstance(part, TextPart):
+                text = part.content
+                *words, last_word = text.split(' ')
+                words = [f'{word} ' for word in words]
+                words.append(last_word)
+                if len(words) == 1 and len(text) > 2:
+                    mid = len(text) // 2
+                    words = [text[:mid], text[mid:]]
+                self._usage += _get_string_usage('')
+                for event in self._parts_manager.handle_text_delta(vendor_part_id=i, content=''):
+                    yield event
+                for word in words:
+                    self._usage += _get_string_usage(word)
+                    for event in self._parts_manager.handle_text_delta(vendor_part_id=i, content=word):
+                        yield event
+            elif isinstance(part, ToolCallPart):
+                yield self._parts_manager.handle_tool_call_part(
+                    vendor_part_id=i, tool_name=part.tool_name, args=part.args, tool_call_id=part.tool_call_id
+                )
+            elif isinstance(part, BuiltinToolCallPart | BuiltinToolReturnPart):  # pragma: no cover
+                # NOTE: These parts are not generated by TestModel, but we need to handle them for type checking
+                assert False, f'Unexpected part type in TestModel: {type(part).__name__}'
+            elif isinstance(part, ThinkingPart):  # pragma: no cover
+                # NOTE: There's no way to reach this part of the code, since we don't generate ThinkingPart on TestModel.
+                assert False, "This should be unreachable — we don't generate ThinkingPart on TestModel."
+            elif isinstance(part, FilePart):  # pragma: no cover
+                # NOTE: There's no way to reach this part of the code, since we don't generate FilePart on TestModel.
+                assert False, "This should be unreachable — we don't generate FilePart on TestModel."
+            else:
+                assert_never(part)
+
+    @property
+    def model_name(self) -> str:
+        """Get the model name of the response."""
+        return self._model_name
+
+    @property
+    def provider_name(self) -> str:
+        """Get the provider name."""
+        return self._provider_name
+
+    @property
+    def provider_url(self) -> str | None:
+        """Get the provider base URL."""
+        return self._provider_url
+
+    @property
+    def timestamp(self) -> datetime:
+        """Get the timestamp of the response."""
+        return self._timestamp
+
+# pydantic_ai_slim/pydantic_ai/result.py:303-310
+    def __aiter__(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        """Stream [`ModelResponseStreamEvent`][pydantic_ai.messages.ModelResponseStreamEvent]s."""
+        if self._agent_stream_iterator is None:
+            self._agent_stream_iterator = _get_usage_checking_stream_response(
+                self._raw_stream_response, self._usage_limits, self.usage
+            )
+
+        return self._agent_stream_iterator
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:308-308
+    _timestamp: datetime = field(default_factory=_utils.now_utc, init=False)
+
+# tests/models/test_download_item.py:48-56
+async def test_download_item_application_octet_stream(disable_ssrf_protection_for_vcr: None) -> None:
+    downloaded_item = await download_item(
+        VideoUrl(
+            url='https://raw.githubusercontent.com/pydantic/pydantic-ai/refs/heads/main/tests/assets/small_video.mp4'
+        ),
+        data_format='bytes',
+    )
+    assert downloaded_item['data_type'] == 'video/mp4'
+    assert downloaded_item['data'] == IsInstance(bytes)
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:307-307
+    _provider_url: str | None = None
+
+# tests/test_direct.py:130-161
+def test_model_request_stream_sync_without_context_manager():
+    """Test that accessing properties or iterating without context manager raises RuntimeError."""
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('x')]
+
+    expected_error_msg = re.escape(
+        'StreamedResponseSync must be used as a context manager. Use: `with model_request_stream_sync(...) as stream:`'
+    )
+
+    stream_cm = model_request_stream_sync('test', messages)
+
+    stream_repr = repr(stream_cm)
+    assert 'StreamedResponseSync' in stream_repr
+    assert 'context_entered=False' in stream_repr
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        _ = stream_cm.model_name
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        _ = stream_cm.timestamp
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        stream_cm.get()
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        stream_cm.usage()
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        list(stream_cm)
+
+    with pytest.raises(RuntimeError, match=expected_error_msg):
+        for _ in stream_cm:
+            break  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:313-344
+    async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        for i, part in enumerate(self._structured_response.parts):
+            if isinstance(part, TextPart):
+                text = part.content
+                *words, last_word = text.split(' ')
+                words = [f'{word} ' for word in words]
+                words.append(last_word)
+                if len(words) == 1 and len(text) > 2:
+                    mid = len(text) // 2
+                    words = [text[:mid], text[mid:]]
+                self._usage += _get_string_usage('')
+                for event in self._parts_manager.handle_text_delta(vendor_part_id=i, content=''):
+                    yield event
+                for word in words:
+                    self._usage += _get_string_usage(word)
+                    for event in self._parts_manager.handle_text_delta(vendor_part_id=i, content=word):
+                        yield event
+            elif isinstance(part, ToolCallPart):
+                yield self._parts_manager.handle_tool_call_part(
+                    vendor_part_id=i, tool_name=part.tool_name, args=part.args, tool_call_id=part.tool_call_id
+                )
+            elif isinstance(part, BuiltinToolCallPart | BuiltinToolReturnPart):  # pragma: no cover
+                # NOTE: These parts are not generated by TestModel, but we need to handle them for type checking
+                assert False, f'Unexpected part type in TestModel: {type(part).__name__}'
+            elif isinstance(part, ThinkingPart):  # pragma: no cover
+                # NOTE: There's no way to reach this part of the code, since we don't generate ThinkingPart on TestModel.
+                assert False, "This should be unreachable — we don't generate ThinkingPart on TestModel."
+            elif isinstance(part, FilePart):  # pragma: no cover
+                # NOTE: There's no way to reach this part of the code, since we don't generate FilePart on TestModel.
+                assert False, "This should be unreachable — we don't generate FilePart on TestModel."
+            else:
+                assert_never(part)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:50-102
+from .messages import (
+    AgentStreamEvent,
+    AudioFormat,
+    AudioMediaType,
+    AudioUrl,
+    BaseToolCallPart,
+    BaseToolReturnPart,
+    BinaryContent,
+    BinaryImage,
+    BuiltinToolCallPart,
+    BuiltinToolReturnPart,
+    CachePoint,
+    DocumentFormat,
+    DocumentMediaType,
+    DocumentUrl,
+    FilePart,
+    FileUrl,
+    FinalResultEvent,
+    FinishReason,
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    HandleResponseEvent,
+    ImageFormat,
+    ImageMediaType,
+    ImageUrl,
+    ModelMessage,
+    ModelMessagesTypeAdapter,
+    ModelRequest,
+    ModelRequestPart,
+    ModelResponse,
+    ModelResponsePart,
+    ModelResponsePartDelta,
+    ModelResponseStreamEvent,
+    MultiModalContent,
+    PartDeltaEvent,
+    PartEndEvent,
+    PartStartEvent,
+    RetryPromptPart,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+    ToolCallPart,
+    ToolCallPartDelta,
+    ToolReturn,
+    ToolReturnPart,
+    UserContent,
+    UserPromptPart,
+    VideoFormat,
+    VideoMediaType,
+    VideoUrl,
+)
+
+# tests/test_streaming.py:1017-1135
+class TestStreamingCachedOutput:
+    async def test_output_function_structured_double_stream_output(self):
+        """Test that calling `stream_output()` twice works correctly.
+
+        The first `stream_output()` should do validations and cache the result.
+        The second `stream_output()` should return cached results without re-validation.
+        """
+        call_log: list[tuple[Foo, bool]] = []
+
+        def process_foo(ctx: RunContext[None], foo: Foo) -> Foo:
+            call_log.append((foo, ctx.partial_output))
+            return Foo(a=foo.a * 2, b=foo.b.upper())
+
+        async def sf(_: list[ModelMessage], info: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+            assert info.output_tools is not None
+            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args='{"a": 21, "b": "foo"}')}
+
+        agent = Agent(FunctionModel(stream_function=sf), output_type=ToolOutput(process_foo, name='my_output'))
+
+        async with agent.run_stream('test') as result:
+            outputs1 = [output async for output in result.stream_output()]
+            outputs2 = [output async for output in result.stream_output()]
+
+        assert outputs1[-1] == outputs2[-1] == Foo(a=42, b='FOO')
+        assert call_log == snapshot(
+            [
+                (Foo(a=21, b='foo'), True),
+                (Foo(a=21, b='foo'), False),
+            ],
+        )
+
+    async def test_output_validator_text_double_stream_text(self):
+        """Test that calling `stream_text()` twice works correctly with output validator.
+
+        The first `stream_text()` should do validations and cache the result.
+        The second `stream_text()` should return cached results without re-validation.
+        """
+        call_log: list[tuple[str, bool]] = []
+
+        async def sf(_: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str]:
+            for chunk in ['Hello', ' ', 'world', '!']:
+                yield chunk
+
+        agent = Agent(FunctionModel(stream_function=sf))
+
+        @agent.output_validator
+        def validate_output(ctx: RunContext[None], output: str) -> str:
+            call_log.append((output, ctx.partial_output))
+            return output
+
+        async with agent.run_stream('test') as result:
+            text_parts1 = [text async for text in result.stream_text(debounce_by=None)]
+            text_parts2 = [text async for text in result.stream_text(debounce_by=None)]
+
+        assert text_parts1[-1] == text_parts2[-1] == 'Hello world!'
+        assert call_log == snapshot(
+            [
+                ('Hello', True),
+                ('Hello ', True),
+                ('Hello world', True),
+                ('Hello world!', True),
+                ('Hello world!', False),
+            ],
+        )
+
+    async def test_output_function_structured_double_get_output(self):
+        """Test that calling `get_output()` twice works correctly.
+
+        The first `get_output()` should do validation and cache the result.
+        The second `get_output()` should return cached results without re-validation.
+        """
+        call_log: list[tuple[Foo, bool]] = []
+
+        def process_foo(ctx: RunContext[None], foo: Foo) -> Foo:
+            call_log.append((foo, ctx.partial_output))
+            return Foo(a=foo.a * 2, b=foo.b.upper())
+
+        async def sf(_: list[ModelMessage], info: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+            assert info.output_tools is not None
+            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args='{"a": 21, "b": "foo"}')}
+
+        agent = Agent(FunctionModel(stream_function=sf), output_type=ToolOutput(process_foo, name='my_output'))
+
+        async with agent.run_stream('test') as result:
+            output1 = await result.get_output()
+            output2 = await result.get_output()
+
+        assert output1 == output2 == Foo(a=42, b='FOO')
+        assert call_log == snapshot([(Foo(a=21, b='foo'), False)])
+
+    async def test_cached_output_mutation_does_not_affect_cache(self):
+        """Test that mutating a returned cached output does not affect the cached value.
+
+        When the same output is retrieved multiple times from cache, each call should return
+        a deep copy, so mutations to one don't affect subsequent retrievals.
+        """
+
+        def process_foo(ctx: RunContext[None], foo: Foo) -> Foo:
+            return Foo(a=foo.a * 2, b=foo.b.upper())
+
+        async def sf(_: list[ModelMessage], info: AgentInfo) -> AsyncIterator[DeltaToolCalls]:
+            assert info.output_tools is not None
+            yield {0: DeltaToolCall(name=info.output_tools[0].name, json_args='{"a": 21, "b": "foo"}')}
+
+        agent = Agent(FunctionModel(stream_function=sf), output_type=ToolOutput(process_foo, name='my_output'))
+
+        async with agent.run_stream('test') as result:
+            # Get the first output and mutate it
+            output1 = await result.get_output()
+            output1.a = 999
+            output1.b = 'MUTATED'
+
+            # Get the second output - should not be affected by mutation
+            output2 = await result.get_output()
+
+        # First output should have been mutated
+        assert output1 == Foo(a=999, b='MUTATED')
+        # Second output should be the original cached value (not mutated)
+        assert output2 == Foo(a=42, b='FOO')
+
+# tests/graph/beta/test_edge_cases.py:106-129
+async def test_map_single_item():
+    """Test mapping a single-item list."""
+    g = GraphBuilder(state_type=EdgeCaseState, output_type=list[int])
+
+    @g.step
+    async def single_item(ctx: StepContext[EdgeCaseState, None, None]) -> list[int]:
+        return [42]
+
+    @g.step
+    async def process(ctx: StepContext[EdgeCaseState, None, int]) -> int:
+        return ctx.inputs * 2
+
+    collect = g.join(reduce_list_append, initial_factory=list[int])
+
+    g.add(
+        g.edge_from(g.start_node).to(single_item),
+        g.edge_from(single_item).map().to(process),
+        g.edge_from(process).to(collect),
+        g.edge_from(collect).to(g.end_node),
+    )
+
+    graph = g.build()
+    result = await graph.run(state=EdgeCaseState())
+    assert result == [84]
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:303-303
+    _model_name: str
+
+# scripts/check_cassettes.py:37-59
+    def pytest_collection_modifyitems(
+        self, session: pytest.Session, config: pytest.Config, items: list[pytest.Item]
+    ) -> None:
+        # prevents pytest.PytestAssertRewriteWarning: Module already imported so cannot be rewritten; pytest_recording
+        from pytest_recording.plugin import get_default_cassette_name
+
+        for item in items:
+            if not any(item.iter_markers('vcr')):
+                continue
+
+            test_file_stem = Path(item.location[0]).stem
+
+            m = item.get_closest_marker('default_cassette')
+            if m and m.args:
+                self.tests[test_file_stem].add(self._remove_yaml_ext(m.args[0]))
+            else:
+                self.tests[test_file_stem].add(
+                    self._remove_yaml_ext(get_default_cassette_name(getattr(item, 'cls', None), item.name))
+                )
+
+            for vm in item.iter_markers('vcr'):
+                for arg in vm.args:
+                    self.tests[test_file_stem].add(self._remove_yaml_ext(arg))
+
+# tests/models/test_model_test.py:449-456
+def test_max_items():
+    json_schema = {
+        'type': 'array',
+        'items': {'type': 'string'},
+        'maxItems': 0,
+    }
+    data = _JsonSchemaTestData(json_schema).generate()
+    assert data == snapshot([])
+
+# tests/models/test_download_item.py:42-44
+async def test_download_item_raises_user_error_with_youtube_url() -> None:
+    with pytest.raises(UserError, match='Downloading YouTube videos is not supported.'):
+        _ = await download_item(VideoUrl(url='https://youtu.be/lCdaVNyHtjU'), data_format='bytes')
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:362-364
+    def timestamp(self) -> datetime:
+        """Get the timestamp of the response."""
+        return self._timestamp
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:306-306
+    _provider_name: str

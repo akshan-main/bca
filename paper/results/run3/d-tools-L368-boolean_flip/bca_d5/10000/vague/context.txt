@@ -1,0 +1,976 @@
+## pydantic_ai_slim/pydantic_ai/profiles/google.py
+
+class GoogleJsonSchemaTransformer(JsonSchemaTransformer):
+    """Transforms the JSON Schema from Pydantic to be suitable for Gemini.
+
+    Gemini supports [a subset of OpenAPI v3.0.3](https://ai.google.dev/gemini-api/docs/function-calling#function_declarations).
+    """
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        # Remove properties not supported by Gemini
+        schema.pop('$schema', None)
+        if (const := schema.pop('const', None)) is not None:
+            # Gemini doesn't support const, but it does support enum with a single value
+            schema['enum'] = [const]
+            # If type is not present, infer it from the const value for Gemini API compatibility
+            if 'type' not in schema:
+                if isinstance(const, str):
+                    schema['type'] = 'string'
+                elif isinstance(const, bool):
+                    # bool must be checked before int since bool is a subclass of int in Python
+                    schema['type'] = 'boolean'
+                elif isinstance(const, int):
+                    schema['type'] = 'integer'
+                elif isinstance(const, float):
+                    schema['type'] = 'number'
+        schema.pop('discriminator', None)
+        schema.pop('examples', None)
+
+        # Remove 'title' due to https://github.com/googleapis/python-genai/issues/1732
+        schema.pop('title', None)
+
+        type_ = schema.get('type')
+        if type_ == 'string' and (fmt := schema.pop('format', None)):
+            description = schema.get('description')
+            if description:
+                schema['description'] = f'{description} (format: {fmt})'
+            else:
+                schema['description'] = f'Format: {fmt}'
+
+        # Note: exclusiveMinimum/exclusiveMaximum are NOT yet supported
+        schema.pop('exclusiveMinimum', None)
+        schema.pop('exclusiveMaximum', None)
+
+        return schema
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+class AsyncTenacityTransport(AsyncBaseTransport):
+    """Asynchronous HTTP transport with tenacity-based retry functionality.
+
+    This transport wraps another AsyncBaseTransport and adds retry capabilities using the tenacity library.
+    It can be configured to retry requests based on various conditions such as specific exception types,
+    response status codes, or custom validation logic.
+
+    The transport works by intercepting HTTP requests and responses, allowing the tenacity controller
+    to determine when and how to retry failed requests. The validate_response function can be used
+    to convert HTTP responses into exceptions that trigger retries.
+
+    Args:
+        wrapped: The underlying async transport to wrap and add retry functionality to.
+        config: The arguments to use for the tenacity `retry` decorator, including retry conditions,
+            wait strategy, stop conditions, etc. See the tenacity docs for more info.
+        validate_response: Optional callable that takes a Response and can raise an exception
+            to be handled by the controller if the response should trigger a retry.
+            Common use case is to raise exceptions for certain HTTP status codes.
+            If None, no response validation is performed.
+
+    Example:
+        ```python
+        from httpx import AsyncClient, HTTPStatusError
+        from tenacity import retry_if_exception_type, stop_after_attempt
+
+        from pydantic_ai.retries import AsyncTenacityTransport, RetryConfig, wait_retry_after
+
+        transport = AsyncTenacityTransport(
+            RetryConfig(
+                retry=retry_if_exception_type(HTTPStatusError),
+                wait=wait_retry_after(max_wait=300),
+                stop=stop_after_attempt(5),
+                reraise=True
+            ),
+            validate_response=lambda r: r.raise_for_status()
+        )
+        client = AsyncClient(transport=transport)
+        ```
+    """
+
+    def __init__(
+        self,
+        config: RetryConfig,
+        wrapped: AsyncBaseTransport | None = None,
+        validate_response: Callable[[Response], Any] | None = None,
+    ):
+        self.config = config
+        self.wrapped = wrapped or AsyncHTTPTransport()
+        self.validate_response = validate_response
+
+    async def handle_async_request(self, request: Request) -> Response:
+        """Handle an async HTTP request with retry logic.
+
+        Args:
+            request: The HTTP request to handle.
+
+        Returns:
+            The HTTP response.
+
+        Raises:
+            RuntimeError: If the retry controller did not make any attempts.
+            Exception: Any exception raised by the wrapped transport or validation function.
+        """
+
+        @retry(**self.config)
+        async def handle_async_request(req: Request) -> Response:
+            response = await self.wrapped.handle_async_request(req)
+
+            # this is normally set by httpx _after_ calling this function, but we want the request in the validator:
+            response.request = req
+
+            if self.validate_response:
+                try:
+                    self.validate_response(response)
+                except Exception:
+                    await response.aclose()
+                    raise
+            return response
+
+        return await handle_async_request(request)
+
+    async def __aenter__(self) -> AsyncTenacityTransport:
+        await self.wrapped.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self.wrapped.__aexit__(exc_type, exc_value, traceback)
+
+    async def aclose(self) -> None:
+        await self.wrapped.aclose()
+
+## tests/evals/test_report_evaluators.py
+
+def _make_report_case(
+    name: str,
+    output: Any = None,
+    expected_output: Any = None,
+    labels: dict[str, Any] | None = None,
+    scores: dict[str, Any] | None = None,
+    assertions: dict[str, Any] | None = None,
+    metrics: dict[str, float | int] | None = None,
+    metadata: Any = None,
+) -> ReportCase[Any, Any, Any]:
+    from pydantic_evals.evaluators.evaluator import EvaluationResult
+    from pydantic_evals.evaluators.spec import EvaluatorSpec
+
+    _source = EvaluatorSpec(name='test', arguments=None)
+
+    def _make_eval_result(key: str, val: Any) -> Any:
+        return EvaluationResult(name=key, value=val, reason=None, source=_source)
+
+    return ReportCase(
+        name=name,
+        inputs={},
+        metadata=metadata,
+        expected_output=expected_output,
+        output=output,
+        metrics=metrics or {},
+        attributes={},
+        scores={k: _make_eval_result(k, v) for k, v in (scores or {}).items()},
+        labels={k: _make_eval_result(k, v) for k, v in (labels or {}).items()},
+        assertions={k: _make_eval_result(k, v) for k, v in (assertions or {}).items()},
+        task_duration=0.1,
+        total_duration=0.2,
+    )
+
+def _make_report(cases: list[ReportCase]) -> EvaluationReport:
+    return EvaluationReport(name='test', cases=cases)
+
+## tests/models/test_google.py
+
+async def test_google_url_input_force_download(
+    allow_model_requests: None, vertex_provider: GoogleProvider, disable_ssrf_protection_for_vcr: None
+) -> None:  # pragma: lax no cover
+    m = GoogleModel('gemini-2.0-flash', provider=vertex_provider)
+    agent = Agent(m)
+
+    video_url = VideoUrl(url='https://data.grepit.app/assets/tiny_video.mp4', force_download=True)
+    result = await agent.run(['What is the main content of this URL?', video_url])
+
+    output = 'The image shows a picturesque scene in what appears to be a Greek island town. The focus is on an outdoor dining area with tables and chairs, situated in a narrow alleyway between whitewashed buildings. The ocean is visible at the end of the alley, creating a beautiful and inviting atmosphere.'
+
+    assert result.output == output
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content=['What is the main content of this URL?', Is(video_url)],
+                        timestamp=IsNow(tz=timezone.utc),
+                    ),
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content=Is(output))],
+                usage=IsInstance(RequestUsage),
+                model_name='gemini-2.0-flash',
+                timestamp=IsDatetime(),
+                provider_name='google-vertex',
+                provider_url='https://aiplatform.googleapis.com/',
+                provider_details={'finish_reason': 'STOP', 'timestamp': IsDatetime()},
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_huggingface.py
+
+async def test_thinking_part_in_history(allow_model_requests: None):
+    c = completion_message(ChatCompletionOutputMessage(content='response', role='assistant'))  # type: ignore
+    mock_client = MockHuggingFace.create_mock(c)
+    model = HuggingFaceModel('hf-model', provider=HuggingFaceProvider(hf_client=mock_client, api_key='x'))
+    agent = Agent(model)
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='request')], timestamp=IsDatetime()),
+        ModelResponse(
+            parts=[
+                TextPart(content='text 1'),
+                ThinkingPart(content='let me do some thinking'),
+                TextPart(content='text 2'),
+            ],
+            model_name='hf-model',
+            timestamp=datetime.now(timezone.utc),
+        ),
+    ]
+
+    await agent.run('another request', message_history=messages)
+
+    kwargs = get_mock_chat_completion_kwargs(mock_client)[0]
+    sent_messages = kwargs['messages']
+    assert [{k: v for k, v in asdict(m).items() if v is not None} for m in sent_messages] == snapshot(
+        [
+            {'content': 'request', 'role': 'user'},
+            {
+                'content': """\
+text 1
+
+<think>
+let me do some thinking
+</think>
+
+text 2\
+""",
+                'role': 'assistant',
+            },
+            {'content': 'another request', 'role': 'user'},
+        ]
+    )
+
+## tests/models/test_mcp_sampling.py
+
+def test_assistant_text_history():
+    result = CreateMessageResult(
+        role='assistant', content=TextContent(type='text', text='text content'), model='test-model'
+    )
+    create_message = AsyncMock(return_value=result)
+    agent = Agent(model=MCPSamplingModel(fake_session(create_message)), instructions='testing')
+
+    result = agent.run_sync('1')
+    result = agent.run_sync('2', message_history=result.all_messages())
+
+    assert result.output == snapshot('text content')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='1', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                instructions='testing',
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='text content')],
+                model_name='test-model',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='2', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                instructions='testing',
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='text content')],
+                model_name='test-model',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+def test_assistant_text_history_complex():
+    history = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='1'),
+                UserPromptPart(content=['a string', BinaryContent(data=b'data', media_type='image/jpeg')]),
+                SystemPromptPart(content='system content'),
+            ],
+            timestamp=IsDatetime(),
+        ),
+        ModelResponse(
+            parts=[TextPart(content='text content')],
+            model_name='test-model',
+        ),
+    ]
+
+    result = CreateMessageResult(
+        role='assistant', content=TextContent(type='text', text='text content'), model='test-model'
+    )
+    create_message = AsyncMock(return_value=result)
+    agent = Agent(model=MCPSamplingModel(fake_session(create_message)))
+    result = agent.run_sync('1', message_history=history)
+    assert result.output == snapshot('text content')
+
+## tests/models/test_openai.py
+
+async def test_message_history_can_start_with_model_response(allow_model_requests: None, openai_api_key: str):
+    """Test that an agent run with message_history starting with ModelResponse is executed correctly."""
+
+    openai_model = OpenAIChatModel('gpt-4.1-mini', provider=OpenAIProvider(api_key=openai_api_key))
+
+    message_history = [ModelResponse(parts=[TextPart('Where do you want to go today?')])]
+
+    agent = Agent(model=openai_model)
+
+    result = await agent.run('Answer in 5 words only. Who is Tux?', message_history=message_history)
+
+    assert result.output == snapshot('Linux mascot, a penguin character.')
+    assert result.all_messages() == snapshot(
+        [
+            ModelResponse(
+                parts=[TextPart(content='Where do you want to go today?')],
+                timestamp=IsDatetime(),
+            ),
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Answer in 5 words only. Who is Tux?',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Linux mascot, a penguin character.')],
+                usage=RequestUsage(
+                    input_tokens=31,
+                    output_tokens=8,
+                    details={
+                        'accepted_prediction_tokens': 0,
+                        'audio_tokens': 0,
+                        'reasoning_tokens': 0,
+                        'rejected_prediction_tokens': 0,
+                    },
+                ),
+                model_name='gpt-4.1-mini-2025-04-14',
+                timestamp=IsDatetime(),
+                provider_name='openai',
+                provider_url='https://api.openai.com/v1/',
+                provider_details={
+                    'finish_reason': 'stop',
+                    'timestamp': datetime(2025, 11, 22, 10, 1, 40, tzinfo=timezone.utc),
+                },
+                provider_response_id='chatcmpl-Ceeiy4ivEE0hcL1EX5ZfLuW5xNUXB',
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_xai.py
+
+async def test_xai_reorders_tool_return_parts_by_tool_call_id(allow_model_requests: None):
+    response = create_response(
+        content='done',
+        usage=create_usage(prompt_tokens=20, completion_tokens=5),
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Run tools')]),
+        ModelResponse(
+            parts=[
+                # Deliberately non-alphabetical order to ensure we don't sort tool results by name/content.
+                ToolCallPart(tool_name='tool_a', args='{}', tool_call_id='tool_a'),
+                ToolCallPart(tool_name='tool_c', args='{}', tool_call_id='tool_c'),
+                ToolCallPart(tool_name='tool_b', args='{}', tool_call_id='tool_b'),
+            ],
+            finish_reason='tool_call',
+        ),
+        # Intentionally shuffled: xAI expects tool results in the order the calls were requested.
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name='tool_b', content='tool_b', tool_call_id='tool_b'),
+                ToolReturnPart(tool_name='tool_a', content='tool_a', tool_call_id='tool_a'),
+                ToolReturnPart(tool_name='tool_c', content='tool_c', tool_call_id='tool_c'),
+            ]
+        ),
+    ]
+
+    await m.request(messages, model_settings=None, model_request_parameters=ModelRequestParameters())
+
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'Run tools'}], 'role': 'ROLE_USER'},
+                    {
+                        'content': [{'text': ''}],
+                        'role': 'ROLE_ASSISTANT',
+                        'tool_calls': [
+                            {
+                                'id': 'tool_a',
+                                'type': 'TOOL_CALL_TYPE_CLIENT_SIDE_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'tool_a', 'arguments': '{}'},
+                            },
+                            {
+                                'id': 'tool_c',
+                                'type': 'TOOL_CALL_TYPE_CLIENT_SIDE_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'tool_c', 'arguments': '{}'},
+                            },
+                            {
+                                'id': 'tool_b',
+                                'type': 'TOOL_CALL_TYPE_CLIENT_SIDE_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'tool_b', 'arguments': '{}'},
+                            },
+                        ],
+                    },
+                    {'content': [{'text': 'tool_a'}], 'role': 'ROLE_TOOL'},
+                    {'content': [{'text': 'tool_c'}], 'role': 'ROLE_TOOL'},
+                    {'content': [{'text': 'tool_b'}], 'role': 'ROLE_TOOL'},
+                ],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+async def test_xai_reorders_retry_prompt_tool_results_by_tool_call_id(allow_model_requests: None):
+    response = create_response(
+        content='done',
+        usage=create_usage(prompt_tokens=20, completion_tokens=5),
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Run tools')]),
+        ModelResponse(
+            parts=[
+                # Deliberately non-alphabetical order to ensure we don't sort tool results by name/content.
+                ToolCallPart(tool_name='tool_a', args='{}', tool_call_id='tool_a'),
+                ToolCallPart(tool_name='tool_c', args='{}', tool_call_id='tool_c'),
+                ToolCallPart(tool_name='tool_b', args='{}', tool_call_id='tool_b'),
+            ],
+            finish_reason='tool_call',
+        ),
+        # Intentionally shuffled, but these are tool-results too (tool_name is set).
+        ModelRequest(
+            parts=[
+                RetryPromptPart(content='retry tool_b', tool_name='tool_b', tool_call_id='tool_b'),
+                RetryPromptPart(content='retry tool_a', tool_name='tool_a', tool_call_id='tool_a'),
+                RetryPromptPart(content='retry tool_c', tool_name='tool_c', tool_call_id='tool_c'),
+            ]
+        ),
+    ]
+
+    await m.request(messages, model_settings=None, model_request_parameters=ModelRequestParameters())
+
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'Run tools'}], 'role': 'ROLE_USER'},
+                    {
+                        'content': [{'text': ''}],
+                        'role': 'ROLE_ASSISTANT',
+                        'tool_calls': [
+                            {
+                                'id': 'tool_a',
+                                'type': 'TOOL_CALL_TYPE_CLIENT_SIDE_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'tool_a', 'arguments': '{}'},
+                            },
+                            {
+                                'id': 'tool_c',
+                                'type': 'TOOL_CALL_TYPE_CLIENT_SIDE_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'tool_c', 'arguments': '{}'},
+                            },
+                            {
+                                'id': 'tool_b',
+                                'type': 'TOOL_CALL_TYPE_CLIENT_SIDE_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'tool_b', 'arguments': '{}'},
+                            },
+                        ],
+                    },
+                    {
+                        'content': [{'text': 'retry tool_a\n\nFix the errors and try again.'}],
+                        'role': 'ROLE_TOOL',
+                    },
+                    {
+                        'content': [{'text': 'retry tool_c\n\nFix the errors and try again.'}],
+                        'role': 'ROLE_TOOL',
+                    },
+                    {
+                        'content': [{'text': 'retry tool_b\n\nFix the errors and try again.'}],
+                        'role': 'ROLE_TOOL',
+                    },
+                ],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+async def test_xai_thinking_part_with_content_and_signature_in_history(allow_model_requests: None):
+    """Test that ThinkingPart with BOTH content AND signature in history is properly mapped."""
+    # First response with BOTH reasoning content AND encrypted signature
+    # This is needed because provider_name is only set to 'xai' when there's a signature
+    # And content is only mapped when provider_name matches
+    response1 = create_response(
+        content='first response',
+        reasoning_content='First reasoning',
+        encrypted_content='encrypted_signature_123',
+        usage=create_usage(prompt_tokens=10, completion_tokens=5),
+    )
+    # Second response
+    response2 = create_response(
+        content='second response',
+        usage=create_usage(prompt_tokens=20, completion_tokens=5),
+    )
+
+    mock_client = MockXai.create_mock([response1, response2])
+    m = XaiModel(XAI_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    # Run twice to test message history containing ThinkingPart with content AND signature
+    result1 = await agent.run('First question')
+    result2 = await agent.run('Second question', message_history=result1.new_messages())
+
+    # Verify kwargs - second call should have ThinkingPart mapped with both reasoning_content AND encrypted_content
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_REASONING_MODEL,
+                'messages': [{'content': [{'text': 'First question'}], 'role': 'ROLE_USER'}],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+            {
+                'model': XAI_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'First question'}], 'role': 'ROLE_USER'},
+                    # ThinkingPart with BOTH content and signature
+                    {
+                        'content': [{'text': ''}],
+                        'reasoning_content': 'First reasoning',
+                        'encrypted_content': 'encrypted_signature_123',
+                        'role': 'ROLE_ASSISTANT',
+                    },
+                    {'content': [{'text': 'first response'}], 'role': 'ROLE_ASSISTANT'},
+                    {'content': [{'text': 'Second question'}], 'role': 'ROLE_USER'},
+                ],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+        ]
+    )
+
+    assert result2.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='First question', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ThinkingPart(content='First reasoning', signature=IsStr(), provider_name='xai'),
+                    TextPart(content='first response'),
+                ],
+                usage=RequestUsage(input_tokens=10, output_tokens=5),
+                model_name=XAI_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_name='xai',
+                provider_url='https://api.x.ai/v1',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='Second question', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='second response')],
+                usage=RequestUsage(input_tokens=20, output_tokens=5),
+                model_name=XAI_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_name='xai',
+                provider_url='https://api.x.ai/v1',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+async def test_xai_thinking_part_content_only_with_provider_in_history(allow_model_requests: None):
+    """Test ThinkingPart with content and provider_name but NO signature in history."""
+    # Create a response for the continuation
+    response = create_response(content='Got it', usage=create_usage(prompt_tokens=10, completion_tokens=5))
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    # Manually construct history with ThinkingPart that has content and provider_name='xai' but NO signature
+    # This triggers the branch where item.signature is falsy
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='First question')]),
+        ModelResponse(
+            parts=[
+                ThinkingPart(
+                    content='I am reasoning about this',
+                    signature=None,  # No signature - this is the key for branch coverage
+                    provider_name='xai',  # Must be 'xai' to enter the if block
+                ),
+                TextPart(content='First answer'),
+            ],
+            model_name=XAI_REASONING_MODEL,
+        ),
+    ]
+
+    await agent.run('Follow up', message_history=message_history)
+
+    # Verify kwargs - ThinkingPart with content only should map to reasoning_content without encrypted_content
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'First question'}], 'role': 'ROLE_USER'},
+                    # ThinkingPart with content only → reasoning_content set, no encrypted_content
+                    {
+                        'content': [{'text': ''}],
+                        'reasoning_content': 'I am reasoning about this',
+                        'role': 'ROLE_ASSISTANT',
+                    },
+                    {'content': [{'text': 'First answer'}], 'role': 'ROLE_ASSISTANT'},
+                    {'content': [{'text': 'Follow up'}], 'role': 'ROLE_USER'},
+                ],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+## tests/test_ag_ui.py
+
+async def run_and_collect_events(
+    agent: Agent[AgentDepsT, OutputDataT],
+    *run_inputs: RunAgentInput,
+    deps: AgentDepsT = None,
+    on_complete: OnCompleteFunc[BaseEvent] | None = None,
+) -> list[dict[str, Any]]:
+    events = list[dict[str, Any]]()
+    for run_input in run_inputs:
+        async for event in run_ag_ui(agent, run_input, deps=deps, on_complete=on_complete):
+            events.append(json.loads(event.removeprefix('data: ')))
+    return events
+
+## tests/test_agent.py
+
+def test_run_with_history_ending_on_model_request_and_no_user_prompt():
+    m = TestModel()
+    agent = Agent(m)
+
+    @agent.system_prompt(dynamic=True)
+    async def system_prompt(ctx: RunContext) -> str:
+        return f'System prompt: user prompt length = {len(ctx.prompt or [])}'
+
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart(content='System prompt', dynamic_ref=system_prompt.__qualname__),
+                UserPromptPart(content=['Hello', ImageUrl('https://example.com/image.jpg')]),
+                UserPromptPart(content='How goes it?'),
+            ],
+            instructions='Original instructions',
+        ),
+    ]
+
+    @agent.instructions
+    async def instructions(ctx: RunContext) -> str:
+        assert ctx.prompt == ['Hello', ImageUrl('https://example.com/image.jpg'), 'How goes it?']
+        return 'New instructions'
+
+    result = agent.run_sync(message_history=messages)
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(
+                        content='System prompt: user prompt length = 3',
+                        timestamp=IsDatetime(),
+                        dynamic_ref=IsStr(),
+                    ),
+                    UserPromptPart(
+                        content=['Hello', ImageUrl(url='https://example.com/image.jpg', identifier='39cfc4')],
+                        timestamp=IsDatetime(),
+                    ),
+                    UserPromptPart(
+                        content='How goes it?',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                instructions='New instructions',
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=61, output_tokens=4),
+                model_name='test',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+    assert result.new_messages() == result.all_messages()[-1:]
+
+async def test_message_history():
+    def llm(messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart('ok here is text')])
+
+    agent = Agent(FunctionModel(llm))
+
+    async with agent.iter(
+        message_history=[
+            ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ],
+    ) as run:
+        async for _ in run:
+            pass
+        assert run.new_messages() == snapshot(
+            [
+                ModelResponse(
+                    parts=[TextPart(content='ok here is text')],
+                    usage=RequestUsage(input_tokens=51, output_tokens=4),
+                    model_name='function:llm:',
+                    timestamp=IsDatetime(),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+        assert run.new_messages_json().startswith(b'[{"parts":[{"content":"ok here is text",')
+        assert run.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content='Hello',
+                            timestamp=IsDatetime(),
+                        )
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[TextPart(content='ok here is text')],
+                    usage=RequestUsage(input_tokens=51, output_tokens=4),
+                    model_name='function:llm:',
+                    timestamp=IsDatetime(),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+        assert run.all_messages_json().startswith(b'[{"parts":[{"content":"Hello",')
+
+## tests/test_dbos.py
+
+def workflow_raises(exc_type: type[Exception], exc_message: str) -> Iterator[None]:
+    """Helper for asserting that a DBOS workflow fails with the expected error."""
+    with pytest.raises(Exception) as exc_info:
+        yield
+    assert isinstance(exc_info.value, Exception)
+    assert str(exc_info.value) == exc_message
+
+## tests/test_history_processor.py
+
+async def test_history_processor_run_replaces_message_history(
+    function_model: FunctionModel, received_messages: list[ModelMessage]
+):
+    """Test that the history processor replaces the message history in the state."""
+
+    def process_previous_answers(messages: list[ModelMessage]) -> list[ModelMessage]:
+        # Keep the last message (last question) and add a new system prompt
+        return messages[-1:] + [ModelRequest(parts=[SystemPromptPart(content='Processed answer')])]
+
+    agent = Agent(function_model, history_processors=[process_previous_answers])
+
+    message_history = [
+        ModelRequest(parts=[UserPromptPart(content='Question 1')]),
+        ModelResponse(parts=[TextPart(content='Answer 1')]),
+        ModelRequest(parts=[UserPromptPart(content='Question 2')]),
+        ModelResponse(parts=[TextPart(content='Answer 2')]),
+    ]
+
+    with capture_run_messages() as captured_messages:
+        result = await agent.run('Question 3', message_history=message_history)
+
+    assert received_messages == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Question 3',
+                        timestamp=IsDatetime(),
+                    ),
+                    SystemPromptPart(
+                        content='Processed answer',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                timestamp=IsDatetime(),
+            )
+        ]
+    )
+    assert captured_messages == result.all_messages()
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Question 3', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[SystemPromptPart(content='Processed answer', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Provider response')],
+                usage=RequestUsage(input_tokens=54, output_tokens=2),
+                model_name='function:capture_model_function:capture_model_stream_function',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.new_messages() == result.all_messages()[-2:]
+
+async def test_history_processor_streaming_replaces_message_history(
+    function_model: FunctionModel, received_messages: list[ModelMessage]
+):
+    """Test that the history processor replaces the message history in the state."""
+
+    def process_previous_answers(messages: list[ModelMessage]) -> list[ModelMessage]:
+        # Keep the last message (last question) and add a new system prompt
+        return messages[-1:] + [ModelRequest(parts=[SystemPromptPart(content='Processed answer')])]
+
+    agent = Agent(function_model, history_processors=[process_previous_answers])
+
+    message_history = [
+        ModelRequest(parts=[UserPromptPart(content='Question 1')]),
+        ModelResponse(parts=[TextPart(content='Answer 1')]),
+        ModelRequest(parts=[UserPromptPart(content='Question 2')]),
+        ModelResponse(parts=[TextPart(content='Answer 2')]),
+    ]
+
+    with capture_run_messages() as captured_messages:
+        async with agent.run_stream('Question 3', message_history=message_history) as result:
+            async for _ in result.stream_text():
+                pass
+
+    assert received_messages == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Question 3',
+                        timestamp=IsDatetime(),
+                    ),
+                    SystemPromptPart(
+                        content='Processed answer',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                timestamp=IsDatetime(),
+            )
+        ]
+    )
+    assert captured_messages == result.all_messages()
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Question 3', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[SystemPromptPart(content='Processed answer', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='hello')],
+                usage=RequestUsage(input_tokens=50, output_tokens=1),
+                model_name='function:capture_model_function:capture_model_stream_function',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.new_messages() == result.all_messages()[-2:]
+
+## tests/test_temporal.py
+
+async def test_temporal_agent_run_stream_events(allow_model_requests: None):
+    events = [event async for event in simple_temporal_agent.run_stream_events('What is the capital of Mexico?')]
+    assert events == snapshot(
+        [
+            PartStartEvent(index=0, part=TextPart(content='The')),
+            FinalResultEvent(tool_name=None, tool_call_id=None),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=' capital')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=' of')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=' Mexico')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=' is')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=' Mexico')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta=' City')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='.')),
+            PartEndEvent(index=0, part=TextPart(content='The capital of Mexico is Mexico City.')),
+            AgentRunResultEvent(result=AgentRunResult(output='The capital of Mexico is Mexico City.')),
+        ]
+    )

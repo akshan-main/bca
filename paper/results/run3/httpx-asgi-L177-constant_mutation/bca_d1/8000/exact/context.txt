@@ -1,0 +1,923 @@
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+class UseClientDefault:
+    """
+    For some parameters such as `auth=...` and `timeout=...` we need to be able
+    to indicate the default "unset" state, in a way that is distinctly different
+    to using `None`.
+
+    The default "unset" state indicates that whatever default is set on the
+    client should be used. This is different to setting `None`, which
+    explicitly disables the parameter, possibly overriding a client default.
+
+    For example we use `timeout=USE_CLIENT_DEFAULT` in the `request()` signature.
+    Omitting the `timeout` parameter will send a request using whatever default
+    timeout has been configured on the client. Including `timeout=None` will
+    ensure no timeout is used.
+
+    Note that user code shouldn't need to use the `USE_CLIENT_DEFAULT` constant,
+    but it is used internally when a parameter is not included.
+    """
+
+USE_CLIENT_DEFAULT = UseClientDefault()
+
+    def _build_request_auth(
+        self,
+        request: Request,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+    ) -> Auth:
+        auth = (
+            self._auth if isinstance(auth, UseClientDefault) else self._build_auth(auth)
+        )
+
+        if auth is not None:
+            return auth
+
+        username, password = request.url.username, request.url.password
+        if username or password:
+            return BasicAuth(username=username, password=password)
+
+        return Auth()
+
+    def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `Client.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                response.read()
+
+            return response
+
+        except BaseException as exc:
+            response.close()
+            raise exc
+
+    def head(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `HEAD` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return self.request(
+            "HEAD",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+## httpx/_config.py
+
+DEFAULT_TIMEOUT_CONFIG = Timeout(timeout=5.0)
+
+DEFAULT_LIMITS = Limits(max_connections=100, max_keepalive_connections=20)
+
+DEFAULT_MAX_REDIRECTS = 20
+
+## httpx/_exceptions.py
+
+class HTTPError(Exception):
+    """
+    Base class for `RequestError` and `HTTPStatusError`.
+
+    Useful for `try...except` blocks when issuing a request,
+    and then calling `.raise_for_status()`.
+
+    For example:
+
+    ```
+    try:
+        response = httpx.get("https://www.example.com")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        print(f"HTTP Exception for {exc.request.url} - {exc}")
+    ```
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._request: Request | None = None
+
+    @property
+    def request(self) -> Request:
+        if self._request is None:
+            raise RuntimeError("The .request property has not been set.")
+        return self._request
+
+    @request.setter
+    def request(self, request: Request) -> None:
+        self._request = request
+
+class RequestError(HTTPError):
+    """
+    Base class for all exceptions that may occur when issuing a `.request()`.
+    """
+
+    def __init__(self, message: str, *, request: Request | None = None) -> None:
+        super().__init__(message)
+        # At the point an exception is raised we won't typically have a request
+        # instance to associate it with.
+        #
+        # The 'request_context' context manager is used within the Client and
+        # Response methods in order to ensure that any raised exceptions
+        # have a `.request` property set on them.
+        self._request = request
+
+class TransportError(RequestError):
+    """
+    Base class for all exceptions that occur at the level of the Transport API.
+    """
+
+class ProtocolError(TransportError):
+    """
+    The protocol was violated.
+    """
+
+class RemoteProtocolError(ProtocolError):
+    """
+    The protocol was violated by the server.
+
+    For example, returning malformed HTTP.
+    """
+
+## httpx/_models.py
+
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        headers: HeaderTypes | None = None,
+        content: ResponseContent | None = None,
+        text: str | None = None,
+        html: str | None = None,
+        json: typing.Any = None,
+        stream: SyncByteStream | AsyncByteStream | None = None,
+        request: Request | None = None,
+        extensions: ResponseExtensions | None = None,
+        history: list[Response] | None = None,
+        default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+    ) -> None:
+        self.status_code = status_code
+        self.headers = Headers(headers)
+
+        self._request: Request | None = request
+
+        # When follow_redirects=False and a redirect is received,
+        # the client will set `response.next_request`.
+        self.next_request: Request | None = None
+
+        self.extensions = {} if extensions is None else dict(extensions)
+        self.history = [] if history is None else list(history)
+
+        self.is_closed = False
+        self.is_stream_consumed = False
+
+        self.default_encoding = default_encoding
+
+        if stream is None:
+            headers, stream = encode_response(content, text, html, json)
+            self._prepare(headers)
+            self.stream = stream
+            if isinstance(stream, ByteStream):
+                # Load the response body, except for streaming content.
+                self.read()
+        else:
+            # There's an important distinction between `Response(content=...)`,
+            # and `Response(stream=...)`.
+            #
+            # Using `content=...` implies automatically populated content headers,
+            # of either `Content-Length: ...` or `Transfer-Encoding: chunked`.
+            #
+            # Using `stream=...` will not automatically include any content headers.
+            #
+            # As an end-user you don't really need `stream=...`. It's only
+            # useful when creating response instances having received a stream
+            # from the transport API.
+            self.stream = stream
+
+        self._num_bytes_downloaded = 0
+
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+## httpx/_multipart.py
+
+def get_multipart_boundary_from_content_type(
+    content_type: bytes | None,
+) -> bytes | None:
+    if not content_type or not content_type.startswith(b"multipart/form-data"):
+        return None
+    # parse boundary according to
+    # https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
+    if b";" in content_type:
+        for section in content_type.split(b";"):
+            if section.strip().lower().startswith(b"boundary="):
+                return section.strip()[len(b"boundary=") :].strip(b'"')
+    return None
+
+    def __init__(
+        self,
+        data: RequestData,
+        files: RequestFiles,
+        boundary: bytes | None = None,
+    ) -> None:
+        if boundary is None:
+            boundary = os.urandom(16).hex().encode("ascii")
+
+        self.boundary = boundary
+        self.content_type = "multipart/form-data; boundary=%s" % boundary.decode(
+            "ascii"
+        )
+        self.fields = list(self._iter_fields(data, files))
+
+## httpx/_status_codes.py
+
+from enum import IntEnum
+
+class codes(IntEnum):
+    """HTTP status codes and reason phrases
+
+    Status codes from the following RFCs are all observed:
+
+        * RFC 7231: Hypertext Transfer Protocol (HTTP/1.1), obsoletes 2616
+        * RFC 6585: Additional HTTP Status Codes
+        * RFC 3229: Delta encoding in HTTP
+        * RFC 4918: HTTP Extensions for WebDAV, obsoletes 2518
+        * RFC 5842: Binding Extensions to WebDAV
+        * RFC 7238: Permanent Redirect
+        * RFC 2295: Transparent Content Negotiation in HTTP
+        * RFC 2774: An HTTP Extension Framework
+        * RFC 7540: Hypertext Transfer Protocol Version 2 (HTTP/2)
+        * RFC 2324: Hyper Text Coffee Pot Control Protocol (HTCPCP/1.0)
+        * RFC 7725: An HTTP Status Code to Report Legal Obstacles
+        * RFC 8297: An HTTP Status Code for Indicating Hints
+        * RFC 8470: Using Early Data in HTTP
+    """
+
+    def __new__(cls, value: int, phrase: str = "") -> codes:
+        obj = int.__new__(cls, value)
+        obj._value_ = value
+
+        obj.phrase = phrase  # type: ignore[attr-defined]
+        return obj
+
+    def __str__(self) -> str:
+        return str(self.value)
+
+    @classmethod
+    def get_reason_phrase(cls, value: int) -> str:
+        try:
+            return codes(value).phrase  # type: ignore
+        except ValueError:
+            return ""
+
+    @classmethod
+    def is_informational(cls, value: int) -> bool:
+        """
+        Returns `True` for 1xx status codes, `False` otherwise.
+        """
+        return 100 <= value <= 199
+
+    @classmethod
+    def is_success(cls, value: int) -> bool:
+        """
+        Returns `True` for 2xx status codes, `False` otherwise.
+        """
+        return 200 <= value <= 299
+
+    @classmethod
+    def is_redirect(cls, value: int) -> bool:
+        """
+        Returns `True` for 3xx status codes, `False` otherwise.
+        """
+        return 300 <= value <= 399
+
+    @classmethod
+    def is_client_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 499
+
+    @classmethod
+    def is_server_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 5xx status codes, `False` otherwise.
+        """
+        return 500 <= value <= 599
+
+    @classmethod
+    def is_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx or 5xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 599
+
+    # informational
+    CONTINUE = 100, "Continue"
+    SWITCHING_PROTOCOLS = 101, "Switching Protocols"
+    PROCESSING = 102, "Processing"
+    EARLY_HINTS = 103, "Early Hints"
+
+    # success
+    OK = 200, "OK"
+    CREATED = 201, "Created"
+    ACCEPTED = 202, "Accepted"
+    NON_AUTHORITATIVE_INFORMATION = 203, "Non-Authoritative Information"
+    NO_CONTENT = 204, "No Content"
+    RESET_CONTENT = 205, "Reset Content"
+    PARTIAL_CONTENT = 206, "Partial Content"
+    MULTI_STATUS = 207, "Multi-Status"
+    ALREADY_REPORTED = 208, "Already Reported"
+    IM_USED = 226, "IM Used"
+
+    # redirection
+    MULTIPLE_CHOICES = 300, "Multiple Choices"
+    MOVED_PERMANENTLY = 301, "Moved Permanently"
+    FOUND = 302, "Found"
+    SEE_OTHER = 303, "See Other"
+    NOT_MODIFIED = 304, "Not Modified"
+    USE_PROXY = 305, "Use Proxy"
+    TEMPORARY_REDIRECT = 307, "Temporary Redirect"
+    PERMANENT_REDIRECT = 308, "Permanent Redirect"
+
+    # client error
+    BAD_REQUEST = 400, "Bad Request"
+    UNAUTHORIZED = 401, "Unauthorized"
+    PAYMENT_REQUIRED = 402, "Payment Required"
+    FORBIDDEN = 403, "Forbidden"
+    NOT_FOUND = 404, "Not Found"
+    METHOD_NOT_ALLOWED = 405, "Method Not Allowed"
+    NOT_ACCEPTABLE = 406, "Not Acceptable"
+    PROXY_AUTHENTICATION_REQUIRED = 407, "Proxy Authentication Required"
+    REQUEST_TIMEOUT = 408, "Request Timeout"
+    CONFLICT = 409, "Conflict"
+    GONE = 410, "Gone"
+    LENGTH_REQUIRED = 411, "Length Required"
+    PRECONDITION_FAILED = 412, "Precondition Failed"
+    REQUEST_ENTITY_TOO_LARGE = 413, "Request Entity Too Large"
+    REQUEST_URI_TOO_LONG = 414, "Request-URI Too Long"
+    UNSUPPORTED_MEDIA_TYPE = 415, "Unsupported Media Type"
+    REQUESTED_RANGE_NOT_SATISFIABLE = 416, "Requested Range Not Satisfiable"
+    EXPECTATION_FAILED = 417, "Expectation Failed"
+    IM_A_TEAPOT = 418, "I'm a teapot"
+    MISDIRECTED_REQUEST = 421, "Misdirected Request"
+    UNPROCESSABLE_ENTITY = 422, "Unprocessable Entity"
+    LOCKED = 423, "Locked"
+    FAILED_DEPENDENCY = 424, "Failed Dependency"
+    TOO_EARLY = 425, "Too Early"
+    UPGRADE_REQUIRED = 426, "Upgrade Required"
+    PRECONDITION_REQUIRED = 428, "Precondition Required"
+    TOO_MANY_REQUESTS = 429, "Too Many Requests"
+    REQUEST_HEADER_FIELDS_TOO_LARGE = 431, "Request Header Fields Too Large"
+    UNAVAILABLE_FOR_LEGAL_REASONS = 451, "Unavailable For Legal Reasons"
+
+    # server errors
+    INTERNAL_SERVER_ERROR = 500, "Internal Server Error"
+    NOT_IMPLEMENTED = 501, "Not Implemented"
+    BAD_GATEWAY = 502, "Bad Gateway"
+    SERVICE_UNAVAILABLE = 503, "Service Unavailable"
+    GATEWAY_TIMEOUT = 504, "Gateway Timeout"
+    HTTP_VERSION_NOT_SUPPORTED = 505, "HTTP Version Not Supported"
+    VARIANT_ALSO_NEGOTIATES = 506, "Variant Also Negotiates"
+    INSUFFICIENT_STORAGE = 507, "Insufficient Storage"
+    LOOP_DETECTED = 508, "Loop Detected"
+    NOT_EXTENDED = 510, "Not Extended"
+    NETWORK_AUTHENTICATION_REQUIRED = 511, "Network Authentication Required"
+
+    def get_reason_phrase(cls, value: int) -> str:
+        try:
+            return codes(value).phrase  # type: ignore
+        except ValueError:
+            return ""
+
+## httpx/_transports/asgi.py
+
+_ASGIApp = typing.Callable[
+    [typing.MutableMapping[str, typing.Any], _Receive, _Send], typing.Awaitable[None]
+]
+
+class ASGIResponseStream(AsyncByteStream):
+    def __init__(self, body: list[bytes]) -> None:
+        self._body = body
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        yield b"".join(self._body)
+
+    def __init__(self, body: list[bytes]) -> None:
+        self._body = body
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        yield b"".join(self._body)
+
+class ASGITransport(AsyncBaseTransport):
+    """
+    A custom AsyncTransport that handles sending requests directly to an ASGI app.
+
+    ```python
+    transport = httpx.ASGITransport(
+        app=app,
+        root_path="/submount",
+        client=("1.2.3.4", 123)
+    )
+    client = httpx.AsyncClient(transport=transport)
+    ```
+
+    Arguments:
+
+    * `app` - The ASGI application.
+    * `raise_app_exceptions` - Boolean indicating if exceptions in the application
+       should be raised. Default to `True`. Can be set to `False` for use cases
+       such as testing the content of a client 500 response.
+    * `root_path` - The root path on which the ASGI application should be mounted.
+    * `client` - A two-tuple indicating the client IP and port of incoming requests.
+    ```
+    """
+
+    def __init__(
+        self,
+        app: _ASGIApp,
+        raise_app_exceptions: bool = True,
+        root_path: str = "",
+        client: tuple[str, int] = ("127.0.0.1", 123),
+    ) -> None:
+        self.app = app
+        self.raise_app_exceptions = raise_app_exceptions
+        self.root_path = root_path
+        self.client = client
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, AsyncByteStream)
+
+        # ASGI scope.
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": request.method,
+            "headers": [(k.lower(), v) for (k, v) in request.headers.raw],
+            "scheme": request.url.scheme,
+            "path": request.url.path,
+            "raw_path": request.url.raw_path.split(b"?")[0],
+            "query_string": request.url.query,
+            "server": (request.url.host, request.url.port),
+            "client": self.client,
+            "root_path": self.root_path,
+        }
+
+        # Request.
+        request_body_chunks = request.stream.__aiter__()
+        request_complete = False
+
+        # Response.
+        status_code = None
+        response_headers = None
+        body_parts = []
+        response_started = False
+        response_complete = create_event()
+
+        # ASGI callables.
+
+        async def receive() -> dict[str, typing.Any]:
+            nonlocal request_complete
+
+            if request_complete:
+                await response_complete.wait()
+                return {"type": "http.disconnect"}
+
+            try:
+                body = await request_body_chunks.__anext__()
+            except StopAsyncIteration:
+                request_complete = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.request", "body": body, "more_body": True}
+
+        async def send(message: typing.MutableMapping[str, typing.Any]) -> None:
+            nonlocal status_code, response_headers, response_started
+
+            if message["type"] == "http.response.start":
+                assert not response_started
+
+                status_code = message["status"]
+                response_headers = message.get("headers", [])
+                response_started = True
+
+            elif message["type"] == "http.response.body":
+                assert not response_complete.is_set()
+                body = message.get("body", b"")
+                more_body = message.get("more_body", False)
+
+                if body and request.method != "HEAD":
+                    body_parts.append(body)
+
+                if not more_body:
+                    response_complete.set()
+
+        try:
+            await self.app(scope, receive, send)
+        except Exception:  # noqa: PIE-786
+            if self.raise_app_exceptions:
+                raise
+
+            response_complete.set()
+            if status_code is None:
+                status_code = 501
+            if response_headers is None:
+                response_headers = {}
+
+        assert response_complete.is_set()
+        assert status_code is not None
+        assert response_headers is not None
+
+        stream = ASGIResponseStream(body_parts)
+
+        return Response(status_code, headers=response_headers, stream=stream)
+
+    def __init__(
+        self,
+        app: _ASGIApp,
+        raise_app_exceptions: bool = True,
+        root_path: str = "",
+        client: tuple[str, int] = ("127.0.0.1", 123),
+    ) -> None:
+        self.app = app
+        self.raise_app_exceptions = raise_app_exceptions
+        self.root_path = root_path
+        self.client = client
+
+## tests/client/test_auth.py
+
+    def __init__(self, auth_header: str = "", status_code: int = 200) -> None:
+        self.auth_header = auth_header
+        self.status_code = status_code
+
+## tests/client/test_headers.py
+
+def test_remove_default_header():
+    """
+    Remove a default header from the Client.
+    """
+    url = "http://example.org/echo_headers"
+
+    client = httpx.Client(transport=httpx.MockTransport(echo_headers))
+    del client.headers["User-Agent"]
+
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org",
+        }
+    }
+
+def test_host_with_non_default_port_in_url():
+    """
+    If the URL includes a non-default port, then it should be included in
+    the Host header.
+    """
+    url = "http://username:password@example.org:123/echo_headers"
+
+    client = httpx.Client(transport=httpx.MockTransport(echo_headers))
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org:123",
+            "user-agent": f"python-httpx/{httpx.__version__}",
+            "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+        }
+    }
+
+def test_is_not_https_redirect_if_not_default_ports():
+    url = httpx.URL("https://example.com:1337")
+    request = httpx.Request(
+        "GET", "http://example.com:9999", headers={"Authorization": "empty"}
+    )
+
+    client = httpx.Client()
+    headers = client._redirect_headers(request, url, "GET")
+
+    assert "Authorization" not in headers
+
+## tests/conftest.py
+
+async def app(scope: Scope, receive: Receive, send: Send) -> None:
+    assert scope["type"] == "http"
+    if scope["path"].startswith("/slow_response"):
+        await slow_response(scope, receive, send)
+    elif scope["path"].startswith("/status"):
+        await status_code(scope, receive, send)
+    elif scope["path"].startswith("/echo_body"):
+        await echo_body(scope, receive, send)
+    elif scope["path"].startswith("/echo_binary"):
+        await echo_binary(scope, receive, send)
+    elif scope["path"].startswith("/echo_headers"):
+        await echo_headers(scope, receive, send)
+    elif scope["path"].startswith("/redirect_301"):
+        await redirect_301(scope, receive, send)
+    elif scope["path"].startswith("/json"):
+        await hello_world_json(scope, receive, send)
+    else:
+        await hello_world(scope, receive, send)
+
+async def status_code(scope: Scope, receive: Receive, send: Send) -> None:
+    status_code = int(scope["path"].replace("/status/", ""))
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [[b"content-type", b"text/plain"]],
+        }
+    )
+    await send({"type": "http.response.body", "body": b"Hello, world!"})
+
+## tests/models/test_responses.py
+
+def test_response_default_to_utf8_encoding():
+    """
+    Default to utf-8 encoding if there is no Content-Type header.
+    """
+    content = "おはようございます。".encode("utf-8")
+    response = httpx.Response(
+        200,
+        content=content,
+    )
+    assert response.text == "おはようございます。"
+    assert response.encoding == "utf-8"
+
+def test_unknown_status_code():
+    response = httpx.Response(
+        600,
+    )
+    assert response.status_code == 600
+    assert response.reason_phrase == ""
+    assert response.text == ""
+
+## tests/test_asgi.py
+
+async def test_asgi_transport():
+    async with httpx.ASGITransport(app=hello_world) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b"Hello, World!"
+
+async def test_asgi_transport_no_body():
+    async with httpx.ASGITransport(app=echo_body) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b""
+
+async def test_asgi():
+    transport = httpx.ASGITransport(app=hello_world)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+    assert response.status_code == 200
+    assert response.text == "Hello, World!"
+
+async def test_asgi_urlencoded_path():
+    transport = httpx.ASGITransport(app=echo_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"path": "/user@example.org"}
+
+async def test_asgi_raw_path():
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/").copy_with(path="/user@example.org")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/user@example.org"}
+
+async def test_asgi_raw_path_should_not_include_querystring_portion():
+    """
+    See https://github.com/encode/httpx/issues/2810
+    """
+    transport = httpx.ASGITransport(app=echo_raw_path)
+    async with httpx.AsyncClient(transport=transport) as client:
+        url = httpx.URL("http://www.example.org/path?query")
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"raw_path": "/path"}
+
+async def test_asgi_upload():
+    transport = httpx.ASGITransport(app=echo_body)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://www.example.org/", content=b"example")
+
+    assert response.status_code == 200
+    assert response.text == "example"
+
+async def test_asgi_headers():
+    transport = httpx.ASGITransport(app=echo_headers)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": [
+            ["host", "www.example.org"],
+            ["accept", "*/*"],
+            ["accept-encoding", "gzip, deflate, br, zstd"],
+            ["connection", "keep-alive"],
+            ["user-agent", f"python-httpx/{httpx.__version__}"],
+        ]
+    }
+
+async def test_asgi_exc():
+    transport = httpx.ASGITransport(app=raise_exc)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError):
+            await client.get("http://www.example.org/")
+
+async def test_asgi_exc_after_response():
+    transport = httpx.ASGITransport(app=raise_exc_after_response)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError):
+            await client.get("http://www.example.org/")
+
+async def test_asgi_disconnect_after_response_complete():
+    disconnect = False
+
+    async def read_body(scope, receive, send):
+        nonlocal disconnect
+
+        status = 200
+        headers = [(b"content-type", "text/plain")]
+
+        await send(
+            {"type": "http.response.start", "status": status, "headers": headers}
+        )
+        more_body = True
+        while more_body:
+            message = await receive()
+            more_body = message.get("more_body", False)
+
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        # The ASGI spec says of the Disconnect message:
+        # "Sent to the application when a HTTP connection is closed or if receive is
+        # called after a response has been sent."
+        # So if receive() is called again, the disconnect message should be received
+        message = await receive()
+        disconnect = message.get("type") == "http.disconnect"
+
+    transport = httpx.ASGITransport(app=read_body)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://www.example.org/", content=b"example")
+
+    assert response.status_code == 200
+    assert disconnect
+
+async def test_asgi_exc_no_raise():
+    transport = httpx.ASGITransport(app=raise_exc, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+        assert response.status_code == 500
+
+## tests/test_config.py
+
+def test_timeout_from_one_value_and_default():
+    timeout = httpx.Timeout(5.0, pool=60.0)
+    assert timeout == httpx.Timeout(timeout=(5.0, 5.0, 5.0, 60.0))
+
+def test_timeout_missing_default():
+    with pytest.raises(ValueError):
+        httpx.Timeout(pool=60.0)
+
+## tests/test_multipart.py
+
+def test_multipart_explicit_boundary(header: str) -> None:
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"content-type": header}
+    response = client.post("http://127.0.0.1:8000/", files=files, headers=headers)
+    boundary_bytes = b"+++"
+
+    assert response.status_code == 200
+    assert response.request.headers["Content-Type"] == header
+    assert response.content == b"".join(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+
+def test_multipart_header_without_boundary(header: str) -> None:
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"content-type": header}
+    response = client.post("http://127.0.0.1:8000/", files=files, headers=headers)
+
+    assert response.status_code == 200
+    assert response.request.headers["Content-Type"] == header
+
+## tests/test_status_codes.py
+
+def test_status_code_as_int():
+    # mypy doesn't (yet) recognize that IntEnum members are ints, so ignore it here
+    assert httpx.codes.NOT_FOUND == 404  # type: ignore[comparison-overlap]
+    assert str(httpx.codes.NOT_FOUND) == "404"
+
+def test_status_code_value_lookup():
+    assert httpx.codes(404) == 404
+
+def test_status_code_phrase_lookup():
+    assert httpx.codes["NOT_FOUND"] == 404
+
+def test_lowercase_status_code():
+    assert httpx.codes.not_found == 404  # type: ignore
+
+def test_reason_phrase_for_status_code():
+    assert httpx.codes.get_reason_phrase(404) == "Not Found"
+
+def test_reason_phrase_for_unknown_status_code():
+    assert httpx.codes.get_reason_phrase(499) == ""

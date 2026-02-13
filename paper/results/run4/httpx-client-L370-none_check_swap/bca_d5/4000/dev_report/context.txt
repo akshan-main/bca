@@ -1,0 +1,467 @@
+## httpx/_api.py
+
+def get(
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `GET` request.
+
+    **Parameters**: See `httpx.request`.
+
+    Note that the `data`, `files`, `json` and `content` parameters are not available
+    on this function, as `GET` requests should not include a request body.
+    """
+    return request(
+        "GET",
+        url,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+class BoundSyncStream(SyncByteStream):
+    """
+    A byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: SyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        for chunk in self._stream:
+            yield chunk
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+class BoundAsyncStream(AsyncByteStream):
+    """
+    An async byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: AsyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+    def _redirect_headers(self, request: Request, url: URL, method: str) -> Headers:
+        """
+        Return the headers that should be used for the redirect request.
+        """
+        headers = Headers(request.headers)
+
+        if not _same_origin(url, request.url):
+            if not _is_https_redirect(request.url, url):
+                # Strip Authorization headers when responses are redirected
+                # away from the origin. (Except for direct HTTP to HTTPS redirects.)
+                headers.pop("Authorization", None)
+
+            # Update the Host header.
+            headers["Host"] = url.netloc.decode("ascii")
+
+        if method != request.method and method == "GET":
+            # If we've switch to a 'GET' request, then strip any headers which
+            # are only relevant to the request body.
+            headers.pop("Content-Length", None)
+            headers.pop("Transfer-Encoding", None)
+
+        # We should use the client cookie store to determine any cookie header,
+        # rather than whatever was on the original outgoing request.
+        headers.pop("Cookie", None)
+
+        return headers
+
+    def _transport_for_url(self, url: URL) -> BaseTransport:
+        """
+        Returns the transport instance that should be used for a given URL.
+        This will either be the standard connection pool, or a proxy.
+        """
+        for pattern, transport in self._mounts.items():
+            if pattern.matches(url):
+                return self._transport if transport is None else transport
+
+        return self._transport
+
+    def request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Build and send a request.
+
+        Equivalent to:
+
+        ```python
+        request = client.build_request(...)
+        response = client.send(request, ...)
+        ```
+
+        See `Client.build_request()`, `Client.send()` and
+        [Merging of configuration][0] for how the various parameters
+        are merged with client-level configuration.
+
+        [0]: /advanced/clients/#merging-of-configuration
+        """
+        if cookies is not None:
+            message = (
+                "Setting per-request cookies=<...> is being deprecated, because "
+                "the expected behaviour on cookie persistence is ambiguous. Set "
+                "cookies directly on the client instance instead."
+            )
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        return self.send(request, auth=auth, follow_redirects=follow_redirects)
+
+    def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `Client.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                response.read()
+
+            return response
+
+        except BaseException as exc:
+            response.close()
+            raise exc
+
+## tests/client/test_async_client.py
+
+async def test_get_invalid_url(server, url):
+    async with httpx.AsyncClient() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            await client.get(url)
+
+## tests/client/test_client.py
+
+def test_get_invalid_url(server, url):
+    with httpx.Client() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            client.get(url)
+
+def test_build_request(server):
+    url = server.url.copy_with(path="/echo_headers")
+    headers = {"Custom-header": "value"}
+
+    with httpx.Client() as client:
+        request = client.build_request("GET", url)
+        request.headers.update(headers)
+        response = client.send(request)
+
+    assert response.status_code == 200
+    assert response.url == url
+
+    assert response.json()["Custom-header"] == "value"
+
+def test_build_post_request(server):
+    url = server.url.copy_with(path="/echo_headers")
+    headers = {"Custom-header": "value"}
+
+    with httpx.Client() as client:
+        request = client.build_request("POST", url)
+        request.headers.update(headers)
+        response = client.send(request)
+
+    assert response.status_code == 200
+    assert response.url == url
+
+    assert response.json()["Content-length"] == "0"
+    assert response.json()["Custom-header"] == "value"
+
+def test_stream_response(server):
+    with httpx.Client() as client:
+        with client.stream("GET", server.url) as response:
+            content = response.read()
+    assert response.status_code == 200
+    assert content == b"Hello, world!"
+
+def test_stream_iterator(server):
+    body = b""
+
+    with httpx.Client() as client:
+        with client.stream("GET", server.url) as response:
+            for chunk in response.iter_bytes():
+                body += chunk
+
+    assert response.status_code == 200
+    assert body == b"Hello, world!"
+
+def test_raw_iterator(server):
+    body = b""
+
+    with httpx.Client() as client:
+        with client.stream("GET", server.url) as response:
+            for chunk in response.iter_raw():
+                body += chunk
+
+    assert response.status_code == 200
+    assert body == b"Hello, world!"
+
+def test_cannot_stream_async_request(server):
+    async def hello_world() -> typing.AsyncIterator[bytes]:  # pragma: no cover
+        yield b"Hello, "
+        yield b"world!"
+
+    with httpx.Client() as client:
+        with pytest.raises(RuntimeError):
+            client.post(server.url, content=hello_world())
+
+def test_raise_for_status(server):
+    with httpx.Client() as client:
+        for status_code in (200, 400, 404, 500, 505):
+            response = client.request(
+                "GET", server.url.copy_with(path=f"/status/{status_code}")
+            )
+            if 400 <= status_code < 600:
+                with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                    response.raise_for_status()
+                assert exc_info.value.response == response
+                assert exc_info.value.request.url.path == f"/status/{status_code}"
+            else:
+                assert response.raise_for_status() is response
+
+def test_raw_client_header():
+    """
+    Set a header in the Client.
+    """
+    url = "http://example.org/echo_headers"
+    headers = {"Example-Header": "example-value"}
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(echo_raw_headers), headers=headers
+    )
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == [
+        ["Host", "example.org"],
+        ["Accept", "*/*"],
+        ["Accept-Encoding", "gzip, deflate, br, zstd"],
+        ["Connection", "keep-alive"],
+        ["User-Agent", f"python-httpx/{httpx.__version__}"],
+        ["Example-Header", "example-value"],
+    ]
+
+def test_mounted_transport():
+    transport = httpx.MockTransport(unmounted)
+    mounts = {"custom://": httpx.MockTransport(mounted)}
+
+    client = httpx.Client(transport=transport, mounts=mounts)
+
+    response = client.get("https://www.example.com")
+    assert response.status_code == 200
+    assert response.json() == {"app": "unmounted"}
+
+    response = client.get("custom://www.example.com")
+    assert response.status_code == 200
+    assert response.json() == {"app": "mounted"}
+
+def test_all_mounted_transport():
+    mounts = {"all://": httpx.MockTransport(mounted)}
+
+    client = httpx.Client(mounts=mounts)
+
+    response = client.get("https://www.example.com")
+    assert response.status_code == 200
+    assert response.json() == {"app": "mounted"}
+
+def test_server_extensions(server):
+    url = server.url.copy_with(path="/http_version_2")
+    with httpx.Client(http2=True) as client:
+        response = client.get(url)
+    assert response.status_code == 200
+    assert response.extensions["http_version"] == b"HTTP/1.1"
+
+## tests/client/test_properties.py
+
+def test_client_base_url():
+    client = httpx.Client()
+    client.base_url = "https://www.example.org/"
+    assert isinstance(client.base_url, httpx.URL)
+    assert client.base_url == "https://www.example.org/"
+
+def test_client_base_url_without_trailing_slash():
+    client = httpx.Client()
+    client.base_url = "https://www.example.org/path"
+    assert isinstance(client.base_url, httpx.URL)
+    assert client.base_url == "https://www.example.org/path/"
+
+def test_client_base_url_with_trailing_slash():
+    client = httpx.Client()
+    client.base_url = "https://www.example.org/path/"
+    assert isinstance(client.base_url, httpx.URL)
+    assert client.base_url == "https://www.example.org/path/"
+
+## tests/conftest.py
+
+class TestServer(Server):
+    @property
+    def url(self) -> httpx.URL:
+        protocol = "https" if self.config.is_ssl else "http"
+        return httpx.URL(f"{protocol}://{self.config.host}:{self.config.port}/")
+
+    def install_signal_handlers(self) -> None:
+        # Disable the default installation of handlers for signals such as SIGTERM,
+        # because it can only be done in the main thread.
+        pass  # pragma: nocover
+
+    async def serve(self, sockets=None):
+        self.restart_requested = asyncio.Event()
+
+        loop = asyncio.get_event_loop()
+        tasks = {
+            loop.create_task(super().serve(sockets=sockets)),
+            loop.create_task(self.watch_restarts()),
+        }
+        await asyncio.wait(tasks)
+
+    async def restart(self) -> None:  # pragma: no cover
+        # This coroutine may be called from a different thread than the one the
+        # server is running on, and from an async environment that's not asyncio.
+        # For this reason, we use an event to coordinate with the server
+        # instead of calling shutdown()/startup() directly, and should not make
+        # any asyncio-specific operations.
+        self.started = False
+        self.restart_requested.set()
+        while not self.started:
+            await sleep(0.2)
+
+    async def watch_restarts(self) -> None:  # pragma: no cover
+        while True:
+            if self.should_exit:
+                return
+
+            try:
+                await asyncio.wait_for(self.restart_requested.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+            self.restart_requested.clear()
+            await self.shutdown()
+            await self.startup()
+
+    def url(self) -> httpx.URL:
+        protocol = "https" if self.config.is_ssl else "http"
+        return httpx.URL(f"{protocol}://{self.config.host}:{self.config.port}/")
+
+## tests/test_api.py
+
+def test_get_invalid_url():
+    with pytest.raises(httpx.UnsupportedProtocol):
+        httpx.get("invalid://example.org")

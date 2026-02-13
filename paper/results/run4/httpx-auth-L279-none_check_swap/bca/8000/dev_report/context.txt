@@ -1,0 +1,909 @@
+## httpx/_api.py
+
+def get(
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends a `GET` request.
+
+    **Parameters**: See `httpx.request`.
+
+    Note that the `data`, `files`, `json` and `content` parameters are not available
+    on this function, as `GET` requests should not include a request body.
+    """
+    return request(
+        "GET",
+        url,
+        params=params,
+        headers=headers,
+        cookies=cookies,
+        auth=auth,
+        proxy=proxy,
+        follow_redirects=follow_redirects,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    )
+
+## httpx/_auth.py
+
+    def sync_auth_flow(
+        self, request: Request
+    ) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow synchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            request.read()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                response.read()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+class DigestAuth(Auth):
+    _ALGORITHM_TO_HASH_FUNCTION: dict[str, typing.Callable[[bytes], _Hash]] = {
+        "MD5": hashlib.md5,
+        "MD5-SESS": hashlib.md5,
+        "SHA": hashlib.sha1,
+        "SHA-SESS": hashlib.sha1,
+        "SHA-256": hashlib.sha256,
+        "SHA-256-SESS": hashlib.sha256,
+        "SHA-512": hashlib.sha512,
+        "SHA-512-SESS": hashlib.sha512,
+    }
+
+    def __init__(self, username: str | bytes, password: str | bytes) -> None:
+        self._username = to_bytes(username)
+        self._password = to_bytes(password)
+        self._last_challenge: _DigestAuthChallenge | None = None
+        self._nonce_count = 1
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        if self._last_challenge:
+            request.headers["Authorization"] = self._build_auth_header(
+                request, self._last_challenge
+            )
+
+        response = yield request
+
+        if response.status_code != 401 or "www-authenticate" not in response.headers:
+            # If the response is not a 401 then we don't
+            # need to build an authenticated request.
+            return
+
+        for auth_header in response.headers.get_list("www-authenticate"):
+            if auth_header.lower().startswith("digest "):
+                break
+        else:
+            # If the response does not include a 'WWW-Authenticate: Digest ...'
+            # header, then we don't need to build an authenticated request.
+            return
+
+        self._last_challenge = self._parse_challenge(request, response, auth_header)
+        self._nonce_count = 1
+
+        request.headers["Authorization"] = self._build_auth_header(
+            request, self._last_challenge
+        )
+        if response.cookies:
+            Cookies(response.cookies).set_cookie_header(request=request)
+        yield request
+
+    def _parse_challenge(
+        self, request: Request, response: Response, auth_header: str
+    ) -> _DigestAuthChallenge:
+        """
+        Returns a challenge from a Digest WWW-Authenticate header.
+        These take the form of:
+        `Digest realm="realm@host.com",qop="auth,auth-int",nonce="abc",opaque="xyz"`
+        """
+        scheme, _, fields = auth_header.partition(" ")
+
+        # This method should only ever have been called with a Digest auth header.
+        assert scheme.lower() == "digest"
+
+        header_dict: dict[str, str] = {}
+        for field in parse_http_list(fields):
+            key, value = field.strip().split("=", 1)
+            header_dict[key] = unquote(value)
+
+        try:
+            realm = header_dict["realm"].encode()
+            nonce = header_dict["nonce"].encode()
+            algorithm = header_dict.get("algorithm", "MD5")
+            opaque = header_dict["opaque"].encode() if "opaque" in header_dict else None
+            qop = header_dict["qop"].encode() if "qop" in header_dict else None
+            return _DigestAuthChallenge(
+                realm=realm, nonce=nonce, algorithm=algorithm, opaque=opaque, qop=qop
+            )
+        except KeyError as exc:
+            message = "Malformed Digest WWW-Authenticate header"
+            raise ProtocolError(message, request=request) from exc
+
+    def _build_auth_header(
+        self, request: Request, challenge: _DigestAuthChallenge
+    ) -> str:
+        hash_func = self._ALGORITHM_TO_HASH_FUNCTION[challenge.algorithm.upper()]
+
+        def digest(data: bytes) -> bytes:
+            return hash_func(data).hexdigest().encode()
+
+        A1 = b":".join((self._username, challenge.realm, self._password))
+
+        path = request.url.raw_path
+        A2 = b":".join((request.method.encode(), path))
+        # TODO: implement auth-int
+        HA2 = digest(A2)
+
+        nc_value = b"%08x" % self._nonce_count
+        cnonce = self._get_client_nonce(self._nonce_count, challenge.nonce)
+        self._nonce_count += 1
+
+        HA1 = digest(A1)
+        if challenge.algorithm.lower().endswith("-sess"):
+            HA1 = digest(b":".join((HA1, challenge.nonce, cnonce)))
+
+        qop = self._resolve_qop(challenge.qop, request=request)
+        if qop is not None:
+            # Following RFC 2069
+            digest_data = [HA1, challenge.nonce, HA2]
+        else:
+            # Following RFC 2617/7616
+            digest_data = [HA1, challenge.nonce, nc_value, cnonce, qop, HA2]
+
+        format_args = {
+            "username": self._username,
+            "realm": challenge.realm,
+            "nonce": challenge.nonce,
+            "uri": path,
+            "response": digest(b":".join(digest_data)),
+            "algorithm": challenge.algorithm.encode(),
+        }
+        if challenge.opaque:
+            format_args["opaque"] = challenge.opaque
+        if qop:
+            format_args["qop"] = b"auth"
+            format_args["nc"] = nc_value
+            format_args["cnonce"] = cnonce
+
+        return "Digest " + self._get_header_value(format_args)
+
+    def _get_client_nonce(self, nonce_count: int, nonce: bytes) -> bytes:
+        s = str(nonce_count).encode()
+        s += nonce
+        s += time.ctime().encode()
+        s += os.urandom(8)
+
+        return hashlib.sha1(s).hexdigest()[:16].encode()
+
+    def _get_header_value(self, header_fields: dict[str, bytes]) -> str:
+        NON_QUOTED_FIELDS = ("algorithm", "qop", "nc")
+        QUOTED_TEMPLATE = '{}="{}"'
+        NON_QUOTED_TEMPLATE = "{}={}"
+
+        header_value = ""
+        for i, (field, value) in enumerate(header_fields.items()):
+            if i > 0:
+                header_value += ", "
+            template = (
+                QUOTED_TEMPLATE
+                if field not in NON_QUOTED_FIELDS
+                else NON_QUOTED_TEMPLATE
+            )
+            header_value += template.format(field, to_str(value))
+
+        return header_value
+
+    def _resolve_qop(self, qop: bytes | None, request: Request) -> bytes | None:
+        if qop is None:
+            return None
+        qops = re.split(b", ?", qop)
+        if b"auth" in qops:
+            return b"auth"
+
+        if qops == [b"auth-int"]:
+            raise NotImplementedError("Digest auth-int support is not yet implemented")
+
+        message = f'Unexpected qop value "{qop!r}" in digest auth'
+        raise ProtocolError(message, request=request)
+
+    def _get_client_nonce(self, nonce_count: int, nonce: bytes) -> bytes:
+        s = str(nonce_count).encode()
+        s += nonce
+        s += time.ctime().encode()
+        s += os.urandom(8)
+
+        return hashlib.sha1(s).hexdigest()[:16].encode()
+
+    def _get_header_value(self, header_fields: dict[str, bytes]) -> str:
+        NON_QUOTED_FIELDS = ("algorithm", "qop", "nc")
+        QUOTED_TEMPLATE = '{}="{}"'
+        NON_QUOTED_TEMPLATE = "{}={}"
+
+        header_value = ""
+        for i, (field, value) in enumerate(header_fields.items()):
+            if i > 0:
+                header_value += ", "
+            template = (
+                QUOTED_TEMPLATE
+                if field not in NON_QUOTED_FIELDS
+                else NON_QUOTED_TEMPLATE
+            )
+            header_value += template.format(field, to_str(value))
+
+        return header_value
+
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+    def _get_proxy_map(
+        self, proxy: ProxyTypes | None, allow_env_proxies: bool
+    ) -> dict[str, Proxy | None]:
+        if proxy is None:
+            if allow_env_proxies:
+                return {
+                    key: None if url is None else Proxy(url=url)
+                    for key, url in get_environment_proxies().items()
+                }
+            return {}
+        else:
+            proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
+            return {"all://": proxy}
+
+    def get(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `GET` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return self.request(
+            "GET",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+    async def get(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `GET` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return await self.request(
+            "GET",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+## httpx/_main.py
+
+def get_lexer_for_response(response: Response) -> str:
+    content_type = response.headers.get("Content-Type")
+    if content_type is not None:
+        mime_type, _, _ = content_type.partition(";")
+        try:
+            return typing.cast(
+                str, pygments.lexers.get_lexer_for_mimetype(mime_type.strip()).name
+            )
+        except pygments.util.ClassNotFound:  # pragma: no cover
+            pass
+    return ""  # pragma: no cover
+
+## httpx/_models.py
+
+    def get(self, key: str, default: typing.Any = None) -> typing.Any:
+        """
+        Return a header value. If multiple occurrences of the header occur
+        then concatenate them together with commas.
+        """
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def get_list(self, key: str, split_commas: bool = False) -> list[str]:
+        """
+        Return a list of all header values for a given key.
+        If `split_commas=True` is passed, then any comma separated header
+        values are split into multiple return strings.
+        """
+        get_header_key = key.lower().encode(self.encoding)
+
+        values = [
+            item_value.decode(self.encoding)
+            for _, item_key, item_value in self._list
+            if item_key.lower() == get_header_key
+        ]
+
+        if not split_commas:
+            return values
+
+        split_values = []
+        for value in values:
+            split_values.extend([item.strip() for item in value.split(",")])
+        return split_values
+
+    def __getitem__(self, key: str) -> str:
+        """
+        Return a single header value.
+
+        If there are multiple headers with the same key, then we concatenate
+        them with commas. See: https://tools.ietf.org/html/rfc7230#section-3.2.2
+        """
+        normalized_key = key.lower().encode(self.encoding)
+
+        items = [
+            header_value.decode(self.encoding)
+            for _, header_key, header_value in self._list
+            if header_key == normalized_key
+        ]
+
+        if items:
+            return ", ".join(items)
+
+        raise KeyError(key)
+
+    def __getstate__(self) -> dict[str, typing.Any]:
+        return {
+            name: value
+            for name, value in self.__dict__.items()
+            if name not in ["extensions", "stream"]
+        }
+
+    def _get_content_decoder(self) -> ContentDecoder:
+        """
+        Returns a decoder instance which can be used to decode the raw byte
+        content, depending on the Content-Encoding used in the response.
+        """
+        if not hasattr(self, "_decoder"):
+            decoders: list[ContentDecoder] = []
+            values = self.headers.get_list("content-encoding", split_commas=True)
+            for value in values:
+                value = value.strip().lower()
+                try:
+                    decoder_cls = SUPPORTED_DECODERS[value]
+                    decoders.append(decoder_cls())
+                except KeyError:
+                    continue
+
+            if len(decoders) == 1:
+                self._decoder = decoders[0]
+            elif len(decoders) > 1:
+                self._decoder = MultiDecoder(children=decoders)
+            else:
+                self._decoder = IdentityDecoder()
+
+        return self._decoder
+
+    def __getstate__(self) -> dict[str, typing.Any]:
+        return {
+            name: value
+            for name, value in self.__dict__.items()
+            if name not in ["extensions", "stream", "is_closed", "_decoder"]
+        }
+
+    def get(  # type: ignore
+        self,
+        name: str,
+        default: str | None = None,
+        domain: str | None = None,
+        path: str | None = None,
+    ) -> str | None:
+        """
+        Get a cookie by name. May optionally include domain and path
+        in order to specify exactly which cookie to retrieve.
+        """
+        value = None
+        for cookie in self.jar:
+            if cookie.name == name:
+                if domain is None or cookie.domain == domain:
+                    if path is None or cookie.path == path:
+                        if value is not None:
+                            message = f"Multiple cookies exist with name={name}"
+                            raise CookieConflict(message)
+                        value = cookie.value
+
+        if value is None:
+            return default
+        return value
+
+    def __getitem__(self, name: str) -> str:
+        value = self.get(name)
+        if value is None:
+            raise KeyError(name)
+        return value
+
+## httpx/_multipart.py
+
+def get_multipart_boundary_from_content_type(
+    content_type: bytes | None,
+) -> bytes | None:
+    if not content_type or not content_type.startswith(b"multipart/form-data"):
+        return None
+    # parse boundary according to
+    # https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
+    if b";" in content_type:
+        for section in content_type.split(b";"):
+            if section.strip().lower().startswith(b"boundary="):
+                return section.strip()[len(b"boundary=") :].strip(b'"')
+    return None
+
+    def get_length(self) -> int:
+        headers = self.render_headers()
+        data = self.render_data()
+        return len(headers) + len(data)
+
+    def get_length(self) -> int | None:
+        headers = self.render_headers()
+
+        if isinstance(self.file, (str, bytes)):
+            return len(headers) + len(to_bytes(self.file))
+
+        file_length = peek_filelike_length(self.file)
+
+        # If we can't determine the filesize without reading it into memory,
+        # then return `None` here, to indicate an unknown file length.
+        if file_length is None:
+            return None
+
+        return len(headers) + file_length
+
+    def get_content_length(self) -> int | None:
+        """
+        Return the length of the multipart encoded content, or `None` if
+        any of the files have a length that cannot be determined upfront.
+        """
+        boundary_length = len(self.boundary)
+        length = 0
+
+        for field in self.fields:
+            field_length = field.get_length()
+            if field_length is None:
+                return None
+
+            length += 2 + boundary_length + 2  # b"--{boundary}\r\n"
+            length += field_length
+            length += 2  # b"\r\n"
+
+        length += 2 + boundary_length + 4  # b"--{boundary}--\r\n"
+        return length
+
+    def get_headers(self) -> dict[str, str]:
+        content_length = self.get_content_length()
+        content_type = self.content_type
+        if content_length is None:
+            return {"Transfer-Encoding": "chunked", "Content-Type": content_type}
+        return {"Content-Length": str(content_length), "Content-Type": content_type}
+
+## httpx/_status_codes.py
+
+    def get_reason_phrase(cls, value: int) -> str:
+        try:
+            return codes(value).phrase  # type: ignore
+        except ValueError:
+            return ""
+
+## httpx/_urlparse.py
+
+def PERCENT(string: str) -> str:
+    return "".join([f"%{byte:02X}" for byte in string.encode("utf-8")])
+
+## httpx/_urls.py
+
+    def host(self) -> str:
+        """
+        The URL host as a string.
+        Always normalized to lowercase, with IDNA hosts decoded into unicode.
+
+        Examples:
+
+        url = httpx.URL("http://www.EXAMPLE.org")
+        assert url.host == "www.example.org"
+
+        url = httpx.URL("http://中国.icom.museum")
+        assert url.host == "中国.icom.museum"
+
+        url = httpx.URL("http://xn--fiqs8s.icom.museum")
+        assert url.host == "中国.icom.museum"
+
+        url = httpx.URL("https://[::ffff:192.168.0.1]")
+        assert url.host == "::ffff:192.168.0.1"
+        """
+        host: str = self._uri_reference.host
+
+        if host.startswith("xn--"):
+            host = idna.decode(host)
+
+        return host
+
+    def get(self, key: typing.Any, default: typing.Any = None) -> typing.Any:
+        """
+        Get a value from the query param for a given key. If the key occurs
+        more than once, then only the first value is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get("a") == "123"
+        """
+        if key in self._dict:
+            return self._dict[str(key)][0]
+        return default
+
+    def get_list(self, key: str) -> list[str]:
+        """
+        Get all values from the query param for a given key.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get_list("a") == ["123", "456"]
+        """
+        return list(self._dict.get(str(key), []))
+
+    def __getitem__(self, key: typing.Any) -> str:
+        return self._dict[key][0]
+
+## httpx/_utils.py
+
+def get_environment_proxies() -> dict[str, str | None]:
+    """Gets proxy information from the environment"""
+
+    # urllib.request.getproxies() falls back on System
+    # Registry and Config for proxies on Windows and macOS.
+    # We don't want to propagate non-HTTP proxies into
+    # our configuration such as 'TRAVIS_APT_PROXY'.
+    proxy_info = getproxies()
+    mounts: dict[str, str | None] = {}
+
+    for scheme in ("http", "https", "all"):
+        if proxy_info.get(scheme):
+            hostname = proxy_info[scheme]
+            mounts[f"{scheme}://"] = (
+                hostname if "://" in hostname else f"http://{hostname}"
+            )
+
+    no_proxy_hosts = [host.strip() for host in proxy_info.get("no", "").split(",")]
+    for hostname in no_proxy_hosts:
+        # See https://curl.haxx.se/libcurl/c/CURLOPT_NOPROXY.html for details
+        # on how names in `NO_PROXY` are handled.
+        if hostname == "*":
+            # If NO_PROXY=* is used or if "*" occurs as any one of the comma
+            # separated hostnames, then we should just bypass any information
+            # from HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and always ignore
+            # proxies.
+            return {}
+        elif hostname:
+            # NO_PROXY=.google.com is marked as "all://*.google.com,
+            #   which disables "www.google.com" but not "google.com"
+            # NO_PROXY=google.com is marked as "all://*google.com,
+            #   which disables "www.google.com" and "google.com".
+            #   (But not "wwwgoogle.com")
+            # NO_PROXY can include domains, IPv6, IPv4 addresses and "localhost"
+            #   NO_PROXY=example.com,::1,localhost,192.168.0.0/16
+            if "://" in hostname:
+                mounts[hostname] = None
+            elif is_ipv4_hostname(hostname):
+                mounts[f"all://{hostname}"] = None
+            elif is_ipv6_hostname(hostname):
+                mounts[f"all://[{hostname}]"] = None
+            elif hostname.lower() == "localhost":
+                mounts[f"all://{hostname}"] = None
+            else:
+                mounts[f"all://*{hostname}"] = None
+
+    return mounts
+
+def to_str(value: str | bytes, encoding: str = "utf-8") -> str:
+    return value if isinstance(value, str) else value.decode(encoding)
+
+## tests/client/test_async_client.py
+
+async def test_get(server):
+    url = server.url
+    async with httpx.AsyncClient(http2=True) as client:
+        response = await client.get(url)
+    assert response.status_code == 200
+    assert response.text == "Hello, world!"
+    assert response.http_version == "HTTP/1.1"
+    assert response.headers
+    assert repr(response) == "<Response [200 OK]>"
+    assert response.elapsed > timedelta(seconds=0)
+
+async def test_get_invalid_url(server, url):
+    async with httpx.AsyncClient() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            await client.get(url)
+
+def hello_world(request):
+    return httpx.Response(200, text="Hello, world!")
+
+async def test_server_extensions(server):
+    url = server.url
+    async with httpx.AsyncClient(http2=True) as client:
+        response = await client.get(url)
+    assert response.status_code == 200
+    assert response.extensions["http_version"] == b"HTTP/1.1"
+
+## tests/client/test_auth.py
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+## tests/client/test_client.py
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+def test_get(server):
+    url = server.url
+    with httpx.Client(http2=True) as http:
+        response = http.get(url)
+    assert response.status_code == 200
+    assert response.url == url
+    assert response.content == b"Hello, world!"
+    assert response.text == "Hello, world!"
+    assert response.http_version == "HTTP/1.1"
+    assert response.encoding == "utf-8"
+    assert response.request.url == url
+    assert response.headers
+    assert response.is_redirect is False
+    assert repr(response) == "<Response [200 OK]>"
+    assert response.elapsed > timedelta(0)
+
+def test_get_invalid_url(server, url):
+    with httpx.Client() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            client.get(url)
+
+def test_base_url(server):
+    base_url = server.url
+    with httpx.Client(base_url=base_url) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    assert response.url == base_url
+
+def test_server_extensions(server):
+    url = server.url.copy_with(path="/http_version_2")
+    with httpx.Client(http2=True) as client:
+        response = client.get(url)
+    assert response.status_code == 200
+    assert response.extensions["http_version"] == b"HTTP/1.1"
+
+## tests/client/test_cookies.py
+
+def get_and_set_cookies(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/echo_cookies":
+        data = {"cookies": request.headers.get("cookie")}
+        return httpx.Response(200, json=data)
+    elif request.url.path == "/set_cookie":
+        return httpx.Response(200, headers={"set-cookie": "example-name=example-value"})
+    else:
+        raise NotImplementedError()  # pragma: no cover
+
+def test_get_cookie() -> None:
+    url = "http://example.org/set_cookie"
+
+    client = httpx.Client(transport=httpx.MockTransport(get_and_set_cookies))
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.cookies["example-name"] == "example-value"
+    assert client.cookies["example-name"] == "example-value"
+
+## tests/client/test_headers.py
+
+def echo_headers(request: httpx.Request) -> httpx.Response:
+    data = {"headers": dict(request.headers)}
+    return httpx.Response(200, json=data)
+
+## tests/client/test_redirects.py
+
+def test_invalid_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.RemoteProtocolError):
+        client.get("http://example.org/invalid_redirect", follow_redirects=True)
+
+def test_redirect_loop():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get("https://example.org/redirect_loop", follow_redirects=True)
+
+## tests/conftest.py
+
+Message = typing.Dict[str, typing.Any]
+
+async def status_code(scope: Scope, receive: Receive, send: Send) -> None:
+    status_code = int(scope["path"].replace("/status/", ""))
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [[b"content-type", b"text/plain"]],
+        }
+    )
+    await send({"type": "http.response.body", "body": b"Hello, world!"})
+
+## tests/models/test_responses.py
+
+def streaming_body() -> typing.Iterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+## tests/test_api.py
+
+def test_get(server):
+    response = httpx.get(server.url)
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+    assert response.text == "Hello, world!"
+    assert response.http_version == "HTTP/1.1"
+
+def test_get_invalid_url():
+    with pytest.raises(httpx.UnsupportedProtocol):
+        httpx.get("invalid://example.org")
+
+## tests/test_auth.py
+
+def test_digest_auth_rfc_2069():
+    # Example from https://datatracker.ietf.org/doc/html/rfc2069#section-2.4
+    # with corrected response from https://www.rfc-editor.org/errata/eid749
+
+    auth = httpx.DigestAuth(username="Mufasa", password="CircleOfLife")
+    request = httpx.Request("GET", "https://www.example.com/dir/index.html")
+
+    # The initial request should not include an auth header.
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    # If a 401 response is returned, then a digest auth request is made.
+    headers = {
+        "WWW-Authenticate": (
+            'Digest realm="testrealm@host.com", '
+            'nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", '
+            'opaque="5ccc069c403ebaf9f0171e9517f40e41"'
+        )
+    }
+    response = httpx.Response(
+        content=b"Auth required", status_code=401, headers=headers, request=request
+    )
+    request = flow.send(response)
+    assert request.headers["Authorization"].startswith("Digest")
+    assert 'username="Mufasa"' in request.headers["Authorization"]
+    assert 'realm="testrealm@host.com"' in request.headers["Authorization"]
+    assert (
+        'nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093"' in request.headers["Authorization"]
+    )
+    assert 'uri="/dir/index.html"' in request.headers["Authorization"]
+    assert (
+        'opaque="5ccc069c403ebaf9f0171e9517f40e41"' in request.headers["Authorization"]
+    )
+    assert (
+        'response="1949323746fe6a43ef61f9606e7febea"'
+        in request.headers["Authorization"]
+    )
+
+    # No other requests are made.
+    response = httpx.Response(content=b"Hello, world!", status_code=200)
+    with pytest.raises(StopIteration):
+        flow.send(response)
+
+## tests/test_config.py
+
+def test_SSLContext_with_get_request(server, cert_pem_file):
+    context = httpx.create_ssl_context()
+    context.load_verify_locations(cert_pem_file)
+    response = httpx.get(server.url, verify=context)
+    assert response.status_code == 200
+
+## tests/test_main.py
+
+def splitlines(output: str) -> typing.Iterable[str]:
+    return [line.strip() for line in output.splitlines()]
+
+def remove_date_header(lines: typing.Iterable[str]) -> typing.Iterable[str]:
+    return [line for line in lines if not line.startswith("date:")]
+
+def test_get(server):
+    url = str(server.url)
+    runner = CliRunner()
+    result = runner.invoke(httpx.main, [url])
+    assert result.exit_code == 0
+    assert remove_date_header(splitlines(result.output)) == [
+        "HTTP/1.1 200 OK",
+        "server: uvicorn",
+        "content-type: text/plain",
+        "Transfer-Encoding: chunked",
+        "",
+        "Hello, world!",
+    ]
+
+## tests/test_status_codes.py
+
+def test_reason_phrase_for_status_code():
+    assert httpx.codes.get_reason_phrase(404) == "Not Found"
+
+def test_reason_phrase_for_unknown_status_code():
+    assert httpx.codes.get_reason_phrase(499) == ""
+
+## tests/test_utils.py
+
+def test_get_environment_proxies(environment, proxies):
+    os.environ.update(environment)
+
+    assert get_environment_proxies() == proxies
+
+## tests/test_wsgi.py
+
+def test_wsgi_http_error():
+    transport = httpx.WSGITransport(app=partial(raise_exc, exc=RuntimeError))
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")

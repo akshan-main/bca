@@ -1,0 +1,199 @@
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    usage: _usage.RunUsage = dataclasses.field(default_factory=_usage.RunUsage)
+
+    request: _messages.ModelRequest
+
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+_MAX_REDIRECTS = 0
+
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def __aiter__(self) -> AsyncIterator[ModelResponseStreamEvent]:
+        """Stream the response as an async iterable of [`ModelResponseStreamEvent`][pydantic_ai.messages.ModelResponseStreamEvent]s.
+
+        This proxies the `_event_iterator()` and emits all events, while also checking for matches
+        on the result schema and emitting a [`FinalResultEvent`][pydantic_ai.messages.FinalResultEvent] if/when the
+        first match is found.
+        """
+        if self._event_iterator is None:
+
+            async def iterator_with_final_event(
+                iterator: AsyncIterator[ModelResponseStreamEvent],
+            ) -> AsyncIterator[ModelResponseStreamEvent]:
+                async for event in iterator:
+                    yield event
+                    if (
+                        final_result_event := _get_final_result_event(event, self.model_request_parameters)
+                    ) is not None:
+                        self.final_result_event = final_result_event
+                        yield final_result_event
+                        break
+
+                # If we broke out of the above loop, we need to yield the rest of the events
+                # If we didn't, this will just be a no-op
+                async for event in iterator:
+                    yield event
+
+            async def iterator_with_part_end(
+                iterator: AsyncIterator[ModelResponseStreamEvent],
+            ) -> AsyncIterator[ModelResponseStreamEvent]:
+                last_start_event: PartStartEvent | None = None
+
+                def part_end_event(next_part: ModelResponsePart | None = None) -> PartEndEvent | None:
+                    if not last_start_event:
+                        return None
+
+                    index = last_start_event.index
+                    part = self._parts_manager.get_parts()[index]
+                    if not isinstance(part, TextPart | ThinkingPart | BaseToolCallPart):
+                        # Parts other than these 3 don't have deltas, so don't need an end part.
+                        return None
+
+                    return PartEndEvent(
+                        index=index,
+                        part=part,
+                        next_part_kind=next_part.part_kind if next_part else None,
+                    )
+
+                async for event in iterator:
+                    if isinstance(event, PartStartEvent):
+                        if last_start_event:
+                            end_event = part_end_event(event.part)
+                            if end_event:
+                                yield end_event
+
+                            event.previous_part_kind = last_start_event.part.part_kind
+                        last_start_event = event
+
+                    yield event
+
+                end_event = part_end_event()
+                if end_event:
+                    yield end_event
+
+            self._event_iterator = iterator_with_part_end(iterator_with_final_event(self._get_event_iterator()))
+        return self._event_iterator
+
+## pydantic_ai_slim/pydantic_ai/models/groq.py
+
+    failed_generation: Json[_GroqToolUseFailedGeneration]
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    sleep: Callable[[int | float], None | Awaitable[None]]
+
+## pydantic_ai_slim/pydantic_ai/ui/_adapter.py
+
+    def transform_stream(
+        self,
+        stream: AsyncIterator[NativeEvent],
+        on_complete: OnCompleteFunc[EventT] | None = None,
+    ) -> AsyncIterator[EventT]:
+        """Transform a stream of Pydantic AI events into protocol-specific events.
+
+        Args:
+            stream: The stream of Pydantic AI events to transform.
+            on_complete: Optional callback function called when the agent run completes successfully.
+                The callback receives the completed [`AgentRunResult`][pydantic_ai.agent.AgentRunResult] and can optionally yield additional protocol-specific events.
+        """
+        return self.build_event_stream().transform_stream(stream, on_complete=on_complete)
+
+## tests/graph/beta/test_broadcast_and_spread.py
+
+    values: list[int] = field(default_factory=list[int])
+
+## tests/test_ssrf.py
+
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')

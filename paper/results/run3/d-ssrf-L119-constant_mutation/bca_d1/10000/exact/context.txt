@@ -1,0 +1,936 @@
+## examples/pydantic_ai_examples/ag_ui/api/agentic_generative_ui.py
+
+from pydantic import BaseModel, Field
+
+## examples/pydantic_ai_examples/evals/custom_evaluators.py
+
+from pydantic_evals.evaluators import (
+    Evaluator,
+    EvaluatorContext,
+    EvaluatorOutput,
+)
+
+## examples/pydantic_ai_examples/question_graph.py
+
+from pydantic_graph import (
+    BaseNode,
+    End,
+    Graph,
+    GraphRunContext,
+)
+
+class Ask(BaseNode[QuestionState]):
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+class GraphAgentState:
+    """State kept across the execution of the agent graph."""
+
+    message_history: list[_messages.ModelMessage] = dataclasses.field(default_factory=list[_messages.ModelMessage])
+    usage: _usage.RunUsage = dataclasses.field(default_factory=_usage.RunUsage)
+    retries: int = 0
+    run_step: int = 0
+    run_id: str = dataclasses.field(default_factory=lambda: str(uuid.uuid4()))
+    metadata: dict[str, Any] | None = None
+
+    def increment_retries(
+        self,
+        max_result_retries: int,
+        error: BaseException | None = None,
+        model_settings: ModelSettings | None = None,
+    ) -> None:
+        self.retries += 1
+        if self.retries > max_result_retries:
+            if (
+                self.message_history
+                and isinstance(model_response := self.message_history[-1], _messages.ModelResponse)
+                and model_response.finish_reason == 'length'
+                and model_response.parts
+                and isinstance(tool_call := model_response.parts[-1], _messages.ToolCallPart)
+            ):
+                try:
+                    tool_call.args_as_dict()
+                except Exception:
+                    max_tokens = model_settings.get('max_tokens') if model_settings else None
+                    raise exceptions.IncompleteToolCall(
+                        f'Model token limit ({max_tokens or "provider default"}) exceeded while generating a tool call, resulting in incomplete arguments. Increase the `max_tokens` model setting, or simplify the prompt to result in a shorter response that will fit within the limit.'
+                    )
+            message = f'Exceeded maximum retries ({max_result_retries}) for output validation'
+            if error:
+                if isinstance(error, exceptions.UnexpectedModelBehavior) and error.__cause__ is not None:
+                    error = error.__cause__
+                raise exceptions.UnexpectedModelBehavior(message) from error
+            else:
+                raise exceptions.UnexpectedModelBehavior(message)
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+from abc import ABC, abstractmethod
+
+## pydantic_ai_slim/pydantic_ai/ag_ui.py
+
+from .models import KnownModelName, Model
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py
+
+from pydantic_ai.providers import Provider
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+class GeminiModel(Model):
+    """A model that uses Gemini via `generativelanguage.googleapis.com` API.
+
+    This is implemented from scratch rather than using a dedicated SDK, good API documentation is
+    available [here](https://ai.google.dev/api).
+
+    Apart from `__init__`, all methods are private or match those of the base class.
+    """
+
+    client: httpx.AsyncClient = field(repr=False)
+
+    _model_name: GeminiModelName = field(repr=False)
+    _provider: Provider[httpx.AsyncClient] = field(repr=False)
+    _auth: AuthProtocol | None = field(repr=False)
+    _url: str | None = field(repr=False)
+
+    def __init__(
+        self,
+        model_name: GeminiModelName,
+        *,
+        provider: Literal['google-gla', 'google-vertex'] | Provider[httpx.AsyncClient] = 'google-gla',
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize a Gemini model.
+
+        Args:
+            model_name: The name of the model to use.
+            provider: The provider to use for authentication and API access. Can be either the string
+                'google-gla' or 'google-vertex' or an instance of `Provider[httpx.AsyncClient]`.
+                If not provided, a new provider will be created using the other parameters.
+            profile: The model profile to use. Defaults to a profile picked by the provider based on the model name.
+            settings: Default model settings for this model instance.
+        """
+        self._model_name = model_name
+
+        if isinstance(provider, str):
+            if provider == 'google-gla':
+                from pydantic_ai.providers.google_gla import GoogleGLAProvider  # type: ignore[reportDeprecated]
+
+                provider = GoogleGLAProvider()  # type: ignore[reportDeprecated]
+            else:
+                from pydantic_ai.providers.google_vertex import GoogleVertexProvider  # type: ignore[reportDeprecated]
+
+                provider = GoogleVertexProvider()  # type: ignore[reportDeprecated]
+        self._provider = provider
+        self.client = provider.client
+        self._url = str(self.client.base_url)
+
+        super().__init__(settings=settings, profile=profile or provider.model_profile)
+
+    @property
+    def base_url(self) -> str:
+        assert self._url is not None, 'URL not initialized'
+        return self._url
+
+    @property
+    def model_name(self) -> GeminiModelName:
+        """The model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The model provider."""
+        return self._provider.name
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        check_allow_model_requests()
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        async with self._make_request(
+            messages, False, cast(GeminiModelSettings, model_settings or {}), model_request_parameters
+        ) as http_response:
+            data = await http_response.aread()
+            response = _gemini_response_ta.validate_json(data)
+        return self._process_response(response)
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        check_allow_model_requests()
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        async with self._make_request(
+            messages, True, cast(GeminiModelSettings, model_settings or {}), model_request_parameters
+        ) as http_response:
+            yield await self._process_streamed_response(http_response, model_request_parameters)
+
+    def _get_tools(self, model_request_parameters: ModelRequestParameters) -> _GeminiTools | None:
+        tools = [_function_from_abstract_tool(t) for t in model_request_parameters.tool_defs.values()]
+        return _GeminiTools(function_declarations=tools) if tools else None
+
+    def _get_tool_config(
+        self, model_request_parameters: ModelRequestParameters, tools: _GeminiTools | None
+    ) -> _GeminiToolConfig | None:
+        if not model_request_parameters.allow_text_output and tools:
+            return _tool_config([t['name'] for t in tools['function_declarations']])
+        else:
+            return None
+
+    @asynccontextmanager
+    async def _make_request(
+        self,
+        messages: list[ModelMessage],
+        streamed: bool,
+        model_settings: GeminiModelSettings,
+        model_request_parameters: ModelRequestParameters,
+    ) -> AsyncIterator[HTTPResponse]:
+        tools = self._get_tools(model_request_parameters)
+        tool_config = self._get_tool_config(model_request_parameters, tools)
+        sys_prompt_parts, contents = await self._message_to_gemini_content(messages, model_request_parameters)
+
+        request_data = _GeminiRequest(contents=contents)
+        if sys_prompt_parts:
+            request_data['systemInstruction'] = _GeminiTextContent(role='user', parts=sys_prompt_parts)
+        if tools is not None:
+            request_data['tools'] = tools
+        if tool_config is not None:
+            request_data['toolConfig'] = tool_config
+
+        generation_config = _settings_to_generation_config(model_settings)
+        if model_request_parameters.output_mode == 'native':
+            if tools:
+                raise UserError(
+                    'Gemini does not support `NativeOutput` and tools at the same time. Use `output_type=ToolOutput(...)` instead.'
+                )
+
+            generation_config['response_mime_type'] = 'application/json'
+
+            output_object = model_request_parameters.output_object
+            assert output_object is not None
+            generation_config['response_json_schema'] = self._map_response_schema(output_object)
+        elif model_request_parameters.output_mode == 'prompted' and not tools:
+            generation_config['response_mime_type'] = 'application/json'
+
+        if generation_config:
+            request_data['generationConfig'] = generation_config
+
+        if gemini_safety_settings := model_settings.get('gemini_safety_settings'):
+            request_data['safetySettings'] = gemini_safety_settings
+
+        if gemini_labels := model_settings.get('gemini_labels'):
+            if self._provider.name == 'google-vertex':
+                request_data['labels'] = gemini_labels  # pragma: lax no cover
+
+        headers = {'Content-Type': 'application/json', 'User-Agent': get_user_agent()}
+        url = f'/{self._model_name}:{"streamGenerateContent" if streamed else "generateContent"}'
+
+        request_json = _gemini_request_ta.dump_json(request_data, by_alias=True)
+        async with self.client.stream(
+            'POST',
+            url,
+            content=request_json,
+            headers=headers,
+            timeout=model_settings.get('timeout', USE_CLIENT_DEFAULT),
+        ) as r:
+            if (status_code := r.status_code) != 200:
+                await r.aread()
+                if status_code >= 400:
+                    raise ModelHTTPError(status_code=status_code, model_name=self.model_name, body=r.text)
+                raise UnexpectedModelBehavior(  # pragma: no cover
+                    f'Unexpected response from gemini {status_code}', r.text
+                )
+            yield r
+
+    def _process_response(self, response: _GeminiResponse) -> ModelResponse:
+        vendor_details: dict[str, Any] | None = None
+
+        if len(response['candidates']) != 1:
+            raise UnexpectedModelBehavior('Expected exactly one candidate in Gemini response')  # pragma: no cover
+        if 'content' not in response['candidates'][0]:
+            if response['candidates'][0].get('finish_reason') == 'SAFETY':
+                raise UnexpectedModelBehavior('Safety settings triggered', str(response))
+            else:
+                raise UnexpectedModelBehavior(  # pragma: no cover
+                    'Content field missing from Gemini response', str(response)
+                )
+        parts = response['candidates'][0]['content']['parts']
+        vendor_id = response.get('vendor_id', None)
+        finish_reason = response['candidates'][0].get('finish_reason')
+        if finish_reason:
+            vendor_details = {'finish_reason': finish_reason}
+        usage = _metadata_as_usage(response)
+        return _process_response_from_parts(
+            parts,
+            response.get('model_version', self._model_name),
+            usage,
+            vendor_id=vendor_id,
+            vendor_details=vendor_details,
+            provider_name=self._provider.name,
+            provider_url=self.base_url,
+        )
+
+    async def _process_streamed_response(
+        self, http_response: HTTPResponse, model_request_parameters: ModelRequestParameters
+    ) -> StreamedResponse:
+        """Process a streamed response, and prepare a streaming response to return."""
+        aiter_bytes = http_response.aiter_bytes()
+        start_response: _GeminiResponse | None = None
+        content = bytearray()
+
+        async for chunk in aiter_bytes:
+            content.extend(chunk)
+            responses = _gemini_streamed_response_ta.validate_json(
+                _ensure_decodeable(content),
+                experimental_allow_partial='trailing-strings',
+            )
+            if responses:  # pragma: no branch
+                last = responses[-1]
+                if last['candidates'] and last['candidates'][0].get('content', {}).get('parts'):
+                    start_response = last
+                    break
+
+        if start_response is None:
+            raise UnexpectedModelBehavior('Streamed response ended without content or tool calls')
+
+        return GeminiStreamedResponse(
+            model_request_parameters=model_request_parameters,
+            _model_name=self._model_name,
+            _content=content,
+            _stream=aiter_bytes,
+            _provider_name=self._provider.name,
+            _provider_url=self.base_url,
+        )
+
+    async def _message_to_gemini_content(
+        self, messages: list[ModelMessage], model_request_parameters: ModelRequestParameters
+    ) -> tuple[list[_GeminiTextPart], list[_GeminiContent]]:
+        sys_prompt_parts: list[_GeminiTextPart] = []
+        contents: list[_GeminiContent] = []
+        for m in messages:
+            if isinstance(m, ModelRequest):
+                message_parts: list[_GeminiPartUnion] = []
+
+                for part in m.parts:
+                    if isinstance(part, SystemPromptPart):
+                        sys_prompt_parts.append(_GeminiTextPart(text=part.content))
+                    elif isinstance(part, UserPromptPart):
+                        message_parts.extend(await self._map_user_prompt(part))
+                    elif isinstance(part, ToolReturnPart):
+                        message_parts.append(_response_part_from_response(part.tool_name, part.model_response_object()))
+                    elif isinstance(part, RetryPromptPart):
+                        if part.tool_name is None:
+                            message_parts.append(_GeminiTextPart(text=part.model_response()))  # pragma: no cover
+                        else:
+                            response = {'call_error': part.model_response()}
+                            message_parts.append(_response_part_from_response(part.tool_name, response))
+                    else:
+                        assert_never(part)
+
+                if message_parts:  # pragma: no branch
+                    contents.append(_GeminiContent(role='user', parts=message_parts))
+            elif isinstance(m, ModelResponse):
+                contents.append(_content_model_response(m))
+            else:
+                assert_never(m)
+        if instructions := self._get_instructions(messages, model_request_parameters):
+            sys_prompt_parts.append(_GeminiTextPart(text=instructions))
+        return sys_prompt_parts, contents
+
+    async def _map_user_prompt(self, part: UserPromptPart) -> list[_GeminiPartUnion]:
+        if isinstance(part.content, str):
+            return [{'text': part.content}]
+        else:
+            content: list[_GeminiPartUnion] = []
+            for item in part.content:
+                if isinstance(item, str):
+                    content.append({'text': item})
+                elif isinstance(item, BinaryContent):
+                    content.append(
+                        _GeminiInlineDataPart(inline_data={'data': item.base64, 'mime_type': item.media_type})
+                    )
+                elif isinstance(item, VideoUrl) and item.is_youtube:
+                    file_data = _GeminiFileDataPart(file_data={'file_uri': item.url, 'mime_type': item.media_type})
+                    content.append(file_data)
+                elif isinstance(item, FileUrl):
+                    if self.system == 'google-gla' or item.force_download:
+                        downloaded_item = await download_item(item, data_format='base64')
+                        inline_data = _GeminiInlineDataPart(
+                            inline_data={'data': downloaded_item['data'], 'mime_type': downloaded_item['data_type']}
+                        )
+                        content.append(inline_data)
+                    else:  # pragma: lax no cover
+                        file_data = _GeminiFileDataPart(file_data={'file_uri': item.url, 'mime_type': item.media_type})
+                        content.append(file_data)
+                elif isinstance(item, CachePoint):
+                    # Gemini doesn't support inline CachePoint markers. Google's caching requires
+                    # pre-creating cache objects via the API, then referencing them by name using
+                    # `GoogleModelSettings.google_cached_content`. See https://ai.google.dev/gemini-api/docs/caching
+                    pass
+                else:
+                    assert_never(item)  # pragma: lax no cover
+        return content
+
+    def _map_response_schema(self, o: OutputObjectDefinition) -> dict[str, Any]:
+        response_schema = o.json_schema.copy()
+        if o.name:
+            response_schema['title'] = o.name
+        if o.description:
+            response_schema['description'] = o.description
+
+        return response_schema
+
+## pydantic_ai_slim/pydantic_ai/models/google.py
+
+def _map_code_execution_result(
+    code_execution_result: CodeExecutionResult, provider_name: str, tool_call_id: str
+) -> BuiltinToolReturnPart:
+    return BuiltinToolReturnPart(
+        provider_name=provider_name,
+        tool_name=CodeExecutionTool.kind,
+        content=code_execution_result.model_dump(mode='json'),
+        tool_call_id=tool_call_id,
+    )
+
+## pydantic_ai_slim/pydantic_ai/providers/google_gla.py
+
+class GoogleGLAProvider(Provider[httpx.AsyncClient]):
+    """Provider for Google Generative Language AI API."""
+
+    @property
+    def name(self):
+        return 'google-gla'
+
+    @property
+    def base_url(self) -> str:
+        return 'https://generativelanguage.googleapis.com/v1beta/models/'
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        return self._client
+
+    def model_profile(self, model_name: str) -> ModelProfile | None:
+        return google_model_profile(model_name)
+
+    def __init__(self, api_key: str | None = None, http_client: httpx.AsyncClient | None = None) -> None:
+        """Create a new Google GLA provider.
+
+        Args:
+            api_key: The API key to use for authentication, if not provided, the `GEMINI_API_KEY` environment variable
+                will be used if available.
+            http_client: An existing `httpx.AsyncClient` to use for making HTTP requests.
+        """
+        api_key = api_key or os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            raise UserError(
+                'Set the `GEMINI_API_KEY` environment variable or pass it via `GoogleGLAProvider(api_key=...)`'
+                'to use the Google GLA provider.'
+            )
+
+        self._client = http_client or cached_async_http_client(provider='google-gla')
+        self._client.base_url = self.base_url
+        # https://cloud.google.com/docs/authentication/api-keys-use#using-with-rest
+        self._client.headers['X-Goog-Api-Key'] = api_key
+
+## pydantic_ai_slim/pydantic_ai/providers/openai.py
+
+class OpenAIProvider(Provider[AsyncOpenAI]):
+    """Provider for OpenAI API."""
+
+    @property
+    def name(self) -> str:
+        return 'openai'
+
+    @property
+    def base_url(self) -> str:
+        return str(self.client.base_url)
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        return self._client
+
+    def model_profile(self, model_name: str) -> ModelProfile | None:
+        return openai_model_profile(model_name)
+
+    @overload
+    def __init__(self, *, openai_client: AsyncOpenAI) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        openai_client: None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        openai_client: AsyncOpenAI | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        """Create a new OpenAI provider.
+
+        Args:
+            base_url: The base url for the OpenAI requests. If not provided, the `OPENAI_BASE_URL` environment variable
+                will be used if available. Otherwise, defaults to OpenAI's base url.
+            api_key: The API key to use for authentication, if not provided, the `OPENAI_API_KEY` environment variable
+                will be used if available.
+            openai_client: An existing
+                [`AsyncOpenAI`](https://github.com/openai/openai-python?tab=readme-ov-file#async-usage)
+                client to use. If provided, `base_url`, `api_key`, and `http_client` must be `None`.
+            http_client: An existing `httpx.AsyncClient` to use for making HTTP requests.
+        """
+        # This is a workaround for the OpenAI client requiring an API key, whilst locally served,
+        # openai compatible models do not always need an API key, but a placeholder (non-empty) key is required.
+        if api_key is None and 'OPENAI_API_KEY' not in os.environ and base_url is not None and openai_client is None:
+            api_key = 'api-key-not-set'
+
+        if openai_client is not None:
+            assert base_url is None, 'Cannot provide both `openai_client` and `base_url`'
+            assert http_client is None, 'Cannot provide both `openai_client` and `http_client`'
+            assert api_key is None, 'Cannot provide both `openai_client` and `api_key`'
+            self._client = openai_client
+        elif http_client is not None:
+            self._client = AsyncOpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
+        else:
+            http_client = cached_async_http_client(provider='openai')
+            self._client = AsyncOpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def result(self) -> AgentRunResult[OutputDataT] | None:
+        """The final result of the run if it has ended, otherwise `None`.
+
+        Once the run returns an [`End`][pydantic_graph.nodes.End] node, `result` is populated
+        with an [`AgentRunResult`][pydantic_ai.agent.AgentRunResult].
+        """
+        graph_run_output = self._graph_run.output
+        if graph_run_output is None:
+            return None
+        return AgentRunResult(
+            graph_run_output.output,
+            graph_run_output.tool_name,
+            self._graph_run.state,
+            self._graph_run.deps.new_message_index,
+            self._traceparent(required=False),
+        )
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_models.py
+
+class CamelBaseModel(BaseModel, ABC):
+    """Base model with camelCase aliases."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra='forbid')
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py
+
+class BaseUIPart(CamelBaseModel, ABC):
+    """Abstract base class for all UI parts."""
+
+class StepStartUIPart(BaseUIPart):
+    """A step boundary part of a message."""
+
+    type: Literal['step-start'] = 'step-start'
+
+## pydantic_evals/pydantic_evals/evaluators/common.py
+
+    async def evaluate(
+        self,
+        ctx: EvaluatorContext[object, object, object],
+    ) -> EvaluatorOutput:
+        if self.include_input:
+            if self.include_expected_output:
+                from .llm_as_a_judge import judge_input_output_expected
+
+                grading_output = await judge_input_output_expected(
+                    ctx.inputs, ctx.output, ctx.expected_output, self.rubric, self.model, self.model_settings
+                )
+            else:
+                from .llm_as_a_judge import judge_input_output
+
+                grading_output = await judge_input_output(
+                    ctx.inputs, ctx.output, self.rubric, self.model, self.model_settings
+                )
+        else:
+            if self.include_expected_output:
+                from .llm_as_a_judge import judge_output_expected
+
+                grading_output = await judge_output_expected(
+                    ctx.output, ctx.expected_output, self.rubric, self.model, self.model_settings
+                )
+            else:
+                from .llm_as_a_judge import judge_output
+
+                grading_output = await judge_output(ctx.output, self.rubric, self.model, self.model_settings)
+
+        output: dict[str, EvaluationScalar | EvaluationReason] = {}
+        include_both = self.score is not False and self.assertion is not False
+        evaluation_name = self.get_default_evaluation_name()
+
+        if self.score is not False:
+            default_name = f'{evaluation_name}_score' if include_both else evaluation_name
+            _update_combined_output(output, grading_output.score, grading_output.reason, self.score, default_name)
+
+        if self.assertion is not False:
+            default_name = f'{evaluation_name}_pass' if include_both else evaluation_name
+            _update_combined_output(output, grading_output.pass_, grading_output.reason, self.assertion, default_name)
+
+        return output
+
+## pydantic_evals/pydantic_evals/evaluators/llm_as_a_judge.py
+
+async def judge_output(
+    output: Any,
+    rubric: str,
+    model: models.Model | models.KnownModelName | str | None = None,
+    model_settings: ModelSettings | None = None,
+) -> GradingOutput:
+    """Judge the output of a model based on a rubric.
+
+    If the model is not specified, a default model is used. The default model starts as 'openai:gpt-5.2',
+    but this can be changed using the `set_default_judge_model` function.
+    """
+    user_prompt = _build_prompt(output=output, rubric=rubric)
+    return (
+        await _judge_output_agent.run(user_prompt, model=model or _default_model, model_settings=model_settings)
+    ).output
+
+def _build_prompt(
+    output: Any,
+    rubric: str,
+    inputs: Any | None = None,
+    expected_output: Any | None = None,
+) -> str | Sequence[str | UserContent]:
+    """Build a prompt that includes input, output, expected output, and rubric."""
+    sections: list[str | UserContent] = []
+    if inputs is not None:
+        sections.extend(_make_section(inputs, 'Input'))
+
+    sections.extend(_make_section(output, 'Output'))
+    sections.extend(_make_section(rubric, 'Rubric'))
+
+    if expected_output is not None:
+        sections.extend(_make_section(expected_output, 'ExpectedOutput'))
+    if all(isinstance(section, str) for section in sections):
+        return '\n'.join(sections)  # type: ignore[arg-type]
+    return sections
+
+## pydantic_graph/pydantic_graph/graph.py
+
+    def result(self) -> GraphRunResult[StateT, RunEndT] | None:
+        """The final result of the graph run if the run is completed, otherwise `None`."""
+        if not isinstance(self._next_node, End):
+            return None  # The GraphRun has not finished running
+        return GraphRunResult[StateT, RunEndT](
+            self._next_node.data,
+            state=self.state,
+            persistence=self.persistence,
+            traceparent=self._traceparent(required=False),
+        )
+
+## tests/evals/test_llm_as_a_judge.py
+
+async def test_judge_output_mock(mocker: MockerFixture):
+    """Test judge_output function with mocked agent."""
+    # Mock the agent run method
+    mock_result = mocker.MagicMock()
+    mock_result.output = GradingOutput(reason='Test passed', pass_=True, score=1.0)
+    mock_run = mocker.patch('pydantic_ai.agent.AbstractAgent.run', return_value=mock_result)
+
+    # Test with string output
+    grading_output = await judge_output('Hello world', 'Content contains a greeting')
+    assert isinstance(grading_output, GradingOutput)
+    assert grading_output.reason == 'Test passed'
+    assert grading_output.pass_ is True
+    assert grading_output.score == 1.0
+
+    # Verify the agent was called with correct prompt
+    mock_run.assert_called_once()
+    call_args = mock_run.call_args[0]
+    assert '<Output>\nHello world\n</Output>' in call_args[0]
+    assert '<Rubric>\nContent contains a greeting\n</Rubric>' in call_args[0]
+
+async def test_judge_output_with_model_settings_mock(mocker: MockerFixture):
+    """Test judge_output function with model_settings and mocked agent."""
+    mock_result = mocker.MagicMock()
+    mock_result.output = GradingOutput(reason='Test passed with settings', pass_=True, score=1.0)
+    mock_run = mocker.patch('pydantic_ai.agent.AbstractAgent.run', return_value=mock_result)
+
+    test_model_settings = ModelSettings(temperature=1)
+
+    grading_output = await judge_output(
+        'Hello world settings',
+        'Content contains a greeting with settings',
+        model_settings=test_model_settings,
+    )
+    assert isinstance(grading_output, GradingOutput)
+    assert grading_output.reason == 'Test passed with settings'
+    assert grading_output.pass_ is True
+    assert grading_output.score == 1.0
+
+    mock_run.assert_called_once()
+    call_args, call_kwargs = mock_run.call_args
+    assert '<Output>\nHello world settings\n</Output>' in call_args[0]
+    assert '<Rubric>\nContent contains a greeting with settings\n</Rubric>' in call_args[0]
+    assert call_kwargs['model_settings'] == test_model_settings
+    # Check if 'model' kwarg is passed, its value will be the default model or None
+    assert 'model' in call_kwargs
+
+async def test_judge_binary_output_mock(mocker: MockerFixture, image_content: BinaryContent) -> None:
+    """Test judge_output function when binary content is to be judged"""
+    # Mock the agent run method
+    mock_result = mocker.MagicMock()
+    mock_result.output = GradingOutput(reason='Test passed', pass_=True, score=1.0)
+    mock_run = mocker.patch('pydantic_ai.agent.AbstractAgent.run', return_value=mock_result)
+
+    result = await judge_output(output=image_content, rubric='dummy rubric')
+    assert isinstance(result, GradingOutput)
+    assert result.reason == 'Test passed'
+    assert result.pass_ is True
+    assert result.score == 1.0
+
+    # Verify the agent was called with correct prompt
+    mock_run.assert_called_once()
+    call_args, *_ = mock_run.call_args
+
+    assert call_args == snapshot((['<Output>', image_content, '</Output>', '<Rubric>', 'dummy rubric', '</Rubric>'],))
+
+## tests/evals/test_reporting.py
+
+async def test_evaluation_renderer_diff_with_changed_metadata(sample_report_case: ReportCase):
+    """Test EvaluationRenderer diff table where both reports have the same metadata."""
+
+    baseline_report = EvaluationReport(
+        cases=[sample_report_case],
+        name='baseline_report',
+        experiment_metadata={
+            'updated-key': 'original value',
+            'preserved-key': 'preserved value',
+            'old-key': 'old value',
+        },
+    )
+
+    new_report = EvaluationReport(
+        cases=[sample_report_case],
+        name='new_report',
+        experiment_metadata={
+            'updated-key': 'updated value',
+            'preserved-key': 'preserved value',
+            'new-key': 'new value',
+        },
+    )
+
+    output = new_report.render(
+        include_input=False,
+        include_metadata=False,
+        include_expected_output=False,
+        include_output=False,
+        include_durations=True,
+        include_total_duration=False,
+        include_removed_cases=False,
+        include_averages=False,
+        include_error_stacktrace=False,
+        include_evaluator_failures=True,
+        input_config={},
+        metadata_config={},
+        output_config={},
+        score_configs={},
+        label_configs={},
+        metric_configs={},
+        duration_config={},
+        include_reasons=False,
+        baseline=baseline_report,
+        include_errors=False,  # Prevent failures table from being added
+    )
+    assert output == snapshot("""\
+╭─ Evaluation Diff: baseline_report → new_report ─╮
+│ + new-key: new value                            │
+│ - old-key: old value                            │
+│ preserved-key: preserved value                  │
+│ updated-key: original value → updated value     │
+╰─────────────────────────────────────────────────╯
+┏━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━┓
+┃ Case ID   ┃ Scores       ┃ Labels        ┃ Metrics         ┃ Assertions ┃ Duration ┃
+┡━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━┩
+│ test_case │ score1: 2.50 │ label1: hello │ accuracy: 0.950 │ ✔          │  100.0ms │
+└───────────┴──────────────┴───────────────┴─────────────────┴────────────┴──────────┘
+""")
+
+## tests/models/test_gemini.py
+
+async def test_image_url_input(
+    allow_model_requests: None, gemini_api_key: str, disable_ssrf_protection_for_vcr: None
+) -> None:
+    m = GeminiModel('gemini-2.0-flash-exp', provider=GoogleGLAProvider(api_key=gemini_api_key))
+    agent = Agent(m)
+
+    image_url = ImageUrl(url='https://goo.gle/instrument-img')
+
+    result = await agent.run(['What is the name of this fruit?', image_url])
+    assert result.output == snapshot("This is not a fruit; it's a pipe organ console.")
+
+async def test_video_url_input(
+    allow_model_requests: None, gemini_api_key: str, disable_ssrf_protection_for_vcr: None
+) -> None:
+    m = GeminiModel('gemini-2.5-flash', provider=GoogleGLAProvider(api_key=gemini_api_key))
+    agent = Agent(m, instructions='You are a helpful chatbot.')
+
+    video_url = VideoUrl(url='https://data.grepit.app/assets/tiny_video.mp4')
+
+    result = await agent.run(['Explain me this video', video_url])
+    assert result.output.strip() == snapshot(
+        """\
+This video is a beautiful, static shot (or appears to be a still image) of a picturesque Mediterranean scene.
+
+Here's a breakdown:
+
+*   **Setting:** It depicts a narrow, charming alleyway or street, likely in a coastal town or island.
+*   **Architecture:** The buildings on both sides are traditional, whitewashed stucco, characteristic of Cycladic architecture often found in the Greek islands. There are minimal details on the walls, with some simple light fixtures on the left and a blue-painted window frame on the right.
+*   **Cafe/Restaurant:** Along the left side of the alley, several rustic wooden tables and chairs are set up, suggesting an outdoor cafe or restaurant. On the far left wall, there are also some woven baskets hanging or placed.
+*   **Pathway:** The ground is paved with a distinctive pattern of light-colored stones, adding to the quaint aesthetic.
+*   **The Sea View:** The alley opens up directly to a stunning view of the sea. The water is a vibrant blue, with noticeable waves gently breaking.
+*   **Horizon:** In the distance, across the sparkling water, another landmass or island can be seen under a clear, bright blue sky.
+*   **Atmosphere:** The overall impression is one of serenity, beauty, and a quintessential Mediterranean vacation spot, perfect for enjoying a meal or drink with a breathtaking ocean view.
+
+It strongly evokes places like Mykonos or Santorini in Greece, known for their iconic white buildings and narrow pathways leading to the sea.\
+"""
+    )
+
+async def test_document_url_input(
+    allow_model_requests: None, gemini_api_key: str, disable_ssrf_protection_for_vcr: None
+) -> None:
+    m = GeminiModel('gemini-2.0-flash-thinking-exp-01-21', provider=GoogleGLAProvider(api_key=gemini_api_key))
+    agent = Agent(m)
+
+    document_url = DocumentUrl(url='https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf')
+
+    result = await agent.run(['What is the main content on this document?', document_url])
+    assert result.output == snapshot('The main content of this document is that it is a **dummy PDF file**.')
+
+## tests/models/test_openai.py
+
+async def test_openai_audio_url_input(
+    allow_model_requests: None, openai_api_key: str, disable_ssrf_protection_for_vcr: None
+):
+    m = OpenAIChatModel('gpt-4o-audio-preview', provider=OpenAIProvider(api_key=openai_api_key))
+    agent = Agent(m)
+
+    result = await agent.run(['Hello', AudioUrl(url='https://cdn.openai.com/API/docs/audio/alloy.wav')])
+    assert result.output == snapshot(
+        'Yes, the phenomenon of the sun rising in the east and setting in the west is due to the rotation of the Earth. The Earth rotates on its axis from west to east, making the sun appear to rise on the eastern horizon and set in the west. This is a daily occurrence and has been a fundamental aspect of human observation and timekeeping throughout history.'
+    )
+    assert result.usage() == snapshot(
+        RunUsage(
+            input_tokens=81,
+            output_tokens=72,
+            input_audio_tokens=69,
+            details={
+                'accepted_prediction_tokens': 0,
+                'audio_tokens': 0,
+                'reasoning_tokens': 0,
+                'rejected_prediction_tokens': 0,
+                'text_tokens': 72,
+            },
+            requests=1,
+        )
+    )
+
+async def test_document_url_input(
+    allow_model_requests: None, openai_api_key: str, disable_ssrf_protection_for_vcr: None
+):
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))
+    agent = Agent(m)
+
+    document_url = DocumentUrl(url='https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf')
+
+    result = await agent.run(['What is the main content on this document?', document_url])
+    assert result.output == snapshot('The document contains the text "Dummy PDF file" on its single page.')
+
+async def test_text_document_url_input(
+    allow_model_requests: None, openai_api_key: str, disable_ssrf_protection_for_vcr: None
+):
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))
+    agent = Agent(m)
+
+    document_url = DocumentUrl(url='https://www.w3.org/TR/2003/REC-PNG-20031110/iso_8859-1.txt')
+
+    result = await agent.run(['What is the main content on this document, in one sentence?', document_url])
+    assert result.output == snapshot(
+        'The document lists the graphical characters defined by ISO 8859-1 (1987) with their hexadecimal codes and descriptions.'
+    )
+
+## tests/test_streaming.py
+
+def _make_run_result(*, metadata: dict[str, Any] | None) -> AgentRunResult[str]:
+    state = GraphAgentState(metadata=metadata)
+    response_message = ModelResponse(parts=[TextPart('final')], model_name='test')
+    state.message_history.append(response_message)
+    return AgentRunResult('final', _state=state)
+
+def test_streamed_run_result_metadata_prefers_run_result_state() -> None:
+    run_result = _make_run_result(metadata={'from': 'run-result'})
+    streamed = StreamedRunResult(
+        all_messages=run_result.all_messages(),
+        new_message_index=0,
+        run_result=run_result,
+    )
+    assert streamed.metadata == {'from': 'run-result'}
+
+def test_streamed_run_result_metadata_none_without_sources() -> None:
+    run_result = _make_run_result(metadata=None)
+    streamed = StreamedRunResult(all_messages=[], new_message_index=0, run_result=run_result)
+    assert streamed.metadata is None
+
+def test_streamed_run_result_sync_exposes_metadata() -> None:
+    run_result = _make_run_result(metadata={'sync': 'metadata'})
+    streamed = StreamedRunResult(
+        all_messages=run_result.all_messages(),
+        new_message_index=0,
+        run_result=run_result,
+    )
+    sync_result = StreamedRunResultSync(streamed)
+    assert sync_result.metadata == {'sync': 'metadata'}
+
+## tests/test_temporal.py
+
+def test_pydantic_ai_plugin_with_pydantic_payload_converter_unchanged() -> None:
+    """When converter already uses PydanticPayloadConverter, return it unchanged."""
+    plugin = PydanticAIPlugin()
+    converter = DataConverter(payload_converter_class=PydanticPayloadConverter)
+    config: dict[str, Any] = {'data_converter': converter}
+    result = plugin.configure_client(config)  # type: ignore[arg-type]
+    assert result['data_converter'] is converter

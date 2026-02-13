@@ -1,0 +1,891 @@
+# pydantic_ai_slim/pydantic_ai/tools.py:283-283
+    function_schema: _function_schema.FunctionSchema
+
+# pydantic_ai_slim/pydantic_ai/_function_schema.py:75-224
+def function_schema(  # noqa: C901
+    function: Callable[..., Any],
+    schema_generator: type[GenerateJsonSchema],
+    takes_ctx: bool | None = None,
+    docstring_format: DocstringFormat = 'auto',
+    require_parameter_descriptions: bool = False,
+) -> FunctionSchema:
+    """Build a Pydantic validator and JSON schema from a tool function.
+
+    Args:
+        function: The function to build a validator and JSON schema for.
+        takes_ctx: Whether the function takes a `RunContext` first argument.
+        docstring_format: The docstring format to use.
+        require_parameter_descriptions: Whether to require descriptions for all tool function parameters.
+        schema_generator: The JSON schema generator class to use.
+
+    Returns:
+        A `FunctionSchema` instance.
+    """
+    config = ConfigDict(title=function.__name__, use_attribute_docstrings=True)
+    config_wrapper = ConfigWrapper(config)
+    gen_schema = _generate_schema.GenerateSchema(config_wrapper)
+    errors: list[str] = []
+
+    try:
+        sig = signature(function)
+    except ValueError as e:
+        errors.append(str(e))
+        sig = signature(lambda: None)
+    original_func = function.func if isinstance(function, partial) else function
+    function = cast(Callable[..., Any], function)  # cope with pyright changing the type from the isinstance() check.
+
+    type_hints = get_type_hints(original_func, include_extras=True)
+
+    var_kwargs_schema: core_schema.CoreSchema | None = None
+    fields: dict[str, core_schema.TypedDictField] = {}
+    positional_fields: list[str] = []
+    var_positional_field: str | None = None
+    decorators = _decorators.DecoratorInfos()
+
+    description, field_descriptions = doc_descriptions(original_func, sig, docstring_format=docstring_format)
+    missing_param_descriptions: set[str] = set()
+
+    for index, (name, p) in enumerate(sig.parameters.items()):
+        if index == 0 and takes_ctx is None:
+            takes_ctx = p.annotation is not sig.empty and _is_call_ctx(type_hints[name])
+
+        if p.annotation is sig.empty:
+            if takes_ctx and index == 0:
+                # should be the `context` argument, skip
+                continue
+            # TODO warn?
+            annotation = Any
+        else:
+            annotation = type_hints[name]
+
+            if index == 0 and takes_ctx:
+                if not _is_call_ctx(annotation):
+                    errors.append('First parameter of tools that take context must be annotated with RunContext[...]')
+                continue
+            elif not takes_ctx and _is_call_ctx(annotation):
+                errors.append('RunContext annotations can only be used with tools that take context')
+                continue
+            elif index != 0 and _is_call_ctx(annotation):
+                errors.append('RunContext annotations can only be used as the first argument')
+                continue
+
+        field_name = p.name
+
+        if require_parameter_descriptions and field_name not in field_descriptions:
+            missing_param_descriptions.add(field_name)
+
+        if p.kind == Parameter.VAR_KEYWORD:
+            var_kwargs_schema = gen_schema.generate_schema(annotation)
+        else:
+            if p.kind == Parameter.VAR_POSITIONAL:
+                annotation = list[annotation]
+
+            required = p.default is Parameter.empty
+            # FieldInfo.from_annotated_attribute expects a type, `annotation` is Any
+            annotation = cast(type[Any], annotation)
+            if required:
+                field_info = FieldInfo.from_annotation(annotation)
+            else:
+                field_info = FieldInfo.from_annotated_attribute(annotation, p.default)
+            if field_info.description is None:
+                field_info.description = field_descriptions.get(field_name)
+
+            fields[field_name] = td_schema = gen_schema._generate_td_field_schema(  # pyright: ignore[reportPrivateUsage]
+                field_name,
+                field_info,
+                decorators,
+                required=required,
+            )
+            # noinspection PyTypeChecker
+            td_schema.setdefault('metadata', {})['is_model_like'] = is_model_like(annotation)
+
+            if p.kind == Parameter.POSITIONAL_ONLY:
+                positional_fields.append(field_name)
+            elif p.kind == Parameter.VAR_POSITIONAL:
+                var_positional_field = field_name
+
+    if missing_param_descriptions:
+        errors.append(f'Missing parameter descriptions for {", ".join(missing_param_descriptions)}')
+
+    if errors:
+        from .exceptions import UserError
+
+        error_details = '\n  '.join(errors)
+        raise UserError(f'Error generating schema for {function.__qualname__}:\n  {error_details}')
+
+    core_config = config_wrapper.core_config(None)
+    # noinspection PyTypedDict
+    core_config['extra_fields_behavior'] = 'allow' if var_kwargs_schema else 'forbid'
+
+    schema, single_arg_name = _build_schema(fields, var_kwargs_schema, gen_schema, core_config)
+    schema = gen_schema.clean_schema(schema)
+    # noinspection PyUnresolvedReferences
+    schema_validator = create_schema_validator(
+        schema,
+        function,
+        function.__module__,
+        function.__qualname__,
+        'validate_call',
+        core_config,
+        config_wrapper.plugin_settings,
+    )
+    # PluggableSchemaValidator is api compatible with SchemaValidator
+    schema_validator = cast(SchemaValidator, schema_validator)
+    json_schema = schema_generator().generate(schema)
+
+    # workaround for https://github.com/pydantic/pydantic/issues/10785
+    # if we build a custom TypedDict schema (matches when `single_arg_name is None`), we manually set
+    # `additionalProperties` in the JSON Schema
+    if single_arg_name is not None and not description:
+        # if the tool description is not set, and we have a single parameter, take the description from that
+        # and set it on the tool
+        description = json_schema.pop('description', None)
+
+    return FunctionSchema(
+        description=description,
+        validator=schema_validator,
+        json_schema=check_object_json_schema(json_schema),
+        single_arg_name=single_arg_name,
+        positional_fields=positional_fields,
+        var_positional_field=var_positional_field,
+        takes_ctx=bool(takes_ctx),
+        is_async=is_async_callable(function),
+        function=function,
+    )
+
+# pydantic_ai_slim/pydantic_ai/_output.py:18-18
+from . import _function_schema, _utils, messages as _messages
+
+# pydantic_ai_slim/pydantic_ai/tools.py:12-12
+from . import _function_schema, _utils
+
+# pydantic_ai_slim/pydantic_ai/_output.py:535-535
+    _function_schema: _function_schema.FunctionSchema | None = None
+
+# pydantic_ai_slim/pydantic_ai/_output.py:820-820
+    _function_schema: _function_schema.FunctionSchema
+
+# pydantic_ai_slim/pydantic_ai/_output.py:77-158
+async def execute_traced_output_function(
+    function_schema: _function_schema.FunctionSchema,
+    run_context: RunContext[AgentDepsT],
+    args: dict[str, Any],
+    wrap_validation_errors: bool = True,
+) -> Any:
+    """Execute an output function within a traced span with error handling.
+
+    This function executes the output function within an OpenTelemetry span for observability,
+    automatically records the function response, and handles ModelRetry exceptions by converting
+    them to ToolRetryError when wrap_validation_errors is True.
+
+    Args:
+        function_schema: The function schema containing the function to execute
+        run_context: The current run context containing tracing and tool information
+        args: Arguments to pass to the function
+        wrap_validation_errors: If True, wrap ModelRetry exceptions in ToolRetryError
+
+    Returns:
+        The result of the function execution
+
+    Raises:
+        ToolRetryError: When wrap_validation_errors is True and a ModelRetry is caught
+        ModelRetry: When wrap_validation_errors is False and a ModelRetry occurs
+    """
+    instrumentation_names = InstrumentationNames.for_version(run_context.instrumentation_version)
+    # Set up span attributes
+    tool_name = run_context.tool_name or getattr(function_schema.function, '__name__', 'output_function')
+    attributes = {
+        'gen_ai.tool.name': tool_name,
+        'logfire.msg': f'running output function: {tool_name}',
+    }
+    if run_context.tool_call_id:
+        attributes['gen_ai.tool.call.id'] = run_context.tool_call_id
+    if run_context.trace_include_content:
+        attributes[instrumentation_names.tool_arguments_attr] = to_json(args).decode()
+
+    attributes['logfire.json_schema'] = json.dumps(
+        {
+            'type': 'object',
+            'properties': {
+                **(
+                    {
+                        instrumentation_names.tool_arguments_attr: {'type': 'object'},
+                        instrumentation_names.tool_result_attr: {'type': 'object'},
+                    }
+                    if run_context.trace_include_content
+                    else {}
+                ),
+                'gen_ai.tool.name': {},
+                **({'gen_ai.tool.call.id': {}} if run_context.tool_call_id else {}),
+            },
+        }
+    )
+
+    with run_context.tracer.start_as_current_span(
+        instrumentation_names.get_output_tool_span_name(tool_name), attributes=attributes
+    ) as span:
+        try:
+            output = await function_schema.call(args, run_context)
+        except ModelRetry as r:
+            if wrap_validation_errors:
+                m = _messages.RetryPromptPart(
+                    content=r.message,
+                    tool_name=run_context.tool_name,
+                )
+                if run_context.tool_call_id:
+                    m.tool_call_id = run_context.tool_call_id  # pragma: no cover
+                raise ToolRetryError(m) from r
+            else:
+                raise
+
+        # Record response if content inclusion is enabled
+        if run_context.trace_include_content and span.is_recording():
+            from .models.instrumented import InstrumentedModel
+
+            span.set_attribute(
+                instrumentation_names.tool_result_attr,
+                output if isinstance(output, str) else json.dumps(InstrumentedModel.serialize_any(output)),
+            )
+
+        return output
+
+# tests/test_usage_limits.py:3-3
+import operator
+
+# pydantic_ai_slim/pydantic_ai/_output.py:14-14
+from typing_extensions import Self, TypedDict, TypeVar
+
+# pydantic_ai_slim/pydantic_ai/agent/__init__.py:16-16
+from typing_extensions import Self, TypeVar, deprecated
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:13-13
+from typing_extensions import Self, TypeIs, TypeVar, deprecated
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:13-13
+from typing_extensions import Self
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_mcp.py:8-8
+from typing_extensions import Self
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_mcp_server.py:7-7
+from typing_extensions import Self
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_toolset.py:11-11
+from typing_extensions import Self, assert_never
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:22-22
+from typing_extensions import Self, assert_never, deprecated
+
+# pydantic_ai_slim/pydantic_ai/profiles/__init__.py:7-7
+from typing_extensions import Self
+
+# pydantic_ai_slim/pydantic_ai/tools.py:10-10
+from typing_extensions import ParamSpec, Self, TypeVar
+
+# pydantic_ai_slim/pydantic_ai/toolsets/_dynamic.py:7-7
+from typing_extensions import Self
+
+# pydantic_ai_slim/pydantic_ai/toolsets/abstract.py:9-9
+from typing_extensions import Self
+
+# pydantic_ai_slim/pydantic_ai/toolsets/combined.py:10-10
+from typing_extensions import Self
+
+# pydantic_ai_slim/pydantic_ai/toolsets/fastmcp.py:11-11
+from typing_extensions import Self, assert_never
+
+# pydantic_ai_slim/pydantic_ai/toolsets/wrapper.py:7-7
+from typing_extensions import Self
+
+# pydantic_ai_slim/pydantic_ai/ui/ag_ui/app.py:9-9
+from typing_extensions import Self
+
+# pydantic_evals/pydantic_evals/dataset.py:35-35
+from typing_extensions import NotRequired, Self, TypedDict, TypeVar
+
+# pydantic_graph/pydantic_graph/beta/decision.py:15-15
+from typing_extensions import Never, Self, TypeVar
+
+# pydantic_graph/pydantic_graph/beta/join.py:16-16
+from typing_extensions import Protocol, Self, TypeAliasType, TypeVar
+
+# pydantic_graph/pydantic_graph/beta/paths.py:15-15
+from typing_extensions import Protocol, Self, TypeAliasType, TypeVar
+
+# pydantic_graph/pydantic_graph/nodes.py:10-10
+from typing_extensions import Never, Self, TypeVar
+
+# tests/test_agent.py:16-16
+from typing_extensions import Self
+
+# tests/test_format_as_xml.py:14-14
+from typing_extensions import Self
+
+# tests/test_logfire.py:11-11
+from typing_extensions import NotRequired, Self, TypedDict
+
+# tests/test_toolsets.py:11-11
+from typing_extensions import Self
+
+# pydantic_ai_slim/pydantic_ai/tools.py:290-386
+    def __init__(
+        self,
+        function: ToolFuncEither[ToolAgentDepsT],
+        *,
+        takes_ctx: bool | None = None,
+        max_retries: int | None = None,
+        name: str | None = None,
+        description: str | None = None,
+        prepare: ToolPrepareFunc[ToolAgentDepsT] | None = None,
+        docstring_format: DocstringFormat = 'auto',
+        require_parameter_descriptions: bool = False,
+        schema_generator: type[GenerateJsonSchema] = GenerateToolJsonSchema,
+        strict: bool | None = None,
+        sequential: bool = False,
+        requires_approval: bool = False,
+        metadata: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        function_schema: _function_schema.FunctionSchema | None = None,
+    ):
+        """Create a new tool instance.
+
+        Example usage:
+
+        ```python {noqa="I001"}
+        from pydantic_ai import Agent, RunContext, Tool
+
+        async def my_tool(ctx: RunContext[int], x: int, y: int) -> str:
+            return f'{ctx.deps} {x} {y}'
+
+        agent = Agent('test', tools=[Tool(my_tool)])
+        ```
+
+        or with a custom prepare method:
+
+        ```python {noqa="I001"}
+
+        from pydantic_ai import Agent, RunContext, Tool
+        from pydantic_ai.tools import ToolDefinition
+
+        async def my_tool(ctx: RunContext[int], x: int, y: int) -> str:
+            return f'{ctx.deps} {x} {y}'
+
+        async def prep_my_tool(
+            ctx: RunContext[int], tool_def: ToolDefinition
+        ) -> ToolDefinition | None:
+            # only register the tool if `deps == 42`
+            if ctx.deps == 42:
+                return tool_def
+
+        agent = Agent('test', tools=[Tool(my_tool, prepare=prep_my_tool)])
+        ```
+
+
+        Args:
+            function: The Python function to call as the tool.
+            takes_ctx: Whether the function takes a [`RunContext`][pydantic_ai.tools.RunContext] first argument,
+                this is inferred if unset.
+            max_retries: Maximum number of retries allowed for this tool, set to the agent default if `None`.
+            name: Name of the tool, inferred from the function if `None`.
+            description: Description of the tool, inferred from the function if `None`.
+            prepare: custom method to prepare the tool definition for each step, return `None` to omit this
+                tool from a given step. This is useful if you want to customise a tool at call time,
+                or omit it completely from a step. See [`ToolPrepareFunc`][pydantic_ai.tools.ToolPrepareFunc].
+            docstring_format: The format of the docstring, see [`DocstringFormat`][pydantic_ai.tools.DocstringFormat].
+                Defaults to `'auto'`, such that the format is inferred from the structure of the docstring.
+            require_parameter_descriptions: If True, raise an error if a parameter description is missing. Defaults to False.
+            schema_generator: The JSON schema generator class to use. Defaults to `GenerateToolJsonSchema`.
+            strict: Whether to enforce JSON schema compliance (only affects OpenAI).
+                See [`ToolDefinition`][pydantic_ai.tools.ToolDefinition] for more info.
+            sequential: Whether the function requires a sequential/serial execution environment. Defaults to False.
+            requires_approval: Whether this tool requires human-in-the-loop approval. Defaults to False.
+                See the [tools documentation](../deferred-tools.md#human-in-the-loop-tool-approval) for more info.
+            metadata: Optional metadata for the tool. This is not sent to the model but can be used for filtering and tool behavior customization.
+            timeout: Timeout in seconds for tool execution. If the tool takes longer, a retry prompt is returned to the model.
+                Defaults to None (no timeout).
+            function_schema: The function schema to use for the tool. If not provided, it will be generated.
+        """
+        self.function = function
+        self.function_schema = function_schema and _function_schema.function_schema(
+            function,
+            schema_generator,
+            takes_ctx=takes_ctx,
+            docstring_format=docstring_format,
+            require_parameter_descriptions=require_parameter_descriptions,
+        )
+        self.takes_ctx = self.function_schema.takes_ctx
+        self.max_retries = max_retries
+        self.name = name or function.__name__
+        self.description = description or self.function_schema.description
+        self.prepare = prepare
+        self.docstring_format = docstring_format
+        self.require_parameter_descriptions = require_parameter_descriptions
+        self.strict = strict
+        self.sequential = sequential
+        self.requires_approval = requires_approval
+        self.metadata = metadata
+        self.timeout = timeout
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:691-782
+    def run_stream_sync(
+        self,
+        user_prompt: str | Sequence[_messages.UserContent] | None = None,
+        *,
+        output_type: OutputSpec[RunOutputDataT] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: models.Model | models.KnownModelName | str | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+        usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool | BuiltinToolFunc[AgentDepsT]] | None = None,
+        event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+    ) -> result.StreamedRunResultSync[AgentDepsT, Any]:
+        """Run the agent with a user prompt in sync streaming mode.
+
+        This is a convenience method that wraps [`run_stream()`][pydantic_ai.agent.AbstractAgent.run_stream] with `loop.run_until_complete(...)`.
+        You therefore can't use this method inside async code or if there's an active event loop.
+
+        This method builds an internal agent graph (using system prompts, tools and output schemas) and then
+        runs the graph until the model produces output matching the `output_type`, for example text or structured data.
+        At this point, a streaming run result object is yielded from which you can stream the output as it comes in,
+        and -- once this output has completed streaming -- get the complete output, message history, and usage.
+
+        As this method will consider the first output matching the `output_type` to be the final output,
+        it will stop running the agent graph and will not execute any tool calls made by the model after this "final" output.
+        If you want to always run the agent graph to completion and stream events and output at the same time,
+        use [`agent.run()`][pydantic_ai.agent.AbstractAgent.run] with an `event_stream_handler` or [`agent.iter()`][pydantic_ai.agent.AbstractAgent.iter] instead.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+
+        def main():
+            response = agent.run_stream_sync('What is the capital of the UK?')
+            print(response.get_output())
+            #> The capital of the UK is London.
+        ```
+
+        Args:
+            user_prompt: User input to start/continue the conversation.
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has no
+                output validators since output validators would expect an argument that matches the agent's output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            metadata: Optional metadata to attach to this run. Accepts a dictionary or a callable taking
+                [`RunContext`][pydantic_ai.tools.RunContext]; merged with the agent's configured metadata.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            event_stream_handler: Optional handler for events from the model's streaming response and the agent's execution of tools to use for this run.
+                It will receive all the events up until the final result is found, which you can then read or stream from inside the context manager.
+                Note that it does _not_ receive any events after the final result is found.
+
+        Returns:
+            The result of the run.
+        """
+        if infer_name and self.name is None:
+            self._infer_name(inspect.currentframe())
+
+        async def _consume_stream():
+            async with self.run_stream(
+                user_prompt,
+                output_type=output_type,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                model=model,
+                deps=deps,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+                usage=usage,
+                metadata=metadata,
+                infer_name=infer_name,
+                toolsets=toolsets,
+                builtin_tools=builtin_tools,
+                event_stream_handler=event_stream_handler,
+            ) as stream_result:
+                yield stream_result
+
+        async_result = _utils.get_event_loop().run_until_complete(anext(_consume_stream()))
+        return result.StreamedRunResultSync(async_result)
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:480-482
+    def _bool_gen(self) -> bool:
+        """Generate a boolean from a JSON Schema boolean."""
+        return bool(self.seed % 2)
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:449-649
+    async def run_stream(  # noqa: C901
+        self,
+        user_prompt: str | Sequence[_messages.UserContent] | None = None,
+        *,
+        output_type: OutputSpec[RunOutputDataT] | None = None,
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: models.Model | models.KnownModelName | str | None = None,
+        instructions: Instructions[AgentDepsT] = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+        usage: _usage.RunUsage | None = None,
+        metadata: AgentMetadata[AgentDepsT] | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool | BuiltinToolFunc[AgentDepsT]] | None = None,
+        event_stream_handler: EventStreamHandler[AgentDepsT] | None = None,
+    ) -> AsyncIterator[result.StreamedRunResult[AgentDepsT, Any]]:
+        """Run the agent with a user prompt in async streaming mode.
+
+        This method builds an internal agent graph (using system prompts, tools and output schemas) and then
+        runs the graph until the model produces output matching the `output_type`, for example text or structured data.
+        At this point, a streaming run result object is yielded from which you can stream the output as it comes in,
+        and -- once this output has completed streaming -- get the complete output, message history, and usage.
+
+        As this method will consider the first output matching the `output_type` to be the final output,
+        it will stop running the agent graph and will not execute any tool calls made by the model after this "final" output.
+        If you want to always run the agent graph to completion and stream events and output at the same time,
+        use [`agent.run()`][pydantic_ai.agent.AbstractAgent.run] with an `event_stream_handler` or [`agent.iter()`][pydantic_ai.agent.AbstractAgent.iter] instead.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+
+        async def main():
+            async with agent.run_stream('What is the capital of the UK?') as response:
+                print(await response.get_output())
+                #> The capital of the UK is London.
+        ```
+
+        Args:
+            user_prompt: User input to start/continue the conversation.
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has no
+                output validators since output validators would expect an argument that matches the agent's output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            instructions: Optional additional instructions to use for this run.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            metadata: Optional metadata to attach to this run. Accepts a dictionary or a callable taking
+                [`RunContext`][pydantic_ai.tools.RunContext]; merged with the agent's configured metadata.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            event_stream_handler: Optional handler for events from the model's streaming response and the agent's execution of tools to use for this run.
+                It will receive all the events up until the final result is found, which you can then read or stream from inside the context manager.
+                Note that it does _not_ receive any events after the final result is found.
+
+        Returns:
+            The result of the run.
+        """
+        if infer_name and self.name is None:
+            # f_back because `asynccontextmanager` adds one frame
+            if frame := inspect.currentframe():  # pragma: no branch
+                self._infer_name(frame.f_back)
+
+        event_stream_handler = event_stream_handler or self.event_stream_handler
+
+        yielded = False
+        async with self.iter(
+            user_prompt,
+            output_type=output_type,
+            message_history=message_history,
+            deferred_tool_results=deferred_tool_results,
+            model=model,
+            deps=deps,
+            instructions=instructions,
+            model_settings=model_settings,
+            usage_limits=usage_limits,
+            usage=usage,
+            metadata=metadata,
+            infer_name=False,
+            toolsets=toolsets,
+            builtin_tools=builtin_tools,
+        ) as agent_run:
+            first_node = agent_run.next_node  # start with the first node
+            assert isinstance(first_node, _agent_graph.UserPromptNode)  # the first node should be a user prompt node
+            node = first_node
+            while True:
+                graph_ctx = agent_run.ctx
+                if self.is_model_request_node(node):
+                    async with node.stream(graph_ctx) as stream:
+                        final_result_event = None
+
+                        async def stream_to_final(
+                            stream: AgentStream,
+                        ) -> AsyncIterator[_messages.ModelResponseStreamEvent]:
+                            nonlocal final_result_event
+                            async for event in stream:
+                                yield event
+                                if isinstance(event, _messages.FinalResultEvent):
+                                    final_result_event = event
+                                    break
+
+                        if event_stream_handler is not None:
+                            await event_stream_handler(
+                                _agent_graph.build_run_context(graph_ctx), stream_to_final(stream)
+                            )
+                        else:
+                            async for _ in stream_to_final(stream):
+                                pass
+
+                        if final_result_event is not None:
+                            final_result = FinalResult(
+                                None, final_result_event.tool_name, final_result_event.tool_call_id
+                            )
+                            if yielded:
+                                raise exceptions.AgentRunError('Agent run produced final results')  # pragma: no cover
+                            yielded = True
+
+                            messages = graph_ctx.state.message_history.copy()
+
+                            async def on_complete() -> None:
+                                """Called when the stream has completed.
+
+                                The model response will have been added to messages by now
+                                by `StreamedRunResult._marked_completed`.
+                                """
+                                nonlocal final_result
+                                final_result = FinalResult(
+                                    await stream.get_output(), final_result.tool_name, final_result.tool_call_id
+                                )
+
+                                # When we get here, the `ModelRequestNode` has completed streaming after the final result was found.
+                                # When running an agent with `agent.run`, we'd then move to `CallToolsNode` to execute the tool calls and
+                                # find the final result.
+                                # We also want to execute tool calls (in case `agent.end_strategy == 'exhaustive'`) here, but
+                                # we don't want to use run the `CallToolsNode` logic to determine the final output, as it would be
+                                # wasteful and could produce a different result (e.g. when text output is followed by tool calls).
+                                # So we call `process_tool_calls` directly and then end the run with the found final result.
+
+                                parts: list[_messages.ModelRequestPart] = []
+                                async for _event in _agent_graph.process_tool_calls(
+                                    tool_manager=graph_ctx.deps.tool_manager,
+                                    tool_calls=stream.response.tool_calls,
+                                    tool_call_results=None,
+                                    tool_call_metadata=None,
+                                    final_result=final_result,
+                                    ctx=graph_ctx,
+                                    output_parts=parts,
+                                ):
+                                    pass
+
+                                # To allow this message history to be used in a future run without dangling tool calls,
+                                # append a new ModelRequest using the tool returns and retries
+                                if parts:
+                                    messages.append(
+                                        _messages.ModelRequest(
+                                            parts, run_id=graph_ctx.state.run_id, timestamp=_utils.now_utc()
+                                        )
+                                    )
+
+                                await agent_run.next(_agent_graph.SetFinalResult(final_result))
+
+                            yield StreamedRunResult(
+                                messages,
+                                graph_ctx.deps.new_message_index,
+                                stream,
+                                on_complete,
+                            )
+                            break
+                elif self.is_call_tools_node(node) and event_stream_handler is not None:
+                    async with node.stream(agent_run.ctx) as stream:
+                        await event_stream_handler(_agent_graph.build_run_context(agent_run.ctx), stream)
+
+                next_node = await agent_run.next(node)
+                if isinstance(next_node, End) and agent_run.result is not None:
+                    # A final output could have been produced by the CallToolsNode rather than the ModelRequestNode,
+                    # if a tool function raised CallDeferred or ApprovalRequired.
+                    # In this case there's no response to stream, but we still let the user access the output etc as normal.
+                    yield StreamedRunResult(
+                        graph_ctx.state.message_history,
+                        graph_ctx.deps.new_message_index,
+                        run_result=agent_run.result,
+                    )
+                    yielded = True
+                    break
+                if not isinstance(next_node, _agent_graph.AgentNode):
+                    raise exceptions.AgentRunError(  # pragma: no cover
+                        'Should have produced a StreamedRunResult before getting here'
+                    )
+                node = cast(_agent_graph.AgentNode[Any, Any], next_node)
+
+        if not yielded:
+            raise exceptions.AgentRunError('Agent run finished without producing a final result')  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/ui/ag_ui/app.py:42-148
+    def __init__(
+        self,
+        agent: AbstractAgent[AgentDepsT, OutputDataT],
+        *,
+        # AGUIAdapter.dispatch_request parameters
+        output_type: OutputSpec[Any] | None = None,
+        message_history: Sequence[ModelMessage] | None = None,
+        deferred_tool_results: DeferredToolResults | None = None,
+        model: Model | KnownModelName | str | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: UsageLimits | None = None,
+        usage: RunUsage | None = None,
+        infer_name: bool = True,
+        toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
+        builtin_tools: Sequence[AbstractBuiltinTool] | None = None,
+        on_complete: OnCompleteFunc[Any] | None = None,
+        # Starlette parameters
+        debug: bool = False,
+        routes: Sequence[BaseRoute] | None = None,
+        middleware: Sequence[Middleware] | None = None,
+        exception_handlers: Mapping[Any, ExceptionHandler] | None = None,
+        on_startup: Sequence[Callable[[], Any]] | None = None,
+        on_shutdown: Sequence[Callable[[], Any]] | None = None,
+        lifespan: Lifespan[Self] | None = None,
+    ) -> None:
+        """An ASGI application that handles every request by running the agent and streaming the response.
+
+        Note that the `deps` will be the same for each request, with the exception of the frontend state that's
+        injected into the `state` field of a `deps` object that implements the [`StateHandler`][pydantic_ai.ui.StateHandler] protocol.
+        To provide different `deps` for each request (e.g. based on the authenticated user),
+        use [`AGUIAdapter.run_stream()`][pydantic_ai.ui.ag_ui.AGUIAdapter.run_stream] or
+        [`AGUIAdapter.dispatch_request()`][pydantic_ai.ui.ag_ui.AGUIAdapter.dispatch_request] instead.
+
+        Args:
+            agent: The agent to run.
+
+            output_type: Custom output type to use for this run, `output_type` may only be used if the agent has
+                no output validators since output validators would expect an argument that matches the agent's
+                output type.
+            message_history: History of the conversation so far.
+            deferred_tool_results: Optional results for deferred tool calls in the message history.
+            model: Optional model to use for this run, required if `model` was not set when creating the agent.
+            deps: Optional dependencies to use for this run.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+            usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+            infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+            toolsets: Optional additional toolsets for this run.
+            builtin_tools: Optional additional builtin tools for this run.
+            on_complete: Optional callback function called when the agent run completes successfully.
+                The callback receives the completed [`AgentRunResult`][pydantic_ai.agent.AgentRunResult] and can access `all_messages()` and other result data.
+
+            debug: Boolean indicating if debug tracebacks should be returned on errors.
+            routes: A list of routes to serve incoming HTTP and WebSocket requests.
+            middleware: A list of middleware to run for every request. A starlette application will always
+                automatically include two middleware classes. `ServerErrorMiddleware` is added as the very
+                outermost middleware, to handle any uncaught errors occurring anywhere in the entire stack.
+                `ExceptionMiddleware` is added as the very innermost middleware, to deal with handled
+                exception cases occurring in the routing or endpoints.
+            exception_handlers: A mapping of either integer status codes, or exception class types onto
+                callables which handle the exceptions. Exception handler callables should be of the form
+                `handler(request, exc) -> response` and may be either standard functions, or async functions.
+            on_startup: A list of callables to run on application startup. Startup handler callables do not
+                take any arguments, and may be either standard functions, or async functions.
+            on_shutdown: A list of callables to run on application shutdown. Shutdown handler callables do
+                not take any arguments, and may be either standard functions, or async functions.
+            lifespan: A lifespan context function, which can be used to perform startup and shutdown tasks.
+                This is a newer style that replaces the `on_startup` and `on_shutdown` handlers. Use one or
+                the other, not both.
+        """
+        super().__init__(
+            debug=debug,
+            routes=routes,
+            middleware=middleware,
+            exception_handlers=exception_handlers,
+            on_startup=on_startup,
+            on_shutdown=on_shutdown,
+            lifespan=lifespan,
+        )
+
+        async def run_agent(request: Request) -> Response:
+            """Endpoint to run the agent with the provided input data."""
+            # `dispatch_request` will store the frontend state from the request on `deps.state` (if it implements the `StateHandler` protocol),
+            # so we need to copy the deps to avoid different requests mutating the same deps object.
+            nonlocal deps
+            if isinstance(deps, StateHandler):  # pragma: no branch
+                deps = replace(deps)
+
+            return await AGUIAdapter[AgentDepsT, OutputDataT].dispatch_request(
+                request,
+                agent=agent,
+                output_type=output_type,
+                message_history=message_history,
+                deferred_tool_results=deferred_tool_results,
+                model=model,
+                deps=deps,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+                usage=usage,
+                infer_name=infer_name,
+                toolsets=toolsets,
+                builtin_tools=builtin_tools,
+                on_complete=on_complete,
+            )
+
+        self.router.add_route('/', run_agent, methods=['POST'])
+
+# pydantic_ai_slim/pydantic_ai/toolsets/function.py:43-43
+    tools: dict[str, Tool[Any]]
+
+# pydantic_ai_slim/pydantic_ai/_tool_manager.py:38-38
+    tools: dict[str, ToolsetTool[AgentDepsT]] | None = None
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:238-238
+    tools: bool = False
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:567-567
+    tools: NotRequired[_GeminiTools]
+
+# pydantic_ai_slim/pydantic_ai/tools.py:149-164
+class DeferredToolRequests:
+    """Tool calls that require approval or external execution.
+
+    This can be used as an agent's `output_type` and will be used as the output of the agent run if the model called any deferred tools.
+
+    Results can be passed to the next agent run using a [`DeferredToolResults`][pydantic_ai.tools.DeferredToolResults] object with the same tool call IDs.
+
+    See [deferred tools docs](../deferred-tools.md#deferred-tools) for more information.
+    """
+
+    calls: list[ToolCallPart] = field(default_factory=list[ToolCallPart])
+    """Tool calls that require external execution."""
+    approvals: list[ToolCallPart] = field(default_factory=list[ToolCallPart])
+    """Tool calls that require human-in-the-loop approval."""
+    metadata: dict[str, dict[str, Any]] = field(default_factory=dict[str, dict[str, Any]])
+    """Metadata for deferred tool calls, keyed by `tool_call_id`."""
+
+# pydantic_ai_slim/pydantic_ai/tools.py:446-460
+    async def prepare_tool_def(self, ctx: RunContext[ToolAgentDepsT]) -> ToolDefinition | None:
+        """Get the tool definition.
+
+        By default, this method creates a tool definition, then either returns it, or calls `self.prepare`
+        if it's set.
+
+        Returns:
+            return a `ToolDefinition` or `None` if the tools should not be registered for this run.
+        """
+        base_tool_def = self.tool_def
+
+        if self.prepare is not None:
+            return await self.prepare(ctx, base_tool_def)
+        else:
+            return base_tool_def
+
+# pydantic_ai_slim/pydantic_ai/tools.py:235-235
+A = TypeVar('A')
+
+# tests/test_agent.py:150-150
+    a: int

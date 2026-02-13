@@ -1,0 +1,1132 @@
+# tests/test_tenacity.py:540-552
+    def test_default_fallback_strategy(self):
+        """Test that default fallback strategy is used when none is provided."""
+        wait_func = wait_retry_after(max_wait=300)
+
+        # Create a retry state with no exception to trigger fallback
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = None
+        retry_state.attempt_number = 1
+
+        # Should use default exponential backoff, exact value depends on retry state
+        result = wait_func(retry_state)
+
+        assert result == 1  # first backoff
+
+# tests/test_tenacity.py:347-593
+class TestWaitRetryAfter:
+    """Tests for the wait_retry_after wait strategy."""
+
+    def test_no_exception_uses_fallback(self):
+        """Test that fallback strategy is used when there's no exception."""
+        fallback = Mock(return_value=5.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a retry state with no exception
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = None
+
+        result = wait_func(retry_state)
+
+        assert result == 5.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_non_http_exception_uses_fallback(self):
+        """Test that fallback strategy is used for non-HTTP exceptions."""
+        fallback = Mock(return_value=3.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a retry state with a non-HTTP exception
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = ValueError('Some error')
+
+        result = wait_func(retry_state)
+
+        assert result == 3.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_http_exception_no_retry_after_uses_fallback(self):
+        """Test that fallback strategy is used when there's no Retry-After header."""
+        fallback = Mock(return_value=2.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error without Retry-After header
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 2.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_retry_after_seconds_format(self):
+        """Test parsing Retry-After header in seconds format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error with Retry-After in seconds
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '30'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 30.0
+        fallback.assert_not_called()
+
+    def test_retry_after_seconds_respects_max_wait(self):
+        """Test that max_wait is respected for seconds format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=60)
+
+        # Create HTTP status error with Retry-After > max_wait
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '120'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 60.0  # Capped at max_wait
+        fallback.assert_not_called()
+
+    def test_retry_after_http_date_format(self):
+        """Test parsing Retry-After header in HTTP date format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a future date (30 seconds from now)
+        future_time = datetime.now(timezone.utc).timestamp() + 30
+        http_date = formatdate(future_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        # Should be approximately 30 seconds (allow some tolerance for test timing)
+        assert 25 <= result <= 35
+        fallback.assert_not_called()
+
+    def test_retry_after_http_date_past_time_uses_fallback(self):
+        """Test that past dates in Retry-After fall back to fallback strategy."""
+        fallback = Mock(return_value=1.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a past date
+        past_time = datetime.now(timezone.utc).timestamp() - 30
+        http_date = formatdate(past_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 1.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_retry_after_http_date_respects_max_wait(self):
+        """Test that max_wait is respected for HTTP date format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=60)
+
+        # Create a future date (120 seconds from now, > max_wait)
+        future_time = datetime.now(timezone.utc).timestamp() + 120
+        http_date = formatdate(future_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 60.0  # Capped at max_wait
+        fallback.assert_not_called()
+
+    def test_retry_after_invalid_format_uses_fallback(self):
+        """Test that invalid Retry-After values fall back to fallback strategy."""
+        fallback = Mock(return_value=4.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error with invalid Retry-After
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': 'invalid-value'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 4.0
+        fallback.assert_called_once_with(retry_state)
+
+    def test_default_fallback_strategy(self):
+        """Test that default fallback strategy is used when none is provided."""
+        wait_func = wait_retry_after(max_wait=300)
+
+        # Create a retry state with no exception to trigger fallback
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = None
+        retry_state.attempt_number = 1
+
+        # Should use default exponential backoff, exact value depends on retry state
+        result = wait_func(retry_state)
+
+        assert result == 1  # first backoff
+
+    def test_default_max_wait(self):
+        """Test that default max_wait of 300 seconds is used."""
+        wait_func = wait_retry_after()  # Use all defaults
+
+        # Create HTTP status error with large Retry-After value
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '600'}  # 10 minutes
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 300.0  # Capped at default max_wait
+
+    def test_case_insensitive_header_access(self):
+        """Test that Retry-After header access is case insensitive."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error with uppercase Retry-After header
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        # httpx headers are case-insensitive, so this should work
+        response.headers = httpx.Headers({'Retry-After': '45'})
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 45.0
+        fallback.assert_not_called()
+
+# tests/test_tenacity.py:554-571
+    def test_default_max_wait(self):
+        """Test that default max_wait of 300 seconds is used."""
+        wait_func = wait_retry_after()  # Use all defaults
+
+        # Create HTTP status error with large Retry-After value
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '600'}  # 10 minutes
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 300.0  # Capped at default max_wait
+
+# tests/test_tenacity.py:350-362
+    def test_no_exception_uses_fallback(self):
+        """Test that fallback strategy is used when there's no exception."""
+        fallback = Mock(return_value=5.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a retry state with no exception
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = None
+
+        result = wait_func(retry_state)
+
+        assert result == 5.0
+        fallback.assert_called_once_with(retry_state)
+
+# tests/test_tenacity.py:380-399
+    def test_http_exception_no_retry_after_uses_fallback(self):
+        """Test that fallback strategy is used when there's no Retry-After header."""
+        fallback = Mock(return_value=2.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error without Retry-After header
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 2.0
+        fallback.assert_called_once_with(retry_state)
+
+# tests/test_tenacity.py:364-378
+    def test_non_http_exception_uses_fallback(self):
+        """Test that fallback strategy is used for non-HTTP exceptions."""
+        fallback = Mock(return_value=3.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a retry state with a non-HTTP exception
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = ValueError('Some error')
+
+        result = wait_func(retry_state)
+
+        assert result == 3.0
+        fallback.assert_called_once_with(retry_state)
+
+# tests/test_tenacity.py:519-538
+    def test_retry_after_invalid_format_uses_fallback(self):
+        """Test that invalid Retry-After values fall back to fallback strategy."""
+        fallback = Mock(return_value=4.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error with invalid Retry-After
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': 'invalid-value'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 4.0
+        fallback.assert_called_once_with(retry_state)
+
+# tests/test_tenacity.py:469-492
+    def test_retry_after_http_date_past_time_uses_fallback(self):
+        """Test that past dates in Retry-After fall back to fallback strategy."""
+        fallback = Mock(return_value=1.0)
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a past date
+        past_time = datetime.now(timezone.utc).timestamp() - 30
+        http_date = formatdate(past_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 1.0
+        fallback.assert_called_once_with(retry_state)
+
+# tests/test_ssrf.py:654-672
+    async def test_default_timeout(self) -> None:
+        """Test that default timeout is used."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('https://example.com/file.txt')
+
+            mock_client_fn.assert_called_once_with(timeout=_DEFAULT_TIMEOUT)
+
+# tests/test_tenacity.py:422-441
+    def test_retry_after_seconds_respects_max_wait(self):
+        """Test that max_wait is respected for seconds format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=60)
+
+        # Create HTTP status error with Retry-After > max_wait
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '120'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 60.0  # Capped at max_wait
+        fallback.assert_not_called()
+
+# tests/test_tenacity.py:494-517
+    def test_retry_after_http_date_respects_max_wait(self):
+        """Test that max_wait is respected for HTTP date format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=60)
+
+        # Create a future date (120 seconds from now, > max_wait)
+        future_time = datetime.now(timezone.utc).timestamp() + 120
+        http_date = formatdate(future_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 60.0  # Capped at max_wait
+        fallback.assert_not_called()
+
+# tests/test_tools.py:2665-2675
+def test_tool_timeout_default_none():
+    """Test that timeout defaults to None when not specified."""
+    agent = Agent(TestModel())
+
+    @agent.tool_plain
+    def tool_without_timeout() -> str:
+        return 'done'  # pragma: no cover
+
+    tool = agent._function_toolset.tools['tool_without_timeout']
+    assert tool.timeout is None
+    assert tool.tool_def.timeout is None
+
+# tests/typed_agent.py:11-11
+from typing_extensions import assert_type
+
+# tests/typed_agent.py:11-11
+from typing_extensions import assert_type
+
+# tests/typed_agent.py:11-11
+from typing_extensions import assert_type
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:12-12
+from typing_extensions import assert_never
+
+# pydantic_evals/pydantic_evals/evaluators/common.py:199-199
+    assertion: OutputConfig | Literal[False] = field(default_factory=lambda: OutputConfig(include_reason=True))
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:88-88
+    assertions: dict[str, EvaluationResult[bool]]
+
+# pydantic_ai_slim/pydantic_ai/models/fallback.py:152-158
+def _default_fallback_condition_factory(exceptions: tuple[type[Exception], ...]) -> Callable[[Exception], bool]:
+    """Create a default fallback condition for the given exceptions."""
+
+    def fallback_condition(exception: Exception) -> bool:
+        return isinstance(exception, exceptions)
+
+    return fallback_condition
+
+# tests/evals/test_reporting.py:46-52
+def sample_assertion(mock_evaluator: Evaluator[TaskInput, TaskOutput, TaskMetadata]) -> EvaluationResult[bool]:
+    return EvaluationResult(
+        name='MockEvaluator',
+        value=True,
+        reason=None,
+        source=mock_evaluator.as_spec(),
+    )
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:171-171
+    assertions: float | None
+
+# tests/conftest.py:21-21
+from _pytest.assertion.rewrite import AssertionRewritingHook
+
+# tests/test_agent.py:3305-3308
+class OutputType(BaseModel):
+    """Result type used by multiple tests."""
+
+    value: str
+
+# tests/test_agent.py:3305-3308
+class OutputType(BaseModel):
+    """Result type used by multiple tests."""
+
+    value: str
+
+# tests/evals/test_report_evaluators.py:311-323
+def test_precision_recall_assertions_requires_key():
+    evaluator = PrecisionRecallEvaluator(
+        score_from='scores',
+        score_key='s',
+        positive_from='assertions',
+        positive_key=None,
+    )
+    cases = [_make_report_case('c1', scores={'s': 0.5})]
+    report = _make_report(cases)
+    ctx = ReportEvaluatorContext(name='test', report=report, experiment_metadata=None)
+
+    with pytest.raises(ValueError, match="'positive_key' is required"):
+        evaluator.evaluate(ctx)
+
+# tests/test_mcp.py:2112-2127
+def test_load_mcp_servers_with_complex_default_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test ${VAR:-default} syntax with special characters in default."""
+    config = tmp_path / 'mcp.json'
+
+    monkeypatch.delenv('PATH_VAR', raising=False)
+    # Test default with slashes, dots, and dashes
+    config.write_text(
+        '{"mcpServers": {"server": {"command": "${PATH_VAR:-/usr/local/bin/python-3.10}", "args": []}}}',
+        encoding='utf-8',
+    )
+
+    servers = load_mcp_servers(config)
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == '/usr/local/bin/python-3.10'
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:946-946
+    include_assertions: bool
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:1277-1290
+    def _render_assertions(
+        self,
+        assertions: list[EvaluationResult[bool]],
+    ) -> str:
+        if not assertions:
+            return EMPTY_CELL_STR
+        lines: list[str] = []
+        for a in assertions:
+            line = '[green]✔[/]' if a.value else '[red]✗[/]'
+            if self.include_reasons:
+                line = f'{a.name}: {line}\n'
+                line = f'{line}  Reason: {a.reason}\n\n' if a.reason else line
+            lines.append(line)
+        return ''.join(lines)
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:1392-1393
+    def include_assertions(self, report: EvaluationReport, baseline: EvaluationReport | None = None):
+        return any(case.assertions for case in self._all_cases(report, baseline))
+
+# tests/models/test_model_function.py:450-472
+def test_retry_result_type():
+    call_count = 0
+
+    async def try_again(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+        nonlocal call_count
+        call_count += 1
+
+        return ModelResponse(parts=[ToolCallPart('final_result', {'x': call_count})])
+
+    class Foo(BaseModel):
+        x: int
+
+    agent = Agent(FunctionModel(try_again), output_type=Foo)
+
+    @agent.output_validator
+    async def validate_output(o: Foo) -> Foo:
+        if o.x == 1:
+            raise ModelRetry('Try again')
+        else:
+            return o
+
+    result = agent.run_sync('')
+    assert result.output == snapshot(Foo(x=2))
+
+# tests/test_temporal.py:2879-2907
+async def test_temporal_agent_without_default_model():
+    """Test that a TemporalAgent can be created without a default model if models is provided.
+
+    When no model is provided to run(), the first registered model should be used.
+    """
+    test_model1 = TestModel(custom_output_text='Model 1 response')
+    test_model2 = TestModel(custom_output_text='Model 2 response')
+
+    # Agent without a model
+    agent = Agent(name='no_default_model_test')
+    temporal_agent = TemporalAgent(
+        agent,
+        name='no_default_model_test',
+        models={
+            'primary': test_model1,
+            'secondary': test_model2,
+        },
+    )
+
+    # Without a model, should use the first registered model
+    result = await temporal_agent.run('Hello')
+    assert result.output == 'Model 1 response'
+
+    # Outside workflow, can use registered models by id
+    result = await temporal_agent.run('Hello', model='primary')
+    assert result.output == 'Model 1 response'
+
+    result = await temporal_agent.run('Hello', model='secondary')
+    assert result.output == 'Model 2 response'
+
+# tests/test_agent.py:4284-4363
+    def test_exhaustive_strategy_with_tool_retry_and_final_result(self):
+        """Test that exhaustive strategy doesn't increment retries when `final_result` exists and `ToolRetryError` occurs."""
+        output_tools_called: list[str] = []
+
+        def process_first(output: OutputType) -> OutputType:
+            """Process first output - will be valid."""
+            output_tools_called.append('first')
+            return output
+
+        def process_second(output: OutputType) -> OutputType:
+            """Process second output - will raise ModelRetry."""
+            output_tools_called.append('second')
+            raise ModelRetry('Second output validation failed')
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            assert info.output_tools is not None
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('first_output', {'value': 'valid'}),
+                    ToolCallPart('second_output', {'value': 'invalid'}),
+                ],
+            )
+
+        agent = Agent(
+            FunctionModel(return_model),
+            output_type=[
+                ToolOutput(process_first, name='first_output'),
+                ToolOutput(process_second, name='second_output'),
+            ],
+            end_strategy='exhaustive',
+            output_retries=1,  # Allow 1 retry so `ToolRetryError` is raised
+        )
+
+        result = agent.run_sync('test exhaustive with tool retry')
+
+        # Verify the result came from the first output tool
+        assert isinstance(result.output, OutputType)
+        assert result.output.value == 'valid'
+
+        # Verify both output tools were called
+        assert output_tools_called == ['first', 'second']
+
+        # Verify we got appropriate messages
+        assert result.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content='test exhaustive with tool retry', timestamp=IsNow(tz=timezone.utc))],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(tool_name='first_output', args={'value': 'valid'}, tool_call_id=IsStr()),
+                        ToolCallPart(tool_name='second_output', args={'value': 'invalid'}, tool_call_id=IsStr()),
+                    ],
+                    usage=RequestUsage(input_tokens=55, output_tokens=10),
+                    model_name='function:return_model:',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='first_output',
+                            content='Final result processed.',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        ),
+                        RetryPromptPart(
+                            content='Second output validation failed',
+                            tool_name='second_output',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        ),
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+# tests/test_agent.py:4284-4363
+    def test_exhaustive_strategy_with_tool_retry_and_final_result(self):
+        """Test that exhaustive strategy doesn't increment retries when `final_result` exists and `ToolRetryError` occurs."""
+        output_tools_called: list[str] = []
+
+        def process_first(output: OutputType) -> OutputType:
+            """Process first output - will be valid."""
+            output_tools_called.append('first')
+            return output
+
+        def process_second(output: OutputType) -> OutputType:
+            """Process second output - will raise ModelRetry."""
+            output_tools_called.append('second')
+            raise ModelRetry('Second output validation failed')
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            assert info.output_tools is not None
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('first_output', {'value': 'valid'}),
+                    ToolCallPart('second_output', {'value': 'invalid'}),
+                ],
+            )
+
+        agent = Agent(
+            FunctionModel(return_model),
+            output_type=[
+                ToolOutput(process_first, name='first_output'),
+                ToolOutput(process_second, name='second_output'),
+            ],
+            end_strategy='exhaustive',
+            output_retries=1,  # Allow 1 retry so `ToolRetryError` is raised
+        )
+
+        result = agent.run_sync('test exhaustive with tool retry')
+
+        # Verify the result came from the first output tool
+        assert isinstance(result.output, OutputType)
+        assert result.output.value == 'valid'
+
+        # Verify both output tools were called
+        assert output_tools_called == ['first', 'second']
+
+        # Verify we got appropriate messages
+        assert result.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content='test exhaustive with tool retry', timestamp=IsNow(tz=timezone.utc))],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(tool_name='first_output', args={'value': 'valid'}, tool_call_id=IsStr()),
+                        ToolCallPart(tool_name='second_output', args={'value': 'invalid'}, tool_call_id=IsStr()),
+                    ],
+                    usage=RequestUsage(input_tokens=55, output_tokens=10),
+                    model_name='function:return_model:',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='first_output',
+                            content='Final result processed.',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        ),
+                        RetryPromptPart(
+                            content='Second output validation failed',
+                            tool_name='second_output',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        ),
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+# tests/test_tenacity.py:401-420
+    def test_retry_after_seconds_format(self):
+        """Test parsing Retry-After header in seconds format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create HTTP status error with Retry-After in seconds
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': '30'}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        assert result == 30.0
+        fallback.assert_not_called()
+
+# tests/test_ag_ui.py:244-262
+async def test_agui_adapter_state_none() -> None:
+    """Ensure adapter exposes `None` state when no frontend state provided."""
+    agent = Agent(
+        model=FunctionModel(stream_function=simple_stream),
+    )
+
+    run_input = RunAgentInput(
+        thread_id=uuid_str(),
+        run_id=uuid_str(),
+        messages=[],
+        state=None,
+        context=[],
+        tools=[],
+        forwarded_props=None,
+    )
+
+    adapter = AGUIAdapter(agent=agent, run_input=run_input, accept=None)
+
+    assert adapter.state is None
+
+# tests/test_tenacity.py:639-673
+    def test_sync_transport_with_wait_retry_after(self):
+        """Test TenacityTransport with wait_retry_after strategy."""
+        mock_transport = Mock(spec=httpx.BaseTransport)
+        mock_response_fail = Mock(spec=httpx.Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.headers = {'retry-after': '30'}  # 30 seconds, will be capped
+        mock_response_success = Mock(spec=httpx.Response)
+        mock_response_success.status_code = 200
+
+        mock_transport.handle_request.side_effect = [mock_response_fail, mock_response_success]
+
+        def validate_response(response: httpx.Response):
+            if response.status_code == 429:
+                raise httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            wait=wait_retry_after(max_wait=0.1),  # Cap at 0.1 seconds for tests
+            stop=stop_after_attempt(3),
+            reraise=True,
+        )
+        transport = TenacityTransport(config, mock_transport, validate_response)
+
+        request = httpx.Request('GET', 'https://example.com')
+
+        # Time the request to ensure max_wait was respected
+        start_time = time.time()
+        result = transport.handle_request(request)
+        end_time = time.time()
+
+        assert result is mock_response_success
+        assert mock_transport.handle_request.call_count == 2
+        # Should have waited approximately 0.2 seconds (capped by max_wait)
+        duration = end_time - start_time
+        assert 0.1 <= duration <= 0.2
+
+# tests/models/test_mistral.py:967-1048
+async def test_stream_result_type_basemodel_with_default_params(allow_model_requests: None):
+    class MyTypedBaseModel(BaseModel):
+        first: str = ''  # Note: Default, set value.
+        second: str = ''  # Note: Default, set value.
+
+    stream = [
+        text_chunk('{'),
+        text_chunk('"'),
+        text_chunk('f'),
+        text_chunk('i'),
+        text_chunk('r'),
+        text_chunk('s'),
+        text_chunk('t'),
+        text_chunk('"'),
+        text_chunk(':'),
+        text_chunk(' '),
+        text_chunk('"'),
+        text_chunk('O'),
+        text_chunk('n'),
+        text_chunk('e'),
+        text_chunk('"'),
+        text_chunk(','),
+        text_chunk(' '),
+        text_chunk('"'),
+        text_chunk('s'),
+        text_chunk('e'),
+        text_chunk('c'),
+        text_chunk('o'),
+        text_chunk('n'),
+        text_chunk('d'),
+        text_chunk('"'),
+        text_chunk(':'),
+        text_chunk(' '),
+        text_chunk('"'),
+        text_chunk('T'),
+        text_chunk('w'),
+        text_chunk('o'),
+        text_chunk('"'),
+        text_chunk('}'),
+        chunk([]),
+    ]
+
+    mock_client = MockMistralAI.create_stream_mock(stream)
+    model = MistralModel('mistral-large-latest', provider=MistralProvider(mistral_client=mock_client))
+    agent = Agent(model=model, output_type=MyTypedBaseModel)
+
+    async with agent.run_stream('User prompt value') as result:
+        assert not result.is_complete
+        v = [c async for c in result.stream_output(debounce_by=None)]
+        assert v == snapshot(
+            [
+                MyTypedBaseModel(first='O', second=''),
+                MyTypedBaseModel(first='On', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second=''),
+                MyTypedBaseModel(first='One', second='T'),
+                MyTypedBaseModel(first='One', second='Tw'),
+                MyTypedBaseModel(first='One', second='Two'),
+                MyTypedBaseModel(first='One', second='Two'),
+                MyTypedBaseModel(first='One', second='Two'),
+                MyTypedBaseModel(first='One', second='Two'),
+            ]
+        )
+        assert result.is_complete
+        assert result.usage().input_tokens == 34
+        assert result.usage().output_tokens == 34
+
+        # double check usage matches stream count
+        assert result.usage().output_tokens == len(stream)
+
+# tests/test_tenacity.py:443-467
+    def test_retry_after_http_date_format(self):
+        """Test parsing Retry-After header in HTTP date format."""
+        fallback = Mock()
+        wait_func = wait_retry_after(fallback_strategy=fallback, max_wait=300)
+
+        # Create a future date (30 seconds from now)
+        future_time = datetime.now(timezone.utc).timestamp() + 30
+        http_date = formatdate(future_time, usegmt=True)
+
+        # Create HTTP status error with Retry-After in HTTP date format
+        request = httpx.Request('GET', 'https://example.com')
+        response = Mock(spec=httpx.Response)
+        response.headers = {'retry-after': http_date}
+        http_error = httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        retry_state = Mock(spec=RetryCallState)
+        retry_state.outcome = Mock()
+        retry_state.outcome.failed = True
+        retry_state.outcome.exception.return_value = http_error
+
+        result = wait_func(retry_state)
+
+        # Should be approximately 30 seconds (allow some tolerance for test timing)
+        assert 25 <= result <= 35
+        fallback.assert_not_called()
+
+# tests/test_tenacity.py:50-74
+    def test_retry_on_exception(self):
+        """Test that exceptions trigger retries."""
+        mock_transport = Mock(spec=httpx.BaseTransport)
+        mock_response = Mock(spec=httpx.Response)
+
+        # Fail twice, succeed on third attempt
+        mock_transport.handle_request.side_effect = [
+            httpx.ConnectError('Connection failed'),
+            httpx.ConnectError('Connection failed again'),
+            mock_response,
+        ]
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.ConnectError),
+            stop=stop_after_attempt(3),
+            wait=wait_fixed(0.001),  # Very short wait for tests
+            reraise=True,
+        )
+        transport = TenacityTransport(config, mock_transport)
+
+        request = httpx.Request('GET', 'https://example.com')
+        result = transport.handle_request(request)
+
+        assert result is mock_response
+        assert mock_transport.handle_request.call_count == 3
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:1303-1311
+    def _render_assertions_diff(
+        assertions: list[EvaluationResult[bool]], new_assertions: list[EvaluationResult[bool]]
+    ) -> str:
+        if not assertions and not new_assertions:  # pragma: no cover
+            return EMPTY_CELL_STR
+
+        old = ''.join(['[green]✔[/]' if a.value else '[red]✗[/]' for a in assertions])
+        new = ''.join(['[green]✔[/]' if a.value else '[red]✗[/]' for a in new_assertions])
+        return old if old == new else f'{old} → {new}'
+
+# pydantic_ai_slim/pydantic_ai/models/fallback.py:35-54
+    def __init__(
+        self,
+        default_model: Model | KnownModelName | str,
+        *fallback_models: Model | KnownModelName | str,
+        fallback_on: Callable[[Exception], bool] | tuple[type[Exception], ...] = (ModelAPIError,),
+    ):
+        """Initialize a fallback model instance.
+
+        Args:
+            default_model: The name or instance of the default model to use.
+            fallback_models: The names or instances of the fallback models to use upon failure.
+            fallback_on: A callable or tuple of exceptions that should trigger a fallback.
+        """
+        super().__init__()
+        self.models = [infer_model(default_model), *[infer_model(m) for m in fallback_models]]
+
+        if isinstance(fallback_on, tuple):
+            self._fallback_on = _default_fallback_condition_factory(fallback_on)  # pyright: ignore[reportUnknownArgumentType]
+        else:
+            self._fallback_on = fallback_on
+
+# scripts/check_cassettes.py:79-85
+def get_all_tests() -> dict[str, set[str]]:
+    """Use pytest collection to get all VCR-marked tests and their cassette names."""
+    collector = _CollectVcrTests()
+    rc = pytest.main(['--collect-only', '-q', 'tests/'], plugins=[collector])
+    if rc not in (pytest.ExitCode.OK, pytest.ExitCode.NO_TESTS_COLLECTED):
+        raise SystemExit(rc)
+    return dict(collector.tests)

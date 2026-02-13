@@ -1,0 +1,220 @@
+## httpx/_decoders.py
+
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+class BrotliDecoder(ContentDecoder):
+    """
+    Handle 'brotli' decoding.
+
+    Requires `pip install brotlipy`. See: https://brotlipy.readthedocs.io/
+        or   `pip install brotli`. See https://github.com/google/brotli
+    Supports both 'brotlipy' and 'Brotli' packages since they share an import
+    name. The top branches are for 'brotlipy' and bottom branches for 'Brotli'
+    """
+
+    def __init__(self) -> None:
+        if brotli is None:  # pragma: no cover
+            raise ImportError(
+                "Using 'BrotliDecoder', but neither of the 'brotlicffi' or 'brotli' "
+                "packages have been installed. "
+                "Make sure to install httpx using `pip install httpx[brotli]`."
+            ) from None
+
+        self.decompressor = brotli.Decompressor()
+        self.seen_data = False
+        self._decompress: typing.Callable[[bytes], bytes]
+        if hasattr(self.decompressor, "decompress"):
+            # The 'brotlicffi' package.
+            self._decompress = self.decompressor.decompress  # pragma: no cover
+        else:
+            # The 'brotli' package.
+            self._decompress = self.decompressor.process  # pragma: no cover
+
+    def decode(self, data: bytes) -> bytes:
+        if not data:
+            return b""
+        self.seen_data = True
+        try:
+            return self._decompress(data)
+        except brotli.error as exc:
+            raise DecodingError(str(exc)) from exc
+
+    def flush(self) -> bytes:
+        if not self.seen_data:
+            return b""
+        try:
+            if hasattr(self.decompressor, "finish"):
+                # Only available in the 'brotlicffi' package.
+
+                # As the decompressor decompresses eagerly, this
+                # will never actually emit any data. However, it will potentially throw
+                # errors if a truncated or damaged data stream has been used.
+                self.decompressor.finish()  # pragma: no cover
+            return b""
+        except brotli.error as exc:  # pragma: no cover
+            raise DecodingError(str(exc)) from exc
+
+class MultiDecoder(ContentDecoder):
+    """
+    Handle the case where multiple encodings have been applied.
+    """
+
+    def __init__(self, children: typing.Sequence[ContentDecoder]) -> None:
+        """
+        'children' should be a sequence of decoders in the order in which
+        each was applied.
+        """
+        # Note that we reverse the order for decoding.
+        self.children = list(reversed(children))
+
+    def decode(self, data: bytes) -> bytes:
+        for child in self.children:
+            data = child.decode(data)
+        return data
+
+    def flush(self) -> bytes:
+        data = b""
+        for child in self.children:
+            data = child.decode(data) + child.flush()
+        return data
+
+## httpx/_exceptions.py
+
+class ProtocolError(TransportError):
+    """
+    The protocol was violated.
+    """
+
+class InvalidURL(Exception):
+    """
+    URL is improperly formed or cannot be parsed.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+
+## httpx/_models.py
+
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+## httpx/_urls.py
+
+    def host(self) -> str:
+        """
+        The URL host as a string.
+        Always normalized to lowercase, with IDNA hosts decoded into unicode.
+
+        Examples:
+
+        url = httpx.URL("http://www.EXAMPLE.org")
+        assert url.host == "www.example.org"
+
+        url = httpx.URL("http://中国.icom.museum")
+        assert url.host == "中国.icom.museum"
+
+        url = httpx.URL("http://xn--fiqs8s.icom.museum")
+        assert url.host == "中国.icom.museum"
+
+        url = httpx.URL("https://[::ffff:192.168.0.1]")
+        assert url.host == "::ffff:192.168.0.1"
+        """
+        host: str = self._uri_reference.host
+
+        if host.startswith("xn--"):
+            host = idna.decode(host)
+
+        return host
+
+    def raw_host(self) -> bytes:
+        """
+        The raw bytes representation of the URL host.
+        Always normalized to lowercase, and IDNA encoded.
+
+        Examples:
+
+        url = httpx.URL("http://www.EXAMPLE.org")
+        assert url.raw_host == b"www.example.org"
+
+        url = httpx.URL("http://中国.icom.museum")
+        assert url.raw_host == b"xn--fiqs8s.icom.museum"
+
+        url = httpx.URL("http://xn--fiqs8s.icom.museum")
+        assert url.raw_host == b"xn--fiqs8s.icom.museum"
+
+        url = httpx.URL("https://[::ffff:192.168.0.1]")
+        assert url.raw_host == b"::ffff:192.168.0.1"
+        """
+        return self._uri_reference.host.encode("ascii")
+
+## tests/models/test_whatwg.py
+
+def test_urlparse(test_case):
+    if test_case["href"] in ("a: foo.com", "lolscheme:x x#x%20x"):
+        # Skip these two test cases.
+        # WHATWG cases where are not using percent-encoding for the space character.
+        # Anyone know what's going on here?
+        return
+
+    p = urlparse(test_case["href"])
+
+    # Test cases include the protocol with the trailing ":"
+    protocol = p.scheme + ":"
+    # Include the square brackets for IPv6 addresses.
+    hostname = f"[{p.host}]" if ":" in p.host else p.host
+    # The test cases use a string representation of the port.
+    port = "" if p.port is None else str(p.port)
+    # I have nothing to say about this one.
+    path = p.path
+    # The 'search' and 'hash' components in the whatwg tests are semantic, not literal.
+    # Our parsing differentiates between no query/hash and empty-string query/hash.
+    search = "" if p.query in (None, "") else "?" + str(p.query)
+    hash = "" if p.fragment in (None, "") else "#" + str(p.fragment)
+
+    # URL hostnames are case-insensitive.
+    # We normalize these, unlike the WHATWG test cases.
+    assert protocol == test_case["protocol"]
+    assert hostname.lower() == test_case["hostname"].lower()
+    assert port == test_case["port"]
+    assert path == test_case["pathname"]
+    assert search == test_case["search"]
+    assert hash == test_case["hash"]
+
+## tests/test_asgi.py
+
+async def test_asgi_disconnect_after_response_complete():
+    disconnect = False
+
+    async def read_body(scope, receive, send):
+        nonlocal disconnect
+
+        status = 200
+        headers = [(b"content-type", "text/plain")]
+
+        await send(
+            {"type": "http.response.start", "status": status, "headers": headers}
+        )
+        more_body = True
+        while more_body:
+            message = await receive()
+            more_body = message.get("more_body", False)
+
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        # The ASGI spec says of the Disconnect message:
+        # "Sent to the application when a HTTP connection is closed or if receive is
+        # called after a response has been sent."
+        # So if receive() is called again, the disconnect message should be received
+        message = await receive()
+        disconnect = message.get("type") == "http.disconnect"
+
+    transport = httpx.ASGITransport(app=read_body)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://www.example.org/", content=b"example")
+
+    assert response.status_code == 200
+    assert disconnect

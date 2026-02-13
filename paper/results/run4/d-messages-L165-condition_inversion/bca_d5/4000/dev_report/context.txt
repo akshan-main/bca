@@ -1,0 +1,401 @@
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class FileUrl(ABC):
+    """Abstract base class for any URL-based file."""
+
+    url: str
+    """The URL of the file."""
+
+    _: KW_ONLY
+
+    force_download: ForceDownloadMode = False
+    """Controls whether the file is downloaded and how SSRF protection is applied:
+
+    * If `False`, the URL is sent directly to providers that support it. For providers that don't,
+      the file is downloaded with SSRF protection (blocks private IPs and cloud metadata).
+    * If `True`, the file is always downloaded with SSRF protection (blocks private IPs and cloud metadata).
+    * If `'allow-local'`, the file is always downloaded, allowing private IPs but still blocking cloud metadata.
+    """
+
+    vendor_metadata: dict[str, Any] | None = None
+    """Vendor-specific metadata for the file.
+
+    Supported by:
+    - `GoogleModel`: `VideoUrl.vendor_metadata` is used as `video_metadata`: https://ai.google.dev/gemini-api/docs/video-understanding#customize-video-processing
+    - `OpenAIChatModel`, `OpenAIResponsesModel`: `ImageUrl.vendor_metadata['detail']` is used as `detail` setting for images
+    - `XaiModel`: `ImageUrl.vendor_metadata['detail']` is used as `detail` setting for images
+    """
+
+    _media_type: Annotated[str | None, pydantic.Field(alias='media_type', default=None, exclude=True)] = field(
+        compare=False, default=None
+    )
+
+    _identifier: Annotated[str | None, pydantic.Field(alias='identifier', default=None, exclude=True)] = field(
+        compare=False, default=None
+    )
+
+    # `pydantic_dataclass` replaces `__init__` so this method is never used.
+    # The signature is kept so that pyright/IDE hints recognize the `media_type` and `identifier` aliases.
+    def __init__(
+        self,
+        url: str,
+        *,
+        media_type: str | None = None,
+        identifier: str | None = None,
+        force_download: ForceDownloadMode = False,
+        vendor_metadata: dict[str, Any] | None = None,
+        # Required for inline-snapshot which expects all dataclass `__init__` methods to take all field names as kwargs.
+        _media_type: str | None = None,
+        _identifier: str | None = None,
+    ) -> None: ...  # pragma: no cover
+
+    @pydantic.computed_field
+    @property
+    def media_type(self) -> str:
+        """Return the media type of the file, based on the URL or the provided `media_type`."""
+        return self._media_type or self._infer_media_type()
+
+    @pydantic.computed_field
+    @property
+    def identifier(self) -> str:
+        """The identifier of the file, such as a unique ID.
+
+        This identifier can be provided to the model in a message to allow it to refer to this file in a tool call argument,
+        and the tool can look up the file in question by iterating over the message history and finding the matching `FileUrl`.
+
+        This identifier is only automatically passed to the model when the `FileUrl` is returned by a tool.
+        If you're passing the `FileUrl` as a user message, it's up to you to include a separate text part with the identifier,
+        e.g. "This is file <identifier>:" preceding the `FileUrl`.
+
+        It's also included in inline-text delimiters for providers that require inlining text documents, so the model can
+        distinguish multiple files.
+        """
+        return self._identifier or _multi_modal_content_identifier(self.url)
+
+    @abstractmethod
+    def _infer_media_type(self) -> str:
+        """Infer the media type of the file based on the URL."""
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def format(self) -> str:
+        """The file format."""
+        raise NotImplementedError
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    def format(self) -> str:
+        """The file format."""
+        raise NotImplementedError
+
+class VideoUrl(FileUrl):
+    """A URL to a video."""
+
+    url: str
+    """The URL of the video."""
+
+    _: KW_ONLY
+
+    kind: Literal['video-url'] = 'video-url'
+    """Type identifier, this is available on all parts as a discriminator."""
+
+    # `pydantic_dataclass` replaces `__init__` so this method is never used.
+    # The signature is kept so that pyright/IDE hints recognize the aliases for the `_media_type` and `_identifier` fields.
+    def __init__(
+        self,
+        url: str,
+        *,
+        media_type: str | None = None,
+        identifier: str | None = None,
+        force_download: ForceDownloadMode = False,
+        vendor_metadata: dict[str, Any] | None = None,
+        kind: Literal['video-url'] = 'video-url',
+        # Required for inline-snapshot which expects all dataclass `__init__` methods to take all field names as kwargs.
+        _media_type: str | None = None,
+        _identifier: str | None = None,
+    ) -> None: ...  # pragma: no cover
+
+    def _infer_media_type(self) -> str:
+        """Return the media type of the video, based on the url."""
+        # Assume that YouTube videos are mp4 because there would be no extension
+        # to infer from. This should not be a problem, as Gemini disregards media
+        # type for YouTube URLs.
+        if self.is_youtube:
+            return 'video/mp4'
+
+        mime_type, _ = _mime_types.guess_type(self.url)
+        if mime_type is None:
+            raise ValueError(
+                f'Could not infer media type from video URL: {self.url}. Explicitly provide a `media_type` instead.'
+            )
+        return mime_type
+
+    @property
+    def is_youtube(self) -> bool:
+        """True if the URL has a YouTube domain."""
+        parsed = urlparse(self.url)
+        hostname = parsed.hostname
+        return hostname in ('youtu.be', 'youtube.com', 'www.youtube.com')
+
+    @property
+    def format(self) -> VideoFormat:
+        """The file format of the video.
+
+        The choice of supported formats were based on the Bedrock Converse API. Other APIs don't require to use a format.
+        """
+        return _video_format_lookup[self.media_type]
+
+MULTI_MODAL_CONTENT_TYPES = (ImageUrl, AudioUrl, DocumentUrl, VideoUrl, BinaryContent)
+
+    def model_response_str(self) -> str:
+        """Return a string representation of the content for the model."""
+        if isinstance(self.content, str):
+            return self.content
+        else:
+            return tool_return_ta.dump_json(self.content).decode()
+
+    def user_text_prompt(cls, user_prompt: str, *, instructions: str | None = None) -> ModelRequest:
+        """Create a `ModelRequest` with a single user prompt as text."""
+        return cls(parts=[UserPromptPart(user_prompt)], instructions=instructions)
+
+    def args_as_dict(self) -> dict[str, Any]:
+        """Return the arguments as a Python dictionary.
+
+        This is just for convenience with models that require dicts as input.
+        """
+        if not self.args:
+            return {}
+        if isinstance(self.args, dict):
+            return self.args
+        args = pydantic_core.from_json(self.args)
+        assert isinstance(args, dict), 'args should be a dict'
+        return cast(dict[str, Any], args)
+
+    def args_as_json_str(self) -> str:
+        """Return the arguments as a JSON string.
+
+        This is just for convenience with models that require JSON strings as input.
+        """
+        if not self.args:
+            return '{}'
+        if isinstance(self.args, str):
+            return self.args
+        return pydantic_core.to_json(self.args).decode()
+
+    def apply(self, part: ModelResponsePart) -> TextPart:
+        """Apply this text delta to an existing `TextPart`.
+
+        Args:
+            part: The existing model response part, which must be a `TextPart`.
+
+        Returns:
+            A new `TextPart` with updated text content.
+
+        Raises:
+            ValueError: If `part` is not a `TextPart`.
+        """
+        if not isinstance(part, TextPart):
+            raise ValueError('Cannot apply TextPartDeltas to non-TextParts')  # pragma: no cover
+        return replace(
+            part,
+            content=part.content + self.content_delta,
+            provider_name=self.provider_name or part.provider_name,
+            provider_details={**(part.provider_details or {}), **(self.provider_details or {})} or None,
+        )
+
+class BuiltinToolCallEvent:
+    """An event indicating the start to a call to a built-in tool."""
+
+    part: BuiltinToolCallPart
+    """The built-in tool call to make."""
+
+    _: KW_ONLY
+
+    event_kind: Literal['builtin_tool_call'] = 'builtin_tool_call'
+    """Event type identifier, used as a discriminator."""
+
+class BuiltinToolResultEvent:
+    """An event indicating the result of a built-in tool call."""
+
+    result: BuiltinToolReturnPart
+    """The result of the call to the built-in tool."""
+
+    _: KW_ONLY
+
+    event_kind: Literal['builtin_tool_result'] = 'builtin_tool_result'
+    """Event type identifier, used as a discriminator."""
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py
+
+    def encode(self, sdk_version: int) -> str:
+        return self.model_dump_json(by_alias=True, exclude_none=True)
+
+## tests/test_messages.py
+
+def test_pre_usage_refactor_messages_deserializable():
+    # https://github.com/pydantic/pydantic-ai/pull/2378 changed the `ModelResponse` fields,
+    # but we as tell people to store those in the DB we want to be very careful not to break deserialization.
+    data = [
+        {
+            'parts': [
+                {
+                    'content': 'What is the capital of Mexico?',
+                    'timestamp': datetime.now(tz=timezone.utc),
+                    'part_kind': 'user-prompt',
+                }
+            ],
+            'instructions': None,
+            'kind': 'request',
+        },
+        {
+            'parts': [{'content': 'Mexico City.', 'part_kind': 'text'}],
+            'usage': {
+                'requests': 1,
+                'request_tokens': 13,
+                'response_tokens': 76,
+                'total_tokens': 89,
+                'details': None,
+            },
+            'model_name': 'gpt-5-2025-08-07',
+            'timestamp': datetime.now(tz=timezone.utc),
+            'kind': 'response',
+            'vendor_details': {
+                'finish_reason': 'STOP',
+            },
+            'vendor_id': 'chatcmpl-CBpEXeCfDAW4HRcKQwbqsRDn7u7C5',
+        },
+    ]
+    messages = ModelMessagesTypeAdapter.validate_python(data)
+    assert messages == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='What is the capital of Mexico?',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Mexico City.')],
+                usage=RequestUsage(
+                    input_tokens=13,
+                    output_tokens=76,
+                    details={},
+                ),
+                model_name='gpt-5-2025-08-07',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_details={'finish_reason': 'STOP'},
+                provider_response_id='chatcmpl-CBpEXeCfDAW4HRcKQwbqsRDn7u7C5',
+            ),
+        ]
+    )
+
+def test_file_part_has_content():
+    filepart = FilePart(content=BinaryContent(data=b'', media_type='application/pdf'))
+    assert not filepart.has_content()
+
+    filepart.content.data = b'not empty'
+    assert filepart.has_content()
+
+def test_model_response_convenience_methods():
+    response = ModelResponse(parts=[])
+    assert response.text == snapshot(None)
+    assert response.thinking == snapshot(None)
+    assert response.files == snapshot([])
+    assert response.images == snapshot([])
+    assert response.tool_calls == snapshot([])
+    assert response.builtin_tool_calls == snapshot([])
+
+    response = ModelResponse(
+        parts=[
+            ThinkingPart(content="Let's generate an image"),
+            ThinkingPart(content="And then, call the 'hello_world' tool"),
+            TextPart(content="I'm going to"),
+            TextPart(content=' generate an image'),
+            BuiltinToolCallPart(tool_name='image_generation', args={}, tool_call_id='123'),
+            FilePart(content=BinaryImage(data=b'fake', media_type='image/jpeg')),
+            BuiltinToolReturnPart(tool_name='image_generation', content={}, tool_call_id='123'),
+            TextPart(content="I'm going to call"),
+            TextPart(content=" the 'hello_world' tool"),
+            ToolCallPart(tool_name='hello_world', args={}, tool_call_id='123'),
+        ]
+    )
+    assert response.text == snapshot("""\
+I'm going to generate an image
+
+I'm going to call the 'hello_world' tool\
+""")
+    assert response.thinking == snapshot("""\
+Let's generate an image
+
+And then, call the 'hello_world' tool\
+""")
+    assert response.files == snapshot([BinaryImage(data=b'fake', media_type='image/jpeg', identifier='c053ec')])
+    assert response.images == snapshot([BinaryImage(data=b'fake', media_type='image/jpeg', identifier='c053ec')])
+    assert response.tool_calls == snapshot([ToolCallPart(tool_name='hello_world', args={}, tool_call_id='123')])
+    assert response.builtin_tool_calls == snapshot(
+        [
+            (
+                BuiltinToolCallPart(tool_name='image_generation', args={}, tool_call_id='123'),
+                BuiltinToolReturnPart(
+                    tool_name='image_generation',
+                    content={},
+                    tool_call_id='123',
+                    timestamp=IsDatetime(),
+                ),
+            )
+        ]
+    )
+
+def test_binary_content_from_path(tmp_path: Path):
+    # test normal file
+    test_xml_file = tmp_path / 'test.xml'
+    test_xml_file.write_text('<think>about trains</think>', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_xml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'<think>about trains</think>', media_type='application/xml'))
+
+    # test non-existent file
+    non_existent_file = tmp_path / 'non-existent.txt'
+    with pytest.raises(FileNotFoundError, match='File not found:'):
+        BinaryContent.from_path(non_existent_file)
+
+    # test file with unknown media type
+    test_unknown_file = tmp_path / 'test.unknownext'
+    test_unknown_file.write_text('some content', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_unknown_file)
+    assert binary_content == snapshot(BinaryContent(data=b'some content', media_type='application/octet-stream'))
+
+    # test string path
+    test_txt_file = tmp_path / 'test.txt'
+    test_txt_file.write_text('just some text', encoding='utf-8')
+    string_path = test_txt_file.as_posix()
+    binary_content = BinaryContent.from_path(string_path)  # pyright: ignore[reportArgumentType]
+    assert binary_content == snapshot(BinaryContent(data=b'just some text', media_type='text/plain'))
+
+    # test image file
+    test_jpg_file = tmp_path / 'test.jpg'
+    test_jpg_file.write_bytes(b'\xff\xd8\xff\xe0' + b'0' * 100)  # minimal JPEG header + padding
+    binary_content = BinaryContent.from_path(test_jpg_file)
+    assert binary_content == snapshot(
+        BinaryImage(data=b'\xff\xd8\xff\xe0' + b'0' * 100, media_type='image/jpeg', _identifier='bc8d49')
+    )
+
+    # test yaml file
+    test_yaml_file = tmp_path / 'config.yaml'
+    test_yaml_file.write_text('key: value', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_yaml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'key: value', media_type='application/yaml'))
+
+    # test yml file (alternative extension)
+    test_yml_file = tmp_path / 'docker-compose.yml'
+    test_yml_file.write_text('version: "3"', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_yml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'version: "3"', media_type='application/yaml'))
+
+    # test toml file
+    test_toml_file = tmp_path / 'pyproject.toml'
+    test_toml_file.write_text('[project]\nname = "test"', encoding='utf-8')
+    binary_content = BinaryContent.from_path(test_toml_file)
+    assert binary_content == snapshot(BinaryContent(data=b'[project]\nname = "test"', media_type='application/toml'))

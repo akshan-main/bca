@@ -1,0 +1,849 @@
+# tests/test_exceptions.py:70-74
+def test_tool_retry_error_str_with_string_content():
+    """Test that ToolRetryError uses string content as message automatically."""
+    part = RetryPromptPart(content='error from tool', tool_name='my_tool')
+    error = ToolRetryError(part)
+    assert str(error) == 'error from tool'
+
+# pydantic_ai_slim/pydantic_ai/exceptions.py:211-227
+    def _format_error_details(errors: list[pydantic_core.ErrorDetails], tool_name: str | None) -> str:
+        """Format ErrorDetails as a human-readable message.
+
+        We format manually rather than using ValidationError.from_exception_data because
+        some error types (value_error, assertion_error, etc.) require an 'error' key in ctx,
+        but when ErrorDetails are serialized, exception objects are stripped from ctx.
+        The 'msg' field already contains the human-readable message, so we use that directly.
+        """
+        error_count = len(errors)
+        lines = [
+            f'{error_count} validation error{"" if error_count == 1 else "s"}{f" for {tool_name!r}" if tool_name else ""}'
+        ]
+        for e in errors:
+            loc = '.'.join(str(x) for x in e['loc']) if e['loc'] else '__root__'
+            lines.append(loc)
+            lines.append(f'  {e["msg"]} [type={e["type"]}, input_value={e["input"]!r}]')
+        return '\n'.join(lines)
+
+# tests/test_exceptions.py:77-87
+def test_tool_retry_error_str_with_error_details():
+    """Test that ToolRetryError formats ErrorDetails automatically."""
+    validation_error = ValidationError.from_exception_data(
+        'Test', [{'type': 'string_type', 'loc': ('name',), 'input': 123}]
+    )
+    part = RetryPromptPart(content=validation_error.errors(include_url=False), tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nname\n  Input should be a valid string [type=string_type, input_value=123]"
+    )
+
+# tests/test_exceptions.py:90-110
+def test_tool_retry_error_str_with_value_error_type():
+    """Test that ToolRetryError handles value_error type without ctx.error.
+
+    When ErrorDetails are serialized, the exception object in ctx is stripped.
+    This test ensures we handle error types that normally require ctx.error.
+    """
+    # Simulate serialized ErrorDetails where ctx.error has been stripped
+    error_details: list[ErrorDetails] = [
+        {
+            'type': 'value_error',
+            'loc': ('field',),
+            'msg': 'Value error, must not be foo',
+            'input': 'foo',
+        }
+    ]
+    part = RetryPromptPart(content=error_details, tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nfield\n  Value error, must not be foo [type=value_error, input_value='foo']"
+    )
+
+# tests/models/test_bedrock.py:1841-1853
+async def test_bedrock_streaming_error(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    """Test that errors during streaming convert to ModelHTTPError."""
+    model_id = 'us.does-not-exist-model-v1:0'
+    model = BedrockConverseModel(model_id, provider=bedrock_provider)
+    agent = Agent(model)
+
+    with pytest.raises(ModelHTTPError) as exc_info:
+        async with agent.run_stream('hello'):
+            pass
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.model_name == model_id
+    assert exc_info.value.body.get('Error', {}).get('Message') == 'The provided model identifier is invalid.'  # type: ignore[union-attr]
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:206-206
+    tool_name: str
+
+# tests/test_agent.py:6793-6878
+async def test_run_with_deferred_tool_results_errors():
+    agent = Agent('test')
+
+    message_history: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=['Hello', 'world'])])]
+
+    with pytest.raises(
+        UserError,
+        match='Tool call results were provided, but the message history does not contain a `ModelResponse`.',
+    ):
+        await agent.run(
+            'Hello again',
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(parts=[TextPart(content='Hello to you too!')]),
+    ]
+
+    with pytest.raises(
+        UserError,
+        match='Tool call results were provided, but the message history does not contain any unprocessed tool calls.',
+    ):
+        await agent.run(
+            'Hello again',
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(parts=[ToolCallPart(tool_name='say_hello')]),
+    ]
+
+    with pytest.raises(
+        UserError, match='Cannot provide a new user prompt when the message history contains unprocessed tool calls.'
+    ):
+        await agent.run('Hello', message_history=message_history)
+
+    with pytest.raises(UserError, match='Tool call results need to be provided for all deferred tool calls.'):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(),
+        )
+
+    with pytest.raises(UserError, match='Tool call results were provided, but the message history is empty.'):
+        await agent.run(
+            'Hello again',
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(tool_name='run_me', tool_call_id='run_me'),
+                ToolCallPart(tool_name='run_me_too', tool_call_id='run_me_too'),
+                ToolCallPart(tool_name='defer_me', tool_call_id='defer_me'),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name='run_me', tool_call_id='run_me', content='Success'),
+                RetryPromptPart(tool_name='run_me_too', tool_call_id='run_me_too', content='Failure'),
+            ]
+        ),
+    ]
+
+    with pytest.raises(UserError, match="Tool call 'run_me' was already executed and its result cannot be overridden."):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(
+                calls={'run_me': 'Failure', 'defer_me': 'Failure'},
+            ),
+        )
+
+    with pytest.raises(
+        UserError, match="Tool call 'run_me_too' was already executed and its result cannot be overridden."
+    ):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(
+                calls={'run_me_too': 'Success', 'defer_me': 'Failure'},
+            ),
+        )
+
+# tests/test_toolsets.py:194-227
+async def test_prepared_toolset_user_error_change_tool_names():
+    """Test that PreparedToolset raises UserError when prepare function tries to change tool names."""
+    context = build_run_context(None)
+    base_toolset = FunctionToolset[None]()
+
+    @base_toolset.tool
+    def add(a: int, b: int) -> int:
+        """Add two numbers"""
+        return a + b  # pragma: no cover
+
+    @base_toolset.tool
+    def subtract(a: int, b: int) -> int:
+        """Subtract two numbers"""
+        return a - b  # pragma: no cover
+
+    async def prepare_change_names(ctx: RunContext[None], tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
+        # Try to change the name of an existing tool
+        modified_tool_defs: list[ToolDefinition] = []
+        for tool_def in tool_defs:
+            if tool_def.name == 'add':
+                modified_tool_defs.append(replace(tool_def, name='modified_add'))
+            else:
+                modified_tool_defs.append(tool_def)
+        return modified_tool_defs
+
+    prepared_toolset = PreparedToolset(base_toolset, prepare_change_names)
+
+    with pytest.raises(
+        UserError,
+        match=re.escape(
+            'Prepare function cannot add or rename tools. Use `FunctionToolset.add_function()` or `RenamedToolset` instead.'
+        ),
+    ):
+        await ToolManager[None](prepared_toolset).for_run_step(context)
+
+# tests/test_agent.py:15-15
+from pydantic_core import ErrorDetails, to_json
+
+# tests/test_agent.py:15-15
+from pydantic_core import ErrorDetails, to_json
+
+# tests/test_agent.py:15-15
+from pydantic_core import ErrorDetails, to_json
+
+# pydantic_ai_slim/pydantic_ai/ui/_event_stream.py:393-400
+    async def on_error(self, error: Exception) -> AsyncIterator[EventT]:
+        """Handle errors that occur during streaming.
+
+        Args:
+            error: The error that occurred during streaming.
+        """
+        return  # pragma: no cover
+        yield  # Make this an async generator
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:138-138
+    tool_name: str
+
+# tests/models/test_groq.py:5511-5642
+async def test_tool_use_failed_error_streaming(allow_model_requests: None, groq_api_key: str):
+    m = GroqModel('openai/gpt-oss-120b', provider=GroqProvider(api_key=groq_api_key))
+    agent = Agent(m, instructions='Be concise. Never use pretty double quotes, just regular ones.')
+
+    @agent.tool_plain
+    async def get_something_by_name(name: str) -> str:
+        return f'Something with name: {name}'
+
+    async with agent.iter(
+        'Please call the "get_something_by_name" tool with non-existent parameters to test error handling'
+    ) as agent_run:
+        async for node in agent_run:
+            if Agent.is_model_request_node(node) or Agent.is_call_tools_node(node):
+                async with node.stream(agent_run.ctx) as request_stream:
+                    async for _ in request_stream:
+                        pass
+
+    assert agent_run.result is not None
+    assert agent_run.result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Please call the "get_something_by_name" tool with non-existent parameters to test error handling',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                instructions='Be concise. Never use pretty double quotes, just regular ones.',
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ThinkingPart(
+                        content="""\
+The user requests to call the tool with non-existent parameters to test error handling. We need to call the function "get_something_by_name" with wrong parameters. The function expects a single argument object with "name". Non-existent parameters means we could provide a wrong key, or missing name. Let's provide an object with wrong key "nonexistent": "value". That should cause error. So we call the function with {"nonexistent": "test"}.
+
+We need to output the call.\
+"""
+                    ),
+                    ToolCallPart(
+                        tool_name='get_something_by_name',
+                        args={'nonexistent': 'test'},
+                        tool_call_id=IsStr(),
+                    ),
+                ],
+                model_name='openai/gpt-oss-120b',
+                timestamp=IsDatetime(),
+                provider_name='groq',
+                provider_url='https://api.groq.com',
+                provider_details={'timestamp': datetime(2025, 9, 2, 21, 23, 3, tzinfo=timezone.utc)},
+                provider_response_id='chatcmpl-4e0ca299-7515-490a-a98a-16d7664d4fba',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content=[
+                            {
+                                'type': 'missing',
+                                'loc': ('name',),
+                                'msg': 'Field required',
+                                'input': {'nonexistent': 'test'},
+                            },
+                            {
+                                'type': 'extra_forbidden',
+                                'loc': ('nonexistent',),
+                                'msg': 'Extra inputs are not permitted',
+                                'input': 'test',
+                            },
+                        ],
+                        tool_name='get_something_by_name',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                instructions='Be concise. Never use pretty double quotes, just regular ones.',
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ThinkingPart(content='We need to call with correct param: name. Use a placeholder name.'),
+                    ToolCallPart(
+                        tool_name='get_something_by_name',
+                        args='{"name":"test_name"}',
+                        tool_call_id=IsStr(),
+                    ),
+                ],
+                usage=RequestUsage(input_tokens=283, output_tokens=43),
+                model_name='openai/gpt-oss-120b',
+                timestamp=IsDatetime(),
+                provider_name='groq',
+                provider_url='https://api.groq.com',
+                provider_details={
+                    'finish_reason': 'tool_calls',
+                    'timestamp': datetime(2025, 9, 2, 21, 23, 4, tzinfo=timezone.utc),
+                },
+                provider_response_id='chatcmpl-fffa1d41-1763-493a-9ced-083bd3f2d98b',
+                finish_reason='tool_call',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='get_something_by_name',
+                        content='Something with name: test_name',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                instructions='Be concise. Never use pretty double quotes, just regular ones.',
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='The tool call succeeded with the name "test_name".')],
+                usage=RequestUsage(input_tokens=320, output_tokens=15),
+                model_name='openai/gpt-oss-120b',
+                timestamp=IsDatetime(),
+                provider_name='groq',
+                provider_url='https://api.groq.com',
+                provider_details={
+                    'finish_reason': 'stop',
+                    'timestamp': datetime(2025, 9, 2, 21, 23, 4, tzinfo=timezone.utc),
+                },
+                provider_response_id='chatcmpl-fe6b5685-166f-4c71-9cd7-3d5a97301bf1',
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+# tests/evals/test_evaluators.py:581-620
+async def test_import_errors():
+    with pytest.raises(
+        ImportError,
+        match='The `Python` evaluator has been removed for security reasons. See https://github.com/pydantic/pydantic-ai/pull/2808 for more details and a workaround.',
+    ):
+        from pydantic_evals.evaluators import Python  # pyright: ignore[reportUnusedImport]
+
+    with pytest.raises(
+        ImportError,
+        match='The `Python` evaluator has been removed for security reasons. See https://github.com/pydantic/pydantic-ai/pull/2808 for more details and a workaround.',
+    ):
+        from pydantic_evals.evaluators.common import Python  # pyright: ignore[reportUnusedImport] # noqa: F401
+
+    with pytest.raises(
+        ImportError,
+        match="cannot import name 'Foo' from 'pydantic_evals.evaluators'",
+    ):
+        from pydantic_evals.evaluators import Foo  # pyright: ignore[reportUnusedImport]
+
+    with pytest.raises(
+        ImportError,
+        match="cannot import name 'Foo' from 'pydantic_evals.evaluators.common'",
+    ):
+        from pydantic_evals.evaluators.common import Foo  # pyright: ignore[reportUnusedImport] # noqa: F401
+
+    with pytest.raises(
+        AttributeError,
+        match="module 'pydantic_evals.evaluators' has no attribute 'Foo'",
+    ):
+        import pydantic_evals.evaluators as _evaluators
+
+        _evaluators.Foo
+
+    with pytest.raises(
+        AttributeError,
+        match="module 'pydantic_evals.evaluators.common' has no attribute 'Foo'",
+    ):
+        import pydantic_evals.evaluators.common as _common
+
+        _common.Foo
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# tests/models/test_google.py:5035-5053
+async def test_google_api_errors_are_handled(
+    allow_model_requests: None,
+    google_provider: GoogleProvider,
+    mocker: MockerFixture,
+    error_class: Any,
+    error_response: dict[str, Any],
+    expected_status: int,
+):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    mocked_error = error_class(expected_status, error_response)
+    mocker.patch.object(model.client.aio.models, 'generate_content', side_effect=mocked_error)
+
+    agent = Agent(model=model)
+
+    with pytest.raises(ModelHTTPError) as exc_info:
+        await agent.run('This prompt will trigger the mocked error.')
+
+    assert exc_info.value.status_code == expected_status
+    assert error_response['error']['message'] in str(exc_info.value.body)
+
+# tests/models/test_model_test.py:276-294
+def test_output_tool_retry_error_handled():
+    class OutputModel(BaseModel):
+        x: int
+        y: str
+
+    agent = Agent('test', output_type=OutputModel, retries=2)
+
+    call_count = 0
+
+    @agent.output_validator
+    def validate_output(ctx: RunContext[None], output: OutputModel) -> OutputModel:
+        nonlocal call_count
+        call_count += 1
+        raise ModelRetry('Fail')
+
+    with pytest.raises(UnexpectedModelBehavior, match=re.escape('Exceeded maximum retries (2) for output validation')):
+        agent.run_sync('Hello', model=TestModel())
+
+    assert call_count == 3
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# tests/test_vercel_ai.py:2731-2816
+async def test_adapter_dump_messages_with_retry_no_tool_name():
+    """Test dumping messages with retry prompts without tool_name (e.g., output validation errors)."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Give me a number')]),
+        ModelResponse(parts=[TextPart(content='Not a valid number')]),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content='Output validation failed: expected integer',
+                    # No tool_name - this is an output validation error, not a tool error
+                )
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Give me a number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Not a valid number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'text',
+                        'text': """\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                        'state': 'done',
+                        'provider_metadata': None,
+                    }
+                ],
+            },
+        ]
+    )
+
+    # Verify roundtrip
+    # Note: This is a lossy conversion - RetryPromptPart without tool_call_id becomes a user text message.
+    # When loaded back, it creates a UserPromptPart instead of RetryPromptPart.
+    # So we check it's value and then replace it with the original RetryPromptPart to assert equality
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    assert reloaded_messages[2] == snapshot(
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content="""\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                    timestamp=IsDatetime(),
+                )
+            ]
+        )
+    )
+    # Get original tool_call_id and replace with original RetryPromptPart
+    original_retry = messages[2].parts[0]
+    assert isinstance(original_retry, RetryPromptPart)
+    reloaded_messages[2] = ModelRequest(
+        parts=[
+            RetryPromptPart(
+                content='Output validation failed: expected integer', tool_call_id=original_retry.tool_call_id
+            )
+        ]
+    )
+    _sync_timestamps(messages, reloaded_messages)
+    assert reloaded_messages == messages
+
+# tests/models/test_instrumented.py:1000-1045
+def test_messages_to_otel_events_serialization_errors():
+    class Foo:
+        def __repr__(self):
+            return 'Foo()'
+
+    class Bar:
+        def __repr__(self):
+            raise ValueError('error!')
+
+    messages = [
+        ModelResponse(parts=[ToolCallPart('tool', {'arg': Foo()}, tool_call_id='tool_call_id')]),
+        ModelRequest(parts=[ToolReturnPart('tool', Bar(), tool_call_id='return_tool_call_id')], timestamp=IsDatetime()),
+    ]
+
+    settings = InstrumentationSettings()
+    assert [InstrumentedModel.event_to_dict(e) for e in settings.messages_to_otel_events(messages)] == [
+        {
+            'body': "{'role': 'assistant', 'tool_calls': [{'id': 'tool_call_id', 'type': 'function', 'function': {'name': 'tool', 'arguments': {'arg': Foo()}}}]}",
+            'gen_ai.message.index': 0,
+            'event.name': 'gen_ai.assistant.message',
+        },
+        {
+            'body': 'Unable to serialize: error!',
+            'gen_ai.message.index': 1,
+            'event.name': 'gen_ai.tool.message',
+        },
+    ]
+    assert settings.messages_to_otel_messages(messages) == snapshot(
+        [
+            {
+                'role': 'assistant',
+                'parts': [{'type': 'tool_call', 'id': 'tool_call_id', 'name': 'tool', 'arguments': {'arg': 'Foo()'}}],
+            },
+            {
+                'role': 'user',
+                'parts': [
+                    {
+                        'type': 'tool_call_response',
+                        'id': 'return_tool_call_id',
+                        'name': 'tool',
+                        'result': 'Unable to serialize: error!',
+                    }
+                ],
+            },
+        ]
+    )
+
+# tests/test_prefect.py:735-750
+async def test_run_stream_in_flow(allow_model_requests: None) -> None:
+    """Test that run_stream errors when used inside a Prefect flow."""
+
+    @flow(name='test_run_stream_in_flow')
+    async def run_stream_workflow():
+        async with simple_prefect_agent.run_stream('What is the capital of Mexico?') as result:
+            return await result.get_output()  # pragma: no cover
+
+    with flow_raises(
+        UserError,
+        snapshot(
+            '`agent.run_stream()` cannot be used inside a Prefect flow. '
+            'Set an `event_stream_handler` on the agent and use `agent.run()` instead.'
+        ),
+    ):
+        await run_stream_workflow()
+
+# tests/models/test_bedrock.py:1826-1837
+async def test_bedrock_error(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    """Test that errors convert to ModelHTTPError."""
+    model_id = 'us.does-not-exist-model-v1:0'
+    model = BedrockConverseModel(model_id, provider=bedrock_provider)
+    agent = Agent(model)
+
+    with pytest.raises(ModelHTTPError) as exc_info:
+        await agent.run('hello')
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.model_name == model_id
+    assert exc_info.value.body.get('Error', {}).get('Message') == 'The provided model identifier is invalid.'  # type: ignore[union-attr]
+
+# tests/evals/test_dataset.py:903-909
+def test_serialization_errors(tmp_path: Path):
+    with pytest.raises(ValueError) as exc_info:
+        Dataset[TaskInput, TaskOutput, TaskMetadata].from_file(tmp_path / 'test_cases.abc')
+
+    assert str(exc_info.value) == snapshot(
+        "Could not infer format for filename 'test_cases.abc'. Use the `fmt` argument to specify the format."
+    )
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:171-171
+    tool_name: str
+
+# pydantic_ai_slim/pydantic_ai/toolsets/abstract.py:94-96
+    def tool_name_conflict_hint(self) -> str:
+        """A hint for how to avoid name conflicts with other toolsets for use in error messages."""
+        return 'Rename the tool or wrap the toolset in a `PrefixedToolset` to avoid name conflicts.'
+
+# tests/models/test_openrouter.py:272-280
+async def test_openrouter_errors_raised(allow_model_requests: None, openrouter_api_key: str) -> None:
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('google/gemini-2.0-flash-exp:free', provider=provider)
+    agent = Agent(model, instructions='Be helpful.', retries=1)
+    with pytest.raises(ModelHTTPError) as exc_info:
+        await agent.run('Tell me a joke.')
+    assert str(exc_info.value) == snapshot(
+        "status_code: 429, model_name: google/gemini-2.0-flash-exp:free, body: {'code': 429, 'message': 'Provider returned error', 'metadata': {'provider_name': 'Google', 'raw': 'google/gemini-2.0-flash-exp:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations'}}"
+    )
+
+# tests/models/test_openrouter.py:152-161
+async def test_openrouter_stream_error(allow_model_requests: None, openrouter_api_key: str) -> None:
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('minimax/minimax-m2:free', provider=provider)
+    settings = OpenRouterModelSettings(max_tokens=10)
+
+    with pytest.raises(ModelHTTPError):
+        async with model_request_stream(
+            model, [ModelRequest.user_text_prompt('Hello there')], model_settings=settings
+        ) as stream:
+            _ = [chunk async for chunk in stream]
+
+# tests/test_ui.py:541-565
+async def test_run_stream_request_error():
+    agent = Agent(model=TestModel())
+
+    @agent.tool_plain
+    async def tool(query: str) -> str:
+        raise ValueError('Unknown tool')
+
+    request = DummyUIRunInput(messages=[ModelRequest.user_text_prompt('Hello')])
+    adapter = DummyUIAdapter(agent, request)
+    events = [event async for event in adapter.run_stream()]
+
+    assert events == snapshot(
+        [
+            '<stream>',
+            '<response>',
+            "<tool-call name='tool'>{'query': 'a'}",
+            "</tool-call name='tool'>",
+            '</response>',
+            '<request>',
+            "<function-tool-call name='tool'>{'query': 'a'}</function-tool-call>",
+            "<error type='ValueError'>Unknown tool</error>",
+            '</request>',
+            '</stream>',
+        ]
+    )
+
+# tests/test_ui.py:541-565
+async def test_run_stream_request_error():
+    agent = Agent(model=TestModel())
+
+    @agent.tool_plain
+    async def tool(query: str) -> str:
+        raise ValueError('Unknown tool')
+
+    request = DummyUIRunInput(messages=[ModelRequest.user_text_prompt('Hello')])
+    adapter = DummyUIAdapter(agent, request)
+    events = [event async for event in adapter.run_stream()]
+
+    assert events == snapshot(
+        [
+            '<stream>',
+            '<response>',
+            "<tool-call name='tool'>{'query': 'a'}",
+            "</tool-call name='tool'>",
+            '</response>',
+            '<request>',
+            "<function-tool-call name='tool'>{'query': 'a'}</function-tool-call>",
+            "<error type='ValueError'>Unknown tool</error>",
+            '</request>',
+            '</stream>',
+        ]
+    )
+
+# pydantic_ai_slim/pydantic_ai/toolsets/abstract.py:86-91
+    def label(self) -> str:
+        """The name of the toolset for use in error messages."""
+        label = self.__class__.__name__
+        if self.id:  # pragma: no branch
+            label += f' {self.id!r}'
+        return label
+
+# tests/test_ui.py:504-538
+async def test_run_stream_response_error():
+    async def stream_function(
+        messages: list[ModelMessage], agent_info: AgentInfo
+    ) -> AsyncIterator[DeltaToolCalls | str]:
+        yield {
+            0: DeltaToolCall(
+                name='unknown_tool',
+            )
+        }
+
+    agent = Agent(model=FunctionModel(stream_function=stream_function))
+
+    request = DummyUIRunInput(messages=[ModelRequest.user_text_prompt('Tell me about Hello World')])
+    adapter = DummyUIAdapter(agent, request)
+    events = [event async for event in adapter.run_stream()]
+
+    assert events == snapshot(
+        [
+            '<stream>',
+            '<response>',
+            "<tool-call name='unknown_tool'>None",
+            "</tool-call name='unknown_tool'>",
+            '</response>',
+            '<request>',
+            "<function-tool-call name='unknown_tool'>None</function-tool-call>",
+            "<function-tool-result name='unknown_tool'>Unknown tool name: 'unknown_tool'. No tools available.</function-tool-result>",
+            '</request>',
+            '<response>',
+            "<tool-call name='unknown_tool'>None",
+            "</tool-call name='unknown_tool'>",
+            "<error type='UnexpectedModelBehavior'>Exceeded maximum retries (1) for output validation</error>",
+            '</response>',
+            '</stream>',
+        ]
+    )
+
+# pydantic_evals/pydantic_evals/evaluators/evaluator.py:102-102
+    error_message: str
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_adapter.py:42-62
+from .request_types import (
+    DataUIPart,
+    DynamicToolInputAvailablePart,
+    DynamicToolOutputAvailablePart,
+    DynamicToolOutputErrorPart,
+    DynamicToolUIPart,
+    FileUIPart,
+    ProviderMetadata,
+    ReasoningUIPart,
+    RequestData,
+    SourceDocumentUIPart,
+    SourceUrlUIPart,
+    StepStartUIPart,
+    TextUIPart,
+    ToolInputAvailablePart,
+    ToolOutputAvailablePart,
+    ToolOutputErrorPart,
+    ToolUIPart,
+    UIMessage,
+    UIMessagePart,
+)
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_adapter.py:42-62
+from .request_types import (
+    DataUIPart,
+    DynamicToolInputAvailablePart,
+    DynamicToolOutputAvailablePart,
+    DynamicToolOutputErrorPart,
+    DynamicToolUIPart,
+    FileUIPart,
+    ProviderMetadata,
+    ReasoningUIPart,
+    RequestData,
+    SourceDocumentUIPart,
+    SourceUrlUIPart,
+    StepStartUIPart,
+    TextUIPart,
+    ToolInputAvailablePart,
+    ToolOutputAvailablePart,
+    ToolOutputErrorPart,
+    ToolUIPart,
+    UIMessage,
+    UIMessagePart,
+)
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_adapter.py:42-62
+from .request_types import (
+    DataUIPart,
+    DynamicToolInputAvailablePart,
+    DynamicToolOutputAvailablePart,
+    DynamicToolOutputErrorPart,
+    DynamicToolUIPart,
+    FileUIPart,
+    ProviderMetadata,
+    ReasoningUIPart,
+    RequestData,
+    SourceDocumentUIPart,
+    SourceUrlUIPart,
+    StepStartUIPart,
+    TextUIPart,
+    ToolInputAvailablePart,
+    ToolOutputAvailablePart,
+    ToolOutputErrorPart,
+    ToolUIPart,
+    UIMessage,
+    UIMessagePart,
+)
+
+# pydantic_evals/pydantic_evals/reporting/__init__.py:118-118
+    error_message: str
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:157-157
+    error_text: str
+
+# pydantic_ai_slim/pydantic_ai/ui/ag_ui/_event_stream.py:77-77
+    _error: bool = False

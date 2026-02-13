@@ -1,0 +1,889 @@
+# httpx/_auth.py:12-12
+from ._models import Cookies, Request, Response
+
+# httpx/_client.py:29-29
+from ._models import Cookies, Headers, Request, Response
+
+# httpx/_transports/asgi.py:5-5
+from .._models import Request, Response
+
+# httpx/_transports/base.py:6-6
+from .._models import Request, Response
+
+# httpx/_transports/default.py:55-55
+from .._models import Request, Response
+
+# httpx/_transports/mock.py:5-5
+from .._models import Request, Response
+
+# httpx/_transports/wsgi.py:8-8
+from .._models import Request, Response
+
+# httpx/_models.py:607-608
+    def request(self, value: Request) -> None:
+        self._request = value
+
+# httpx/_transports/asgi.py:99-187
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, AsyncByteStream)
+
+        # ASGI scope.
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": request.method,
+            "headers": [(k.lower(), v) for (k, v) in request.headers.raw],
+            "scheme": request.url.scheme,
+            "path": request.url.path,
+            "raw_path": request.url.raw_path.split(b"?")[0],
+            "query_string": request.url.query,
+            "server": (request.url.host, request.url.port),
+            "client": self.client,
+            "root_path": self.root_path,
+        }
+
+        # Request.
+        request_body_chunks = request.stream.__aiter__()
+        request_complete = False
+
+        # Response.
+        status_code = None
+        response_headers = None
+        body_parts = []
+        response_started = False
+        response_complete = create_event()
+
+        # ASGI callables.
+
+        async def receive() -> dict[str, typing.Any]:
+            nonlocal request_complete
+
+            if request_complete:
+                await response_complete.wait()
+                return {"type": "http.disconnect"}
+
+            try:
+                body = await request_body_chunks.__anext__()
+            except StopAsyncIteration:
+                request_complete = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.request", "body": body, "more_body": True}
+
+        async def send(message: typing.MutableMapping[str, typing.Any]) -> None:
+            nonlocal status_code, response_headers, response_started
+
+            if message["type"] == "http.response.start":
+                assert not response_started
+
+                status_code = message["status"]
+                response_headers = message.get("headers", [])
+                response_started = True
+
+            elif message["type"] == "http.response.body":
+                assert not response_complete.is_set()
+                body = message.get("body", b"")
+                more_body = message.get("more_body", False)
+
+                if body and request.method != "HEAD":
+                    body_parts.append(body)
+
+                if not more_body:
+                    response_complete.set()
+
+        try:
+            await self.app(scope, receive, send)
+        except Exception:  # noqa: PIE-786
+            if self.raise_app_exceptions:
+                raise
+
+            response_complete.set()
+            if status_code is None:
+                status_code = 500
+            if response_headers is None:
+                response_headers = {}
+
+        assert response_complete.is_set()
+        assert status_code is None
+        assert response_headers is not None
+
+        stream = ASGIResponseStream(body_parts)
+
+        return Response(status_code, headers=response_headers, stream=stream)
+
+# httpx/_exceptions.py:103-104
+    def request(self, request: Request) -> None:
+        self._request = request
+
+# httpx/_models.py:382-512
+class Request:
+    def __init__(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        stream: SyncByteStream | AsyncByteStream | None = None,
+        extensions: RequestExtensions | None = None,
+    ) -> None:
+        self.method = method.upper()
+        self.url = URL(url) if params is None else URL(url, params=params)
+        self.headers = Headers(headers)
+        self.extensions = {} if extensions is None else dict(extensions)
+
+        if cookies:
+            Cookies(cookies).set_cookie_header(self)
+
+        if stream is None:
+            content_type: str | None = self.headers.get("content-type")
+            headers, stream = encode_request(
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                boundary=get_multipart_boundary_from_content_type(
+                    content_type=content_type.encode(self.headers.encoding)
+                    if content_type
+                    else None
+                ),
+            )
+            self._prepare(headers)
+            self.stream = stream
+            # Load the request body, except for streaming content.
+            if isinstance(stream, ByteStream):
+                self.read()
+        else:
+            # There's an important distinction between `Request(content=...)`,
+            # and `Request(stream=...)`.
+            #
+            # Using `content=...` implies automatically populated `Host` and content
+            # headers, of either `Content-Length: ...` or `Transfer-Encoding: chunked`.
+            #
+            # Using `stream=...` will not automatically include *any*
+            # auto-populated headers.
+            #
+            # As an end-user you don't really need `stream=...`. It's only
+            # useful when:
+            #
+            # * Preserving the request stream when copying requests, eg for redirects.
+            # * Creating request instances on the *server-side* of the transport API.
+            self.stream = stream
+
+    def _prepare(self, default_headers: dict[str, str]) -> None:
+        for key, value in default_headers.items():
+            # Ignore Transfer-Encoding if the Content-Length has been set explicitly.
+            if key.lower() == "transfer-encoding" and "Content-Length" in self.headers:
+                continue
+            self.headers.setdefault(key, value)
+
+        auto_headers: list[tuple[bytes, bytes]] = []
+
+        has_host = "Host" in self.headers
+        has_content_length = (
+            "Content-Length" in self.headers or "Transfer-Encoding" in self.headers
+        )
+
+        if not has_host and self.url.host:
+            auto_headers.append((b"Host", self.url.netloc))
+        if not has_content_length and self.method in ("POST", "PUT", "PATCH"):
+            auto_headers.append((b"Content-Length", b"0"))
+
+        self.headers = Headers(auto_headers + self.headers.raw)
+
+    @property
+    def content(self) -> bytes:
+        if not hasattr(self, "_content"):
+            raise RequestNotRead()
+        return self._content
+
+    def read(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.Iterable)
+            self._content = b"".join(self.stream)
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.AsyncIterable)
+            self._content = b"".join([part async for part in self.stream])
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+        url = str(self.url)
+        return f"<{class_name}({self.method!r}, {url!r})>"
+
+    def __getstate__(self) -> dict[str, typing.Any]:
+        return {
+            name: value
+            for name, value in self.__dict__.items()
+            if name not in ["extensions", "stream"]
+        }
+
+    def __setstate__(self, state: dict[str, typing.Any]) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+        self.extensions = {}
+        self.stream = UnattachedStream()
+
+# tests/client/test_auth.py:689-692
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.AsyncByteStream)
+        [_ async for _ in request.stream]
+        return self.handler(request)  # type: ignore[return-value]
+
+# tests/test_asgi.py:74-80
+async def test_asgi_transport():
+    async with httpx.ASGITransport(app=hello_world) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b"Hello, World!"
+
+# httpx/_transports/base.py:77-83
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        raise NotImplementedError(
+            "The 'handle_async_request' method must be implemented."
+        )  # pragma: no cover
+
+# httpx/_transports/default.py:374-403
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, AsyncByteStream)
+        import httpcore
+
+        req = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        )
+        with map_httpcore_exceptions():
+            resp = await self._pool.handle_async_request(req)
+
+        assert isinstance(resp.stream, typing.AsyncIterable)
+
+        return Response(
+            status_code=resp.status,
+            headers=resp.headers,
+            stream=AsyncResponseStream(resp.stream),
+            extensions=resp.extensions,
+        )
+
+# httpx/_transports/mock.py:29-43
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        await request.aread()
+        response = self.handler(request)
+
+        # Allow handler to *optionally* be an `async` function.
+        # If it is, then the `response` variable need to be awaited to actually
+        # return the result.
+
+        if not isinstance(response, Response):
+            response = await response
+
+        return response
+
+# tests/client/test_event_hooks.py:6-13
+def app(request: httpx.Request) -> httpx.Response:
+    if request.url.path == "/redirect":
+        return httpx.Response(303, headers={"server": "testserver", "location": "/"})
+    elif request.url.path.startswith("/status/"):
+        status_code = int(request.url.path[-3:])
+        return httpx.Response(status_code, headers={"server": "testserver"})
+
+    return httpx.Response(200, headers={"server": "testserver"})
+
+# tests/client/test_queryparams.py:4-5
+def hello_world(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, text="Hello, world")
+
+# tests/client/test_auth.py:100-112
+    def auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        nonces = []
+
+        for index in range(self.repeat):
+            request.headers["Authorization"] = f"Repeat {index}"
+            response = yield request
+            nonces.append(response.headers["www-authenticate"])
+
+        key = ".".join(nonces)
+        request.headers["Authorization"] = f"Repeat {key}"
+        yield request
+
+# tests/client/test_auth.py:127-134
+    def auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        request.headers["Authorization"] = self.token
+        response = yield request
+        data = response.text
+        request.headers["Authorization"] = data
+        yield request
+
+# httpx/_client.py:1594-1643
+    async def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `AsyncClient.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = await self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                await response.aread()
+
+            return response
+
+        except BaseException as exc:
+            await response.aclose()
+            raise exc
+
+# tests/client/test_auth.py:154-159
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.AsyncGenerator[httpx.Request, httpx.Response]:
+        async with self._async_lock:
+            request.headers["Authorization"] = "async-auth"
+        yield request
+
+# httpx/_client.py:879-928
+    def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `Client.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                response.read()
+
+            return response
+
+        except BaseException as exc:
+            response.close()
+            raise exc
+
+# httpx/_urls.py:218-231
+    def port(self) -> int | None:
+        """
+        The URL port as an integer.
+
+        Note that the URL class performs port normalization as per the WHATWG spec.
+        Default ports for "http", "https", "ws", "wss", and "ftp" schemes are always
+        treated as `None`.
+
+        For example:
+
+        assert httpx.URL("http://www.example.com") == httpx.URL("http://www.example.com:80")
+        assert httpx.URL("http://www.example.com:80").port is None
+        """
+        return self._uri_reference.port
+
+# httpx/_transports/asgi.py:63-187
+class ASGITransport(AsyncBaseTransport):
+    """
+    A custom AsyncTransport that handles sending requests directly to an ASGI app.
+
+    ```python
+    transport = httpx.ASGITransport(
+        app=app,
+        root_path="/submount",
+        client=("1.2.3.4", 123)
+    )
+    client = httpx.AsyncClient(transport=transport)
+    ```
+
+    Arguments:
+
+    * `app` - The ASGI application.
+    * `raise_app_exceptions` - Boolean indicating if exceptions in the application
+       should be raised. Default to `True`. Can be set to `False` for use cases
+       such as testing the content of a client 500 response.
+    * `root_path` - The root path on which the ASGI application should be mounted.
+    * `client` - A two-tuple indicating the client IP and port of incoming requests.
+    ```
+    """
+
+    def __init__(
+        self,
+        app: _ASGIApp,
+        raise_app_exceptions: bool = True,
+        root_path: str = "",
+        client: tuple[str, int] = ("127.0.0.1", 123),
+    ) -> None:
+        self.app = app
+        self.raise_app_exceptions = raise_app_exceptions
+        self.root_path = root_path
+        self.client = client
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, AsyncByteStream)
+
+        # ASGI scope.
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": request.method,
+            "headers": [(k.lower(), v) for (k, v) in request.headers.raw],
+            "scheme": request.url.scheme,
+            "path": request.url.path,
+            "raw_path": request.url.raw_path.split(b"?")[0],
+            "query_string": request.url.query,
+            "server": (request.url.host, request.url.port),
+            "client": self.client,
+            "root_path": self.root_path,
+        }
+
+        # Request.
+        request_body_chunks = request.stream.__aiter__()
+        request_complete = False
+
+        # Response.
+        status_code = None
+        response_headers = None
+        body_parts = []
+        response_started = False
+        response_complete = create_event()
+
+        # ASGI callables.
+
+        async def receive() -> dict[str, typing.Any]:
+            nonlocal request_complete
+
+            if request_complete:
+                await response_complete.wait()
+                return {"type": "http.disconnect"}
+
+            try:
+                body = await request_body_chunks.__anext__()
+            except StopAsyncIteration:
+                request_complete = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.request", "body": body, "more_body": True}
+
+        async def send(message: typing.MutableMapping[str, typing.Any]) -> None:
+            nonlocal status_code, response_headers, response_started
+
+            if message["type"] == "http.response.start":
+                assert not response_started
+
+                status_code = message["status"]
+                response_headers = message.get("headers", [])
+                response_started = True
+
+            elif message["type"] == "http.response.body":
+                assert not response_complete.is_set()
+                body = message.get("body", b"")
+                more_body = message.get("more_body", False)
+
+                if body and request.method != "HEAD":
+                    body_parts.append(body)
+
+                if not more_body:
+                    response_complete.set()
+
+        try:
+            await self.app(scope, receive, send)
+        except Exception:  # noqa: PIE-786
+            if self.raise_app_exceptions:
+                raise
+
+            response_complete.set()
+            if status_code is None:
+                status_code = 500
+            if response_headers is None:
+                response_headers = {}
+
+        assert response_complete.is_set()
+        assert status_code is None
+        assert response_headers is not None
+
+        stream = ASGIResponseStream(body_parts)
+
+        return Response(status_code, headers=response_headers, stream=stream)
+
+# tests/client/test_auth.py:147-152
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+# httpx/_transports/base.py:26-59
+    def handle_request(self, request: Request) -> Response:
+        """
+        Send a single HTTP request and return a response.
+
+        Developers shouldn't typically ever need to call into this API directly,
+        since the Client class provides all the higher level user-facing API
+        niceties.
+
+        In order to properly release any network resources, the response
+        stream should *either* be consumed immediately, with a call to
+        `response.stream.read()`, or else the `handle_request` call should
+        be followed with a try/finally block to ensuring the stream is
+        always closed.
+
+        Example usage:
+
+            with httpx.HTTPTransport() as transport:
+                req = httpx.Request(
+                    method=b"GET",
+                    url=(b"https", b"www.example.com", 443, b"/"),
+                    headers=[(b"Host", b"www.example.com")],
+                )
+                resp = transport.handle_request(req)
+                body = resp.stream.read()
+                print(resp.status_code, resp.headers, body)
+
+
+        Takes a `Request` instance as the only argument.
+
+        Returns a `Response` instance.
+        """
+        raise NotImplementedError(
+            "The 'handle_request' method must be implemented."
+        )  # pragma: no cover
+
+# tests/models/test_cookies.py:1-1
+import http
+
+# httpx/_client.py:475-492
+    def _build_redirect_request(self, request: Request, response: Response) -> Request:
+        """
+        Given a request and a redirect response, return a new request that
+        should be used to effect the redirect.
+        """
+        method = self._redirect_method(request, response)
+        url = self._redirect_url(request, response)
+        headers = self._redirect_headers(request, url, method)
+        stream = self._redirect_stream(request, method)
+        cookies = Cookies(self.cookies)
+        return Request(
+            method=method,
+            url=url,
+            headers=headers,
+            cookies=cookies,
+            stream=stream,
+            extensions=request.extensions,
+        )
+
+# httpx/_auth.py:193-222
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        if self._last_challenge:
+            request.headers["Authorization"] = self._build_auth_header(
+                request, self._last_challenge
+            )
+
+        response = yield request
+
+        if response.status_code != 401 or "www-authenticate" not in response.headers:
+            # If the response is not a 401 then we don't
+            # need to build an authenticated request.
+            return
+
+        for auth_header in response.headers.get_list("www-authenticate"):
+            if auth_header.lower().startswith("digest "):
+                break
+        else:
+            # If the response does not include a 'WWW-Authenticate: Digest ...'
+            # header, then we don't need to build an authenticated request.
+            return
+
+        self._last_challenge = self._parse_challenge(request, response, auth_header)
+        self._nonce_count = 1
+
+        request.headers["Authorization"] = self._build_auth_header(
+            request, self._last_challenge
+        )
+        if response.cookies:
+            Cookies(response.cookies).set_cookie_header(request=request)
+        yield request
+
+# httpx/_auth.py:135-137
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        request.headers["Authorization"] = self._auth_header
+        yield request
+
+# httpx/_auth.py:122-123
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        yield self._func(request)
+
+# httpx/_auth.py:157-167
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        auth_info = self._netrc_info.authenticators(request.url.host)
+        if auth_info is None or not auth_info[2]:
+            # The netrc file did not have authentication credentials for this host.
+            yield request
+        else:
+            # Build a basic auth header with credentials from the netrc file.
+            request.headers["Authorization"] = self._build_auth_header(
+                username=auth_info[0], password=auth_info[2]
+            )
+            yield request
+
+# tests/client/test_auth.py:32-35
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        headers = {"www-authenticate": self.auth_header} if self.auth_header else {}
+        data = {"auth": request.headers.get("Authorization")}
+        return httpx.Response(self.status_code, headers=headers, json=data)
+
+# tests/concurrency.py:5-5
+import asyncio
+
+# tests/conftest.py:1-1
+import asyncio
+
+# httpx/_urls.py:283-297
+    def raw_path(self) -> bytes:
+        """
+        The complete URL path and query string as raw bytes.
+        Used as the target when constructing HTTP requests.
+
+        For example:
+
+        GET /users?search=some%20text HTTP/1.1
+        Host: www.example.org
+        Connection: close
+        """
+        path = self._uri_reference.path or "/"
+        if self._uri_reference.query is not None:
+            path += "?" + self._uri_reference.query
+        return path.encode("ascii")
+
+# httpx/_exceptions.py:265-268
+    def __init__(self, message: str, *, request: Request, response: Response) -> None:
+        super().__init__(message)
+        self.request = request
+        self.response = response
+
+# tests/client/test_redirects.py:346-349
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.SyncByteStream)
+        list(request.stream)
+        return self.handler(request)  # type: ignore[return-value]
+
+# httpx/_client.py:1485-1540
+    async def request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Build and send a request.
+
+        Equivalent to:
+
+        ```python
+        request = client.build_request(...)
+        response = await client.send(request, ...)
+        ```
+
+        See `AsyncClient.build_request()`, `AsyncClient.send()`
+        and [Merging of configuration][0] for how the various parameters
+        are merged with client-level configuration.
+
+        [0]: /advanced/clients/#merging-of-configuration
+        """
+
+        if cookies is not None:  # pragma: no cover
+            message = (
+                "Setting per-request cookies=<...> is being deprecated, because "
+                "the expected behaviour on cookie persistence is ambiguous. Set "
+                "cookies directly on the client instance instead."
+            )
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        return await self.send(request, auth=auth, follow_redirects=follow_redirects)
+
+# httpx/_client.py:1751-1778
+    async def get(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `GET` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return await self.request(
+            "GET",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+# tests/client/test_async_client.py:296-298
+def mounted(request: httpx.Request) -> httpx.Response:
+    data = {"app": "mounted"}
+    return httpx.Response(200, json=data)
+
+# tests/client/test_client.py:372-374
+def mounted(request: httpx.Request) -> httpx.Response:
+    data = {"app": "mounted"}
+    return httpx.Response(200, json=data)
+
+# tests/client/test_headers.py:8-10
+def echo_headers(request: httpx.Request) -> httpx.Response:
+    data = {"headers": dict(request.headers)}
+    return httpx.Response(200, json=data)
+
+# tests/client/test_async_client.py:291-293
+def unmounted(request: httpx.Request) -> httpx.Response:
+    data = {"app": "unmounted"}
+    return httpx.Response(200, json=data)

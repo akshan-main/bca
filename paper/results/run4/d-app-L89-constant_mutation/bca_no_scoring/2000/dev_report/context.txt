@@ -1,0 +1,206 @@
+## tests/test_ui_web.py
+
+def test_agent_to_web_with_model_instances():
+    """Test to_web() accepts model instances, not just strings."""
+    agent = Agent(TestModel())
+    model_instance = TestModel()
+
+    # List with instances
+    app = agent.to_web(models=[model_instance, 'test'])
+    assert isinstance(app, Starlette)
+
+    # Dict with instances
+    app = agent.to_web(models={'Custom': model_instance, 'Test': 'test'})
+    assert isinstance(app, Starlette)
+
+async def test_model_instance_preserved_in_dispatch(monkeypatch: pytest.MonkeyPatch):
+    """Test that model instances are preserved and used in dispatch, not reconstructed from string."""
+    model_instance = TestModel(custom_output_text='Custom output')
+    agent: Agent[None, str] = Agent()
+    app = create_web_app(agent, models=[model_instance])
+
+    # Mock dispatch_request to capture the model parameter
+    mock_dispatch = AsyncMock(return_value=Response(content=b'', status_code=200))
+    monkeypatch.setattr(VercelAIAdapter, 'dispatch_request', mock_dispatch)
+
+    with TestClient(app) as client:
+        client.post(
+            '/api/chat',
+            json={
+                'trigger': 'submit-message',
+                'id': 'test-id',
+                'messages': [
+                    {
+                        'id': 'msg-1',
+                        'role': 'user',
+                        'parts': [{'type': 'text', 'text': 'Hello'}],
+                    }
+                ],
+                'model': 'test:test',
+                'builtinTools': [],
+            },
+        )
+
+    # Verify dispatch_request was called with the original model instance
+    mock_dispatch.assert_called_once()
+    call_kwargs = mock_dispatch.call_args.kwargs
+    assert call_kwargs['model'] is model_instance, 'Model instance should be preserved, not reconstructed from string'
+
+def test_agent_to_web_with_deps():
+    """Test to_web() accepts deps parameter."""
+
+    @dataclass
+    class MyDeps:
+        api_key: str
+
+    agent: Agent[MyDeps, str] = Agent(TestModel(), deps_type=MyDeps)
+    deps = MyDeps(api_key='test-key')
+
+    app = agent.to_web(deps=deps)
+    assert isinstance(app, Starlette)
+
+def test_agent_to_web_with_model_settings():
+    """Test to_web() accepts model_settings parameter."""
+    agent = Agent(TestModel())
+    settings = ModelSettings(temperature=0.5, max_tokens=100)
+
+    app = agent.to_web(model_settings=settings)
+    assert isinstance(app, Starlette)
+
+def test_mcp_server_tool_label():
+    """Test MCPServerTool.label property."""
+    tool = MCPServerTool(id='test-server', url='https://example.com')
+    assert tool.label == 'MCP: test-server'
+
+def test_model_profile():
+    """Test Model.profile cached property."""
+    model = TestModel()
+    assert model.profile is not None
+
+def test_model_label_openrouter():
+    """Test Model.label handles OpenRouter-style names with /."""
+    model = TestModel(model_name='meta-llama/llama-3-70b')
+    assert model.label == snapshot('Llama 3 70b')
+
+def test_agent_to_web_with_instructions():
+    """Test to_web() accepts instructions parameter."""
+    agent = Agent(TestModel())
+    app = agent.to_web(instructions='Always respond in Spanish')
+    assert isinstance(app, Starlette)
+
+async def test_get_ui_html_custom_url(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html fetches from custom URL when provided."""
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: tmp_path)
+
+    test_content = b'<html>Custom CDN UI</html>'
+    captured_url: list[str] = []
+
+    class MockResponse:
+        content = test_content
+
+        def raise_for_status(self) -> None:
+            pass
+
+    class MockAsyncClient:
+        async def __aenter__(self) -> MockAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> MockResponse:
+            captured_url.append(url)
+            return MockResponse()
+
+    monkeypatch.setattr(app_module.httpx, 'AsyncClient', MockAsyncClient)
+
+    # URL is used directly, no version templating
+    custom_url = 'https://my-internal-cdn.example.com/ui/index.html'
+    result = await _get_ui_html(html_source=custom_url)
+
+    assert result == test_content
+    assert len(captured_url) == 1
+    assert captured_url[0] == custom_url
+
+def test_agent_to_web_with_html_source():
+    """Test that Agent.to_web() accepts html_source parameter."""
+    agent = Agent('test')
+    app = agent.to_web(html_source='https://custom-cdn.example.com/ui/index.html')
+
+    assert isinstance(app, Starlette)
+
+async def test_get_ui_html_local_file_path_string(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html supports local file paths as strings."""
+    # Create a test HTML file
+    test_html = b'<html><body>Local UI Content</body></html>'
+    local_file = tmp_path / 'custom-ui.html'
+    local_file.write_bytes(test_html)
+
+    result = await app_module._get_ui_html(html_source=str(local_file))  # pyright: ignore[reportPrivateUsage]
+
+    assert result == test_html
+
+async def test_get_ui_html_local_file_path_instance(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html supports Path instances."""
+    # Create a test HTML file
+    test_html = b'<html><body>Path Instance UI</body></html>'
+    local_file = tmp_path / 'path-ui.html'
+    local_file.write_bytes(test_html)
+
+    result = await app_module._get_ui_html(html_source=local_file)  # pyright: ignore[reportPrivateUsage]
+
+    assert result == test_html
+
+async def test_get_ui_html_local_file_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html raises FileNotFoundError for missing local file paths."""
+    # Try to use a non-existent local file path
+    nonexistent_path = str(tmp_path / 'nonexistent-ui.html')
+
+    with pytest.raises(FileNotFoundError, match='Local UI file not found'):
+        await app_module._get_ui_html(html_source=nonexistent_path)  # pyright: ignore[reportPrivateUsage]
+
+async def test_get_ui_html_source_instance_not_found(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Test that _get_ui_html raises FileNotFoundError for missing Path instances."""
+    # Try to use a non-existent Path instance
+    nonexistent_path = tmp_path / 'nonexistent-ui.html'
+
+    with pytest.raises(FileNotFoundError, match='Local UI file not found'):
+        await app_module._get_ui_html(html_source=nonexistent_path)  # pyright: ignore[reportPrivateUsage]
+
+def test_chat_app_index_file_not_found(tmp_path: Path):
+    """Test that index endpoint raises FileNotFoundError for non-existent html_source file."""
+    agent = Agent('test')
+    nonexistent_file = tmp_path / 'nonexistent-ui.html'
+    app = create_web_app(agent, html_source=str(nonexistent_file))
+
+    with TestClient(app, raise_server_exceptions=True) as client:
+        with pytest.raises(FileNotFoundError, match='Local UI file not found'):
+            client.get('/')
+
+def test_chat_app_index_http_error(monkeypatch: pytest.MonkeyPatch):
+    """Test that index endpoint raises HTTPStatusError when CDN fetch fails."""
+
+    class MockResponse:
+        status_code = 500
+
+    class MockAsyncClient:
+        async def __aenter__(self) -> MockAsyncClient:
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+        async def get(self, url: str) -> None:
+            response = MockResponse()
+            raise httpx.HTTPStatusError('Server error', request=None, response=response)  # type: ignore
+
+    monkeypatch.setattr(app_module.httpx, 'AsyncClient', MockAsyncClient)
+    # Use a fresh temp dir so there's no cached file
+    monkeypatch.setattr(app_module, '_get_cache_dir', lambda: Path('/tmp/nonexistent-cache-dir-for-test'))
+
+    agent = Agent('test')
+    app = create_web_app(agent)
+
+    with TestClient(app, raise_server_exceptions=True) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            client.get('/')

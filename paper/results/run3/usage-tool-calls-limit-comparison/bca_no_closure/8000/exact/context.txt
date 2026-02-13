@@ -1,0 +1,856 @@
+## clai/clai/__init__.py
+
+def cli():
+    """Run the clai CLI and exit."""
+    _cli.cli_exit('clai')
+
+## examples/pydantic_ai_examples/chat_app.py
+
+async def index() -> FileResponse:
+    return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
+
+## examples/pydantic_ai_examples/pydantic_model.py
+
+class MyModel(BaseModel):
+    city: str
+    country: str
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/store.py
+
+    async def add(cls, analysis: Analysis):
+        await cls._get_store().put.aio(analysis.profile.email, analysis.model_dump())
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    usage: _usage.RunUsage = dataclasses.field(default_factory=_usage.RunUsage)
+
+    request: _messages.ModelRequest
+
+async def _call_tools(  # noqa: C901
+    tool_manager: ToolManager[DepsT],
+    tool_calls: list[_messages.ToolCallPart],
+    tool_call_results: dict[str, DeferredToolResult],
+    tool_call_metadata: dict[str, dict[str, Any]] | None,
+    tracer: Tracer,
+    usage: _usage.RunUsage,
+    usage_limits: _usage.UsageLimits,
+    output_parts: list[_messages.ModelRequestPart],
+    output_deferred_calls: dict[Literal['external', 'unapproved'], list[_messages.ToolCallPart]],
+    output_deferred_metadata: dict[str, dict[str, Any]],
+) -> AsyncIterator[_messages.HandleResponseEvent]:
+    tool_parts_by_index: dict[int, _messages.ModelRequestPart] = {}
+    user_parts_by_index: dict[int, _messages.UserPromptPart] = {}
+    deferred_calls_by_index: dict[int, Literal['external', 'unapproved']] = {}
+    deferred_metadata_by_index: dict[int, dict[str, Any] | None] = {}
+
+    if usage_limits.tool_calls_limit is not None:
+        projected_usage = deepcopy(usage)
+        projected_usage.tool_calls += len(tool_calls)
+        usage_limits.check_before_tool_call(projected_usage)
+
+    for call in tool_calls:
+        yield _messages.FunctionToolCallEvent(call)
+
+    with tracer.start_as_current_span(
+        'running tools',
+        attributes={
+            'tools': [call.tool_name for call in tool_calls],
+            'logfire.msg': f'running {len(tool_calls)} tool{"" if len(tool_calls) == 1 else "s"}',
+        },
+    ):
+
+        async def handle_call_or_result(
+            coro_or_task: Awaitable[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ]
+            | Task[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ],
+            index: int,
+        ) -> _messages.HandleResponseEvent | None:
+            try:
+                tool_part, tool_user_content = (
+                    (await coro_or_task) if inspect.isawaitable(coro_or_task) else coro_or_task.result()
+                )
+            except exceptions.CallDeferred as e:
+                deferred_calls_by_index[index] = 'external'
+                deferred_metadata_by_index[index] = e.metadata
+            except exceptions.ApprovalRequired as e:
+                deferred_calls_by_index[index] = 'unapproved'
+                deferred_metadata_by_index[index] = e.metadata
+            else:
+                tool_parts_by_index[index] = tool_part
+                if tool_user_content:
+                    user_parts_by_index[index] = _messages.UserPromptPart(content=tool_user_content)
+
+                return _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
+
+        parallel_execution_mode = tool_manager.get_parallel_execution_mode(tool_calls)
+        if parallel_execution_mode == 'sequential':
+            for index, call in enumerate(tool_calls):
+                if event := await handle_call_or_result(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    index,
+                ):
+                    yield event
+
+        else:
+            tasks = [
+                asyncio.create_task(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    name=call.tool_name,
+                )
+                for call in tool_calls
+            ]
+            try:
+                if parallel_execution_mode == 'parallel_ordered_events':
+                    # Wait for all tasks to complete before yielding any events
+                    await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+                    for index, task in enumerate(tasks):
+                        if event := await handle_call_or_result(coro_or_task=task, index=index):
+                            yield event
+                else:
+                    pending: set[
+                        asyncio.Task[
+                            tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, _messages.UserPromptPart | None]
+                        ]
+                    ] = set(tasks)  # pyright: ignore[reportAssignmentType]
+                    while pending:
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            index = tasks.index(task)  # pyright: ignore[reportArgumentType]
+                            if event := await handle_call_or_result(coro_or_task=task, index=index):  # pyright: ignore[reportArgumentType]
+                                yield event
+
+            except asyncio.CancelledError as e:
+                for task in tasks:
+                    task.cancel(msg=e.args[0] if len(e.args) != 0 else None)
+
+                raise
+
+    # We append the results at the end, rather than as they are received, to retain a consistent ordering
+    # This is mostly just to simplify testing
+    output_parts.extend([tool_parts_by_index[k] for k in sorted(tool_parts_by_index)])
+    output_parts.extend([user_parts_by_index[k] for k in sorted(user_parts_by_index)])
+
+    _populate_deferred_calls(
+        tool_calls, deferred_calls_by_index, deferred_metadata_by_index, output_deferred_calls, output_deferred_metadata
+    )
+
+def get_captured_run_messages() -> _RunMessages:
+    return _messages_ctx_var.get()
+
+## pydantic_ai_slim/pydantic_ai/_cli/__init__.py
+
+    def __init__(self, special_suggestions: list[str] | None = None):
+        super().__init__()
+        self.special_suggestions = special_suggestions or []
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        """Make changes to the schema."""
+        return schema
+
+## pydantic_ai_slim/pydantic_ai/_otel_messages.py
+
+    type: Literal['text']
+
+## pydantic_ai_slim/pydantic_ai/_output.py
+
+    def label(self) -> str:
+        return "the agent's output tools"
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def number_to_datetime(x: int | float) -> datetime:
+    return _datetime_ta.validate_python(x)
+
+## pydantic_ai_slim/pydantic_ai/agent/__init__.py
+
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the instrumentation options for all agents where `instrument` is not set."""
+        Agent._instrument_default = instrument
+
+    def event_stream_handler(self) -> EventStreamHandler[AgentDepsT] | None:
+        """Optional handler for events from the model's streaming response and the agent's execution of tools."""
+        return self._event_stream_handler
+
+    def tool(
+        self,
+        func: ToolFuncContext[AgentDepsT, ToolParams] | None = None,
+        /,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        retries: int | None = None,
+        prepare: ToolPrepareFunc[AgentDepsT] | None = None,
+        docstring_format: DocstringFormat = 'auto',
+        require_parameter_descriptions: bool = False,
+        schema_generator: type[GenerateJsonSchema] = GenerateToolJsonSchema,
+        strict: bool | None = None,
+        sequential: bool = False,
+        requires_approval: bool = False,
+        metadata: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """Decorator to register a tool function which takes [`RunContext`][pydantic_ai.tools.RunContext] as its first argument.
+
+        Can decorate a sync or async functions.
+
+        The docstring is inspected to extract both the tool description and description of each parameter,
+        [learn more](../tools.md#function-tools-and-schema).
+
+        We can't add overloads for every possible signature of tool, since the return type is a recursive union
+        so the signature of functions decorated with `@agent.tool` is obscured.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent, RunContext
+
+        agent = Agent('test', deps_type=int)
+
+        @agent.tool
+        def foobar(ctx: RunContext[int], x: int) -> int:
+            return ctx.deps + x
+
+        @agent.tool(retries=2)
+        async def spam(ctx: RunContext[str], y: float) -> float:
+            return ctx.deps + y
+
+        result = agent.run_sync('foobar', deps=1)
+        print(result.output)
+        #> {"foobar":1,"spam":1.0}
+        ```
+
+        Args:
+            func: The tool function to register.
+            name: The name of the tool, defaults to the function name.
+            description: The description of the tool, defaults to the function docstring.
+            retries: The number of retries to allow for this tool, defaults to the agent's default retries,
+                which defaults to 1.
+            prepare: custom method to prepare the tool definition for each step, return `None` to omit this
+                tool from a given step. This is useful if you want to customise a tool at call time,
+                or omit it completely from a step. See [`ToolPrepareFunc`][pydantic_ai.tools.ToolPrepareFunc].
+            docstring_format: The format of the docstring, see [`DocstringFormat`][pydantic_ai.tools.DocstringFormat].
+                Defaults to `'auto'`, such that the format is inferred from the structure of the docstring.
+            require_parameter_descriptions: If True, raise an error if a parameter description is missing. Defaults to False.
+            schema_generator: The JSON schema generator class to use for this tool. Defaults to `GenerateToolJsonSchema`.
+            strict: Whether to enforce JSON schema compliance (only affects OpenAI).
+                See [`ToolDefinition`][pydantic_ai.tools.ToolDefinition] for more info.
+            sequential: Whether the function requires a sequential/serial execution environment. Defaults to False.
+            requires_approval: Whether this tool requires human-in-the-loop approval. Defaults to False.
+                See the [tools documentation](../deferred-tools.md#human-in-the-loop-tool-approval) for more info.
+            metadata: Optional metadata for the tool. This is not sent to the model but can be used for filtering and tool behavior customization.
+            timeout: Timeout in seconds for tool execution. If the tool takes longer, a retry prompt is returned to the model.
+                Overrides the agent-level `tool_timeout` if set. Defaults to None (no timeout).
+        """
+
+        def tool_decorator(
+            func_: ToolFuncContext[AgentDepsT, ToolParams],
+        ) -> ToolFuncContext[AgentDepsT, ToolParams]:
+            # noinspection PyTypeChecker
+            self._function_toolset.add_function(
+                func_,
+                takes_ctx=True,
+                name=name,
+                description=description,
+                retries=retries,
+                prepare=prepare,
+                docstring_format=docstring_format,
+                require_parameter_descriptions=require_parameter_descriptions,
+                schema_generator=schema_generator,
+                strict=strict,
+                sequential=sequential,
+                requires_approval=requires_approval,
+                metadata=metadata,
+                timeout=timeout,
+            )
+            return func_
+
+        return tool_decorator if func is None else tool_decorator(func)
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    def toolsets(self) -> Sequence[AbstractToolset[AgentDepsT]]:
+        """All toolsets registered on the agent.
+
+        Output tools are not included.
+        """
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/direct.py
+
+    def get(self) -> messages.ModelResponse:
+        """Build a ModelResponse from the data received from the stream so far."""
+        return self._ensure_stream_ready().get()
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_run_context.py
+
+    def deserialize_run_context(cls, ctx: dict[str, Any], deps: Any) -> TemporalRunContext[Any]:
+        """Deserialize the run context from a `dict[str, Any]`."""
+        return cls(**ctx, deps=deps)
+
+## pydantic_ai_slim/pydantic_ai/exceptions.py
+
+class UsageLimitExceeded(AgentRunError):
+    """Error raised when a Model's usage exceeds the specified limits."""
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    def format(self) -> str:
+        """The file format."""
+        raise NotImplementedError
+
+    def user_text_prompt(cls, user_prompt: str, *, instructions: str | None = None) -> ModelRequest:
+        """Create a `ModelRequest` with a single user prompt as text."""
+        return cls(parts=[UserPromptPart(user_prompt)], instructions=instructions)
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+    def gen_tool_args(self, tool_def: ToolDefinition) -> Any:
+        return _JsonSchemaTestData(tool_def.parameters_json_schema, self.seed).generate()
+
+    def generate(self) -> dict[str, Any]:
+        """Generate data for the JSON schema."""
+        return self._gen_any(self.schema)
+
+## pydantic_ai_slim/pydantic_ai/providers/__init__.py
+
+    def model_profile(self, model_name: str) -> ModelProfile | None:
+        """The model profile for the named model, if available."""
+        return None  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    async def aclose(self) -> None:
+        await self.wrapped.aclose()
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+    def validate_python(
+        self, input: Any, *, allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False, **kwargs: Any
+    ) -> Any: ...
+
+    async def get_tools(self, ctx: RunContext[AgentDepsT]) -> dict[str, ToolsetTool[AgentDepsT]]:
+        """The tools that are available in this toolset."""
+        raise NotImplementedError()
+
+## pydantic_ai_slim/pydantic_ai/toolsets/approval_required.py
+
+class ApprovalRequiredToolset(WrapperToolset[AgentDepsT]):
+    """A toolset that requires (some) calls to tools it contains to be approved.
+
+    See [toolset docs](../toolsets.md#requiring-tool-approval) for more information.
+    """
+
+    approval_required_func: Callable[[RunContext[AgentDepsT], ToolDefinition, dict[str, Any]], bool] = (
+        lambda ctx, tool_def, tool_args: True
+    )
+
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+    ) -> Any:
+        if not ctx.tool_call_approved and self.approval_required_func(ctx, tool.tool_def, tool_args):
+            raise ApprovalRequired
+
+        return await super().call_tool(name, tool_args, ctx, tool)
+
+## pydantic_ai_slim/pydantic_ai/toolsets/function.py
+
+    def tool(
+        self,
+        func: ToolFuncEither[AgentDepsT, ToolParams] | None = None,
+        /,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        retries: int | None = None,
+        prepare: ToolPrepareFunc[AgentDepsT] | None = None,
+        docstring_format: DocstringFormat | None = None,
+        require_parameter_descriptions: bool | None = None,
+        schema_generator: type[GenerateJsonSchema] | None = None,
+        strict: bool | None = None,
+        sequential: bool | None = None,
+        requires_approval: bool | None = None,
+        metadata: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """Decorator to register a tool function which takes [`RunContext`][pydantic_ai.tools.RunContext] as its first argument.
+
+        Can decorate a sync or async functions.
+
+        The docstring is inspected to extract both the tool description and description of each parameter,
+        [learn more](../tools.md#function-tools-and-schema).
+
+        We can't add overloads for every possible signature of tool, since the return type is a recursive union
+        so the signature of functions decorated with `@toolset.tool` is obscured.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent, FunctionToolset, RunContext
+
+        toolset = FunctionToolset()
+
+        @toolset.tool
+        def foobar(ctx: RunContext[int], x: int) -> int:
+            return ctx.deps + x
+
+        @toolset.tool(retries=2)
+        async def spam(ctx: RunContext[str], y: float) -> float:
+            return ctx.deps + y
+
+        agent = Agent('test', toolsets=[toolset], deps_type=int)
+        result = agent.run_sync('foobar', deps=1)
+        print(result.output)
+        #> {"foobar":1,"spam":1.0}
+        ```
+
+        Args:
+            func: The tool function to register.
+            name: The name of the tool, defaults to the function name.
+            description: The description of the tool,defaults to the function docstring.
+            retries: The number of retries to allow for this tool, defaults to the agent's default retries,
+                which defaults to 1.
+            prepare: custom method to prepare the tool definition for each step, return `None` to omit this
+                tool from a given step. This is useful if you want to customise a tool at call time,
+                or omit it completely from a step. See [`ToolPrepareFunc`][pydantic_ai.tools.ToolPrepareFunc].
+            docstring_format: The format of the docstring, see [`DocstringFormat`][pydantic_ai.tools.DocstringFormat].
+                If `None`, the default value is determined by the toolset.
+            require_parameter_descriptions: If True, raise an error if a parameter description is missing.
+                If `None`, the default value is determined by the toolset.
+            schema_generator: The JSON schema generator class to use for this tool.
+                If `None`, the default value is determined by the toolset.
+            strict: Whether to enforce JSON schema compliance (only affects OpenAI).
+                See [`ToolDefinition`][pydantic_ai.tools.ToolDefinition] for more info.
+                If `None`, the default value is determined by the toolset.
+            sequential: Whether the function requires a sequential/serial execution environment. Defaults to False.
+                If `None`, the default value is determined by the toolset.
+            requires_approval: Whether this tool requires human-in-the-loop approval. Defaults to False.
+                See the [tools documentation](../deferred-tools.md#human-in-the-loop-tool-approval) for more info.
+                If `None`, the default value is determined by the toolset.
+            metadata: Optional metadata for the tool. This is not sent to the model but can be used for filtering and tool behavior customization.
+                If `None`, the default value is determined by the toolset. If provided, it will be merged with the toolset's metadata.
+            timeout: Timeout in seconds for tool execution. If the tool takes longer, a retry prompt is returned to the model.
+                Defaults to None (no timeout).
+        """
+
+        def tool_decorator(
+            func_: ToolFuncEither[AgentDepsT, ToolParams],
+        ) -> ToolFuncEither[AgentDepsT, ToolParams]:
+            # noinspection PyTypeChecker
+            self.add_function(
+                func=func_,
+                takes_ctx=None,
+                name=name,
+                description=description,
+                retries=retries,
+                prepare=prepare,
+                docstring_format=docstring_format,
+                require_parameter_descriptions=require_parameter_descriptions,
+                schema_generator=schema_generator,
+                strict=strict,
+                sequential=sequential,
+                requires_approval=requires_approval,
+                metadata=metadata,
+                timeout=timeout,
+            )
+            return func_
+
+        return tool_decorator if func is None else tool_decorator(func)
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py
+
+    def encode(self, sdk_version: int) -> str:
+        return self.model_dump_json(by_alias=True, exclude_none=True)
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+class Usage(RunUsage):
+    """Deprecated alias for `RunUsage`."""
+
+    def check_before_tool_call(self, projected_usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next tool call(s) would exceed the tool call limit."""
+        tool_calls_limit = self.tool_calls_limit
+        tool_calls = projected_usage.tool_calls
+        if tool_calls_limit is not None and tool_calls < tool_calls_limit:
+            raise UsageLimitExceeded(
+                f'The next tool call(s) would exceed the tool_calls_limit of {tool_calls_limit} ({tool_calls=}).'
+            )
+
+## pydantic_evals/pydantic_evals/otel/span_tree.py
+
+    def find(self, predicate: SpanQuery | SpanPredicate) -> list[SpanNode]:
+        """Find all nodes in the entire tree that match the predicate, scanning from each root in DFS order."""
+        return list(self._filter(predicate))
+
+    def first(self, predicate: SpanQuery | SpanPredicate) -> SpanNode | None:
+        """Find the first node that matches a predicate, scanning from each root in DFS order. Returns `None` if not found."""
+        return next(self._filter(predicate), None)
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+    items: list[PathItem]
+
+## tests/conftest.py
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+## tests/example_modules/fake_database.py
+
+    async def execute(self, query: str) -> list[dict[str, Any]]:
+        return [{'id': 123, 'name': 'John Doe'}]
+
+## tests/graph/beta/test_broadcast_and_spread.py
+
+class CounterState:
+    values: list[int] = field(default_factory=list[int])
+
+## tests/graph/beta/test_decisions.py
+
+class DecisionState:
+    path_taken: str | None = None
+    value: int = 0
+
+## tests/graph/beta/test_edge_cases.py
+
+class EdgeCaseState:
+    value: int = 0
+    error_raised: bool = False
+
+## tests/graph/beta/test_edge_labels.py
+
+class LabelState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_builder.py
+
+class SimpleState:
+    counter: int = 0
+    result: str | None = None
+
+## tests/graph/beta/test_graph_edge_cases.py
+
+class MyState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_execution.py
+
+class ExecutionState:
+    log: list[str] = field(default_factory=list[str])
+    counter: int = 0
+
+## tests/graph/test_mermaid.py
+
+class Foo(BaseNode):
+    async def run(self, ctx: GraphRunContext) -> Bar:
+        return Bar()
+
+class Bar(BaseNode[None, None, None]):
+    async def run(self, ctx: GraphRunContext) -> End[None]:
+        return End(None)
+
+## tests/models/mock_openai.py
+
+    def create_mock(cls, completions: MockChatCompletion | Sequence[MockChatCompletion]) -> AsyncOpenAI:
+        return cast(AsyncOpenAI, cls(completions=completions))
+
+## tests/models/test_anthropic.py
+
+    def create_mock(cls, messages_: MockAnthropicMessage | Sequence[MockAnthropicMessage]) -> AsyncAnthropic:
+        return cast(AsyncAnthropic, cls(messages_=messages_))
+
+## tests/models/test_cohere.py
+
+    def create_mock(cls, completions: MockChatResponse | Sequence[MockChatResponse]) -> AsyncClientV2:
+        return cast(AsyncClientV2, cls(completions=completions))
+
+## tests/models/test_groq.py
+
+def text_chunk(text: str, finish_reason: FinishReason | None = None) -> chat.ChatCompletionChunk:
+    return chunk([ChoiceDelta(content=text, role='assistant')], finish_reason=finish_reason)
+
+## tests/models/test_mistral.py
+
+    def create_mock(cls, completions: MockChatCompletion | Sequence[MockChatCompletion]) -> Mistral:
+        return cast(Mistral, cls(completions=completions))
+
+## tests/models/test_model_names.py
+
+    object: Literal['model']
+
+## tests/test_agent.py
+
+class Foo(BaseModel):
+    a: int
+    b: str
+
+    def test_exhaustive_strategy_calls_all_output_tools(self):
+        """Test that 'exhaustive' strategy executes all output tool functions."""
+        output_tools_called: list[str] = []
+
+        def process_first(output: OutputType) -> OutputType:
+            """Process first output."""
+            output_tools_called.append('first')
+            return output
+
+        def process_second(output: OutputType) -> OutputType:
+            """Process second output."""
+            output_tools_called.append('second')
+            return output
+
+        def return_model(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            assert info.output_tools is not None
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('first_output', {'value': 'first'}),
+                    ToolCallPart('second_output', {'value': 'second'}),
+                ],
+            )
+
+        agent = Agent(
+            FunctionModel(return_model),
+            output_type=[
+                ToolOutput(process_first, name='first_output'),
+                ToolOutput(process_second, name='second_output'),
+            ],
+            end_strategy='exhaustive',
+        )
+
+        result = agent.run_sync('test exhaustive output tools')
+
+        # Verify the result came from the first output tool
+        assert isinstance(result.output, OutputType)
+        assert result.output.value == 'first'
+
+        # Verify both output tools were called
+        assert output_tools_called == ['first', 'second']
+
+        # Verify we got tool returns in the correct order
+        assert result.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content='test exhaustive output tools', timestamp=IsNow(tz=timezone.utc))],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(tool_name='first_output', args={'value': 'first'}, tool_call_id=IsStr()),
+                        ToolCallPart(tool_name='second_output', args={'value': 'second'}, tool_call_id=IsStr()),
+                    ],
+                    usage=RequestUsage(input_tokens=54, output_tokens=10),
+                    model_name='function:return_model:',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='first_output',
+                            content='Final result processed.',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        ),
+                        ToolReturnPart(
+                            tool_name='second_output',
+                            content='Final result processed.',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        ),
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+class Bar(BaseModel):
+    c: int
+    d: str
+
+def test_instructions_decorator_with_parenthesis():
+    agent = Agent('test')
+
+    @agent.instructions()
+    def instructions_2() -> str:
+        return 'You are a helpful assistant.'
+
+    result = agent.run_sync('Hello')
+    assert result.all_messages()[0] == snapshot(
+        ModelRequest(
+            parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+            timestamp=IsNow(tz=timezone.utc),
+            instructions='You are a helpful assistant.',
+            run_id=IsStr(),
+        )
+    )
+
+class UserContext:
+    location: str | None
+
+## tests/test_deps.py
+
+class MyDeps:
+    foo: int
+    bar: int
+
+## tests/test_logfire.py
+
+class WeatherInfo(BaseModel):
+    temperature: float
+    description: str
+
+## tests/test_streaming.py
+
+    async def test_exhaustive_strategy_calls_all_output_tools(self):
+        """Test that 'exhaustive' strategy executes all output tool functions."""
+        output_tools_called: list[str] = []
+
+        def process_first(output: OutputType) -> OutputType:
+            """Process first output."""
+            output_tools_called.append('first')
+            return output
+
+        def process_second(output: OutputType) -> OutputType:
+            """Process second output."""
+            output_tools_called.append('second')
+            return output
+
+        async def stream_function(_: list[ModelMessage], info: AgentInfo) -> AsyncIterator[str | DeltaToolCalls]:
+            assert info.output_tools is not None
+            yield {1: DeltaToolCall('first_output', '{"value": "first"}')}
+            yield {2: DeltaToolCall('second_output', '{"value": "second"}')}
+
+        agent = Agent(
+            FunctionModel(stream_function=stream_function),
+            output_type=[
+                ToolOutput(process_first, name='first_output'),
+                ToolOutput(process_second, name='second_output'),
+            ],
+            end_strategy='exhaustive',
+        )
+
+        async with agent.run_stream('test exhaustive output tools') as result:
+            response = await result.get_output()
+
+        # Verify the result came from the first output tool
+        assert isinstance(response, OutputType)
+        assert response.value == 'first'
+
+        # Verify both output tools were called
+        assert output_tools_called == ['first', 'second']
+
+        # Verify we got tool returns in the correct order
+        assert result.all_messages() == snapshot(
+            [
+                ModelRequest(
+                    parts=[UserPromptPart(content='test exhaustive output tools', timestamp=IsNow(tz=timezone.utc))],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelResponse(
+                    parts=[
+                        ToolCallPart(tool_name='first_output', args='{"value": "first"}', tool_call_id=IsStr()),
+                        ToolCallPart(tool_name='second_output', args='{"value": "second"}', tool_call_id=IsStr()),
+                    ],
+                    usage=RequestUsage(input_tokens=50, output_tokens=8),
+                    model_name='function::stream_function',
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+                ModelRequest(
+                    parts=[
+                        ToolReturnPart(
+                            tool_name='first_output',
+                            content='Final result processed.',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        ),
+                        ToolReturnPart(
+                            tool_name='second_output',
+                            content='Final result processed.',
+                            tool_call_id=IsStr(),
+                            timestamp=IsNow(tz=timezone.utc),
+                        ),
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                    run_id=IsStr(),
+                ),
+            ]
+        )
+
+## tests/test_temporal.py
+
+    async def run(self, prompt: str) -> str:
+        result = await simple_temporal_agent.run(prompt)
+        return result.output
+
+    async def decode(
+        self, payloads: Sequence[temporalio.api.common.v1.Payload]
+    ) -> list[temporalio.api.common.v1.Payload]:  # pragma: no cover
+        return list(payloads)
+
+## tests/test_ui.py
+
+class DummyUIRunInput(BaseModel):
+    messages: list[ModelMessage] = field(default_factory=list[ModelMessage])
+    tool_defs: list[ToolDefinition] = field(default_factory=list[ToolDefinition])
+    state: dict[str, Any] = field(default_factory=dict[str, Any])
+
+## tests/test_usage_limits.py
+
+async def test_output_tool_not_counted() -> None:
+    """Test that output tools are not counted in tool_calls usage metric."""
+    test_agent = Agent(TestModel())
+
+    @test_agent.tool_plain
+    async def regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    class MyOutput(BaseModel):
+        result: str
+
+    result_regular = await test_agent.run('test')
+    assert result_regular.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=14, tool_calls=1))
+
+    test_agent_with_output = Agent(TestModel(), output_type=ToolOutput(MyOutput))
+
+    @test_agent_with_output.tool_plain
+    async def another_regular_tool(x: str) -> str:
+        return f'{x}-processed'
+
+    result_output = await test_agent_with_output.run('test')
+
+    assert result_output.usage() == snapshot(RunUsage(requests=2, input_tokens=103, output_tokens=15, tool_calls=1))
+
+async def test_failed_tool_calls_not_counted() -> None:
+    """Test that failed tool calls (raising ModelRetry) are not counted in usage or against limits."""
+    test_agent = Agent(TestModel())
+
+    call_count = 0
+
+    @test_agent.tool_plain
+    async def flaky_tool(x: str) -> str:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ModelRetry('Temporary failure, please retry')
+        return f'{x}-success'
+
+    result = await test_agent.run('test', usage_limits=UsageLimits(tool_calls_limit=1))
+    assert call_count == 2
+    assert result.usage() == snapshot(RunUsage(requests=3, input_tokens=176, output_tokens=29, tool_calls=1))

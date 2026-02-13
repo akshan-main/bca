@@ -1,0 +1,800 @@
+## pydantic_ai_slim/pydantic_ai/exceptions.py
+
+class ToolRetryError(Exception):
+    """Exception used to signal a `ToolRetry` message should be returned to the LLM."""
+
+    def __init__(self, tool_retry: RetryPromptPart):
+        self.tool_retry = tool_retry
+        message = (
+            tool_retry.content
+            if isinstance(tool_retry.content, str)
+            else self._format_error_details(tool_retry.content, tool_retry.tool_name)
+        )
+        super().__init__(message)
+
+    @staticmethod
+    def _format_error_details(errors: list[pydantic_core.ErrorDetails], tool_name: str | None) -> str:
+        """Format ErrorDetails as a human-readable message.
+
+        We format manually rather than using ValidationError.from_exception_data because
+        some error types (value_error, assertion_error, etc.) require an 'error' key in ctx,
+        but when ErrorDetails are serialized, exception objects are stripped from ctx.
+        The 'msg' field already contains the human-readable message, so we use that directly.
+        """
+        error_count = len(errors)
+        lines = [
+            f'{error_count} validation error{"s" if error_count == 1 else ""}{f" for {tool_name!r}" if tool_name else ""}'
+        ]
+        for e in errors:
+            loc = '.'.join(str(x) for x in e['loc']) if e['loc'] else '__root__'
+            lines.append(loc)
+            lines.append(f'  {e["msg"]} [type={e["type"]}, input_value={e["input"]!r}]')
+        return '\n'.join(lines)
+
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+    def name(self) -> str: ...
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class RetryPromptPart:
+    """A message back to a model asking it to try again.
+
+    This can be sent for a number of reasons:
+
+    * Pydantic validation of tool arguments failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * a tool raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    * no tool was found for the tool name
+    * the model returned plain text when a structured response was expected
+    * Pydantic validation of a structured response failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * an output validator raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    """
+
+    content: list[pydantic_core.ErrorDetails] | str
+    """Details of why and how the model should retry.
+
+    If the retry was triggered by a [`ValidationError`][pydantic_core.ValidationError], this will be a list of
+    error details.
+    """
+
+    _: KW_ONLY
+
+    tool_name: str | None = None
+    """The name of the tool that was called, if any."""
+
+    tool_call_id: str = field(default_factory=_generate_tool_call_id)
+    """The tool call identifier, this is used by some models including OpenAI.
+
+    In case the tool call id is not provided by the model, Pydantic AI will generate a random one.
+    """
+
+    timestamp: datetime = field(default_factory=_now_utc)
+    """The timestamp, when the retry was triggered."""
+
+    part_kind: Literal['retry-prompt'] = 'retry-prompt'
+    """Part type identifier, this is available on all parts as a discriminator."""
+
+    def model_response(self) -> str:
+        """Return a string message describing why the retry is requested."""
+        if isinstance(self.content, str):
+            if self.tool_name is None:
+                description = f'Validation feedback:\n{self.content}'
+            else:
+                description = self.content
+        else:
+            json_errors = error_details_ta.dump_json(self.content, exclude={'__all__': {'ctx'}}, indent=2)
+            plural = isinstance(self.content, list) and len(self.content) != 1
+            description = (
+                f'{len(self.content)} validation error{"s" if plural else ""}:\n```json\n{json_errors.decode()}\n```'
+            )
+        return f'{description}\n\nFix the errors and try again.'
+
+    def otel_event(self, settings: InstrumentationSettings) -> LogRecord:
+        if self.tool_name is None:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.user.message'},
+                body={'content': self.model_response(), 'role': 'user'},
+            )
+        else:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.tool.message'},
+                body={
+                    **({'content': self.model_response()} if settings.include_content else {}),
+                    'role': 'tool',
+                    'id': self.tool_call_id,
+                    'name': self.tool_name,
+                },
+            )
+
+    def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
+        if self.tool_name is None:
+            return [_otel_messages.TextPart(type='text', content=self.model_response())]
+        else:
+            part = _otel_messages.ToolCallResponsePart(
+                type='tool_call_response',
+                id=self.tool_call_id,
+                name=self.tool_name,
+            )
+
+            if settings.include_content:
+                part['result'] = self.model_response()
+
+            return [part]
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+## pydantic_evals/pydantic_evals/evaluators/evaluator.py
+
+    def name(cls) -> str:
+        """`name` has been renamed, use `get_serialization_name` instead."""
+        return cls.get_serialization_name()
+
+## tests/models/test_anthropic.py
+
+async def test_anthropic_prompted_output_multiple(allow_model_requests: None, anthropic_api_key: str):
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+
+    class CityLocation(BaseModel):
+        city: str
+        country: str
+
+    class CountryLanguage(BaseModel):
+        country: str
+        language: str
+
+    agent = Agent(m, output_type=PromptedOutput([CityLocation, CountryLanguage]))
+
+    result = await agent.run('What is the largest city in Mexico?')
+    assert result.output == snapshot(CityLocation(city='Mexico City', country='Mexico'))
+
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='What is the largest city in Mexico?',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content='{"result": {"kind": "CityLocation", "data": {"city": "Mexico City", "country": "Mexico"}}}'
+                    )
+                ],
+                usage=RequestUsage(
+                    input_tokens=265,
+                    output_tokens=31,
+                    details={
+                        'cache_creation_input_tokens': 0,
+                        'cache_read_input_tokens': 0,
+                        'input_tokens': 265,
+                        'output_tokens': 31,
+                    },
+                ),
+                model_name='claude-sonnet-4-5-20250929',
+                timestamp=IsDatetime(),
+                provider_name='anthropic',
+                provider_url='https://api.anthropic.com',
+                provider_details={'finish_reason': 'end_turn'},
+                provider_response_id='msg_01N2PwwVQo2aBtt6UFhMDtEX',
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_model_retry(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    model = BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+    agent = Agent(
+        model=model, instructions='You are a helpful chatbot.', model_settings={'temperature': 0.0}, retries=2
+    )
+
+    @agent.tool_plain
+    async def get_capital(country: str) -> str:
+        """Get the capital of a country.
+
+        Args:
+            country: The country name.
+        """
+        raise ModelRetry('The country is not supported.')
+
+    result = await agent.run('What is the capital of France?')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='What is the capital of France?',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                instructions='You are a helpful chatbot.',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content='<thinking> To determine the capital of France, I can use the provided tool that returns the capital of a given country. Since the country in question is France, I will use the tool with the country parameter set to "France". </thinking>\n'
+                    ),
+                    ToolCallPart(
+                        tool_name='get_capital',
+                        args={'country': 'France'},
+                        tool_call_id=IsStr(),
+                    ),
+                ],
+                usage=RequestUsage(input_tokens=426, output_tokens=66),
+                model_name='us.amazon.nova-micro-v1:0',
+                timestamp=IsDatetime(),
+                provider_name='bedrock',
+                provider_url='https://bedrock-runtime.us-east-1.amazonaws.com',
+                provider_details={'finish_reason': 'tool_use'},
+                finish_reason='tool_call',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='The country is not supported.',
+                        tool_name='get_capital',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                instructions='You are a helpful chatbot.',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content="""\
+<thinking> It appears that there was an error in retrieving the capital of France as the tool indicated that the country is not supported. Since the tool is not able to provide the requested information, I will respond to the User with the information I have access to. </thinking> \n\
+
+The capital of France is Paris. If you need any further information, feel free to ask!\
+"""
+                    )
+                ],
+                usage=RequestUsage(input_tokens=531, output_tokens=76),
+                model_name='us.amazon.nova-micro-v1:0',
+                timestamp=IsDatetime(),
+                provider_name='bedrock',
+                provider_url='https://bedrock-runtime.us-east-1.amazonaws.com',
+                provider_details={'finish_reason': 'end_turn'},
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_huggingface.py
+
+async def test_hf_model_thinking_part_iter(allow_model_requests: None, huggingface_api_key: str):
+    m = HuggingFaceModel(
+        'Qwen/Qwen3-235B-A22B', provider=HuggingFaceProvider(provider_name='nebius', api_key=huggingface_api_key)
+    )
+    agent = Agent(m)
+
+    result: AgentRunResult | None = None
+    async for event in agent.run_stream_events(user_prompt='How do I cross the street?'):
+        if isinstance(event, AgentRunResultEvent):
+            result = event.result
+
+    assert result is not None
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='How do I cross the street?',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ThinkingPart(content=IsStr()),
+                    TextPart(content=IsStr()),
+                ],
+                model_name='Qwen/Qwen3-235B-A22B',
+                timestamp=IsDatetime(),
+                provider_name='huggingface',
+                provider_details={
+                    'finish_reason': 'stop',
+                    'timestamp': datetime(2025, 7, 23, 19, 58, 41, tzinfo=timezone.utc),
+                },
+                provider_response_id='chatcmpl-357f347a3f5d4897b36a128fb4e4cf7b',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_model_function.py
+
+def test_call_all():
+    result = agent_all.run_sync('Hello', model=TestModel())
+    assert result.output == snapshot('{"foo":"1","bar":"2","baz":"3","qux":"4","quz":"a"}')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(content='foobar', timestamp=IsNow(tz=timezone.utc)),
+                    UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc)),
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name='foo', args={'x': 0}, tool_call_id=IsStr()),
+                    ToolCallPart(tool_name='bar', args={'x': 0}, tool_call_id=IsStr()),
+                    ToolCallPart(tool_name='baz', args={'x': 0}, tool_call_id=IsStr()),
+                    ToolCallPart(tool_name='qux', args={'x': 0}, tool_call_id=IsStr()),
+                    ToolCallPart(tool_name='quz', args={'x': 'a'}, tool_call_id=IsStr()),
+                ],
+                usage=RequestUsage(input_tokens=52, output_tokens=21),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='foo', content='1', timestamp=IsNow(tz=timezone.utc), tool_call_id=IsStr()
+                    ),
+                    ToolReturnPart(
+                        tool_name='bar', content='2', timestamp=IsNow(tz=timezone.utc), tool_call_id=IsStr()
+                    ),
+                    ToolReturnPart(
+                        tool_name='baz', content='3', timestamp=IsNow(tz=timezone.utc), tool_call_id=IsStr()
+                    ),
+                    ToolReturnPart(
+                        tool_name='qux', content='4', timestamp=IsNow(tz=timezone.utc), tool_call_id=IsStr()
+                    ),
+                    ToolReturnPart(
+                        tool_name='quz', content='a', timestamp=IsNow(tz=timezone.utc), tool_call_id=IsStr()
+                    ),
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='{"foo":"1","bar":"2","baz":"3","qux":"4","quz":"a"}')],
+                usage=RequestUsage(input_tokens=57, output_tokens=33),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_model_test.py
+
+def test_custom_output_args_model():
+    class Foo(BaseModel):
+        foo: str
+        bar: int
+
+    agent = Agent(output_type=Foo)
+    result = agent.run_sync('x', model=TestModel(custom_output_args={'foo': 'a', 'bar': 1}))
+    assert result.output == Foo(foo='a', bar=1)
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='x',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args={'foo': 'a', 'bar': 1},
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=51, output_tokens=6),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/models/test_openai.py
+
+async def test_message_history_can_start_with_model_response(allow_model_requests: None, openai_api_key: str):
+    """Test that an agent run with message_history starting with ModelResponse is executed correctly."""
+
+    openai_model = OpenAIChatModel('gpt-4.1-mini', provider=OpenAIProvider(api_key=openai_api_key))
+
+    message_history = [ModelResponse(parts=[TextPart('Where do you want to go today?')])]
+
+    agent = Agent(model=openai_model)
+
+    result = await agent.run('Answer in 5 words only. Who is Tux?', message_history=message_history)
+
+    assert result.output == snapshot('Linux mascot, a penguin character.')
+    assert result.all_messages() == snapshot(
+        [
+            ModelResponse(
+                parts=[TextPart(content='Where do you want to go today?')],
+                timestamp=IsDatetime(),
+            ),
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Answer in 5 words only. Who is Tux?',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Linux mascot, a penguin character.')],
+                usage=RequestUsage(
+                    input_tokens=31,
+                    output_tokens=8,
+                    details={
+                        'accepted_prediction_tokens': 0,
+                        'audio_tokens': 0,
+                        'reasoning_tokens': 0,
+                        'rejected_prediction_tokens': 0,
+                    },
+                ),
+                model_name='gpt-4.1-mini-2025-04-14',
+                timestamp=IsDatetime(),
+                provider_name='openai',
+                provider_url='https://api.openai.com/v1/',
+                provider_details={
+                    'finish_reason': 'stop',
+                    'timestamp': datetime(2025, 11, 22, 10, 1, 40, tzinfo=timezone.utc),
+                },
+                provider_response_id='chatcmpl-Ceeiy4ivEE0hcL1EX5ZfLuW5xNUXB',
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+async def test_openai_auto_mode_reasoning_field_different_provider_uses_tags(allow_model_requests: None):
+    """Test that auto mode falls back to tags when provider_name doesn't match."""
+    # This test verifies behavior by checking that when thinking comes from a different provider, auto mode falls back to tags.
+    c1 = completion_message(ChatCompletionMessage.model_construct(content='response2', role='assistant'))
+    m = OpenAIChatModel(
+        'foobar',
+        provider=OpenAIProvider(openai_client=MockOpenAI.create_mock(c1)),
+        profile=OpenAIModelProfile(
+            openai_chat_thinking_field='reasoning_content',
+            openai_chat_send_back_thinking_parts='auto',
+        ),
+    )
+
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='question')]),
+        ModelResponse(
+            parts=[
+                ThinkingPart(
+                    content='reasoning from different provider',
+                    id='reasoning_content',
+                    provider_name='different-provider',
+                ),
+            ]
+        ),
+    ]
+
+    settings = ModelSettings()
+    params = ModelRequestParameters()
+    await m.request(messages=messages, model_settings=settings, model_request_parameters=params)
+
+    mapped = m._map_model_response(messages[1])  # type: ignore[reportPrivateUsage]
+    assert mapped == snapshot(
+        {
+            'role': 'assistant',
+            'content': """<think>
+reasoning from different provider
+</think>""",
+        }
+    )
+
+## tests/models/test_xai.py
+
+async def test_xai_builtin_tool_without_tool_call_id(allow_model_requests: None):
+    """Test that BuiltinToolCallPart without tool_call_id returns None."""
+    # Create a response for the call
+    response = create_response(content='Done')
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m, builtin_tools=[CodeExecutionTool()])
+
+    # Manually construct message history with BuiltinToolCallPart that has empty tool_call_id
+    # This directly tests the case when tool_call_id is empty
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Run code')]),
+        ModelResponse(
+            parts=[
+                BuiltinToolCallPart(
+                    tool_name='code_execution',
+                    args={},
+                    tool_call_id='',  # Empty - should be skipped
+                    provider_name='xai',
+                ),
+                TextPart(content='Code ran'),
+            ],
+            model_name=XAI_NON_REASONING_MODEL,
+        ),
+    ]
+
+    result = await agent.run('What happened?', message_history=message_history)
+
+    # Verify kwargs - the builtin tool call with empty id is skipped
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'Run code'}], 'role': 'ROLE_USER'},
+                    # BuiltinToolCallPart with empty tool_call_id is skipped
+                    {'content': [{'text': 'Code ran'}], 'role': 'ROLE_ASSISTANT'},
+                    {'content': [{'text': 'What happened?'}], 'role': 'ROLE_USER'},
+                ],
+                'tools': [{'code_execution': {}}],
+                'tool_choice': 'auto',
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            },
+        ]
+    )
+
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(parts=[UserPromptPart(content='Run code', timestamp=IsDatetime())]),
+            ModelResponse(
+                parts=[
+                    BuiltinToolCallPart(tool_name='code_execution', args={}, tool_call_id='', provider_name='xai'),
+                    TextPart(content='Code ran'),
+                ],
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='What happened?', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Done')],
+                usage=RequestUsage(),
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_url='https://api.x.ai/v1',
+                provider_name='xai',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_agent.py
+
+def test_prompted_output_with_defs():
+    class Foo(BaseModel):
+        """Foo description"""
+
+        foo: str
+
+    class Bar(BaseModel):
+        """Bar description"""
+
+        bar: str
+
+    class Baz(BaseModel):
+        """Baz description"""
+
+        baz: str
+
+    class FooBar(BaseModel):
+        """FooBar description"""
+
+        foo: Foo
+        bar: Bar
+
+    class FooBaz(BaseModel):
+        """FooBaz description"""
+
+        foo: Foo
+        baz: Baz
+
+    def return_foo_bar(_: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        text = '{"result": {"kind": "FooBar", "data": {"foo": {"foo": "foo"}, "bar": {"bar": "bar"}}}}'
+        return ModelResponse(parts=[TextPart(content=text)])
+
+    m = FunctionModel(return_foo_bar)
+
+    agent = Agent(
+        m,
+        output_type=PromptedOutput(
+            [FooBar, FooBaz], name='FooBar or FooBaz', description='FooBar or FooBaz description'
+        ),
+    )
+
+    result = agent.run_sync('What is foo?')
+    assert result.output == snapshot(FooBar(foo=Foo(foo='foo'), bar=Bar(bar='bar')))
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='What is foo?',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(
+                        content='{"result": {"kind": "FooBar", "data": {"foo": {"foo": "foo"}, "bar": {"bar": "bar"}}}}'
+                    )
+                ],
+                usage=RequestUsage(input_tokens=53, output_tokens=17),
+                model_name='function:return_foo_bar:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_exceptions.py
+
+def test_tool_retry_error_str_with_string_content():
+    """Test that ToolRetryError uses string content as message automatically."""
+    part = RetryPromptPart(content='error from tool', tool_name='my_tool')
+    error = ToolRetryError(part)
+    assert str(error) == 'error from tool'
+
+def test_tool_retry_error_str_with_value_error_type():
+    """Test that ToolRetryError handles value_error type without ctx.error.
+
+    When ErrorDetails are serialized, the exception object in ctx is stripped.
+    This test ensures we handle error types that normally require ctx.error.
+    """
+    # Simulate serialized ErrorDetails where ctx.error has been stripped
+    error_details: list[ErrorDetails] = [
+        {
+            'type': 'value_error',
+            'loc': ('field',),
+            'msg': 'Value error, must not be foo',
+            'input': 'foo',
+        }
+    ]
+    part = RetryPromptPart(content=error_details, tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nfield\n  Value error, must not be foo [type=value_error, input_value='foo']"
+    )
+
+## tests/test_streaming.py
+
+async def test_tool_raises_call_deferred():
+    agent = Agent(TestModel(), output_type=[str, DeferredToolRequests])
+
+    @agent.tool_plain()
+    def my_tool(x: int) -> int:
+        raise CallDeferred
+
+    async with agent.run_stream('Hello') as result:
+        assert not result.is_complete
+        assert isinstance(result.run_id, str)
+        assert [c async for c in result.stream_output(debounce_by=None)] == snapshot(
+            [DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])]
+        )
+        assert await result.get_output() == snapshot(
+            DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])
+        )
+        responses = [c async for c, _is_last in result.stream_responses(debounce_by=None)]
+        assert responses == snapshot(
+            [
+                ModelResponse(
+                    parts=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())],
+                    usage=RequestUsage(input_tokens=51),
+                    model_name='test',
+                    timestamp=IsDatetime(),
+                    provider_name='test',
+                    run_id=IsStr(),
+                )
+            ]
+        )
+        assert await result.validate_response_output(responses[0]) == snapshot(
+            DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])
+        )
+        assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=0))
+        assert result.timestamp() == IsNow(tz=timezone.utc)
+        assert result.is_complete
+
+async def test_get_output_after_stream_output():
+    """Verify that we don't get duplicate messages in history when using tool output and `get_output` is called after `stream_output`."""
+    m = TestModel()
+
+    agent = Agent(m, output_type=bool)
+
+    async with agent.run_stream('Hello') as result:
+        outputs: list[bool] = []
+        async for o in result.stream_output():
+            outputs.append(o)
+        o = await result.get_output()
+        outputs.append(o)
+
+    assert outputs == snapshot([False, False, False])
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Hello',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args={'response': False},
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=51),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )

@@ -1,0 +1,218 @@
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py
+
+    async def _invoke_model(self, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """Invoke the Bedrock model and return parsed response with token count.
+
+        Returns:
+            A tuple of (response_body, input_token_count).
+        """
+        try:
+            response: InvokeModelResponseTypeDef = await anyio.to_thread.run_sync(
+                functools.partial(
+                    self.client.invoke_model,
+                    modelId=self._model_name,
+                    body=json.dumps(body),
+                    contentType='application/json',
+                    accept='application/json',
+                )
+            )
+        except ClientError as e:
+            status_code = e.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+            if isinstance(status_code, int):
+                raise ModelHTTPError(status_code=status_code, model_name=self.model_name, body=e.response) from e
+            raise ModelAPIError(model_name=self.model_name, message=str(e)) from e
+
+        # Extract input token count from HTTP headers
+        input_tokens = int(
+            response.get('ResponseMetadata', {}).get('HTTPHeaders', {}).get('x-amzn-bedrock-input-token-count', '0')
+        )
+
+        response_body = json.loads(response['body'].read())
+        return response_body, input_tokens
+
+## pydantic_ai_slim/pydantic_ai/embeddings/google.py
+
+def _map_usage(
+    response: EmbedContentResponse,
+    provider: str,
+    provider_url: str,
+    model: str,
+) -> RequestUsage:
+    """Map Google embedding response to RequestUsage.
+
+    Note: The Gemini API (google-gla) doesn't return token usage information.
+    Vertex AI (google-vertex) returns token_count in embedding statistics.
+    """
+    total_tokens = 0
+    if response.embeddings:  # pragma: no branch
+        for emb in response.embeddings:
+            if emb.statistics and emb.statistics.token_count:
+                total_tokens += int(emb.statistics.token_count)  # pragma: lax no cover -- requires vertexai
+
+    return RequestUsage(input_tokens=total_tokens)
+
+## pydantic_ai_slim/pydantic_ai/embeddings/voyageai.py
+
+def _map_usage(total_tokens: int) -> RequestUsage:
+    return RequestUsage(input_tokens=total_tokens)
+
+## pydantic_ai_slim/pydantic_ai/models/xai.py
+
+def _extract_usage(
+    response: chat_types.Response,
+    model: str,
+    provider: str,
+    provider_url: str,
+) -> RequestUsage:
+    """Extract usage information from xAI SDK response.
+
+    Extracts token counts and additional usage details including:
+    - reasoning_tokens: Tokens used for model reasoning/thinking
+    - cache_read_tokens: Tokens read from prompt cache
+    - server_side_tools_used: Count of server-side (built-in) tools executed
+    """
+    usage_obj = response.usage
+
+    # Build usage data dict with all integer fields for genai-prices extraction
+    usage_data: dict[str, int] = {
+        'prompt_tokens': usage_obj.prompt_tokens or 0,
+        'completion_tokens': usage_obj.completion_tokens or 0,
+    }
+
+    # Add reasoning tokens if available (optional attribute)
+    if usage_obj.reasoning_tokens:
+        usage_data['reasoning_tokens'] = usage_obj.reasoning_tokens
+
+    # Add cached prompt tokens if available (optional attribute)
+    if usage_obj.cached_prompt_text_tokens:
+        usage_data['cache_read_tokens'] = usage_obj.cached_prompt_text_tokens
+
+    # Aggregate server-side tools used by PydanticAI builtin tool name
+    if usage_obj.server_side_tools_used:
+        tool_counts: dict[str, int] = defaultdict(int)
+        for server_side_tool in usage_obj.server_side_tools_used:
+            tool_name = _map_server_side_tools_used_to_name(server_side_tool)
+            tool_counts[tool_name] += 1
+        # Add each tool as a separate details entry (server_side_tools must be flattened to comply with details being dict[str, int])
+        for tool_name, count in tool_counts.items():
+            usage_data[f'server_side_tools_{tool_name}'] = count
+
+    # Build details from non-standard fields
+    details = {k: v for k, v in usage_data.items() if k not in {'prompt_tokens', 'completion_tokens'}}
+
+    extracted = RequestUsage.extract(
+        dict(model=model, usage=usage_data),
+        provider=provider,
+        provider_url=provider_url,
+        provider_fallback='x_ai',  # Pricing file is defined as x_ai.yml
+        details=details or None,
+    )
+
+    # Ensure token counts are set even if genai-prices extraction failed
+    if extracted.input_tokens == 0 and usage_data['prompt_tokens']:
+        extracted.input_tokens = usage_data['prompt_tokens']
+    if extracted.output_tokens == 0 and usage_data['completion_tokens']:
+        extracted.output_tokens = usage_data['completion_tokens']
+
+    return extracted
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._initial_run_ctx_usage + self._raw_stream_response.usage()
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+        # deprecated:
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+    ):
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit if input_tokens_limit is not None else request_tokens_limit
+        self.output_tokens_limit = output_tokens_limit if output_tokens_limit is not None else response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+    items: list[PathItem]
+
+## tests/models/mock_xai.py
+
+def create_usage(
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    cached_prompt_text_tokens: int = 0,
+    server_side_tools_used: list[usage_pb2.ServerSideTool] | None = None,
+) -> usage_pb2.SamplingUsage:
+    """Helper to create xAI SamplingUsage protobuf objects for tests with all required fields."""
+    return usage_pb2.SamplingUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cached_prompt_text_tokens=cached_prompt_text_tokens,
+        server_side_tools_used=server_side_tools_used or [],
+    )
+
+## tests/models/test_openai.py
+
+def chunk_with_usage(
+    delta: list[ChoiceDelta],
+    finish_reason: FinishReason | None = None,
+    completion_tokens: int = 1,
+    prompt_tokens: int = 2,
+    total_tokens: int = 3,
+) -> chat.ChatCompletionChunk:
+    """Create a chunk with configurable usage stats for testing continuous_usage_stats."""
+    return chat.ChatCompletionChunk(
+        id='123',
+        choices=[
+            ChunkChoice(index=index, delta=delta, finish_reason=finish_reason) for index, delta in enumerate(delta)
+        ],
+        created=1704067200,  # 2024-01-01
+        model='gpt-4o-123',
+        object='chat.completion.chunk',
+        usage=CompletionUsage(
+            completion_tokens=completion_tokens, prompt_tokens=prompt_tokens, total_tokens=total_tokens
+        ),
+    )
+
+## tests/models/test_xai.py
+
+async def test_xai_usage_without_details(allow_model_requests: None):
+    """Test that xAI model handles usage without reasoning_tokens or cached tokens."""
+    mock_usage = create_usage(prompt_tokens=20, completion_tokens=10)
+    response = create_response(
+        content='Simple answer',
+        usage=mock_usage,
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Simple question')
+    assert result.output == 'Simple answer'
+
+    # Verify usage without details (empty dict when no additional usage info)
+    assert result.usage() == snapshot(RunUsage(input_tokens=20, output_tokens=10, requests=1))

@@ -1,0 +1,800 @@
+## clai/clai/__init__.py
+
+def cli():
+    """Run the clai CLI and exit."""
+    _cli.cli_exit('clai')
+
+## examples/pydantic_ai_examples/chat_app.py
+
+async def index() -> FileResponse:
+    return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
+
+## examples/pydantic_ai_examples/rag.py
+
+    id: int
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/store.py
+
+    async def add(cls, analysis: Analysis):
+        await cls._get_store().put.aio(analysis.profile.email, analysis.model_dump())
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+async def _call_tools(  # noqa: C901
+    tool_manager: ToolManager[DepsT],
+    tool_calls: list[_messages.ToolCallPart],
+    tool_call_results: dict[str, DeferredToolResult],
+    tool_call_metadata: dict[str, dict[str, Any]] | None,
+    tracer: Tracer,
+    usage: _usage.RunUsage,
+    usage_limits: _usage.UsageLimits,
+    output_parts: list[_messages.ModelRequestPart],
+    output_deferred_calls: dict[Literal['external', 'unapproved'], list[_messages.ToolCallPart]],
+    output_deferred_metadata: dict[str, dict[str, Any]],
+) -> AsyncIterator[_messages.HandleResponseEvent]:
+    tool_parts_by_index: dict[int, _messages.ModelRequestPart] = {}
+    user_parts_by_index: dict[int, _messages.UserPromptPart] = {}
+    deferred_calls_by_index: dict[int, Literal['external', 'unapproved']] = {}
+    deferred_metadata_by_index: dict[int, dict[str, Any] | None] = {}
+
+    if usage_limits.tool_calls_limit is not None:
+        projected_usage = deepcopy(usage)
+        projected_usage.tool_calls += len(tool_calls)
+        usage_limits.check_before_tool_call(projected_usage)
+
+    for call in tool_calls:
+        yield _messages.FunctionToolCallEvent(call)
+
+    with tracer.start_as_current_span(
+        'running tools',
+        attributes={
+            'tools': [call.tool_name for call in tool_calls],
+            'logfire.msg': f'running {len(tool_calls)} tool{"" if len(tool_calls) == 1 else "s"}',
+        },
+    ):
+
+        async def handle_call_or_result(
+            coro_or_task: Awaitable[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ]
+            | Task[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ],
+            index: int,
+        ) -> _messages.HandleResponseEvent | None:
+            try:
+                tool_part, tool_user_content = (
+                    (await coro_or_task) if inspect.isawaitable(coro_or_task) else coro_or_task.result()
+                )
+            except exceptions.CallDeferred as e:
+                deferred_calls_by_index[index] = 'external'
+                deferred_metadata_by_index[index] = e.metadata
+            except exceptions.ApprovalRequired as e:
+                deferred_calls_by_index[index] = 'unapproved'
+                deferred_metadata_by_index[index] = e.metadata
+            else:
+                tool_parts_by_index[index] = tool_part
+                if tool_user_content:
+                    user_parts_by_index[index] = _messages.UserPromptPart(content=tool_user_content)
+
+                return _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
+
+        parallel_execution_mode = tool_manager.get_parallel_execution_mode(tool_calls)
+        if parallel_execution_mode == 'sequential':
+            for index, call in enumerate(tool_calls):
+                if event := await handle_call_or_result(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    index,
+                ):
+                    yield event
+
+        else:
+            tasks = [
+                asyncio.create_task(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    name=call.tool_name,
+                )
+                for call in tool_calls
+            ]
+            try:
+                if parallel_execution_mode == 'parallel_ordered_events':
+                    # Wait for all tasks to complete before yielding any events
+                    await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+                    for index, task in enumerate(tasks):
+                        if event := await handle_call_or_result(coro_or_task=task, index=index):
+                            yield event
+                else:
+                    pending: set[
+                        asyncio.Task[
+                            tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, _messages.UserPromptPart | None]
+                        ]
+                    ] = set(tasks)  # pyright: ignore[reportAssignmentType]
+                    while pending:
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            index = tasks.index(task)  # pyright: ignore[reportArgumentType]
+                            if event := await handle_call_or_result(coro_or_task=task, index=index):  # pyright: ignore[reportArgumentType]
+                                yield event
+
+            except asyncio.CancelledError as e:
+                for task in tasks:
+                    task.cancel(msg=e.args[0] if len(e.args) != 0 else None)
+
+                raise
+
+    # We append the results at the end, rather than as they are received, to retain a consistent ordering
+    # This is mostly just to simplify testing
+    output_parts.extend([tool_parts_by_index[k] for k in sorted(tool_parts_by_index)])
+    output_parts.extend([user_parts_by_index[k] for k in sorted(user_parts_by_index)])
+
+    _populate_deferred_calls(
+        tool_calls, deferred_calls_by_index, deferred_metadata_by_index, output_deferred_calls, output_deferred_metadata
+    )
+
+## pydantic_ai_slim/pydantic_ai/_cli/__init__.py
+
+    def __init__(self, special_suggestions: list[str] | None = None):
+        super().__init__()
+        self.special_suggestions = special_suggestions or []
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    async def to_cli(
+        self: Self,
+        deps: AgentDepsT = None,
+        prog_name: str = 'pydantic-ai',
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+    ) -> None:
+        """Run the agent in a CLI chat interface.
+
+        Args:
+            deps: The dependencies to pass to the agent.
+            prog_name: The name of the program to use for the CLI. Defaults to 'pydantic-ai'.
+            message_history: History of the conversation so far.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+
+        Example:
+        ```python {title="agent_to_cli.py" test="skip"}
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2', instructions='You always respond in Italian.')
+
+        async def main():
+            await agent.to_cli()
+        ```
+        """
+        from rich.console import Console
+
+        from pydantic_ai._cli import run_chat
+
+        await run_chat(
+            stream=True,
+            agent=self,
+            deps=deps,
+            console=Console(),
+            code_theme='monokai',
+            prog_name=prog_name,
+            message_history=message_history,
+            model_settings=model_settings,
+            usage_limits=usage_limits,
+        )
+
+    def to_cli_sync(
+        self: Self,
+        deps: AgentDepsT = None,
+        prog_name: str = 'pydantic-ai',
+        message_history: Sequence[_messages.ModelMessage] | None = None,
+        model_settings: ModelSettings | None = None,
+        usage_limits: _usage.UsageLimits | None = None,
+    ) -> None:
+        """Run the agent in a CLI chat interface with the non-async interface.
+
+        Args:
+            deps: The dependencies to pass to the agent.
+            prog_name: The name of the program to use for the CLI. Defaults to 'pydantic-ai'.
+            message_history: History of the conversation so far.
+            model_settings: Optional settings to use for this model's request.
+            usage_limits: Optional limits on model request count or token usage.
+
+        ```python {title="agent_to_cli_sync.py" test="skip"}
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2', instructions='You always respond in Italian.')
+        agent.to_cli_sync()
+        agent.to_cli_sync(prog_name='assistant')
+        ```
+        """
+        return _utils.get_event_loop().run_until_complete(
+            self.to_cli(
+                deps=deps,
+                prog_name=prog_name,
+                message_history=message_history,
+                model_settings=model_settings,
+                usage_limits=usage_limits,
+            )
+        )
+
+## pydantic_ai_slim/pydantic_ai/concurrency.py
+
+    def release(self) -> None:
+        """Release a slot."""
+        ...
+
+async def _null_context() -> AsyncIterator[None]:
+    """A no-op async context manager."""
+    yield
+
+def get_concurrency_context(
+    limiter: AbstractConcurrencyLimiter | None,
+    source: str = 'unnamed',
+) -> AbstractAsyncContextManager[None]:
+    """Get an async context manager for the concurrency limiter.
+
+    If limiter is None, returns a no-op context manager.
+
+    Args:
+        limiter: The AbstractConcurrencyLimiter or None.
+        source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+
+    Returns:
+        An async context manager.
+    """
+    if limiter is None:
+        return _null_context()
+    return _limiter_context(limiter, source)
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    def user_text_prompt(cls, user_prompt: str, *, instructions: str | None = None) -> ModelRequest:
+        """Create a `ModelRequest` with a single user prompt as text."""
+        return cls(parts=[UserPromptPart(user_prompt)], instructions=instructions)
+
+## pydantic_ai_slim/pydantic_ai/models/anthropic.py
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        check_allow_model_requests()
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        response = await self._messages_create(
+            messages, False, cast(AnthropicModelSettings, model_settings or {}), model_request_parameters
+        )
+        model_response = self._process_response(response)
+        return model_response
+
+## pydantic_ai_slim/pydantic_ai/models/function.py
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        agent_info = AgentInfo(
+            function_tools=model_request_parameters.function_tools,
+            allow_text_output=model_request_parameters.allow_text_output,
+            output_tools=model_request_parameters.output_tools,
+            model_settings=model_settings,
+            model_request_parameters=model_request_parameters,
+            instructions=self._get_instructions(messages, model_request_parameters),
+        )
+
+        assert self.function is not None, 'FunctionModel must receive a `function` to support non-streamed requests'
+
+        if inspect.iscoroutinefunction(self.function):
+            response = await self.function(messages, agent_info)
+        else:
+            response_ = await _utils.run_in_executor(self.function, messages, agent_info)
+            assert isinstance(response_, ModelResponse), response_
+            response = response_
+        response.model_name = self._model_name
+        # Add usage data if not already present
+        if not response.usage.has_values():  # pragma: no branch
+            response.usage = _estimate_usage(chain(messages, [response]))
+        return response
+
+## pydantic_ai_slim/pydantic_ai/models/google.py
+
+    def prepare_request(
+        self, model_settings: ModelSettings | None, model_request_parameters: ModelRequestParameters
+    ) -> tuple[ModelSettings | None, ModelRequestParameters]:
+        supports_native_output_with_builtin_tools = GoogleModelProfile.from_profile(
+            self.profile
+        ).google_supports_native_output_with_builtin_tools
+        if model_request_parameters.builtin_tools and model_request_parameters.output_tools:
+            if model_request_parameters.output_mode == 'auto':
+                output_mode = 'native' if supports_native_output_with_builtin_tools else 'prompted'
+                model_request_parameters = replace(model_request_parameters, output_mode=output_mode)
+            else:
+                output_mode = 'NativeOutput' if supports_native_output_with_builtin_tools else 'PromptedOutput'
+                raise UserError(
+                    f'Google does not support output tools and built-in tools at the same time. Use `output_type={output_mode}(...)` instead.'
+                )
+        return super().prepare_request(model_settings, model_request_parameters)
+
+## pydantic_ai_slim/pydantic_ai/models/groq.py
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        check_allow_model_requests()
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        try:
+            response = await self._completions_create(
+                messages, False, cast(GroqModelSettings, model_settings or {}), model_request_parameters
+            )
+        except ModelHTTPError as e:
+            if isinstance(e.body, dict):  # pragma: no branch
+                # The Groq SDK tries to be helpful by raising an exception when generated tool arguments don't match the schema,
+                # but we'd rather handle it ourselves so we can tell the model to retry the tool call.
+                try:
+                    error = _GroqToolUseFailedError.model_validate(e.body)  # pyright: ignore[reportUnknownMemberType]
+                    tool_call_part = ToolCallPart(
+                        tool_name=error.error.failed_generation.name,
+                        args=error.error.failed_generation.arguments,
+                    )
+                    return ModelResponse(
+                        parts=[tool_call_part],
+                        model_name=e.model_name,
+                        provider_name=self._provider.name,
+                        provider_url=self.base_url,
+                        finish_reason='error',
+                    )
+                except ValidationError:
+                    pass
+            raise
+        model_response = self._process_response(response)
+        return model_response
+
+## pydantic_ai_slim/pydantic_ai/models/instrumented.py
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        prepared_settings, prepared_parameters = self.wrapped.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        with self._instrument(messages, prepared_settings, prepared_parameters) as finish:
+            response = await self.wrapped.request(messages, model_settings, model_request_parameters)
+            finish(response, prepared_parameters)
+            return response
+
+## pydantic_ai_slim/pydantic_ai/models/openai.py
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        check_allow_model_requests()
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        response = await self._completions_create(
+            messages, False, cast(OpenAIChatModelSettings, model_settings or {}), model_request_parameters
+        )
+
+        # Handle ModelResponse returned directly (for content filters)
+        if isinstance(response, ModelResponse):
+            return response
+
+        model_response = self._process_response(response)
+        return model_response
+
+## pydantic_ai_slim/pydantic_ai/providers/__init__.py
+
+    def model_profile(self, model_name: str) -> ModelProfile | None:
+        """The model profile for the named model, if available."""
+        return None  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+def _get_usage_checking_stream_response(
+    stream_response: models.StreamedResponse,
+    limits: UsageLimits | None,
+    get_usage: Callable[[], RunUsage],
+) -> AsyncIterator[ModelResponseStreamEvent]:
+    if limits is not None and limits.has_token_limits():
+
+        async def _usage_checking_iterator():
+            async for item in stream_response:
+                limits.check_tokens(get_usage())
+                yield item
+
+        return _usage_checking_iterator()
+    else:
+        return aiter(stream_response)
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    async def aclose(self) -> None:
+        await self.wrapped.aclose()
+
+## pydantic_ai_slim/pydantic_ai/ui/_web/api.py
+
+def validate_request_options(
+    extra_data: ChatRequestExtra,
+    model_ids: set[str],
+    builtin_tool_ids: set[str],
+) -> str | None:
+    """Validate that requested model and tools are in the allowed lists.
+
+    Returns an error message if validation fails, or None if valid.
+    """
+    if extra_data.model and extra_data.model not in model_ids:
+        return f'Model "{extra_data.model}" is not in the allowed models list'
+
+    # base model also validates this but makes sense to have an api check, since one could be a UI bug/misbehavior
+    # the other would be a pydantic-ai bug
+    # also as future proofing since we don't know how users will use this feature in the future
+    invalid_tools = [t for t in extra_data.builtin_tools if t not in builtin_tool_ids]
+    if invalid_tools:
+        return f'Builtin tool(s) {invalid_tools} not in the allowed tools list'
+
+    return None
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py
+
+    def encode(self, sdk_version: int) -> str:
+        return self.model_dump_json(by_alias=True, exclude_none=True)
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+class UsageLimits:
+    """Limits on model usage.
+
+    The request count is tracked by pydantic_ai, and the request limit is checked before each request to the model.
+    Token counts are provided in responses from the model, and the token limits are checked after each response.
+
+    Each of the limits can be set to `None` to disable that limit.
+    """
+
+    request_limit: int | None = 50
+    """The maximum number of requests allowed to the model."""
+    tool_calls_limit: int | None = None
+    """The maximum number of successful tool calls allowed to be executed."""
+    input_tokens_limit: int | None = None
+    """The maximum number of input/prompt tokens allowed."""
+    output_tokens_limit: int | None = None
+    """The maximum number of output/response tokens allowed."""
+    total_tokens_limit: int | None = None
+    """The maximum number of tokens allowed in requests and responses combined."""
+    count_tokens_before_request: bool = False
+    """If True, perform a token counting pass before sending the request to the model,
+    to enforce `request_tokens_limit` ahead of time.
+
+    This may incur additional overhead (from calling the model's `count_tokens` API before making the actual request) and is disabled by default.
+
+    Supported by:
+
+    - Anthropic
+    - Google
+    - Bedrock Converse
+
+    Support for OpenAI is in development: https://github.com/pydantic/pydantic-ai/issues/3430
+    """
+
+    @property
+    @deprecated('`request_tokens_limit` is deprecated, use `input_tokens_limit` instead')
+    def request_tokens_limit(self) -> int | None:
+        return self.input_tokens_limit
+
+    @property
+    @deprecated('`response_tokens_limit` is deprecated, use `output_tokens_limit` instead')
+    def response_tokens_limit(self) -> int | None:
+        return self.output_tokens_limit
+
+    @overload
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+    ) -> None:
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit
+        self.output_tokens_limit = output_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    @overload
+    @deprecated(
+        'Use `input_tokens_limit` instead of `request_tokens_limit` and `output_tokens_limit` and `total_tokens_limit`'
+    )
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+    ) -> None:
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = request_tokens_limit
+        self.output_tokens_limit = response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+        # deprecated:
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+    ):
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit if input_tokens_limit is not None else request_tokens_limit
+        self.output_tokens_limit = output_tokens_limit if output_tokens_limit is not None else response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    def has_token_limits(self) -> bool:
+        """Returns `True` if this instance places any limits on token counts.
+
+        If this returns `False`, the `check_tokens` method will never raise an error.
+
+        This is useful because if we have token limits, we need to check them after receiving each streamed message.
+        If there are no limits, we can skip that processing in the streaming response iterator.
+        """
+        return any(
+            limit is not None for limit in (self.input_tokens_limit, self.output_tokens_limit, self.total_tokens_limit)
+        )
+
+    def check_before_request(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next request would exceed any of the limits."""
+        request_limit = self.request_limit
+        if request_limit is not None and usage.requests > request_limit:
+            raise UsageLimitExceeded(f'The next request would exceed the request_limit of {request_limit}')
+
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(
+                f'The next request would exceed the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(  # pragma: lax no cover
+                f'The next request would exceed the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})'
+            )
+
+    def check_tokens(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the usage exceeds any of the token limits."""
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})')
+
+        output_tokens = usage.output_tokens
+        if self.output_tokens_limit is not None and output_tokens > self.output_tokens_limit:
+            raise UsageLimitExceeded(
+                f'Exceeded the output_tokens_limit of {self.output_tokens_limit} ({output_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})')
+
+    def check_before_tool_call(self, projected_usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next tool call(s) would exceed the tool call limit."""
+        tool_calls_limit = self.tool_calls_limit
+        tool_calls = projected_usage.tool_calls
+        if tool_calls_limit is not None and tool_calls > tool_calls_limit:
+            raise UsageLimitExceeded(
+                f'The next tool call(s) would exceed the tool_calls_limit of {tool_calls_limit} ({tool_calls=}).'
+            )
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+    def request_tokens_limit(self) -> int | None:
+        return self.input_tokens_limit
+
+    def response_tokens_limit(self) -> int | None:
+        return self.output_tokens_limit
+
+    def check_before_request(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the next request would exceed any of the limits."""
+        request_limit = self.request_limit
+        if request_limit is not None and usage.requests > request_limit:
+            raise UsageLimitExceeded(f'The next request would exceed the request_limit of {request_limit}')
+
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(
+                f'The next request would exceed the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(  # pragma: lax no cover
+                f'The next request would exceed the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})'
+            )
+
+## pydantic_evals/pydantic_evals/otel/span_tree.py
+
+    def first(self, predicate: SpanQuery | SpanPredicate) -> SpanNode | None:
+        """Find the first node that matches a predicate, scanning from each root in DFS order. Returns `None` if not found."""
+        return next(self._filter(predicate), None)
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+## tests/conftest.py
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+## tests/models/mock_openai.py
+
+    def create_mock(cls, completions: MockChatCompletion | Sequence[MockChatCompletion]) -> AsyncOpenAI:
+        return cast(AsyncOpenAI, cls(completions=completions))
+
+## tests/models/test_anthropic.py
+
+    def create_mock(cls, messages_: MockAnthropicMessage | Sequence[MockAnthropicMessage]) -> AsyncAnthropic:
+        return cast(AsyncAnthropic, cls(messages_=messages_))
+
+async def test_model_settings_reusable_with_beta_headers(allow_model_requests: None):
+    """Verify that model_settings with extra_headers can be reused across multiple runs.
+
+    This test ensures that the beta header extraction doesn't mutate the original model_settings,
+    allowing the same settings to be used for multiple agent runs.
+    """
+    c = completion_message(
+        [BetaTextBlock(text='Hello!', type='text')],
+        BetaUsage(input_tokens=5, output_tokens=10),
+    )
+    mock_client = MockAnthropic.create_mock(c)
+
+    model_settings = AnthropicModelSettings(extra_headers={'anthropic-beta': 'custom-feature-1, custom-feature-2'})
+
+    model = AnthropicModel(
+        'claude-sonnet-4-5',
+        provider=AnthropicProvider(anthropic_client=mock_client),
+        settings=model_settings,
+    )
+
+    agent = Agent(model)
+
+    # First run
+    await agent.run('Hello')
+
+    # Verify the original model_settings is not mutated
+    assert model_settings.get('extra_headers') == {'anthropic-beta': 'custom-feature-1, custom-feature-2'}
+
+    # Second run should work with the same beta headers
+    await agent.run('Hello again')
+
+    # Verify again after second run
+    assert model_settings.get('extra_headers') == {'anthropic-beta': 'custom-feature-1, custom-feature-2'}
+
+    # Verify both runs had the correct betas
+    all_kwargs = get_mock_chat_completion_kwargs(mock_client)
+    assert len(all_kwargs) == 2
+    for completion_kwargs in all_kwargs:
+        betas = completion_kwargs['betas']
+        assert 'custom-feature-1' in betas
+        assert 'custom-feature-2' in betas
+
+## tests/models/test_xai.py
+
+async def test_xai_image_input(allow_model_requests: None):
+    """Test that xAI model handles image inputs (text is extracted from content)."""
+    response = create_response(content='done')
+    mock_client = MockXai.create_mock([response])
+    model = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(model)
+
+    image_url = ImageUrl('https://example.com/image.png')
+    binary_image = BinaryContent(b'\x89PNG', media_type='image/png', vendor_metadata={'detail': 'high'})
+
+    result = await agent.run(['Describe these inputs.', image_url, binary_image])
+    assert result.output == 'done'
+
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [
+                    {
+                        'content': [
+                            {'text': 'Describe these inputs.'},
+                            {'image_url': {'image_url': 'https://example.com/image.png', 'detail': 'DETAIL_AUTO'}},
+                            {'image_url': {'image_url': 'data:image/png;base64,iVBORw==', 'detail': 'DETAIL_HIGH'}},
+                        ],
+                        'role': 'ROLE_USER',
+                    }
+                ],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+async def test_xai_response_with_logprobs(allow_model_requests: None):
+    """Test that logprobs are correctly extracted from xAI responses."""
+    response = create_response(
+        content='Belo Horizonte.',
+        logprobs=[
+            create_logprob('Belo', -0.5),
+            create_logprob(' Horizonte', -0.25),
+            create_logprob('.', -0.0),
+        ],
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('What is the capital of Minas Gerais?')
+    messages = result.all_messages()
+    response_msg = messages[1]
+    assert isinstance(response_msg, ModelResponse)
+    text_part = response_msg.parts[0]
+    assert isinstance(text_part, TextPart)
+    assert text_part.provider_details is not None
+    assert 'logprobs' in text_part.provider_details
+    assert text_part.provider_details['logprobs'] == snapshot(
+        {
+            'content': [
+                {'token': 'Belo', 'logprob': -0.5, 'bytes': [66, 101, 108, 111], 'top_logprobs': []},
+                {
+                    'token': ' Horizonte',
+                    'logprob': -0.25,
+                    'bytes': [32, 72, 111, 114, 105, 122, 111, 110, 116, 101],
+                    'top_logprobs': [],
+                },
+                {'token': '.', 'logprob': -0.0, 'bytes': [46], 'top_logprobs': []},
+            ]
+        }
+    )

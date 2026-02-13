@@ -1,0 +1,194 @@
+## pydantic_ai_slim/pydantic_ai/direct.py
+
+STREAM_INITIALIZATION_TIMEOUT = 30
+
+async def model_request(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> messages.ModelResponse:
+    """Make a non-streamed request to a model.
+
+    ```py title="model_request_example.py"
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request
+
+
+    async def main():
+        model_response = await model_request(
+            'anthropic:claude-haiku-4-5',
+            [ModelRequest.user_text_prompt('What is the capital of France?')]  # (1)!
+        )
+        print(model_response)
+        '''
+        ModelResponse(
+            parts=[TextPart(content='The capital of France is Paris.')],
+            usage=RequestUsage(input_tokens=56, output_tokens=7),
+            model_name='claude-haiku-4-5',
+            timestamp=datetime.datetime(...),
+        )
+        '''
+    ```
+
+    1. See [`ModelRequest.user_text_prompt`][pydantic_ai.messages.ModelRequest.user_text_prompt] for details.
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        The model response and token usage associated with the request.
+    """
+    model_instance = _prepare_model(model, instrument)
+    return await model_instance.request(
+        list(messages),
+        model_settings,
+        model_request_parameters or models.ModelRequestParameters(),
+    )
+
+def model_request_stream(
+    model: models.Model | models.KnownModelName | str,
+    messages: Sequence[messages.ModelMessage],
+    *,
+    model_settings: settings.ModelSettings | None = None,
+    model_request_parameters: models.ModelRequestParameters | None = None,
+    instrument: instrumented_models.InstrumentationSettings | bool | None = None,
+) -> AbstractAsyncContextManager[models.StreamedResponse]:
+    """Make a streamed async request to a model.
+
+    ```py {title="model_request_stream_example.py"}
+
+    from pydantic_ai import ModelRequest
+    from pydantic_ai.direct import model_request_stream
+
+
+    async def main():
+        messages = [ModelRequest.user_text_prompt('Who was Albert Einstein?')]  # (1)!
+        async with model_request_stream('openai:gpt-5-mini', messages) as stream:
+            chunks = []
+            async for chunk in stream:
+                chunks.append(chunk)
+            print(chunks)
+            '''
+            [
+                PartStartEvent(index=0, part=TextPart(content='Albert Einstein was ')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(
+                    index=0, delta=TextPartDelta(content_delta='a German-born theoretical ')
+                ),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='physicist.')),
+                PartEndEvent(
+                    index=0,
+                    part=TextPart(
+                        content='Albert Einstein was a German-born theoretical physicist.'
+                    ),
+                ),
+            ]
+            '''
+    ```
+
+    1. See [`ModelRequest.user_text_prompt`][pydantic_ai.messages.ModelRequest.user_text_prompt] for details.
+
+    Args:
+        model: The model to make a request to. We allow `str` here since the actual list of allowed models changes frequently.
+        messages: Messages to send to the model
+        model_settings: optional model settings
+        model_request_parameters: optional model request parameters
+        instrument: Whether to instrument the request with OpenTelemetry/Logfire, if `None` the value from
+            [`logfire.instrument_pydantic_ai`][logfire.Logfire.instrument_pydantic_ai] is used.
+
+    Returns:
+        A [stream response][pydantic_ai.models.StreamedResponse] async context manager.
+    """
+    model_instance = _prepare_model(model, instrument)
+    return model_instance.request_stream(
+        list(messages),
+        model_settings,
+        model_request_parameters or models.ModelRequestParameters(),
+    )
+
+## pydantic_ai_slim/pydantic_ai/models/instrumented.py
+
+class CostCalculationFailedWarning(Warning):
+    """Warning raised when cost calculation fails."""
+
+## tests/test_direct.py
+
+async def test_model_request():
+    model_response = await model_request('test', [ModelRequest.user_text_prompt('x')])
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[TextPart(content='success (no tool calls)')],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=4),
+        )
+    )
+
+async def test_model_request_tool_call():
+    model_response = await model_request(
+        'test',
+        [ModelRequest.user_text_prompt('x')],
+        model_request_parameters=ModelRequestParameters(
+            function_tools=[ToolDefinition(name='tool_name', parameters_json_schema={'type': 'object'})],
+            allow_text_output=False,
+        ),
+    )
+    assert model_response == snapshot(
+        ModelResponse(
+            parts=[ToolCallPart(tool_name='tool_name', args={}, tool_call_id=IsStr(regex='pyd_ai_.*'))],
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            usage=RequestUsage(input_tokens=51, output_tokens=2),
+        )
+    )
+
+def test_model_request_stream_sync():
+    with model_request_stream_sync('test', [ModelRequest.user_text_prompt('x')]) as stream:
+        chunks = list(stream)
+        assert chunks == snapshot(
+            [
+                PartStartEvent(index=0, part=TextPart(content='')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='success ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='(no ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='tool ')),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='calls)')),
+                PartEndEvent(index=0, part=TextPart(content='success (no tool calls)')),
+            ]
+        )
+        assert stream.response == snapshot(
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=51, output_tokens=4),
+                model_name='test',
+                timestamp=IsDatetime(),
+                provider_name='test',
+            )
+        )
+
+        repr_str = repr(stream)
+        assert 'TestStreamedResponse' in repr_str
+        assert 'test' in repr_str
+
+async def test_model_request_stream():
+    async with model_request_stream('test', [ModelRequest.user_text_prompt('x')]) as stream:
+        chunks = [chunk async for chunk in stream]
+    assert chunks == snapshot(
+        [
+            PartStartEvent(index=0, part=TextPart(content='')),
+            FinalResultEvent(tool_name=None, tool_call_id=None),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='success ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='(no ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='tool ')),
+            PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='calls)')),
+            PartEndEvent(index=0, part=TextPart(content='success (no tool calls)')),
+        ]
+    )

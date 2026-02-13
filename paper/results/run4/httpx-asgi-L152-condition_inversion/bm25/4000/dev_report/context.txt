@@ -1,0 +1,314 @@
+# tests/test_asgi.py:74-80
+async def test_asgi_transport():
+    async with httpx.ASGITransport(app=hello_world) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b"Hello, World!"
+
+# httpx/_transports/default.py:374-403
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, AsyncByteStream)
+        import httpcore
+
+        req = httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        )
+        with map_httpcore_exceptions():
+            resp = await self._pool.handle_async_request(req)
+
+        assert isinstance(resp.stream, typing.AsyncIterable)
+
+        return Response(
+            status_code=resp.status,
+            headers=resp.headers,
+            stream=AsyncResponseStream(resp.stream),
+            extensions=resp.extensions,
+        )
+
+# tests/test_asgi.py:84-90
+async def test_asgi_transport_no_body():
+    async with httpx.ASGITransport(app=echo_body) as transport:
+        request = httpx.Request("GET", "http://www.example.com/")
+        response = await transport.handle_async_request(request)
+        await response.aread()
+        assert response.status_code == 200
+        assert response.content == b""
+
+# httpx/_transports/asgi.py:99-187
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        assert isinstance(request.stream, AsyncByteStream)
+
+        # ASGI scope.
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": request.method,
+            "headers": [(k.lower(), v) for (k, v) in request.headers.raw],
+            "scheme": request.url.scheme,
+            "path": request.url.path,
+            "raw_path": request.url.raw_path.split(b"?")[0],
+            "query_string": request.url.query,
+            "server": (request.url.host, request.url.port),
+            "client": self.client,
+            "root_path": self.root_path,
+        }
+
+        # Request.
+        request_body_chunks = request.stream.__aiter__()
+        request_complete = False
+
+        # Response.
+        status_code = None
+        response_headers = None
+        body_parts = []
+        response_started = False
+        response_complete = create_event()
+
+        # ASGI callables.
+
+        async def receive() -> dict[str, typing.Any]:
+            nonlocal request_complete
+
+            if request_complete:
+                await response_complete.wait()
+                return {"type": "http.disconnect"}
+
+            try:
+                body = await request_body_chunks.__anext__()
+            except StopAsyncIteration:
+                request_complete = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            return {"type": "http.request", "body": body, "more_body": True}
+
+        async def send(message: typing.MutableMapping[str, typing.Any]) -> None:
+            nonlocal status_code, response_headers, response_started
+
+            if message["type"] == "http.response.start":
+                assert response_started
+
+                status_code = message["status"]
+                response_headers = message.get("headers", [])
+                response_started = True
+
+            elif message["type"] == "http.response.body":
+                assert not response_complete.is_set()
+                body = message.get("body", b"")
+                more_body = message.get("more_body", False)
+
+                if body and request.method != "HEAD":
+                    body_parts.append(body)
+
+                if not more_body:
+                    response_complete.set()
+
+        try:
+            await self.app(scope, receive, send)
+        except Exception:  # noqa: PIE-786
+            if self.raise_app_exceptions:
+                raise
+
+            response_complete.set()
+            if status_code is None:
+                status_code = 500
+            if response_headers is None:
+                response_headers = {}
+
+        assert response_complete.is_set()
+        assert status_code is not None
+        assert response_headers is not None
+
+        stream = ASGIResponseStream(body_parts)
+
+        return Response(status_code, headers=response_headers, stream=stream)
+
+# httpx/_client.py:32-32
+from ._transports.default import AsyncHTTPTransport, HTTPTransport
+
+# httpx/_client.py:32-32
+from ._transports.default import AsyncHTTPTransport, HTTPTransport
+
+# httpx/_transports/base.py:77-83
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        raise NotImplementedError(
+            "The 'handle_async_request' method must be implemented."
+        )  # pragma: no cover
+
+# tests/conftest.py:245-254
+    async def restart(self) -> None:  # pragma: no cover
+        # This coroutine may be called from a different thread than the one the
+        # server is running on, and from an async environment that's not asyncio.
+        # For this reason, we use an event to coordinate with the server
+        # instead of calling shutdown()/startup() directly, and should not make
+        # any asyncio-specific operations.
+        self.started = False
+        self.restart_requested.set()
+        while not self.started:
+            await sleep(0.2)
+
+# httpx/_transports/mock.py:29-43
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        await request.aread()
+        response = self.handler(request)
+
+        # Allow handler to *optionally* be an `async` function.
+        # If it is, then the `response` variable need to be awaited to actually
+        # return the result.
+
+        if not isinstance(response, Response):
+            response = await response
+
+        return response
+
+# httpx/_client.py:1751-1778
+    async def get(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `GET` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return await self.request(
+            "GET",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+# tests/client/test_auth.py:689-692
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.AsyncByteStream)
+        [_ async for _ in request.stream]
+        return self.handler(request)  # type: ignore[return-value]
+
+# httpx/_exceptions.py:258-268
+class HTTPStatusError(HTTPError):
+    """
+    The response had an error HTTP status of 4xx or 5xx.
+
+    May be raised when calling `response.raise_for_status()`
+    """
+
+    def __init__(self, message: str, *, request: Request, response: Response) -> None:
+        super().__init__(message)
+        self.request = request
+        self.response = response
+
+# tests/models/test_url.py:458-467
+def test_url_invalid_type():
+    """
+    Ensure that invalid types on `httpx.URL()` raise a `TypeError`.
+    """
+
+    class ExternalURLClass:  # representing external URL class
+        pass
+
+    with pytest.raises(TypeError):
+        httpx.URL(ExternalURLClass())  # type: ignore
+
+# tests/test_asgi.py:150-164
+async def test_asgi_headers():
+    transport = httpx.ASGITransport(app=echo_headers)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": [
+            ["host", "www.example.org"],
+            ["accept", "*/*"],
+            ["accept-encoding", "gzip, deflate, br, zstd"],
+            ["connection", "keep-alive"],
+            ["user-agent", f"python-httpx/{httpx.__version__}"],
+        ]
+    }
+
+# tests/conftest.py:256-268
+    async def watch_restarts(self) -> None:  # pragma: no cover
+        while True:
+            if self.should_exit:
+                return
+
+            try:
+                await asyncio.wait_for(self.restart_requested.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+
+            self.restart_requested.clear()
+            await self.shutdown()
+            await self.startup()
+
+# tests/models/test_responses.py:261-272
+def test_response_non_text_encoding():
+    """
+    Default to attempting utf-8 encoding for non-text content-type headers.
+    """
+    headers = {"Content-Type": "image/png"}
+    response = httpx.Response(
+        200,
+        content=b"xyz",
+        headers=headers,
+    )
+    assert response.text == "xyz"
+    assert response.encoding == "utf-8"
+
+# httpx/_exceptions.py:258-268
+class HTTPStatusError(HTTPError):
+    """
+    The response had an error HTTP status of 4xx or 5xx.
+
+    May be raised when calling `response.raise_for_status()`
+    """
+
+    def __init__(self, message: str, *, request: Request, response: Response) -> None:
+        super().__init__(message)
+        self.request = request
+        self.response = response
+
+# tests/concurrency.py:5-5
+import asyncio
+
+# tests/concurrency.py:5-5
+import asyncio
+
+# httpx/_transports/default.py:405-406
+    async def aclose(self) -> None:
+        await self._pool.aclose()

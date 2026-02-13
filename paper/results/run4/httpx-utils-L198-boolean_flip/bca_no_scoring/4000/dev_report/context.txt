@@ -1,0 +1,472 @@
+## httpx/_decoders.py
+
+class ContentDecoder:
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+class TextDecoder:
+    """
+    Handles incrementally decoding bytes into text
+    """
+
+    def __init__(self, encoding: str = "utf-8") -> None:
+        self.decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+
+    def decode(self, data: bytes) -> str:
+        return self.decoder.decode(data)
+
+    def flush(self) -> str:
+        return self.decoder.decode(b"", True)
+
+## httpx/_models.py
+
+def _is_known_encoding(encoding: str) -> bool:
+    """
+    Return `True` if `encoding` is a known codec.
+    """
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        return False
+    return True
+
+def _normalize_header_key(key: str | bytes, encoding: str | None = None) -> bytes:
+    """
+    Coerce str/bytes into a strictly byte-wise HTTP header key.
+    """
+    return key if isinstance(key, bytes) else key.encode(encoding or "ascii")
+
+def _parse_content_type_charset(content_type: str) -> str | None:
+    # We used to use `cgi.parse_header()` here, but `cgi` became a dead battery.
+    # See: https://peps.python.org/pep-0594/#cgi
+    msg = email.message.Message()
+    msg["content-type"] = content_type
+    return msg.get_content_charset(failobj=None)
+
+def _obfuscate_sensitive_headers(
+    items: typing.Iterable[tuple[typing.AnyStr, typing.AnyStr]],
+) -> typing.Iterator[tuple[typing.AnyStr, typing.AnyStr]]:
+    for k, v in items:
+        if to_str(k.lower()) in SENSITIVE_HEADERS:
+            v = to_bytes_or_str("[secure]", match_type_of=v)
+        yield k, v
+
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+## httpx/_utils.py
+
+def to_bytes(value: str | bytes, encoding: str = "utf-8") -> bytes:
+    return value.encode(encoding) if isinstance(value, str) else value
+
+def to_str(value: str | bytes, encoding: str = "utf-8") -> str:
+    return value if isinstance(value, str) else value.decode(encoding)
+
+def to_bytes_or_str(value: str, match_type_of: typing.AnyStr) -> typing.AnyStr:
+    return value if isinstance(match_type_of, str) else value.encode()
+
+def unquote(value: str) -> str:
+    return value[1:-1] if value[0] == value[-1] == '"' else value
+
+class URLPattern:
+    """
+    A utility class currently used for making lookups against proxy keys...
+
+    # Wildcard matching...
+    >>> pattern = URLPattern("all://")
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    True
+
+    # Witch scheme matching...
+    >>> pattern = URLPattern("https://")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    False
+
+    # With domain matching...
+    >>> pattern = URLPattern("https://example.com")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    False
+    >>> pattern.matches(httpx.URL("https://other.com"))
+    False
+
+    # Wildcard scheme, with domain matching...
+    >>> pattern = URLPattern("all://example.com")
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("http://example.com"))
+    True
+    >>> pattern.matches(httpx.URL("https://other.com"))
+    False
+
+    # With port matching...
+    >>> pattern = URLPattern("https://example.com:1234")
+    >>> pattern.matches(httpx.URL("https://example.com:1234"))
+    True
+    >>> pattern.matches(httpx.URL("https://example.com"))
+    False
+    """
+
+    def __init__(self, pattern: str) -> None:
+        from ._urls import URL
+
+        if pattern and ":" not in pattern:
+            raise ValueError(
+                f"Proxy keys should use proper URL forms rather "
+                f"than plain scheme strings. "
+                f'Instead of "{pattern}", use "{pattern}://"'
+            )
+
+        url = URL(pattern)
+        self.pattern = pattern
+        self.scheme = "" if url.scheme == "all" else url.scheme
+        self.host = "" if url.host == "*" else url.host
+        self.port = url.port
+        if not url.host or url.host == "*":
+            self.host_regex: typing.Pattern[str] | None = None
+        elif url.host.startswith("*."):
+            # *.example.com should match "www.example.com", but not "example.com"
+            domain = re.escape(url.host[2:])
+            self.host_regex = re.compile(f"^.+\\.{domain}$")
+        elif url.host.startswith("*"):
+            # *example.com should match "www.example.com" and "example.com"
+            domain = re.escape(url.host[1:])
+            self.host_regex = re.compile(f"^(.+\\.)?{domain}$")
+        else:
+            # example.com should match "example.com" but not "www.example.com"
+            domain = re.escape(url.host)
+            self.host_regex = re.compile(f"^{domain}$")
+
+    def matches(self, other: URL) -> bool:
+        if self.scheme and self.scheme != other.scheme:
+            return False
+        if (
+            self.host
+            and self.host_regex is not None
+            or not self.host_regex.match(other.host)
+        ):
+            return False
+        if self.port is not None and self.port != other.port:
+            return False
+        return True
+
+    @property
+    def priority(self) -> tuple[int, int, int]:
+        """
+        The priority allows URLPattern instances to be sortable, so that
+        we can match from most specific to least specific.
+        """
+        # URLs with a port should take priority over URLs without a port.
+        port_priority = 0 if self.port is not None else 1
+        # Longer hostnames should match first.
+        host_priority = -len(self.host)
+        # Longer schemes should match first.
+        scheme_priority = -len(self.scheme)
+        return (port_priority, host_priority, scheme_priority)
+
+    def __hash__(self) -> int:
+        return hash(self.pattern)
+
+    def __lt__(self, other: URLPattern) -> bool:
+        return self.priority < other.priority
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return isinstance(other, URLPattern) and self.pattern == other.pattern
+
+    def matches(self, other: URL) -> bool:
+        if self.scheme and self.scheme != other.scheme:
+            return False
+        if (
+            self.host
+            and self.host_regex is not None
+            or not self.host_regex.match(other.host)
+        ):
+            return False
+        if self.port is not None and self.port != other.port:
+            return False
+        return True
+
+    def priority(self) -> tuple[int, int, int]:
+        """
+        The priority allows URLPattern instances to be sortable, so that
+        we can match from most specific to least specific.
+        """
+        # URLs with a port should take priority over URLs without a port.
+        port_priority = 0 if self.port is not None else 1
+        # Longer hostnames should match first.
+        host_priority = -len(self.host)
+        # Longer schemes should match first.
+        scheme_priority = -len(self.scheme)
+        return (port_priority, host_priority, scheme_priority)
+
+    def __hash__(self) -> int:
+        return hash(self.pattern)
+
+    def __lt__(self, other: URLPattern) -> bool:
+        return self.priority < other.priority
+
+    def __eq__(self, other: typing.Any) -> bool:
+        return isinstance(other, URLPattern) and self.pattern == other.pattern
+
+def is_ipv4_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv4Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+def is_ipv6_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv6Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+## tests/client/test_async_client.py
+
+def hello_world(request):
+    return httpx.Response(200, text="Hello, world!")
+
+## tests/client/test_headers.py
+
+def echo_headers(request: httpx.Request) -> httpx.Response:
+    data = {"headers": dict(request.headers)}
+    return httpx.Response(200, json=data)
+
+## tests/client/test_proxies.py
+
+def test_transport_for_request(url, proxies, expected):
+    mounts = {key: httpx.HTTPTransport(proxy=value) for key, value in proxies.items()}
+    client = httpx.Client(mounts=mounts)
+
+    transport = client._transport_for_url(httpx.URL(url))
+
+    if expected is None:
+        assert transport is client._transport
+    else:
+        assert isinstance(transport, httpx.HTTPTransport)
+        assert isinstance(transport._pool, httpcore.HTTPProxy)
+        assert transport._pool._proxy_url == url_to_origin(expected)
+
+def test_proxies_environ(monkeypatch, client_class, url, env, expected):
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    client = client_class()
+    transport = client._transport_for_url(httpx.URL(url))
+
+    if expected is None:
+        assert transport == client._transport
+    else:
+        assert transport._pool._proxy_url == url_to_origin(expected)
+
+def test_proxy_with_mounts():
+    proxy_transport = httpx.HTTPTransport(proxy="http://127.0.0.1")
+    client = httpx.Client(mounts={"http://": proxy_transport})
+
+    transport = client._transport_for_url(httpx.URL("http://example.com"))
+    assert transport == proxy_transport
+
+## tests/concurrency.py
+
+async def sleep(seconds: float) -> None:
+    if sniffio.current_async_library() == "trio":
+        await trio.sleep(seconds)  # pragma: no cover
+    else:
+        await asyncio.sleep(seconds)
+
+## tests/conftest.py
+
+async def hello_world(scope: Scope, receive: Receive, send: Send) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [[b"content-type", b"text/plain"]],
+        }
+    )
+    await send({"type": "http.response.body", "body": b"Hello, world!"})
+
+async def hello_world_json(scope: Scope, receive: Receive, send: Send) -> None:
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [[b"content-type", b"application/json"]],
+        }
+    )
+    await send({"type": "http.response.body", "body": b'{"Hello": "world!"}'})
+
+async def redirect_301(scope: Scope, receive: Receive, send: Send) -> None:
+    await send(
+        {"type": "http.response.start", "status": 301, "headers": [[b"location", b"/"]]}
+    )
+    await send({"type": "http.response.body"})
+
+def cert_authority():
+    return trustme.CA()
+
+def localhost_cert(cert_authority):
+    return cert_authority.issue_cert("localhost")
+
+def cert_pem_file(localhost_cert):
+    with localhost_cert.cert_chain_pems[0].tempfile() as tmp:
+        yield tmp
+
+def cert_private_key_file(localhost_cert):
+    with localhost_cert.private_key_pem.tempfile() as tmp:
+        yield tmp
+
+    def url(self) -> httpx.URL:
+        protocol = "https" if self.config.is_ssl else "http"
+        return httpx.URL(f"{protocol}://{self.config.host}:{self.config.port}/")
+
+def serve_in_thread(server: TestServer) -> typing.Iterator[TestServer]:
+    thread = threading.Thread(target=server.run)
+    thread.start()
+    try:
+        while not server.started:
+            time.sleep(1e-3)
+        yield server
+    finally:
+        server.should_exit = True
+        thread.join()
+
+def server() -> typing.Iterator[TestServer]:
+    config = Config(app=app, lifespan="off", loop="asyncio")
+    server = TestServer(config=config)
+    yield from serve_in_thread(server)
+
+## tests/models/test_responses.py
+
+def test_iter_raw_on_async():
+    response = httpx.Response(
+        200,
+        content=async_streaming_body(),
+    )
+
+    with pytest.raises(RuntimeError):
+        list(response.iter_raw())
+
+def test_iter_raw_increments_updates_counter():
+    response = httpx.Response(200, content=streaming_body())
+
+    num_downloaded = response.num_bytes_downloaded
+    for part in response.iter_raw():
+        assert len(part) == (response.num_bytes_downloaded - num_downloaded)
+        num_downloaded = response.num_bytes_downloaded
+
+async def test_aiter_raw():
+    response = httpx.Response(200, content=async_streaming_body())
+
+    raw = b""
+    async for part in response.aiter_raw():
+        raw += part
+    assert raw == b"Hello, world!"
+
+async def test_aiter_raw_on_sync():
+    response = httpx.Response(
+        200,
+        content=streaming_body(),
+    )
+
+    with pytest.raises(RuntimeError):
+        [part async for part in response.aiter_raw()]
+
+async def test_aiter_raw_increments_updates_counter():
+    response = httpx.Response(200, content=async_streaming_body())
+
+    num_downloaded = response.num_bytes_downloaded
+    async for part in response.aiter_raw():
+        assert len(part) == (response.num_bytes_downloaded - num_downloaded)
+        num_downloaded = response.num_bytes_downloaded
+
+def test_iter_bytes():
+    response = httpx.Response(200, content=b"Hello, world!")
+
+    content = b""
+    for part in response.iter_bytes():
+        content += part
+    assert content == b"Hello, world!"
+
+def test_iter_bytes_with_empty_response():
+    response = httpx.Response(200, content=b"")
+    parts = list(response.iter_bytes())
+    assert parts == []
+
+def test_iter_lines():
+    response = httpx.Response(
+        200,
+        content=b"Hello,\nworld!",
+    )
+    content = list(response.iter_lines())
+    assert content == ["Hello,", "world!"]
+
+## tests/test_content.py
+
+url = "https://www.example.com"
+
+## tests/test_decoders.py
+
+def test_streaming_text_decoder(
+    data: typing.Iterable[bytes], expected: list[str]
+) -> None:
+    response = httpx.Response(200, content=iter(data))
+    assert list(response.iter_text()) == expected
+
+## tests/test_utils.py
+
+def test_encoded(encoding):
+    content = '{"abc": 123}'.encode(encoding)
+    response = httpx.Response(200, content=content)
+    assert response.json() == {"abc": 123}
+
+def test_bad_utf_like_encoding():
+    content = b"\x00\x00\x00\x00"
+    response = httpx.Response(200, content=content)
+    with pytest.raises(json.decoder.JSONDecodeError):
+        response.json()
+
+def test_guess_by_bom(encoding, expected):
+    content = '\ufeff{"abc": 123}'.encode(encoding)
+    response = httpx.Response(200, content=content)
+    assert response.json() == {"abc": 123}
+
+def test_get_environment_proxies(environment, proxies):
+    os.environ.update(environment)
+
+    assert get_environment_proxies() == proxies
+
+def test_url_matches(pattern, url, expected):
+    pattern = URLPattern(pattern)
+    assert pattern.matches(httpx.URL(url)) == expected
+
+def test_pattern_priority():
+    matchers = [
+        URLPattern("all://"),
+        URLPattern("http://"),
+        URLPattern("http://example.com"),
+        URLPattern("http://example.com:123"),
+    ]
+    random.shuffle(matchers)
+    assert sorted(matchers) == [
+        URLPattern("http://example.com:123"),
+        URLPattern("http://example.com"),
+        URLPattern("http://"),
+        URLPattern("all://"),
+    ]

@@ -90,6 +90,7 @@ class EvalTask:
     commit: str = ""
     setup_cmd: str = ""
     vague_description: str = ""
+    dev_report_description: str = ""  # test failure + traceback (no line numbers)
     in_place: bool = False  # True for editable installs (e.g. pydantic-ai)
     timeout: int = 60
     mutation: dict = field(default_factory=dict)  # {file, original, mutated, line_num}
@@ -103,7 +104,7 @@ class EvalResult:
     task_id: str
     method: str
     budget: int
-    query_type: str  # "exact" or "vague"
+    query_type: str  # "exact", "dev_report", or "vague"
     tokens_used: int
     symbols_selected: int
     files_included: int
@@ -2129,7 +2130,7 @@ async def run_benchmark(
 
     Args:
         query_types: List of query types to run. Default: ["exact"].
-            Use ["exact", "vague"] for dual-query mode.
+            Use ["exact", "vague", "dev_report"] for all three tiers.
     """
     if query_types is None:
         query_types = ["exact"]
@@ -2256,13 +2257,18 @@ async def run_benchmark(
                         print(f"  SKIP vague: no vague_description for {task.task_id}")
                         continue
                     description = task.vague_description
+                elif qt == "dev_report":
+                    if not task.dev_report_description:
+                        print(f"  SKIP dev_report: no dev_report_description for {task.task_id}")
+                        continue
+                    description = task.dev_report_description
                 else:
                     description = task.description
 
                 # Methods whose output doesn't depend on budget (context is fixed).
                 # Run once at min budget; duplicate results for other budgets to keep
                 # the grid complete without wasting LLM calls + test time.
-                _BUDGET_INDEPENDENT = {"no_retrieval", "target_file"}
+                _BUDGET_INDEPENDENT = {"no_retrieval"}
 
                 for budget in budgets:
                     for method_name in methods:

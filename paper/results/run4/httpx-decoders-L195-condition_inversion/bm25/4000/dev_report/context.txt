@@ -1,0 +1,524 @@
+# httpx/_decoders.py:194-200
+    def flush(self) -> bytes:
+        if self.seen_data:
+            return b""
+        ret = self.decompressor.flush()  # note: this is a no-op
+        if not self.decompressor.eof:
+            raise DecodingError("Zstandard data is incomplete")  # pragma: no cover
+        return bytes(ret)
+
+# httpx/_decoders.py:161-200
+class ZStandardDecoder(ContentDecoder):
+    """
+    Handle 'zstd' RFC 8878 decoding.
+
+    Requires `pip install zstandard`.
+    Can be installed as a dependency of httpx using `pip install httpx[zstd]`.
+    """
+
+    # inspired by the ZstdDecoder implementation in urllib3
+    def __init__(self) -> None:
+        if zstandard is None:  # pragma: no cover
+            raise ImportError(
+                "Using 'ZStandardDecoder', ..."
+                "Make sure to install httpx using `pip install httpx[zstd]`."
+            ) from None
+
+        self.decompressor = zstandard.ZstdDecompressor().decompressobj()
+        self.seen_data = False
+
+    def decode(self, data: bytes) -> bytes:
+        assert zstandard is not None
+        self.seen_data = True
+        output = io.BytesIO()
+        try:
+            output.write(self.decompressor.decompress(data))
+            while self.decompressor.eof and self.decompressor.unused_data:
+                unused_data = self.decompressor.unused_data
+                self.decompressor = zstandard.ZstdDecompressor().decompressobj()
+                output.write(self.decompressor.decompress(unused_data))
+        except zstandard.ZstdError as exc:
+            raise DecodingError(str(exc)) from exc
+        return output.getvalue()
+
+    def flush(self) -> bytes:
+        if self.seen_data:
+            return b""
+        ret = self.decompressor.flush()  # note: this is a no-op
+        if not self.decompressor.eof:
+            raise DecodingError("Zstandard data is incomplete")  # pragma: no cover
+        return bytes(ret)
+
+# httpx/_decoders.py:78-82
+    def flush(self) -> bytes:
+        try:
+            return self.decompressor.flush()
+        except zlib.error as exc:  # pragma: no cover
+            raise DecodingError(str(exc)) from exc
+
+# tests/test_decoders.py:103-106
+def test_zstd_empty():
+    headers = [(b"Content-Encoding", b"zstd")]
+    response = httpx.Response(200, headers=headers, content=b"")
+    assert response.content == b""
+
+# httpx/_decoders.py:170-178
+    def __init__(self) -> None:
+        if zstandard is None:  # pragma: no cover
+            raise ImportError(
+                "Using 'ZStandardDecoder', ..."
+                "Make sure to install httpx using `pip install httpx[zstd]`."
+            ) from None
+
+        self.decompressor = zstandard.ZstdDecompressor().decompressobj()
+        self.seen_data = False
+
+# httpx/_models.py:884-905
+    def iter_bytes(self, chunk_size: int | None = None) -> typing.Iterator[bytes]:
+        """
+        A byte-iterator over the decoded response content.
+        This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+        """
+        if hasattr(self, "_content"):
+            chunk_size = len(self._content) if chunk_size is None else chunk_size
+            for i in range(0, len(self._content), max(chunk_size, 1)):
+                yield self._content[i : i + chunk_size]
+        else:
+            decoder = self._get_content_decoder()
+            chunker = ByteChunker(chunk_size=chunk_size)
+            with request_context(request=self._request):
+                for raw_bytes in self.iter_raw():
+                    decoded = decoder.decode(raw_bytes)
+                    for chunk in chunker.decode(decoded):
+                        yield chunk
+                decoded = decoder.flush()
+                for chunk in chunker.decode(decoded):
+                    yield chunk  # pragma: no cover
+                for chunk in chunker.flush():
+                    yield chunk
+
+# httpx/_models.py:982-1005
+    async def aiter_bytes(
+        self, chunk_size: int | None = None
+    ) -> typing.AsyncIterator[bytes]:
+        """
+        A byte-iterator over the decoded response content.
+        This allows us to handle gzip, deflate, brotli, and zstd encoded responses.
+        """
+        if hasattr(self, "_content"):
+            chunk_size = len(self._content) if chunk_size is None else chunk_size
+            for i in range(0, len(self._content), max(chunk_size, 1)):
+                yield self._content[i : i + chunk_size]
+        else:
+            decoder = self._get_content_decoder()
+            chunker = ByteChunker(chunk_size=chunk_size)
+            with request_context(request=self._request):
+                async for raw_bytes in self.aiter_raw():
+                    decoded = decoder.decode(raw_bytes)
+                    for chunk in chunker.decode(decoded):
+                        yield chunk
+                decoded = decoder.flush()
+                for chunk in chunker.decode(decoded):
+                    yield chunk  # pragma: no cover
+                for chunk in chunker.flush():
+                    yield chunk
+
+# tests/test_content.py:433-443
+async def test_response_bytes_content():
+    response = httpx.Response(200, content=b"Hello, world!")
+    assert isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(response.stream))
+    async_content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {"Content-Length": "13"}
+    assert sync_content == b"Hello, world!"
+    assert async_content == b"Hello, world!"
+
+# tests/test_content.py:299-342
+async def test_multipart_data_and_files_content():
+    data = {"message": "Hello, world!"}
+    files = {"file": io.BytesIO(b"<file content>")}
+    headers = {"Content-Type": "multipart/form-data; boundary=+++"}
+    request = httpx.Request(method, url, data=data, files=files, headers=headers)
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Length": "210",
+        "Content-Type": "multipart/form-data; boundary=+++",
+    }
+    assert sync_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="message"\r\n',
+            b"\r\n",
+            b"Hello, world!\r\n",
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+    assert async_content == b"".join(
+        [
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="message"\r\n',
+            b"\r\n",
+            b"Hello, world!\r\n",
+            b"--+++\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--+++--\r\n",
+        ]
+    )
+
+# tests/models/test_responses.py:559-569
+def test_iter_bytes_doesnt_return_empty_chunks():
+    def streaming_body_with_empty_chunks() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b""
+        yield b"world!"
+        yield b""
+
+    response = httpx.Response(200, content=streaming_body_with_empty_chunks())
+
+    parts = list(response.iter_bytes())
+    assert parts == [b"Hello, ", b"world!"]
+
+# httpx/_models.py:876-882
+    def read(self) -> bytes:
+        """
+        Read and return the response content.
+        """
+        if not hasattr(self, "_content"):
+            self._content = b"".join(self.iter_bytes())
+        return self._content
+
+# httpx/_decoders.py:40-41
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+# httpx/_models.py:974-980
+    async def aread(self) -> bytes:
+        """
+        Read and return the response content.
+        """
+        if not hasattr(self, "_content"):
+            self._content = b"".join([part async for part in self.aiter_bytes()])
+        return self._content
+
+# httpx/_decoders.py:180-192
+    def decode(self, data: bytes) -> bytes:
+        assert zstandard is not None
+        self.seen_data = True
+        output = io.BytesIO()
+        try:
+            output.write(self.decompressor.decompress(data))
+            while self.decompressor.eof and self.decompressor.unused_data:
+                unused_data = self.decompressor.unused_data
+                self.decompressor = zstandard.ZstdDecompressor().decompressobj()
+                output.write(self.decompressor.decompress(unused_data))
+        except zstandard.ZstdError as exc:
+            raise DecodingError(str(exc)) from exc
+        return output.getvalue()
+
+# httpx/_decoders.py:14-14
+from ._exceptions import DecodingError
+
+# tests/models/test_requests.py:78-86
+def test_read_and_stream_data():
+    # Ensure a request may still be streamed if it has been read.
+    # Needed for cases such as authentication classes that read the request body.
+    request = httpx.Request("POST", "http://example.org", json={"test": 123})
+    request.read()
+    assert request.stream is not None
+    assert isinstance(request.stream, typing.Iterable)
+    content = b"".join(list(request.stream))
+    assert content == request.content
+
+# tests/models/test_requests.py:90-98
+async def test_aread_and_stream_data():
+    # Ensure a request may still be streamed if it has been read.
+    # Needed for cases such as authentication classes that read the request body.
+    request = httpx.Request("POST", "http://example.org", json={"test": 123})
+    await request.aread()
+    assert request.stream is not None
+    assert isinstance(request.stream, typing.AsyncIterable)
+    content = b"".join([part async for part in request.stream])
+    assert content == request.content
+
+# tests/test_decoders.py:216-219
+def test_decoders_empty_cases(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    response = httpx.Response(content=b"", status_code=200, headers=headers)
+    assert response.read() == b""
+
+# tests/models/test_requests.py:101-108
+def test_cannot_access_streaming_content_without_read():
+    # Ensure that streaming requests
+    def streaming_body() -> typing.Iterator[bytes]:  # pragma: no cover
+        yield b""
+
+    request = httpx.Request("POST", "http://example.org", content=streaming_body())
+    with pytest.raises(httpx.RequestNotRead):
+        request.content  # noqa: B018
+
+# tests/models/test_responses.py:172-182
+def test_response_default_to_utf8_encoding():
+    """
+    Default to utf-8 encoding if there is no Content-Type header.
+    """
+    content = "おはようございます。".encode("utf-8")
+    response = httpx.Response(
+        200,
+        content=content,
+    )
+    assert response.text == "おはようございます。"
+    assert response.encoding == "utf-8"
+
+# tests/models/test_responses.py:46-52
+def test_response_content():
+    response = httpx.Response(200, content="Hello, world!")
+
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+    assert response.text == "Hello, world!"
+    assert response.headers == {"Content-Length": "13"}
+
+# tests/test_content.py:27-50
+async def test_bytes_content():
+    request = httpx.Request(method, url, content=b"Hello, world!")
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+    assert sync_content == b"Hello, world!"
+    assert async_content == b"Hello, world!"
+
+    # Support 'data' for compat with requests.
+    with pytest.warns(DeprecationWarning):
+        request = httpx.Request(method, url, data=b"Hello, world!")  # type: ignore
+    assert isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(request.stream))
+    async_content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+    assert sync_content == b"Hello, world!"
+    assert async_content == b"Hello, world!"
+
+# tests/models/test_responses.py:553-556
+def test_iter_bytes_with_empty_response():
+    response = httpx.Response(200, content=b"")
+    parts = list(response.iter_bytes())
+    assert parts == []
+
+# tests/models/test_responses.py:530-536
+def test_iter_bytes():
+    response = httpx.Response(200, content=b"Hello, world!")
+
+    content = b""
+    for part in response.iter_bytes():
+        content += part
+    assert content == b"Hello, world!"
+
+# tests/test_content.py:54-62
+async def test_bytesio_content():
+    request = httpx.Request(method, url, content=io.BytesIO(b"Hello, world!"))
+    assert isinstance(request.stream, typing.Iterable)
+    assert not isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers == {"Host": "www.example.com", "Content-Length": "13"}
+    assert content == b"Hello, world!"
+
+# tests/models/test_responses.py:573-582
+async def test_aiter_bytes():
+    response = httpx.Response(
+        200,
+        content=b"Hello, world!",
+    )
+
+    content = b""
+    async for part in response.aiter_bytes():
+        content += part
+    assert content == b"Hello, world!"
+
+# httpx/_decoders.py:14-14
+from ._exceptions import DecodingError
+
+# tests/models/test_responses.py:261-272
+def test_response_non_text_encoding():
+    """
+    Default to attempting utf-8 encoding for non-text content-type headers.
+    """
+    headers = {"Content-Type": "image/png"}
+    response = httpx.Response(
+        200,
+        content=b"xyz",
+        headers=headers,
+    )
+    assert response.text == "xyz"
+    assert response.encoding == "utf-8"
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/client/test_async_client.py:8-8
+import httpx
+
+# tests/test_content.py:419-429
+async def test_response_empty_content():
+    response = httpx.Response(200)
+    assert isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    sync_content = b"".join(list(response.stream))
+    async_content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {}
+    assert sync_content == b""
+    assert async_content == b""
+
+# tests/test_content.py:66-90
+async def test_async_bytesio_content():
+    class AsyncBytesIO:
+        def __init__(self, content: bytes) -> None:
+            self._idx = 0
+            self._content = content
+
+        async def aread(self, chunk_size: int) -> bytes:
+            chunk = self._content[self._idx : self._idx + chunk_size]
+            self._idx = self._idx + chunk_size
+            return chunk
+
+        async def __aiter__(self):
+            yield self._content  # pragma: no cover
+
+    request = httpx.Request(method, url, content=AsyncBytesIO(b"Hello, world!"))
+    assert not isinstance(request.stream, typing.Iterable)
+    assert isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join([part async for part in request.stream])
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+# httpx/_exceptions.py:175-178
+class ReadError(NetworkError):
+    """
+    Failed to receive data from the network.
+    """
+
+# httpx/_decoders.py:317-318
+    def flush(self) -> str:
+        return self.decoder.decode(b"", True)
+
+# httpx/_decoders.py:52-53
+    def flush(self) -> bytes:
+        return b""

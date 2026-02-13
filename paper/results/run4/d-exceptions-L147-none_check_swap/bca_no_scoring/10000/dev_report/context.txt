@@ -1,0 +1,1081 @@
+## pydantic_ai_slim/pydantic_ai/agent/__init__.py
+
+    def model(self, value: models.Model | models.KnownModelName | str | None) -> None:
+        """Set the default model configured for this agent.
+
+        We allow `str` here since the actual list of allowed models changes frequently.
+        """
+        self._model = value
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    def model(self) -> models.Model | models.KnownModelName | str | None:
+        """The default model configured for this agent."""
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/agent/wrapper.py
+
+    def model(self) -> models.Model | models.KnownModelName | str | None:
+        return self.wrapped.model
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_agent.py
+
+    def model(self) -> Model:
+        return self._model
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_agent.py
+
+    def model(self) -> Model:
+        return self._model
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py
+
+    def model(self) -> Model:
+        return self._temporal_model
+
+## pydantic_ai_slim/pydantic_ai/embeddings/__init__.py
+
+    def model(self) -> EmbeddingModel | KnownEmbeddingModelName | str:
+        """The embedding model used by this embedder."""
+        return self._model
+
+## pydantic_ai_slim/pydantic_ai/exceptions.py
+
+class ModelRetry(Exception):
+    """Exception to raise when a tool function should be retried.
+
+    The agent will return the message to the model and ask it to try calling the function/tool again.
+    """
+
+    message: str
+    """The message to return to the model."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, self.__class__) and other.message == self.message
+
+    def __hash__(self) -> int:
+        return hash((self.__class__, self.message))
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, _: Any, __: Any) -> core_schema.CoreSchema:
+        """Pydantic core schema to allow `ModelRetry` to be (de)serialized."""
+        schema = core_schema.typed_dict_schema(
+            {
+                'message': core_schema.typed_dict_field(core_schema.str_schema()),
+                'kind': core_schema.typed_dict_field(core_schema.literal_schema(['model-retry'])),
+            }
+        )
+        return core_schema.no_info_after_validator_function(
+            lambda dct: ModelRetry(dct['message']),
+            schema,
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                lambda x: {'message': x.message, 'kind': 'model-retry'},
+                return_schema=schema,
+            ),
+        )
+
+class CallDeferred(Exception):
+    """Exception to raise when a tool call should be deferred.
+
+    See [tools docs](../deferred-tools.md#deferred-tools) for more information.
+
+    Args:
+        metadata: Optional dictionary of metadata to attach to the deferred tool call.
+            This metadata will be available in `DeferredToolRequests.metadata` keyed by `tool_call_id`.
+    """
+
+    def __init__(self, metadata: dict[str, Any] | None = None):
+        self.metadata = metadata
+        super().__init__()
+
+class ApprovalRequired(Exception):
+    """Exception to raise when a tool call requires human-in-the-loop approval.
+
+    See [tools docs](../deferred-tools.md#human-in-the-loop-tool-approval) for more information.
+
+    Args:
+        metadata: Optional dictionary of metadata to attach to the deferred tool call.
+            This metadata will be available in `DeferredToolRequests.metadata` keyed by `tool_call_id`.
+    """
+
+    def __init__(self, metadata: dict[str, Any] | None = None):
+        self.metadata = metadata
+        super().__init__()
+
+class UserError(RuntimeError):
+    """Error caused by a usage mistake by the application developer — You!"""
+
+    message: str
+    """Description of the mistake."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+class AgentRunError(RuntimeError):
+    """Base class for errors occurring during an agent run."""
+
+    message: str
+    """The error message."""
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
+
+    def __str__(self) -> str:
+        return self.message
+
+class UsageLimitExceeded(AgentRunError):
+    """Error raised when a Model's usage exceeds the specified limits."""
+
+class UnexpectedModelBehavior(AgentRunError):
+    """Error caused by unexpected Model behavior, e.g. an unexpected response code."""
+
+    message: str
+    """Description of the unexpected behavior."""
+    body: str | None
+    """The body of the response, if available."""
+
+    def __init__(self, message: str, body: str | None = None):
+        self.message = message
+        if body is not None:
+            self.body: str | None = None
+        else:
+            try:
+                self.body = json.dumps(json.loads(body), indent=2)
+            except ValueError:
+                self.body = body
+        super().__init__(message)
+
+    def __str__(self) -> str:
+        if self.body:
+            return f'{self.message}, body:\n{self.body}'
+        else:
+            return self.message
+
+class ToolRetryError(Exception):
+    """Exception used to signal a `ToolRetry` message should be returned to the LLM."""
+
+    def __init__(self, tool_retry: RetryPromptPart):
+        self.tool_retry = tool_retry
+        message = (
+            tool_retry.content
+            if isinstance(tool_retry.content, str)
+            else self._format_error_details(tool_retry.content, tool_retry.tool_name)
+        )
+        super().__init__(message)
+
+    @staticmethod
+    def _format_error_details(errors: list[pydantic_core.ErrorDetails], tool_name: str | None) -> str:
+        """Format ErrorDetails as a human-readable message.
+
+        We format manually rather than using ValidationError.from_exception_data because
+        some error types (value_error, assertion_error, etc.) require an 'error' key in ctx,
+        but when ErrorDetails are serialized, exception objects are stripped from ctx.
+        The 'msg' field already contains the human-readable message, so we use that directly.
+        """
+        error_count = len(errors)
+        lines = [
+            f'{error_count} validation error{"" if error_count == 1 else "s"}{f" for {tool_name!r}" if tool_name else ""}'
+        ]
+        for e in errors:
+            loc = '.'.join(str(x) for x in e['loc']) if e['loc'] else '__root__'
+            lines.append(loc)
+            lines.append(f'  {e["msg"]} [type={e["type"]}, input_value={e["input"]!r}]')
+        return '\n'.join(lines)
+
+class IncompleteToolCall(UnexpectedModelBehavior):
+    """Error raised when a model stops due to token limit while emitting a tool call."""
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class RetryPromptPart:
+    """A message back to a model asking it to try again.
+
+    This can be sent for a number of reasons:
+
+    * Pydantic validation of tool arguments failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * a tool raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    * no tool was found for the tool name
+    * the model returned plain text when a structured response was expected
+    * Pydantic validation of a structured response failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * an output validator raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    """
+
+    content: list[pydantic_core.ErrorDetails] | str
+    """Details of why and how the model should retry.
+
+    If the retry was triggered by a [`ValidationError`][pydantic_core.ValidationError], this will be a list of
+    error details.
+    """
+
+    _: KW_ONLY
+
+    tool_name: str | None = None
+    """The name of the tool that was called, if any."""
+
+    tool_call_id: str = field(default_factory=_generate_tool_call_id)
+    """The tool call identifier, this is used by some models including OpenAI.
+
+    In case the tool call id is not provided by the model, Pydantic AI will generate a random one.
+    """
+
+    timestamp: datetime = field(default_factory=_now_utc)
+    """The timestamp, when the retry was triggered."""
+
+    part_kind: Literal['retry-prompt'] = 'retry-prompt'
+    """Part type identifier, this is available on all parts as a discriminator."""
+
+    def model_response(self) -> str:
+        """Return a string message describing why the retry is requested."""
+        if isinstance(self.content, str):
+            if self.tool_name is None:
+                description = f'Validation feedback:\n{self.content}'
+            else:
+                description = self.content
+        else:
+            json_errors = error_details_ta.dump_json(self.content, exclude={'__all__': {'ctx'}}, indent=2)
+            plural = isinstance(self.content, list) and len(self.content) != 1
+            description = (
+                f'{len(self.content)} validation error{"s" if plural else ""}:\n```json\n{json_errors.decode()}\n```'
+            )
+        return f'{description}\n\nFix the errors and try again.'
+
+    def otel_event(self, settings: InstrumentationSettings) -> LogRecord:
+        if self.tool_name is None:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.user.message'},
+                body={'content': self.model_response(), 'role': 'user'},
+            )
+        else:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.tool.message'},
+                body={
+                    **({'content': self.model_response()} if settings.include_content else {}),
+                    'role': 'tool',
+                    'id': self.tool_call_id,
+                    'name': self.tool_name,
+                },
+            )
+
+    def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
+        if self.tool_name is None:
+            return [_otel_messages.TextPart(type='text', content=self.model_response())]
+        else:
+            part = _otel_messages.ToolCallResponsePart(
+                type='tool_call_response',
+                id=self.tool_call_id,
+                name=self.tool_name,
+            )
+
+            if settings.include_content:
+                part['result'] = self.model_response()
+
+            return [part]
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+## tests/conftest.py
+
+def model(
+    request: pytest.FixtureRequest,
+    openai_api_key: str,
+    anthropic_api_key: str,
+    mistral_api_key: str,
+    groq_api_key: str,
+    co_api_key: str,
+    gemini_api_key: str,
+    huggingface_api_key: str,
+    bedrock_provider: BedrockProvider,
+) -> Model:  # pragma: lax no cover
+    try:
+        if request.param == 'test':
+            from pydantic_ai.models.test import TestModel
+
+            return TestModel()
+        elif request.param == 'openai':
+            from pydantic_ai.models.openai import OpenAIChatModel
+            from pydantic_ai.providers.openai import OpenAIProvider
+
+            return OpenAIChatModel('o3-mini', provider=OpenAIProvider(api_key=openai_api_key))
+        elif request.param == 'anthropic':
+            from pydantic_ai.models.anthropic import AnthropicModel
+            from pydantic_ai.providers.anthropic import AnthropicProvider
+
+            return AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+        elif request.param == 'mistral':
+            from pydantic_ai.models.mistral import MistralModel
+            from pydantic_ai.providers.mistral import MistralProvider
+
+            return MistralModel('ministral-8b-latest', provider=MistralProvider(api_key=mistral_api_key))
+        elif request.param == 'groq':
+            from pydantic_ai.models.groq import GroqModel
+            from pydantic_ai.providers.groq import GroqProvider
+
+            return GroqModel('llama3-8b-8192', provider=GroqProvider(api_key=groq_api_key))
+        elif request.param == 'cohere':
+            from pydantic_ai.models.cohere import CohereModel
+            from pydantic_ai.providers.cohere import CohereProvider
+
+            return CohereModel('command-r-plus', provider=CohereProvider(api_key=co_api_key))
+        elif request.param == 'gemini':
+            from pydantic_ai.models.gemini import GeminiModel  # type: ignore[reportDeprecated]
+            from pydantic_ai.providers.google_gla import GoogleGLAProvider  # type: ignore[reportDeprecated]
+
+            return GeminiModel('gemini-1.5-flash', provider=GoogleGLAProvider(api_key=gemini_api_key))  # type: ignore[reportDeprecated]
+        elif request.param == 'google':
+            from pydantic_ai.models.google import GoogleModel
+            from pydantic_ai.providers.google import GoogleProvider
+
+            return GoogleModel('gemini-1.5-flash', provider=GoogleProvider(api_key=gemini_api_key))
+        elif request.param == 'bedrock':
+            from pydantic_ai.models.bedrock import BedrockConverseModel
+
+            return BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+        elif request.param == 'huggingface':
+            from pydantic_ai.models.huggingface import HuggingFaceModel
+            from pydantic_ai.providers.huggingface import HuggingFaceProvider
+
+            return HuggingFaceModel(
+                'Qwen/Qwen2.5-72B-Instruct',
+                provider=HuggingFaceProvider(provider_name='nebius', api_key=huggingface_api_key),
+            )
+        elif request.param == 'outlines':
+            from outlines.models.transformers import from_transformers
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            from pydantic_ai.models.outlines import OutlinesModel
+
+            return OutlinesModel(
+                from_transformers(
+                    AutoModelForCausalLM.from_pretrained('erwanf/gpt2-mini'),
+                    AutoTokenizer.from_pretrained('erwanf/gpt2-mini'),
+                )
+            )
+        else:
+            raise ValueError(f'Unknown model: {request.param}')
+    except ImportError:
+        pytest.skip(f'{request.param} is not installed')
+
+## tests/evals/test_report_evaluators.py
+
+def test_report_evaluator_build_serialization_arguments_excludes_defaults():
+    """ConfusionMatrixEvaluator with all defaults returns empty dict."""
+    evaluator = ConfusionMatrixEvaluator()
+    args = evaluator.build_serialization_arguments()
+    assert args == {}
+
+## tests/evals/test_utils.py
+
+def test_get_unwrapped_function_name_decorated():
+    """Test get_unwrapped_function_name with decorated function."""
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            raise NotImplementedError
+
+        return wrapper
+
+    @decorator
+    def test_func():
+        pass
+
+    assert get_unwrapped_function_name(test_func) == 'test_func'
+
+## tests/graph/beta/test_edge_cases.py
+
+async def test_null_reducer_with_no_inputs():
+    """Test NullReducer behavior with map that produces no items."""
+    g = GraphBuilder(state_type=EdgeCaseState)
+
+    @g.step
+    async def empty_list(ctx: StepContext[EdgeCaseState, None, None]) -> list[int]:
+        return []
+
+    @g.step
+    async def process(ctx: StepContext[EdgeCaseState, None, int]) -> int:
+        return ctx.inputs  # pragma: no cover
+
+    null_join = g.join(reduce_null, initial=None)
+
+    g.add(
+        g.edge_from(g.start_node).to(empty_list),
+        g.edge_from(empty_list).map(downstream_join_id=null_join.id).to(process),
+        g.edge_from(process).to(null_join),
+        g.edge_from(null_join).to(g.end_node),
+    )
+
+    graph = g.build()
+    result = await graph.run(state=EdgeCaseState())
+    assert result is None
+
+async def test_step_that_modifies_deps():
+    """Test that deps modifications don't persist (deps should be immutable)."""
+
+    @dataclass
+    class MutableDeps:
+        value: int
+
+    g = GraphBuilder(state_type=EdgeCaseState, deps_type=MutableDeps, output_type=int)
+
+    @g.step
+    async def try_modify_deps(ctx: StepContext[EdgeCaseState, MutableDeps, None]) -> int:
+        original = ctx.deps.value
+        # Attempt to modify (this DOES mutate the object, but that's user error)
+        ctx.deps.value = 999
+        return original
+
+    @g.step
+    async def check_deps(ctx: StepContext[EdgeCaseState, MutableDeps, int]) -> int:
+        # Deps will show the mutation since it's the same object
+        return ctx.deps.value
+
+    g.add(
+        g.edge_from(g.start_node).to(try_modify_deps),
+        g.edge_from(try_modify_deps).to(check_deps),
+        g.edge_from(check_deps).to(g.end_node),
+    )
+
+    graph = g.build()
+    deps = MutableDeps(value=42)
+    result = await graph.run(state=EdgeCaseState(), deps=deps)
+    # The deps object was mutated (user responsibility to avoid this)
+    assert result == 999
+    assert deps.value == 999
+
+## tests/graph/beta/test_joins_and_reducers.py
+
+async def test_join_with_custom_id():
+    """Test creating a join with a custom node ID."""
+    g = GraphBuilder(state_type=SimpleState, output_type=list[int])
+
+    @g.step
+    async def source(ctx: StepContext[SimpleState, None, None]) -> list[int]:
+        return [1, 2, 3]  # pragma: no cover
+
+    @g.step
+    async def process(ctx: StepContext[SimpleState, None, int]) -> int:
+        return ctx.inputs  # pragma: no cover
+
+    custom_join = g.join(reduce_list_append, initial_factory=list[int], node_id='my_custom_join')
+
+    g.add(
+        g.edge_from(g.start_node).to(source),
+        g.edge_from(source).map().to(process),
+        g.edge_from(process).to(custom_join),
+        g.edge_from(custom_join).to(g.end_node),
+    )
+
+    graph = g.build()
+    assert 'my_custom_join' in graph.nodes
+
+## tests/graph/test_mermaid.py
+
+def test_mermaid_code_all_nodes_no_direction():
+    assert graph3.mermaid_code() == snapshot("""\
+---
+title: graph3
+---
+stateDiagram-v2
+  AllNodes --> AllNodes
+  AllNodes --> Foo
+  AllNodes --> Bar
+  Foo --> Bar
+  Bar --> [*]\
+""")
+
+## tests/graph/test_utils.py
+
+def test_get_event_loop_in_thread():
+    def get_and_close_event_loop():
+        event_loop = get_event_loop()
+        event_loop.close()
+
+    thread = Thread(target=get_and_close_event_loop)
+    thread.start()
+    thread.join()
+
+## tests/models/test_anthropic.py
+
+async def test_cache_point_with_image_content(allow_model_requests: None):
+    """Test CachePoint works with image content."""
+    c = completion_message(
+        [BetaTextBlock(text='response', type='text')],
+        usage=BetaUsage(input_tokens=3, output_tokens=5),
+    )
+    mock_client = MockAnthropic.create_mock(c)
+    m = AnthropicModel('claude-haiku-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+    agent = Agent(m)
+
+    await agent.run(
+        [
+            ImageUrl('https://example.com/image.jpg'),
+            CachePoint(),
+            'What is in this image?',
+        ]
+    )
+
+    completion_kwargs = get_mock_chat_completion_kwargs(mock_client)[0]
+    content = completion_kwargs['messages'][0]['content']
+
+    # Default ttl='5m' for non-Bedrock clients
+    assert content == snapshot(
+        [
+            {
+                'source': {'type': 'url', 'url': 'https://example.com/image.jpg'},
+                'type': 'image',
+                'cache_control': {'type': 'ephemeral', 'ttl': '5m'},
+            },
+            {'text': 'What is in this image?', 'type': 'text'},
+        ]
+    )
+
+def test_model_connection_error(allow_model_requests: None) -> None:
+    mock_client = MockAnthropic.create_mock(
+        APIConnectionError(
+            message='Connection to https://api.anthropic.com timed out',
+            request=httpx.Request('POST', 'https://api.anthropic.com/v1/messages'),
+        )
+    )
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+    agent = Agent(m)
+    with pytest.raises(ModelAPIError) as exc_info:
+        agent.run_sync('hello')
+    assert exc_info.value.model_name == 'claude-sonnet-4-5'
+    assert 'Connection to https://api.anthropic.com timed out' in str(exc_info.value.message)
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_cache_point_multiple_markers(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    model = BedrockConverseModel('us.anthropic.claude-3-5-haiku-20241022-v1:0', provider=bedrock_provider)
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[UserPromptPart(content=['First chunk', CachePoint(), 'Second chunk', CachePoint(), 'Question'])]
+        )
+    ]
+    _, bedrock_messages = await model._map_messages(messages, ModelRequestParameters(), BedrockModelSettings())  # pyright: ignore[reportPrivateUsage]
+    assert bedrock_messages[0]['content'] == snapshot(
+        [
+            {'text': 'First chunk'},
+            {'cachePoint': {'type': 'default'}},
+            {'text': 'Second chunk'},
+            {'cachePoint': {'type': 'default'}},
+            {'text': 'Question'},
+        ]
+    )
+
+## tests/models/test_cerebras.py
+
+async def test_cerebras_settings_transformation():
+    """Test that CerebrasModelSettings are correctly transformed to OpenAIChatModelSettings."""
+    # Test with disable_reasoning
+    settings = CerebrasModelSettings(cerebras_disable_reasoning=True)
+    transformed = _cerebras_settings_to_openai_settings(settings)
+    extra_body = cast(dict[str, Any], transformed.get('extra_body', {}))
+    assert extra_body.get('disable_reasoning') is True
+
+    # Test without disable_reasoning (should not have extra_body)
+    settings_empty = CerebrasModelSettings()
+    transformed_empty = _cerebras_settings_to_openai_settings(settings_empty)
+    assert transformed_empty.get('extra_body') is None
+
+    # Test with disable_reasoning=False
+    settings_false = CerebrasModelSettings(cerebras_disable_reasoning=False)
+    transformed_false = _cerebras_settings_to_openai_settings(settings_false)
+    extra_body_false = cast(dict[str, Any], transformed_false.get('extra_body', {}))
+    assert extra_body_false.get('disable_reasoning') is False
+
+## tests/models/test_google.py
+
+async def test_google_image_generation_resolution(google_provider: GoogleProvider) -> None:
+    """Test that resolution parameter from ImageGenerationTool is added to image_config."""
+    model = GoogleModel('gemini-3-pro-image-preview', provider=google_provider)
+    params = ModelRequestParameters(builtin_tools=[ImageGenerationTool(size='2K')])
+
+    tools, image_config = model._get_tools(params)  # pyright: ignore[reportPrivateUsage]
+    assert tools is None
+    assert image_config == {'image_size': '2K'}
+
+async def test_http_video_url_uses_file_uri_on_google_vertex(mocker: MockerFixture):
+    """HTTP VideoUrls use file_uri directly on google-vertex with video_metadata."""
+    model = GoogleModel('gemini-1.5-flash', provider=GoogleProvider(api_key='test-key'))
+    mocker.patch.object(GoogleModel, 'system', new_callable=mocker.PropertyMock, return_value='google-vertex')
+
+    video = VideoUrl(
+        url='https://example.com/video.mp4',
+        vendor_metadata={'start_offset': '10s', 'end_offset': '20s'},
+    )
+    content = await model._map_user_prompt(UserPromptPart(content=[video]))  # pyright: ignore[reportPrivateUsage]
+
+    assert len(content) == 1
+    assert content[0] == {
+        'file_data': {'file_uri': 'https://example.com/video.mp4', 'mime_type': 'video/mp4'},
+        'video_metadata': {'start_offset': '10s', 'end_offset': '20s'},
+    }
+
+def test_google_provider_respects_custom_http_client_timeout(gemini_api_key: str):
+    """Test that GoogleProvider respects a custom timeout from a user-provided http_client.
+
+    See https://github.com/pydantic/pydantic-ai/pull/4032#discussion_r2709797127
+    """
+    custom_timeout = 120
+    custom_http_client = HttpxAsyncClient(timeout=Timeout(custom_timeout))
+    provider = GoogleProvider(api_key=gemini_api_key, http_client=custom_http_client)
+
+    http_options = provider._client._api_client._http_options  # pyright: ignore[reportPrivateUsage]
+    assert http_options.timeout == custom_timeout * 1000
+
+## tests/models/test_model_settings.py
+
+def test_settings_merge_hierarchy():
+    """Test the complete settings merge hierarchy: model -> agent -> run."""
+    # Create a function that captures the merged settings
+    captured_settings = None
+
+    def capture_settings(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+        nonlocal captured_settings
+        captured_settings = agent_info.model_settings
+        return ModelResponse(parts=[TextPart('captured')])
+
+    # Model settings (lowest priority)
+    model_settings = ModelSettings(max_tokens=100, temperature=0.5, top_p=0.8, seed=123)
+    model = FunctionModel(capture_settings, settings=model_settings)
+
+    # Agent settings (medium priority)
+    agent_settings = ModelSettings(
+        max_tokens=200,  # overrides model
+        temperature=0.6,  # overrides model
+        frequency_penalty=0.1,  # new setting
+    )
+    agent = Agent(model=model, model_settings=agent_settings)
+
+    # Run settings (highest priority)
+    run_settings = ModelSettings(
+        temperature=0.7,  # overrides agent and model
+        presence_penalty=0.2,  # new setting
+        seed=456,  # overrides model
+    )
+
+    # Run the agent
+    result = agent.run_sync('test', model_settings=run_settings)
+    assert result.output == 'captured'
+
+    # Verify the merged settings follow the correct precedence
+    assert captured_settings is not None
+    assert captured_settings['temperature'] == 0.7  # from run_settings
+    assert captured_settings['max_tokens'] == 200  # from agent_settings
+    assert captured_settings['top_p'] == 0.8  # from model_settings
+    assert captured_settings['seed'] == 456  # from run_settings
+    assert captured_settings['frequency_penalty'] == 0.1  # from agent_settings
+    assert captured_settings['presence_penalty'] == 0.2  # from run_settings
+
+def test_direct_model_request_merges_model_settings():
+    """Ensure direct requests merge model defaults with provided run settings."""
+
+    captured_settings = None
+
+    async def capture(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+        nonlocal captured_settings
+        captured_settings = agent_info.model_settings
+        return ModelResponse(parts=[TextPart('ok')])
+
+    model = FunctionModel(
+        capture,
+        settings=ModelSettings(max_tokens=50, temperature=0.3),
+    )
+
+    messages: list[ModelMessage] = [ModelRequest.user_text_prompt('hi')]
+    run_settings = ModelSettings(temperature=0.9, top_p=0.2)
+
+    async def _run() -> ModelResponse:
+        return await direct_model_request(
+            model,
+            messages,
+            model_settings=run_settings,
+            model_request_parameters=ModelRequestParameters(),
+        )
+
+    response = asyncio.run(_run())
+
+    assert response.parts == [TextPart('ok')]
+    assert captured_settings == {
+        'max_tokens': 50,
+        'temperature': 0.9,
+        'top_p': 0.2,
+    }
+
+## tests/models/test_openrouter.py
+
+async def test_openrouter_stream_error(allow_model_requests: None, openrouter_api_key: str) -> None:
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('minimax/minimax-m2:free', provider=provider)
+    settings = OpenRouterModelSettings(max_tokens=10)
+
+    with pytest.raises(ModelHTTPError):
+        async with model_request_stream(
+            model, [ModelRequest.user_text_prompt('Hello there')], model_settings=settings
+        ) as stream:
+            _ = [chunk async for chunk in stream]
+
+async def test_openrouter_file_annotation(
+    allow_model_requests: None, openrouter_api_key: str, document_content: BinaryContent
+) -> None:
+    """Test that file annotations from OpenRouter are handled correctly.
+
+    When sending files (e.g., PDFs) to OpenRouter, the response can include
+    annotations with type="file". This test ensures those annotations are
+    parsed without validation errors.
+    """
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('openai/gpt-5.1-codex-mini', provider=provider)
+    agent = Agent(model)
+
+    result = await agent.run(
+        user_prompt=[
+            'What does this PDF contain? Answer in one short sentence.',
+            document_content,
+        ]
+    )
+
+    # The response should contain text (model may or may not include file annotations)
+    assert isinstance(result.output, str)
+    assert len(result.output) > 0
+
+async def test_openrouter_url_citation_annotation_validation(openrouter_api_key: str) -> None:
+    """Test that url_citation annotations from OpenRouter are correctly validated."""
+    from openai.types.chat.chat_completion_message import ChatCompletionMessage
+
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('openai/gpt-4.1-mini', provider=provider)
+
+    message = ChatCompletionMessage.model_construct(
+        role='assistant',
+        content='According to the source, this is the answer.',
+        annotations=[
+            {
+                'type': 'url_citation',
+                'url_citation': {'url': 'https://example.com', 'title': 'Example', 'start_index': 0, 'end_index': 10},
+            },
+        ],
+    )
+    choice = Choice.model_construct(index=0, message=message, finish_reason='stop', native_finish_reason='stop')
+    response = ChatCompletion.model_construct(
+        id='test', choices=[choice], created=0, object='chat.completion', model='test', provider='test'
+    )
+
+    # This should not raise a validation error
+    result = model._process_response(response)  # type: ignore[reportPrivateUsage]
+    text_part = cast(TextPart, result.parts[0])
+    assert text_part.content == 'According to the source, this is the answer.'
+
+## tests/models/test_xai.py
+
+async def test_xai_stream_no_usage_no_finish_reason(allow_model_requests: None):
+    """Test streaming handles responses without usage or finish reason."""
+    # Create streaming chunks where intermediate chunks have no usage/finish_reason
+    # First chunk: no usage, no finish_reason (UNSPECIFIED = 0 = falsy)
+    chunk1 = create_stream_chunk(content='Hello', finish_reason=None)
+    response1 = create_response_without_usage(content='Hello', finish_reason=None)
+
+    # Second chunk: with usage and finish_reason to complete the stream
+    chunk2 = create_stream_chunk(content=' world', finish_reason='stop')
+    response2 = create_response(
+        content='Hello world', finish_reason='stop', usage=create_usage(prompt_tokens=5, completion_tokens=2)
+    )
+
+    stream = [(response1, chunk1), (response2, chunk2)]
+    mock_client = MockXai.create_mock_stream([stream])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    async with agent.run_stream('Hello') as result:
+        [c async for c in result.stream_text(debounce_by=None)]
+
+    # Verify kwargs
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [{'content': [{'text': 'Hello'}], 'role': 'ROLE_USER'}],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+    # Should complete without errors
+    assert result.is_complete
+
+## tests/providers/test_fireworks.py
+
+def test_fireworks_provider():
+    provider = FireworksProvider(api_key='api-key')
+    assert provider.name == 'fireworks'
+    assert provider.base_url == 'https://api.fireworks.ai/inference/v1'
+    assert isinstance(provider.client, openai.AsyncOpenAI)
+    assert provider.client.api_key == 'api-key'
+
+## tests/providers/test_together.py
+
+def test_together_provider():
+    provider = TogetherProvider(api_key='api-key')
+    assert provider.name == 'together'
+    assert provider.base_url == 'https://api.together.xyz/v1'
+    assert isinstance(provider.client, openai.AsyncOpenAI)
+    assert provider.client.api_key == 'api-key'
+
+## tests/test_agent.py
+
+def test_override_nested_contexts():
+    """Test nested override contexts."""
+    agent = Agent('test', instructions='ORIG')
+
+    with agent.override(instructions='OUTER'):
+        with capture_run_messages() as outer_messages:
+            agent.run_sync('Hi', model=TestModel(custom_output_text='ok'))
+
+        with agent.override(instructions='INNER'):
+            with capture_run_messages() as inner_messages:
+                agent.run_sync('Hi', model=TestModel(custom_output_text='ok'))
+
+    outer_req = outer_messages[0]
+    assert isinstance(outer_req, ModelRequest)
+    inner_req = inner_messages[0]
+    assert isinstance(inner_req, ModelRequest)
+
+    assert outer_req.instructions == 'OUTER'
+    assert inner_req.instructions == 'INNER'
+
+## tests/test_cli.py
+
+def test_clai_web_generic_with_instructions(mocker: MockerFixture, env: TestEnv):
+    """Test generic agent with custom instructions."""
+    env.set('OPENAI_API_KEY', 'test')
+
+    mock_run_web = mocker.patch('pydantic_ai._cli.web.run_web_command', return_value=0)
+
+    assert cli(['web', '-m', 'openai:gpt-5', '-i', 'You are a helpful coding assistant'], prog_name='clai') == 0
+
+    mock_run_web.assert_called_once_with(
+        agent_path=None,
+        host='127.0.0.1',
+        port=7932,
+        models=['openai:gpt-5'],
+        tools=[],
+        instructions='You are a helpful coding assistant',
+        default_model='openai:gpt-5',
+        html_source=None,
+    )
+
+## tests/test_exceptions.py
+
+def test_tool_retry_error_str_with_string_content():
+    """Test that ToolRetryError uses string content as message automatically."""
+    part = RetryPromptPart(content='error from tool', tool_name='my_tool')
+    error = ToolRetryError(part)
+    assert str(error) == 'error from tool'
+
+def test_tool_retry_error_str_with_error_details():
+    """Test that ToolRetryError formats ErrorDetails automatically."""
+    validation_error = ValidationError.from_exception_data(
+        'Test', [{'type': 'string_type', 'loc': ('name',), 'input': 123}]
+    )
+    part = RetryPromptPart(content=validation_error.errors(include_url=False), tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nname\n  Input should be a valid string [type=string_type, input_value=123]"
+    )
+
+def test_tool_retry_error_str_with_value_error_type():
+    """Test that ToolRetryError handles value_error type without ctx.error.
+
+    When ErrorDetails are serialized, the exception object in ctx is stripped.
+    This test ensures we handle error types that normally require ctx.error.
+    """
+    # Simulate serialized ErrorDetails where ctx.error has been stripped
+    error_details: list[ErrorDetails] = [
+        {
+            'type': 'value_error',
+            'loc': ('field',),
+            'msg': 'Value error, must not be foo',
+            'input': 'foo',
+        }
+    ]
+    part = RetryPromptPart(content=error_details, tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nfield\n  Value error, must not be foo [type=value_error, input_value='foo']"
+    )
+
+## tests/test_mcp.py
+
+def model(openai_api_key: str) -> Model:
+    return OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))
+
+async def test_agent_with_conflict_tool_name(agent: Agent):
+    @agent.tool_plain
+    def get_none() -> None:  # pragma: no cover
+        """Return nothing"""
+        return None
+
+    async with agent:
+        with pytest.raises(
+            UserError,
+            match=re.escape(
+                "MCPServerStdio(command='python', args=['-m', 'tests.mcp_server']) defines a tool whose name conflicts with existing tool from the agent: 'get_none'. Set the `tool_prefix` attribute to avoid name conflicts."
+            ),
+        ):
+            await agent.run('Get me a conflict')
+
+async def test_elicitation_callback_functionality(run_context: RunContext[int]):
+    """Test that elicitation callback is actually called and works."""
+    # Track callback execution
+    callback_called = False
+    callback_message = None
+    callback_response = 'Yes, proceed with the action'
+
+    async def mock_elicitation_callback(
+        context: RequestContext[ClientSession, Any, Any], params: ElicitRequestParams
+    ) -> ElicitResult:
+        nonlocal callback_called, callback_message
+        callback_called = True
+        callback_message = params.message
+        return ElicitResult(action='accept', content={'response': callback_response})
+
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'], elicitation_callback=mock_elicitation_callback)
+
+    async with server:
+        # Call the tool that uses elicitation
+        result = await server.direct_call_tool('use_elicitation', {'question': 'Should I continue?'})
+
+        # Verify the callback was called
+        assert callback_called, 'Elicitation callback should have been called'
+        assert callback_message == 'Should I continue?', 'Callback should receive the question'
+        assert result == f'User responded: {callback_response}', 'Tool should return the callback response'
+
+## tests/test_streaming.py
+
+async def test_get_output_after_stream_output():
+    """Verify that we don't get duplicate messages in history when using tool output and `get_output` is called after `stream_output`."""
+    m = TestModel()
+
+    agent = Agent(m, output_type=bool)
+
+    async with agent.run_stream('Hello') as result:
+        outputs: list[bool] = []
+        async for o in result.stream_output():
+            outputs.append(o)
+        o = await result.get_output()
+        outputs.append(o)
+
+    assert outputs == snapshot([False, False, False])
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Hello',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args={'response': False},
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=51),
+                model_name='test',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='test',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id='pyd_ai_tool_call_id__final_result',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_vercel_ai.py
+
+async def test_event_stream_tool_call_end_with_provider_metadata_v5():
+    """Test that tool-input-start events exclude provider_metadata for SDK v5."""
+
+    async def event_generator():
+        part = ToolCallPart(
+            tool_name='my_tool',
+            tool_call_id='tc_meta',
+            args={'key': 'value'},
+            id='tool_call_id_123',
+            provider_name='anthropic',
+            provider_details={'tool_index': 0},
+        )
+        yield PartStartEvent(index=0, part=part)
+        yield PartEndEvent(index=0, part=part)
+
+    request = SubmitMessage(
+        id='foo',
+        messages=[
+            UIMessage(
+                id='bar',
+                role='user',
+                parts=[TextUIPart(text='Test')],
+            ),
+        ],
+    )
+    event_stream = VercelAIEventStream(run_input=request, sdk_version=5)
+    events = [
+        '[DONE]' if '[DONE]' in event else json.loads(event.removeprefix('data: '))
+        async for event in event_stream.encode_stream(event_stream.transform_stream(event_generator()))
+    ]
+
+    assert events == snapshot(
+        [
+            {'type': 'start'},
+            {'type': 'start-step'},
+            {'type': 'tool-input-start', 'toolCallId': 'tc_meta', 'toolName': 'my_tool'},
+            {'type': 'tool-input-delta', 'toolCallId': 'tc_meta', 'inputTextDelta': '{"key":"value"}'},
+            {
+                'type': 'tool-input-available',
+                'toolCallId': 'tc_meta',
+                'toolName': 'my_tool',
+                'input': {'key': 'value'},
+                'providerMetadata': {
+                    'pydantic_ai': {
+                        'id': 'tool_call_id_123',
+                        'provider_name': 'anthropic',
+                        'provider_details': {'tool_index': 0},
+                    }
+                },
+            },
+            {'type': 'finish-step'},
+            {'type': 'finish'},
+            '[DONE]',
+        ]
+    )

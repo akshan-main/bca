@@ -1,0 +1,1032 @@
+# tests/test_ssrf.py:432-459
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+# tests/test_agent.py:5553-5624
+def test_empty_final_response():
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[TextPart('foo'), ToolCallPart('my_tool', {'x': 1})])
+        elif len(messages) == 3:
+            return ModelResponse(parts=[TextPart('bar'), ToolCallPart('my_tool', {'x': 2})])
+        else:
+            return ModelResponse(parts=[])
+
+    agent = Agent(FunctionModel(llm))
+
+    @agent.tool_plain
+    def my_tool(x: int) -> int:
+        return x * 2
+
+    result = agent.run_sync('Hello')
+    assert result.output == 'bar'
+
+    assert result.new_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(content='foo'),
+                    ToolCallPart(tool_name='my_tool', args={'x': 1}, tool_call_id=IsStr()),
+                ],
+                usage=RequestUsage(input_tokens=51, output_tokens=5),
+                model_name='function:llm:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='my_tool', content=2, tool_call_id=IsStr(), timestamp=IsNow(tz=timezone.utc)
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    TextPart(content='bar'),
+                    ToolCallPart(tool_name='my_tool', args={'x': 2}, tool_call_id=IsStr()),
+                ],
+                usage=RequestUsage(input_tokens=52, output_tokens=10),
+                model_name='function:llm:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='my_tool', content=4, tool_call_id=IsStr(), timestamp=IsNow(tz=timezone.utc)
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[],
+                usage=RequestUsage(input_tokens=53, output_tokens=10),
+                model_name='function:llm:',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+# tests/test_ssrf.py:484-501
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/test_ssrf.py:402-672
+class TestSafeDownload:
+    """Tests for safe_download function."""
+
+    async def test_successful_download(self) -> None:
+        """Test successful download of a public URL."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+        mock_response.content = b'test content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'test content'
+
+            # Verify the request was made to the resolved IP with Host header and SNI
+            mock_client.get.assert_called_once()
+            call_args = mock_client.get.call_args
+            assert '93.184.215.14' in call_args[0][0]
+            assert call_args[1]['headers']['Host'] == 'example.com'
+            assert call_args[1]['extensions'] == {'sni_hostname': 'example.com'}
+
+    async def test_redirect_followed(self) -> None:
+        """Test that redirects are followed with validation."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+    async def test_redirect_to_private_ip_blocked(self) -> None:
+        """Test that redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'http://internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com (public), second for internal.local (private)
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_max_redirects_exceeded(self) -> None:
+        """Test that too many redirects raises an error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'https://example.com/redirect'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match=f'Too many redirects \\({_MAX_REDIRECTS + 1}\\)'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_relative_redirect_resolved(self) -> None:
+        """Test that relative redirect URLs are resolved correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '/new-path/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/old-path/file.txt')
+            assert response.content == b'final content'
+
+            # Check that the second request was to the correct path
+            second_call = mock_client.get.call_args_list[1]
+            assert '/new-path/file.txt' in second_call[0][0]
+
+    async def test_missing_location_header(self) -> None:
+        """Test that redirect without Location header raises error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Redirect response missing Location header'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_protocol_relative_redirect(self) -> None:
+        """Test that protocol-relative redirects are handled correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+            # Verify second request was to cdn.example.com with https
+            second_call = mock_client.get.call_args_list[1]
+            assert second_call[1]['headers']['Host'] == 'cdn.example.com'
+
+    async def test_protocol_relative_redirect_to_private_blocked(self) -> None:
+        """Test that protocol-relative redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+    async def test_http_no_sni_extension(self) -> None:
+        """Test that sni_hostname extension is not set for HTTP requests."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('http://example.com/file.txt')
+
+            call_args = mock_client.get.call_args
+            assert call_args[1]['extensions'] == {}
+
+    async def test_protocol_validation(self) -> None:
+        """Test that non-http(s) protocols are rejected."""
+        with pytest.raises(ValueError, match='URL protocol "file" is not allowed'):
+            await safe_download('file:///etc/passwd')
+
+        with pytest.raises(ValueError, match='URL protocol "ftp" is not allowed'):
+            await safe_download('ftp://ftp.example.com/file.txt')
+
+    async def test_timeout_parameter(self) -> None:
+        """Test that timeout parameter is passed to client."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('https://example.com/file.txt', timeout=60)
+
+            mock_client_fn.assert_called_once_with(timeout=60)
+
+    async def test_default_timeout(self) -> None:
+        """Test that default timeout is used."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('https://example.com/file.txt')
+
+            mock_client_fn.assert_called_once_with(timeout=_DEFAULT_TIMEOUT)
+
+# tests/models/test_openai.py:2864-2882
+async def test_compatible_api_with_tool_calls_without_id(allow_model_requests: None, gemini_api_key: str):
+    provider = OpenAIProvider(
+        openai_client=AsyncOpenAI(
+            base_url='https://generativelanguage.googleapis.com/v1beta/openai/',
+            api_key=gemini_api_key,
+        )
+    )
+
+    model = OpenAIChatModel('gemini-2.5-pro-preview-05-06', provider=provider)
+
+    agent = Agent(model)
+
+    @agent.tool_plain
+    def get_current_time() -> str:
+        """Get the current time."""
+        return 'Noon'
+
+    response = await agent.run('What is the current time?')
+    assert response.output == snapshot('The current time is Noon.')
+
+# tests/test_ssrf.py:531-548
+    async def test_missing_location_header(self) -> None:
+        """Test that redirect without Location header raises error."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Redirect response missing Location header'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/test_fastmcp.py:360-382
+    async def test_call_tool_with_text_content(
+        self,
+        fastmcp_toolset: FastMCPToolset[None],
+        run_context: RunContext[None],
+    ):
+        """Test tool call that returns text content."""
+        async with fastmcp_toolset:
+            tools = await fastmcp_toolset.get_tools(run_context)
+            text_tool = tools['text_tool']
+
+            result = await fastmcp_toolset.call_tool(
+                name='text_tool', tool_args={'message': 'Hello World'}, ctx=run_context, tool=text_tool
+            )
+
+            assert result == snapshot({'result': 'Echo: Hello World'})
+
+            text_list_tool = tools['text_list_tool']
+
+            result = await fastmcp_toolset.call_tool(
+                name='text_list_tool', tool_args={'message': 'Hello World'}, ctx=run_context, tool=text_list_tool
+            )
+
+            assert result == snapshot(['Echo: Hello World', 'Echo: Hello World again'])
+
+# tests/test_fastmcp.py:403-418
+    async def test_call_tool_with_json_content(
+        self,
+        fastmcp_toolset: FastMCPToolset[None],
+        run_context: RunContext[None],
+    ):
+        """Test tool call that returns JSON content."""
+        async with fastmcp_toolset:
+            tools = await fastmcp_toolset.get_tools(run_context)
+            json_tool = tools['json_tool']
+
+            result = await fastmcp_toolset.call_tool(
+                name='json_tool', tool_args={'data': {'key': 'value'}}, ctx=run_context, tool=json_tool
+            )
+
+            # Should parse the JSON string into a dict
+            assert result == snapshot({'result': '{"received": {"key": "value"}, "processed": true}'})
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:35-48
+from .exceptions import (
+    AgentRunError,
+    ApprovalRequired,
+    CallDeferred,
+    ConcurrencyLimitExceeded,
+    FallbackExceptionGroup,
+    IncompleteToolCall,
+    ModelAPIError,
+    ModelHTTPError,
+    ModelRetry,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+    UserError,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:35-48
+from .exceptions import (
+    AgentRunError,
+    ApprovalRequired,
+    CallDeferred,
+    ConcurrencyLimitExceeded,
+    FallbackExceptionGroup,
+    IncompleteToolCall,
+    ModelAPIError,
+    ModelHTTPError,
+    ModelRetry,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+    UserError,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:35-48
+from .exceptions import (
+    AgentRunError,
+    ApprovalRequired,
+    CallDeferred,
+    ConcurrencyLimitExceeded,
+    FallbackExceptionGroup,
+    IncompleteToolCall,
+    ModelAPIError,
+    ModelHTTPError,
+    ModelRetry,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+    UserError,
+)
+
+# tests/test_fastmcp.py:344-358
+    async def test_call_tool_with_audio_content(
+        self,
+        fastmcp_toolset: FastMCPToolset[None],
+        run_context: RunContext[None],
+    ):
+        """Test tool call that returns audio content."""
+        async with fastmcp_toolset:
+            tools = await fastmcp_toolset.get_tools(run_context)
+            audio_tool = tools['audio_tool']
+
+            result = await fastmcp_toolset.call_tool(name='audio_tool', tool_args={}, ctx=run_context, tool=audio_tool)
+
+            assert result == snapshot(
+                BinaryContent(data=b'fake_audio_data', media_type='audio/mpeg', identifier='f1220f')
+            )
+
+# pydantic_ai_slim/pydantic_ai/toolsets/combined.py:18-22
+class _CombinedToolsetTool(ToolsetTool[AgentDepsT]):
+    """A tool definition for a combined toolset tools that keeps track of the source toolset and tool."""
+
+    source_toolset: AbstractToolset[AgentDepsT]
+    source_tool: ToolsetTool[AgentDepsT]
+
+# tests/test_fastmcp.py:326-342
+    async def test_call_tool_with_binary_content(
+        self,
+        fastmcp_toolset: FastMCPToolset[None],
+        run_context: RunContext[None],
+    ):
+        """Test tool call that returns binary content."""
+        async with fastmcp_toolset:
+            tools = await fastmcp_toolset.get_tools(run_context)
+            binary_tool = tools['binary_tool']
+
+            result = await fastmcp_toolset.call_tool(
+                name='binary_tool', tool_args={}, ctx=run_context, tool=binary_tool
+            )
+
+            assert result == snapshot(
+                BinaryContent(data=b'fake_image_data', media_type='image/png', identifier='427d68')
+            )
+
+# tests/test_tools.py:2533-2571
+async def test_tool_with_timeout_completes_successfully():
+    """Test that a tool completes successfully when within its timeout."""
+    import asyncio
+
+    from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    call_count = 0
+
+    async def model_logic(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First call: ask to run the slow tool
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name='slow_but_allowed_tool', args={}, tool_call_id='call-1')]
+            )
+        # Second call: tool completed successfully, return final response
+        return ModelResponse(parts=[TextPart(content='Tool completed successfully')])
+
+    agent = Agent(FunctionModel(model_logic))
+
+    @agent.tool_plain(timeout=5.0)  # 5s per-tool timeout
+    async def slow_but_allowed_tool() -> str:
+        await asyncio.sleep(0.2)  # 200ms - within 5s timeout
+        return 'completed successfully'
+
+    result = await agent.run('call slow_but_allowed_tool')
+
+    # Should NOT have any retry prompts since tool completed within timeout
+    retry_parts = [
+        part
+        for msg in result.all_messages()
+        if isinstance(msg, ModelRequest)
+        for part in msg.parts
+        if isinstance(part, RetryPromptPart) and 'Timed out' in str(part.content)
+    ]
+    assert len(retry_parts) == 0
+    assert 'completed successfully' in result.output
+
+# docs/.hooks/test_snippets.py:403-494
+def test_complicated_example():
+    """Test extracting multiple overlapping sections."""
+    content = """line 1
+### [fragment1]
+line 2
+### [fragment2]
+line 3
+### [highlight1,highlight2]
+line 4
+### [/fragment1,/highlight1]
+line 5
+### [/fragment2]
+line 6
+### [/highlight2]
+"""
+
+    with temp_text_file(content) as temp_path:
+        parsed = parse_file_sections(temp_path)
+
+    assert parsed.render([], []) == snapshot(
+        RenderedSnippet(
+            content="""\
+line 1
+line 2
+line 3
+line 4
+line 5
+line 6\
+""",
+            highlights=[],
+            original_range=LineRange(start_line=0, end_line=11),
+        )
+    )
+
+    assert parsed.render(['fragment1'], ['highlight1']) == snapshot(
+        RenderedSnippet(
+            content="""\
+line 2
+line 3
+line 4
+
+...\
+""",
+            highlights=[LineRange(start_line=2, end_line=3)],
+            original_range=LineRange(start_line=2, end_line=7),
+        )
+    )
+
+    assert parsed.render(['fragment1'], ['highlight2']) == snapshot(
+        RenderedSnippet(
+            content="""\
+line 2
+line 3
+line 4
+
+...\
+""",
+            highlights=[LineRange(start_line=2, end_line=5)],
+            original_range=LineRange(start_line=2, end_line=7),
+        )
+    )
+
+    assert parsed.render(['fragment2'], ['highlight2']) == snapshot(
+        RenderedSnippet(
+            content="""\
+...
+
+line 3
+line 4
+line 5
+
+...\
+""",
+            highlights=[LineRange(start_line=2, end_line=5)],
+            original_range=LineRange(start_line=4, end_line=9),
+        )
+    )
+
+    assert parsed.render(['fragment1', 'fragment2'], []) == snapshot(
+        RenderedSnippet(
+            content="""\
+line 2
+line 3
+line 4
+line 5
+
+...\
+""",
+            highlights=[],
+            original_range=LineRange(start_line=2, end_line=9),
+        )
+    )
+
+# tests/test_ssrf.py:654-672
+    async def test_default_timeout(self) -> None:
+        """Test that default timeout is used."""
+        mock_response = AsyncMock()
+        mock_response.is_redirect = False
+        mock_response.raise_for_status = lambda: None
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            mock_executor.return_value = [(2, 1, 6, '', ('93.184.215.14', 0))]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = mock_response
+            mock_client_fn.return_value = mock_client
+
+            await safe_download('https://example.com/file.txt')
+
+            mock_client_fn.assert_called_once_with(timeout=_DEFAULT_TIMEOUT)
+
+# tests/test_fastmcp.py:310-324
+    async def test_call_tool_with_structured_content(
+        self,
+        fastmcp_toolset: FastMCPToolset[None],
+        run_context: RunContext[None],
+    ):
+        """Test tool call with structured content."""
+        async with fastmcp_toolset:
+            tools = await fastmcp_toolset.get_tools(run_context)
+            another_tool = tools['another_tool']
+
+            result = await fastmcp_toolset.call_tool(
+                name='another_tool', tool_args={'value': 3.14}, ctx=run_context, tool=another_tool
+            )
+
+            assert result == {'result': 'success', 'value': 3.14, 'doubled': 6.28}
+
+# tests/test_fastmcp.py:384-401
+    async def test_call_tool_with_unknown_text_content(
+        self,
+        fastmcp_toolset: FastMCPToolset[None],
+        run_context: RunContext[None],
+    ):
+        """Test tool call that returns text content."""
+        async with fastmcp_toolset:
+            tools = await fastmcp_toolset.get_tools(run_context)
+            text_tool = tools['text_tool_wo_return_annotation']
+
+            result = await fastmcp_toolset.call_tool(
+                name='text_tool_wo_return_annotation',
+                tool_args={'message': 'Hello World'},
+                ctx=run_context,
+                tool=text_tool,
+            )
+
+            assert result == snapshot('Echo: Hello World')
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:115-128
+from .toolsets import (
+    AbstractToolset,
+    ApprovalRequiredToolset,
+    CombinedToolset,
+    ExternalToolset,
+    FilteredToolset,
+    FunctionToolset,
+    PrefixedToolset,
+    PreparedToolset,
+    RenamedToolset,
+    ToolsetFunc,
+    ToolsetTool,
+    WrapperToolset,
+)
+
+# tests/test_ssrf.py:461-482
+    async def test_redirect_to_private_ip_blocked(self) -> None:
+        """Test that redirects to private IPs are blocked."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': 'http://internal.local/file.txt'}
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com (public), second for internal.local (private)
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('192.168.1.1', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.return_value = redirect_response
+            mock_client_fn.return_value = mock_client
+
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await safe_download('https://example.com/file.txt')
+
+# tests/test_ssrf.py:626-632
+    async def test_protocol_validation(self) -> None:
+        """Test that non-http(s) protocols are rejected."""
+        with pytest.raises(ValueError, match='URL protocol "file" is not allowed'):
+            await safe_download('file:///etc/passwd')
+
+        with pytest.raises(ValueError, match='URL protocol "ftp" is not allowed'):
+            await safe_download('ftp://ftp.example.com/file.txt')
+
+# tests/test_exceptions.py:70-74
+def test_tool_retry_error_str_with_string_content():
+    """Test that ToolRetryError uses string content as message automatically."""
+    part = RetryPromptPart(content='error from tool', tool_name='my_tool')
+    error = ToolRetryError(part)
+    assert str(error) == 'error from tool'
+
+# tests/graph/beta/test_parent_forks.py:200-225
+def test_parent_fork_complex_intermediate_nodes():
+    """Test parent fork with complex intermediate node structure."""
+    join_id = 'J'
+    nodes = {'start', 'F', 'A1', 'A2', 'B1', 'B2', 'J', 'end'}
+    start_ids = {'start'}
+    fork_ids = {'F'}
+    edges = {
+        'start': ['F'],
+        'F': ['A1', 'B1'],
+        'A1': ['A2'],
+        'A2': ['J'],
+        'B1': ['B2'],
+        'B2': ['J'],
+        'J': ['end'],
+    }
+
+    finder = ParentForkFinder(nodes, start_ids, fork_ids, edges)
+    parent_fork = finder.find_parent_fork(join_id)
+
+    assert parent_fork is not None
+    assert parent_fork.fork_id == 'F'
+    # All intermediate nodes between F and J
+    assert 'A1' in parent_fork.intermediate_nodes
+    assert 'A2' in parent_fork.intermediate_nodes
+    assert 'B1' in parent_fork.intermediate_nodes
+    assert 'B2' in parent_fork.intermediate_nodes
+
+# tests/graph/beta/test_graph_execution.py:190-224
+async def test_complex_fork_stack_with_multiple_levels():
+    """Test complex scenarios with multiple fork levels"""
+    g = GraphBuilder(state_type=ExecutionState, output_type=list[int])
+
+    @g.step
+    async def level1(ctx: StepContext[ExecutionState, None, None]) -> list[int]:
+        return [1, 2]
+
+    @g.step
+    async def level2(ctx: StepContext[ExecutionState, None, int]) -> list[int]:
+        return [ctx.inputs * 10, ctx.inputs * 10 + 1]
+
+    @g.step
+    async def level3(ctx: StepContext[ExecutionState, None, int]) -> int:
+        ctx.state.log.append(f'processing-{ctx.inputs}')
+        return ctx.inputs
+
+    collect = g.join(reduce_list_append, initial_factory=list[int])
+
+    g.add(
+        g.edge_from(g.start_node).to(level1),
+        g.edge_from(level1).map().to(level2),
+        g.edge_from(level2).map().to(level3),
+        g.edge_from(level3).to(collect),
+        g.edge_from(collect).to(g.end_node),
+    )
+
+    graph = g.build()
+    state = ExecutionState()
+    result = await graph.run(state=state)
+
+    # Should process 4 items total (2 from level1 * 2 from each level2)
+    assert len(result) == 4
+    assert sorted(result) == [10, 11, 20, 21]
+    assert len(state.log) == 4
+
+# tests/test_ssrf.py:550-581
+    async def test_protocol_relative_redirect(self) -> None:
+        """Test that protocol-relative redirects are handled correctly."""
+        redirect_response = AsyncMock()
+        redirect_response.is_redirect = True
+        redirect_response.headers = {'location': '//cdn.example.com/file.txt'}
+
+        final_response = AsyncMock()
+        final_response.is_redirect = False
+        final_response.raise_for_status = lambda: None
+        final_response.content = b'final content'
+
+        with (
+            patch('pydantic_ai._ssrf.run_in_executor') as mock_executor,
+            patch('pydantic_ai._ssrf.cached_async_http_client') as mock_client_fn,
+        ):
+            # First call for example.com, second for cdn.example.com
+            mock_executor.side_effect = [
+                [(2, 1, 6, '', ('93.184.215.14', 0))],
+                [(2, 1, 6, '', ('203.0.113.50', 0))],
+            ]
+
+            mock_client = AsyncMock()
+            mock_client.get.side_effect = [redirect_response, final_response]
+            mock_client_fn.return_value = mock_client
+
+            response = await safe_download('https://example.com/file.txt')
+            assert response.content == b'final content'
+            assert mock_client.get.call_count == 2
+
+            # Verify second request was to cdn.example.com with https
+            second_call = mock_client.get.call_args_list[1]
+            assert second_call[1]['headers']['Host'] == 'cdn.example.com'
+
+# pydantic_ai_slim/pydantic_ai/toolsets/combined.py:86-90
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+    ) -> Any:
+        assert isinstance(tool, _CombinedToolsetTool)
+        return await tool.source_toolset.call_tool(name, tool_args, ctx, tool.source_tool)
+
+# tests/test_cli.py:134-140
+def test_no_command_defaults_to_chat(mocker: MockerFixture):
+    """Test that running clai with no command defaults to chat mode."""
+    # Mock _run_chat_command to avoid actual execution
+    mock_run_chat = mocker.patch('pydantic_ai._cli._run_chat_command', return_value=0)
+    result = cli([])
+    assert result == 0
+    mock_run_chat.assert_called_once()
+
+# tests/models/test_outlines.py:434-443
+async def test_tool_definition_error_async_model(mock_async_model: OutlinesModel) -> None:
+    """Test that function tools raise UserError with async model."""
+    agent = Agent(mock_async_model)
+
+    @agent.tool_plain
+    def dummy_tool() -> str:  # pragma: no cover
+        return 'dummy'
+
+    with pytest.raises(UserError, match='Outlines does not support function tools yet.'):
+        await agent.run('Hello')
+
+# pydantic_ai_slim/pydantic_ai/models/openai.py:2839-2846
+def _split_combined_tool_call_id(combined_id: str) -> tuple[str, str | None]:
+    # When reasoning, the Responses API requires the `ResponseFunctionToolCall` to be returned with both the `call_id` and `id` fields.
+    # Before our `ToolCallPart` gained the `id` field alongside `tool_call_id` field, we combined the two fields into a single string stored on `tool_call_id`.
+    if '|' in combined_id:
+        call_id, id = combined_id.split('|', 1)
+        return call_id, id
+    else:
+        return combined_id, None
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:115-128
+from .toolsets import (
+    AbstractToolset,
+    ApprovalRequiredToolset,
+    CombinedToolset,
+    ExternalToolset,
+    FilteredToolset,
+    FunctionToolset,
+    PrefixedToolset,
+    PreparedToolset,
+    RenamedToolset,
+    ToolsetFunc,
+    ToolsetTool,
+    WrapperToolset,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:115-128
+from .toolsets import (
+    AbstractToolset,
+    ApprovalRequiredToolset,
+    CombinedToolset,
+    ExternalToolset,
+    FilteredToolset,
+    FunctionToolset,
+    PrefixedToolset,
+    PreparedToolset,
+    RenamedToolset,
+    ToolsetFunc,
+    ToolsetTool,
+    WrapperToolset,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:115-128
+from .toolsets import (
+    AbstractToolset,
+    ApprovalRequiredToolset,
+    CombinedToolset,
+    ExternalToolset,
+    FilteredToolset,
+    FunctionToolset,
+    PrefixedToolset,
+    PreparedToolset,
+    RenamedToolset,
+    ToolsetFunc,
+    ToolsetTool,
+    WrapperToolset,
+)
+
+# tests/test_deps.py:17-18
+async def example_tool(ctx: RunContext[MyDeps]) -> str:
+    return f'{ctx.deps}'
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:35-48
+from .exceptions import (
+    AgentRunError,
+    ApprovalRequired,
+    CallDeferred,
+    ConcurrencyLimitExceeded,
+    FallbackExceptionGroup,
+    IncompleteToolCall,
+    ModelAPIError,
+    ModelHTTPError,
+    ModelRetry,
+    UnexpectedModelBehavior,
+    UsageLimitExceeded,
+    UserError,
+)
+
+# tests/models/test_openai.py:1717-1718
+def strict_compatible_tool(x: int) -> str:
+    return str(x)  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/models/openrouter.py:393-393
+    tool_calls: list[_OpenRouterChatCompletionMessageToolCallUnion] | None = None  # type: ignore[reportIncompatibleVariableOverride]

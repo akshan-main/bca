@@ -1,0 +1,238 @@
+## httpx/_main.py
+
+def format_request_headers(request: httpcore.Request, http2: bool = False) -> str:
+    version = "HTTP/2" if http2 else "HTTP/1.1"
+    headers = [
+        (name.lower() if http2 else name, value) for name, value in request.headers
+    ]
+    method = request.method.decode("ascii")
+    target = request.url.target.decode("ascii")
+    lines = [f"{method} {target} {version}"] + [
+        f"{name.decode('ascii')}: {value.decode('ascii')}" for name, value in headers
+    ]
+    return "\n".join(lines)
+
+def format_response_headers(
+    http_version: bytes,
+    status: int,
+    reason_phrase: bytes | None,
+    headers: list[tuple[bytes, bytes]],
+) -> str:
+    version = http_version.decode("ascii")
+    reason = (
+        codes.get_reason_phrase(status)
+        if reason_phrase is None
+        else reason_phrase.decode("ascii")
+    )
+    lines = [f"{version} {status} {reason}"] + [
+        f"{name.decode('ascii')}: {value.decode('ascii')}" for name, value in headers
+    ]
+    return "\n".join(lines)
+
+def print_request_headers(request: httpcore.Request, http2: bool = False) -> None:
+    console = rich.console.Console()
+    http_text = format_request_headers(request, http2=http2)
+    syntax = rich.syntax.Syntax(http_text, "http", theme="ansi_dark", word_wrap=True)
+    console.print(syntax)
+    syntax = rich.syntax.Syntax("", "http", theme="ansi_dark", word_wrap=True)
+    console.print(syntax)
+
+## tests/client/test_client.py
+
+def echo_raw_headers(request: httpx.Request) -> httpx.Response:
+    data = [
+        (name.decode("ascii"), value.decode("ascii"))
+        for name, value in request.headers.raw
+    ]
+    return httpx.Response(200, json=data)
+
+## tests/client/test_headers.py
+
+def echo_repeated_headers_items(request: httpx.Request) -> httpx.Response:
+    data = {"headers": list(request.headers.items())}
+    return httpx.Response(200, json=data)
+
+def test_header_merge_conflicting_headers():
+    url = "http://example.org/echo_headers"
+    client_headers = {"X-Auth-Token": "FooBar"}
+    request_headers = {"X-Auth-Token": "BazToken"}
+    client = httpx.Client(
+        transport=httpx.MockTransport(echo_headers), headers=client_headers
+    )
+    response = client.get(url, headers=request_headers)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org",
+            "user-agent": f"python-httpx/{httpx.__version__}",
+            "x-auth-token": "BazToken",
+        }
+    }
+
+def test_request_auto_headers():
+    request = httpx.Request("GET", "https://www.example.org/")
+    assert "host" in request.headers
+
+## tests/conftest.py
+
+async def echo_headers(scope: Scope, receive: Receive, send: Send) -> None:
+    body = {
+        name.capitalize().decode(): value.decode()
+        for name, value in scope.get("headers", [])
+    }
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [[b"content-type", b"application/json"]],
+        }
+    )
+    await send({"type": "http.response.body", "body": json.dumps(body).encode()})
+
+## tests/models/test_headers.py
+
+def test_headers():
+    h = httpx.Headers([("a", "123"), ("a", "456"), ("b", "789")])
+    assert "a" in h
+    assert "A" in h
+    assert "b" in h
+    assert "B" in h
+    assert "c" not in h
+    assert h["a"] == "123, 456"
+    assert h.get("a") == "123, 456"
+    assert h.get("nope", default=None) is None
+    assert h.get_list("a") == ["123", "456"]
+
+    assert list(h.keys()) == ["a", "b"]
+    assert list(h.values()) == ["123, 456", "789"]
+    assert list(h.items()) == [("a", "123, 456"), ("b", "789")]
+    assert h.multi_items() == [("a", "123"), ("a", "456"), ("b", "789")]
+    assert list(h) == ["a", "b"]
+    assert dict(h) == {"a": "123, 456", "b": "789"}
+    assert repr(h) == "Headers([('a', '123'), ('a', '456'), ('b', '789')])"
+    assert h == [("a", "123"), ("b", "789"), ("a", "456")]
+    assert h == [("a", "123"), ("A", "456"), ("b", "789")]
+    assert h == {"a": "123", "A": "456", "b": "789"}
+    assert h != "a: 123\nA: 456\nb: 789"
+
+    h = httpx.Headers({"a": "123", "b": "789"})
+    assert h["A"] == "123"
+    assert h["B"] == "789"
+    assert h.raw == [(b"a", b"123"), (b"b", b"789")]
+    assert repr(h) == "Headers({'a': '123', 'b': '789'})"
+
+def test_copy_headers_method():
+    headers = httpx.Headers({"custom": "example"})
+    headers_copy = headers.copy()
+    assert headers == headers_copy
+    assert headers is not headers_copy
+
+def test_copy_headers_init():
+    headers = httpx.Headers({"custom": "example"})
+    headers_copy = httpx.Headers(headers)
+    assert headers == headers_copy
+
+def test_headers_insert_appends_if_new():
+    headers = httpx.Headers({"a": "a", "b": "b", "c": "c"})
+    headers["d"] = "123"
+    assert list(headers.values()) == ["a", "b", "c", "123"]
+
+def test_headers_insert_removes_all_existing():
+    headers = httpx.Headers([("a", "123"), ("a", "456")])
+    headers["a"] = "789"
+    assert dict(headers) == {"a": "789"}
+
+def test_headers_encoding_in_repr():
+    """
+    Headers should display an encoding in the repr if required.
+    """
+    headers = httpx.Headers({b"custom": "example ☃".encode("utf-8")})
+    assert repr(headers) == "Headers({'custom': 'example ☃'}, encoding='utf-8')"
+
+def test_headers_list_repr():
+    """
+    Headers should display with a list repr if they include multiple identical keys.
+    """
+    headers = httpx.Headers([("custom", "example 1"), ("custom", "example 2")])
+    assert (
+        repr(headers) == "Headers([('custom', 'example 1'), ('custom', 'example 2')])"
+    )
+
+def test_headers_decode_ascii():
+    """
+    Headers should decode as ascii by default.
+    """
+    raw_headers = [(b"Custom", b"Example")]
+    headers = httpx.Headers(raw_headers)
+    assert dict(headers) == {"custom": "Example"}
+    assert headers.encoding == "ascii"
+
+def test_headers_decode_utf_8():
+    """
+    Headers containing non-ascii codepoints should default to decoding as utf-8.
+    """
+    raw_headers = [(b"Custom", "Code point: ☃".encode("utf-8"))]
+    headers = httpx.Headers(raw_headers)
+    assert dict(headers) == {"custom": "Code point: ☃"}
+    assert headers.encoding == "utf-8"
+
+def test_headers_decode_iso_8859_1():
+    """
+    Headers containing non-UTF-8 codepoints should default to decoding as iso-8859-1.
+    """
+    raw_headers = [(b"Custom", "Code point: ÿ".encode("iso-8859-1"))]
+    headers = httpx.Headers(raw_headers)
+    assert dict(headers) == {"custom": "Code point: ÿ"}
+    assert headers.encoding == "iso-8859-1"
+
+def test_multiple_headers():
+    """
+    `Headers.get_list` should support both split_commas=False and split_commas=True.
+    """
+    h = httpx.Headers([("set-cookie", "a, b"), ("set-cookie", "c")])
+    assert h.get_list("Set-Cookie") == ["a, b", "c"]
+
+    h = httpx.Headers([("vary", "a, b"), ("vary", "c")])
+    assert h.get_list("Vary", split_commas=True) == ["a", "b", "c"]
+
+def test_obfuscate_sensitive_headers(headers, output):
+    as_dict = {k: v for k, v in output}
+    headers_class = httpx.Headers({k: v for k, v in headers})
+    assert repr(headers_class) == f"Headers({as_dict!r})"
+
+## tests/models/test_requests.py
+
+def test_headers():
+    request = httpx.Request("POST", "http://example.org", json={"test": 123})
+
+    assert request.headers == {
+        "Host": "example.org",
+        "Content-Type": "application/json",
+        "Content-Length": "12",
+    }
+
+## tests/models/test_responses.py
+
+def test_link_headers(headers, expected):
+    response = httpx.Response(
+        200,
+        content=None,
+        headers=headers,
+    )
+    assert response.links == expected
+
+## tests/test_asgi.py
+
+async def echo_headers(scope, receive, send):
+    status = 200
+    output = json.dumps(
+        {"headers": [[k.decode(), v.decode()] for k, v in scope["headers"]]}
+    ).encode("utf-8")
+    headers = [(b"content-type", "text/plain"), (b"content-length", str(len(output)))]
+
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": output})

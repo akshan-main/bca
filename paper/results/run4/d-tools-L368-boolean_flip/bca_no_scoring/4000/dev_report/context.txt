@@ -1,0 +1,492 @@
+## pydantic_ai_slim/pydantic_ai/agent/__init__.py
+
+    _function_toolset: FunctionToolset[AgentDepsT] = dataclasses.field(repr=False)
+
+    output_schema: _output.OutputSchema[Any]
+
+    def __init__(
+        self,
+        tools: Sequence[Tool[AgentDepsT] | ToolFuncEither[AgentDepsT, ...]] = [],
+        *,
+        max_retries: int = 1,
+        timeout: float | None = None,
+        id: str | None = None,
+        output_schema: _output.OutputSchema[Any],
+    ):
+        self.output_schema = output_schema
+        super().__init__(tools, max_retries=max_retries, timeout=timeout, id=id)
+
+    def id(self) -> str:
+        return '<agent>'
+
+    def add_tool(self, tool: Tool[AgentDepsT]) -> None:
+        if tool.requires_approval and not self.output_schema.allows_deferred_tools:
+            raise exceptions.UserError(
+                'To use tools that require approval, add `DeferredToolRequests` to the list of output types for this agent.'
+            )
+        super().add_tool(tool)
+
+## pydantic_ai_slim/pydantic_ai/models/function.py
+
+    function_tools: list[ToolDefinition]
+
+## tests/test_agent.py
+
+def test_toolsets():
+    toolset = FunctionToolset()
+
+    @toolset.tool
+    def foo() -> str:
+        return 'Hello from foo'  # pragma: no cover
+
+    agent = Agent('test', toolsets=[toolset])
+    assert toolset in agent.toolsets
+
+    other_toolset = FunctionToolset()
+    with agent.override(toolsets=[other_toolset]):
+        assert other_toolset in agent.toolsets
+        assert toolset not in agent.toolsets
+
+## tests/test_prefect.py
+
+async def test_toolset_without_id():
+    """Test that agents can be created with toolsets without IDs."""
+    # This is allowed in Prefect
+    PrefectAgent(Agent(model=model, name='test_agent', toolsets=[FunctionToolset()]))
+
+## tests/test_tools.py
+
+def test_tool_no_ctx():
+    agent = Agent(TestModel())
+
+    with pytest.raises(UserError) as exc_info:
+
+        @agent.tool  # pyright: ignore[reportArgumentType]
+        def invalid_tool(x: int) -> str:  # pragma: no cover
+            return 'Hello'
+
+    assert str(exc_info.value) == snapshot(
+        'Error generating schema for test_tool_no_ctx.<locals>.invalid_tool:\n'
+        '  First parameter of tools that take context must be annotated with RunContext[...]'
+    )
+
+def test_tool_plain_with_ctx():
+    agent = Agent(TestModel())
+
+    with pytest.raises(UserError) as exc_info:
+
+        @agent.tool_plain
+        async def invalid_tool(ctx: RunContext[None]) -> str:  # pragma: no cover
+            return 'Hello'
+
+    assert str(exc_info.value) == snapshot(
+        'Error generating schema for test_tool_plain_with_ctx.<locals>.invalid_tool:\n'
+        '  RunContext annotations can only be used with tools that take context'
+    )
+
+def test_builtin_tool_registration():
+    """
+    Test that built-in functions can't be registered as tools.
+    """
+
+    with pytest.raises(
+        UserError,
+        match='Error generating schema for min:\n  no signature found for builtin <built-in function min>',
+    ):
+        agent = Agent(TestModel())
+        agent.tool_plain(min)
+
+    with pytest.raises(
+        UserError,
+        match='Error generating schema for max:\n  no signature found for builtin <built-in function max>',
+    ):
+        agent = Agent(TestModel())
+        agent.tool_plain(max)
+
+def test_tool_ctx_second():
+    agent = Agent(TestModel())
+
+    with pytest.raises(UserError) as exc_info:
+
+        @agent.tool  # pyright: ignore[reportArgumentType]
+        def invalid_tool(x: int, ctx: RunContext[None]) -> str:  # pragma: no cover
+            return 'Hello'
+
+    assert str(exc_info.value) == snapshot(
+        'Error generating schema for test_tool_ctx_second.<locals>.invalid_tool:\n'
+        '  First parameter of tools that take context must be annotated with RunContext[...]\n'
+        '  RunContext annotations can only be used as the first argument'
+    )
+
+async def get_json_schema(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    if len(info.function_tools) == 1:
+        r = info.function_tools[0]
+        return ModelResponse(parts=[TextPart(pydantic_core.to_json(r).decode())])
+    else:
+        return ModelResponse(parts=[TextPart(pydantic_core.to_json(info.function_tools).decode())])
+
+def test_docstring_google(docstring_format: Literal['google', 'auto']):
+    agent = Agent(FunctionModel(get_json_schema))
+    agent.tool_plain(docstring_format=docstring_format)(google_style_docstring)
+
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'google_style_docstring',
+            'description': 'Do foobar stuff, a lot.',
+            'parameters_json_schema': {
+                'properties': {
+                    'foo': {'description': 'The foo thing.', 'type': 'integer'},
+                    'bar': {'description': 'The bar thing.', 'type': 'string'},
+                },
+                'required': ['foo', 'bar'],
+                'type': 'object',
+                'additionalProperties': False,
+            },
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )
+
+def sphinx_style_docstring(foo: int, /) -> str:  # pragma: no cover
+    """Sphinx style docstring.
+
+    :param foo: The foo thing.
+    """
+    return str(foo)
+
+def test_docstring_sphinx(docstring_format: Literal['sphinx', 'auto']):
+    agent = Agent(FunctionModel(get_json_schema))
+    agent.tool_plain(docstring_format=docstring_format)(sphinx_style_docstring)
+
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'sphinx_style_docstring',
+            'description': 'Sphinx style docstring.',
+            'parameters_json_schema': {
+                'properties': {'foo': {'description': 'The foo thing.', 'type': 'integer'}},
+                'required': ['foo'],
+                'type': 'object',
+                'additionalProperties': False,
+            },
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )
+
+def numpy_style_docstring(*, foo: int, bar: str) -> str:  # pragma: no cover
+    """Numpy style docstring.
+
+    Parameters
+    ----------
+    foo : int
+        The foo thing.
+    bar : str
+        The bar thing.
+    """
+    return f'{foo} {bar}'
+
+def test_docstring_numpy(docstring_format: Literal['numpy', 'auto']):
+    agent = Agent(FunctionModel(get_json_schema))
+    agent.tool_plain(docstring_format=docstring_format)(numpy_style_docstring)
+
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'numpy_style_docstring',
+            'description': 'Numpy style docstring.',
+            'parameters_json_schema': {
+                'properties': {
+                    'foo': {'description': 'The foo thing.', 'type': 'integer'},
+                    'bar': {'description': 'The bar thing.', 'type': 'string'},
+                },
+                'required': ['foo', 'bar'],
+                'type': 'object',
+                'additionalProperties': False,
+            },
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )
+
+def test_google_style_with_returns():
+    agent = Agent(FunctionModel(get_json_schema))
+
+    def my_tool(x: int) -> str:  # pragma: no cover
+        """A function that does something.
+
+        Args:
+            x: The input value.
+
+        Returns:
+            str: The result as a string.
+        """
+        return str(x)
+
+    agent.tool_plain(my_tool)
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'my_tool',
+            'description': """\
+<summary>A function that does something.</summary>
+<returns>
+<type>str</type>
+<description>The result as a string.</description>
+</returns>\
+""",
+            'parameters_json_schema': {
+                'additionalProperties': False,
+                'properties': {'x': {'description': 'The input value.', 'type': 'integer'}},
+                'required': ['x'],
+                'type': 'object',
+            },
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )
+
+def test_sphinx_style_with_returns():
+    agent = Agent(FunctionModel(get_json_schema))
+
+    def my_tool(x: int) -> str:  # pragma: no cover
+        """A sphinx function with returns.
+
+        :param x: The input value.
+        :rtype: str
+        :return: The result as a string with type.
+        """
+        return str(x)
+
+    agent.tool_plain(docstring_format='sphinx')(my_tool)
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'my_tool',
+            'description': """\
+<summary>A sphinx function with returns.</summary>
+<returns>
+<type>str</type>
+<description>The result as a string with type.</description>
+</returns>\
+""",
+            'parameters_json_schema': {
+                'additionalProperties': False,
+                'properties': {'x': {'description': 'The input value.', 'type': 'integer'}},
+                'required': ['x'],
+                'type': 'object',
+            },
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )
+
+def test_numpy_style_with_returns():
+    agent = Agent(FunctionModel(get_json_schema))
+
+    def my_tool(x: int) -> str:  # pragma: no cover
+        """A numpy function with returns.
+
+        Parameters
+        ----------
+        x : int
+            The input value.
+
+        Returns
+        -------
+        str
+            The result as a string with type.
+        """
+        return str(x)
+
+    agent.tool_plain(docstring_format='numpy')(my_tool)
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'my_tool',
+            'description': """\
+<summary>A numpy function with returns.</summary>
+<returns>
+<type>str</type>
+<description>The result as a string with type.</description>
+</returns>\
+""",
+            'parameters_json_schema': {
+                'additionalProperties': False,
+                'properties': {'x': {'description': 'The input value.', 'type': 'integer'}},
+                'required': ['x'],
+                'type': 'object',
+            },
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )
+
+def only_returns_type() -> str:  # pragma: no cover
+    """
+
+    Returns:
+        str: The result as a string.
+    """
+    return 'foo'
+
+def test_only_returns_type():
+    agent = Agent(FunctionModel(get_json_schema))
+    agent.tool_plain(only_returns_type)
+
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'only_returns_type',
+            'description': """\
+<returns>
+<type>str</type>
+<description>The result as a string.</description>
+</returns>\
+""",
+            'parameters_json_schema': {'additionalProperties': False, 'properties': {}, 'type': 'object'},
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )
+
+def unknown_docstring(**kwargs: int) -> str:  # pragma: no cover
+    """Unknown style docstring."""
+    return str(kwargs)
+
+def test_docstring_unknown():
+    agent = Agent(FunctionModel(get_json_schema))
+    agent.tool_plain(unknown_docstring)
+
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'unknown_docstring',
+            'description': 'Unknown style docstring.',
+            'parameters_json_schema': {'additionalProperties': {'type': 'integer'}, 'properties': {}, 'type': 'object'},
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )
+
+async def google_style_docstring_no_body(
+    foo: int, bar: Annotated[str, Field(description='from fields')]
+) -> str:  # pragma: no cover
+    """
+    Args:
+        foo: The foo thing.
+        bar: The bar thing.
+    """
+
+    return f'{foo} {bar}'
+
+class Foo(BaseModel):
+    x: int
+    y: str
+
+def ctx_tool(ctx: RunContext[int], x: int) -> int:
+    return x + ctx.deps
+
+def test_init_tool_ctx():
+    agent = Agent('test', tools=[Tool(ctx_tool, takes_ctx=True, max_retries=3)], deps_type=int, retries=7)
+    result = agent.run_sync('foobar', deps=5)
+    assert result.output == snapshot('{"ctx_tool":5}')
+    assert agent._function_toolset.tools['ctx_tool'].takes_ctx is True
+    assert agent._function_toolset.tools['ctx_tool'].max_retries == 3
+
+    agent_infer = Agent('test', tools=[ctx_tool], deps_type=int)
+    result = agent_infer.run_sync('foobar', deps=6)
+    assert result.output == snapshot('{"ctx_tool":6}')
+    assert agent_infer._function_toolset.tools['ctx_tool'].takes_ctx is True
+
+def test_tool_raises_call_deferred():
+    agent = Agent(TestModel(), output_type=[str, DeferredToolRequests])
+
+    @agent.tool_plain
+    def my_tool(x: int) -> int:
+        raise CallDeferred
+
+    result = agent.run_sync('Hello')
+    assert result.output == snapshot(
+        DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])
+    )
+
+def test_agent_tool_timeout_passed_to_toolset():
+    """Test that agent-level tool_timeout is passed to FunctionToolset as timeout."""
+    agent = Agent(TestModel(), tool_timeout=30.0)
+
+    # The agent's tool_timeout should be passed to the toolset as timeout
+    assert agent._function_toolset.timeout == 30.0
+
+async def test_tool_cancelled_when_agent_cancelled(is_stream: bool):
+    """Test that tools are cancelled when agent is cancelled."""
+    import asyncio
+
+    agent = Agent(TestModel())
+    is_called = asyncio.Event()
+    is_cancelled = asyncio.Event()
+
+    @agent.tool_plain
+    async def tool() -> None:
+        is_called.set()
+
+        try:
+            await asyncio.sleep(1.0)
+
+        except asyncio.CancelledError:
+            is_cancelled.set()
+            raise
+
+    async def run_agent() -> None:
+        if not is_stream:
+            await agent.run('call tool')
+
+        else:
+            async for _ in agent.run_stream_events('call tool'):
+                pass
+
+    task = asyncio.create_task(run_agent())
+    await asyncio.wait_for(is_called.wait(), timeout=1.0)
+    task.cancel()
+    await asyncio.wait_for(is_cancelled.wait(), timeout=1.0)

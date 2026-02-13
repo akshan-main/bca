@@ -1,0 +1,424 @@
+## pydantic_ai_slim/pydantic_ai/_function_schema.py
+
+def _takes_ctx(callable_obj: TargetCallable[P, R]) -> TypeIs[WithCtx[P, R]]:  # pyright: ignore[reportUnusedFunction]
+    """Check if a callable takes a `RunContext` first argument.
+
+    Args:
+        callable_obj: The callable to check.
+
+    Returns:
+        `True` if the callable takes a `RunContext` as first argument, `False` otherwise.
+    """
+    try:
+        sig = signature(callable_obj)
+    except ValueError:
+        return False
+    try:
+        first_param_name = next(iter(sig.parameters.keys()))
+    except StopIteration:
+        return False
+    else:
+        # See https://github.com/pydantic/pydantic/pull/11451 for a similar implementation in Pydantic
+        if not isinstance(callable_obj, _decorators._function_like):  # pyright: ignore[reportPrivateUsage]
+            call_func = getattr(type(callable_obj), '__call__', None)
+            if call_func is not None:
+                callable_obj = call_func
+            else:
+                return False  # pragma: no cover
+
+        type_hints = _typing_extra.get_function_type_hints(_decorators.unwrap_wrapped_function(callable_obj))
+        annotation = type_hints.get(first_param_name)
+        if annotation is None:
+            return False
+        return True is not sig.empty and _is_call_ctx(annotation)
+
+def _is_call_ctx(annotation: Any) -> bool:
+    """Return whether the annotation is the `RunContext` class, parameterized or not."""
+    return annotation is RunContext or get_origin(annotation) is RunContext
+
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+class ResolvedUrl:
+    """Result of URL validation and DNS resolution."""
+
+    resolved_ip: str
+    """The resolved IP address to connect to."""
+
+    hostname: str
+    """The original hostname (used for Host header)."""
+
+    port: int
+    """The port number."""
+
+    is_https: bool
+    """Whether to use HTTPS."""
+
+    path: str
+    """The path including query string and fragment."""
+
+def extract_host_and_port(url: str) -> tuple[str, str, int, bool]:
+    """Extract hostname, path, port, and protocol info from a URL.
+
+    Returns:
+        Tuple of (hostname, path_with_query, port, is_https)
+
+    Raises:
+        ValueError: If the URL is malformed or uses an unsupported protocol.
+    """
+    # Validate protocol first, before trying to extract hostname
+    _, is_https = validate_url_protocol(url)
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+
+    if not hostname:
+        raise ValueError(f'Invalid URL: no hostname found in "{url}"')
+
+    default_port = 443 if is_https else 80
+    port = parsed.port or default_port
+
+    # Reconstruct path with query string
+    path = parsed.path or '/'
+    if parsed.query:
+        path = f'{path}?{parsed.query}'
+    if parsed.fragment:
+        path = f'{path}#{parsed.fragment}'
+
+    return hostname, path, port, is_https
+
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+def load_mcp_servers(config_path: str | Path) -> list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE]:
+    """Load MCP servers from a configuration file.
+
+    Environment variables can be referenced in the configuration file using:
+    - `${VAR_NAME}` syntax - expands to the value of VAR_NAME, raises error if not defined
+    - `${VAR_NAME:-default}` syntax - expands to VAR_NAME if set, otherwise uses the default value
+
+    Args:
+        config_path: The path to the configuration file.
+
+    Returns:
+        A list of MCP servers.
+
+    Raises:
+        FileNotFoundError: If the configuration file does not exist.
+        ValidationError: If the configuration file does not match the schema.
+        ValueError: If an environment variable referenced in the configuration is not defined and no default value is provided.
+    """
+    config_path = Path(config_path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f'Config file {config_path} not found')
+
+    config_data = pydantic_core.from_json(config_path.read_bytes())
+    expanded_config_data = _expand_env_vars(config_data)
+    config = MCPServerConfig.model_validate(expanded_config_data)
+
+    servers: list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE] = []
+    for name, server in config.mcp_servers.items():
+        server.id = name
+        server.tool_prefix = name
+        servers.append(server)
+
+    return servers
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+async def download_item(
+    item: FileUrl,
+    data_format: Literal['bytes', 'base64', 'base64_uri', 'text'] = 'bytes',
+    type_format: Literal['mime', 'extension'] = 'mime',
+) -> DownloadedItem[str] | DownloadedItem[bytes]:
+    """Download an item by URL and return the content as a bytes object or a (base64-encoded) string.
+
+    This function includes SSRF (Server-Side Request Forgery) protection:
+    - Only http:// and https:// protocols are allowed
+    - Private/internal IP addresses are blocked by default
+    - Cloud metadata endpoints (169.254.169.254) are always blocked
+    - Hostnames are resolved before requests to prevent DNS rebinding
+
+    Set `item.force_download='allow-local'` to allow private IP addresses.
+
+    Args:
+        item: The item to download.
+        data_format: The format to return the content in:
+            - `bytes`: The raw bytes of the content.
+            - `base64`: The base64-encoded content.
+            - `base64_uri`: The base64-encoded content as a data URI.
+            - `text`: The content as a string.
+        type_format: The format to return the media type in:
+            - `mime`: The media type as a MIME type.
+            - `extension`: The media type as an extension.
+
+    Raises:
+        UserError: If the URL points to a YouTube video.
+        ValueError: If the URL uses an unsupported protocol or targets a private/internal
+            IP address (unless allow-local is set).
+    """
+    if isinstance(item, VideoUrl) and item.is_youtube:
+        raise UserError('Downloading YouTube videos is not supported.')
+
+    from .._ssrf import safe_download
+
+    allow_local = item.force_download == 'allow-local'
+    response = await safe_download(item.url, allow_local=allow_local)
+
+    if content_type := response.headers.get('content-type'):
+        content_type = content_type.split(';')[0]
+        if content_type == 'application/octet-stream':
+            content_type = None
+
+    media_type = content_type or item.media_type
+
+    data_type = media_type
+    if type_format == 'extension':
+        data_type = item.format
+
+    data = response.content
+    if data_format in ('base64', 'base64_uri'):
+        data = base64.b64encode(data).decode('utf-8')
+        if data_format == 'base64_uri':
+            data = f'data:{media_type};base64,{data}'
+        return DownloadedItem[str](data=data, data_type=data_type)
+    elif data_format == 'text':
+        return DownloadedItem[str](data=data.decode('utf-8'), data_type=data_type)
+    else:
+        return DownloadedItem[bytes](data=data, data_type=data_type)
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+    async def call_tool(
+        self, name: str, tool_args: dict[str, Any], ctx: RunContext[AgentDepsT], tool: ToolsetTool[AgentDepsT]
+    ) -> Any:
+        """Call a tool with the given arguments.
+
+        Args:
+            name: The name of the tool to call.
+            tool_args: The arguments to pass to the tool.
+            ctx: The run context.
+            tool: The tool definition returned by [`get_tools`][pydantic_ai.toolsets.AbstractToolset.get_tools] that was called.
+        """
+        raise NotImplementedError()
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+## pydantic_evals/pydantic_evals/otel/span_tree.py
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+## tests/conftest.py
+
+def disable_ssrf_protection_for_vcr():
+    """Disable SSRF protection for VCR compatibility.
+
+    VCR cassettes record requests with the original hostname. Since SSRF protection
+    resolves hostnames to IPs before making requests, we need to disable the validation
+    for VCR tests to match the pre-recorded cassettes.
+
+    This fixture patches validate_and_resolve_url to return the hostname in place
+    of the resolved IP, allowing the request URL to use the original hostname.
+    """
+    from unittest.mock import patch
+
+    from pydantic_ai._ssrf import ResolvedUrl, extract_host_and_port
+
+    async def mock_validate_and_resolve(url: str, allow_local: bool) -> ResolvedUrl:
+        hostname, path, port, is_https = extract_host_and_port(url)
+        # Return hostname in place of resolved IP - this allows VCR matching
+        return ResolvedUrl(resolved_ip=hostname, hostname=hostname, port=port, is_https=is_https, path=path)
+
+    with patch('pydantic_ai._ssrf.validate_and_resolve_url', mock_validate_and_resolve):
+        yield
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_group_consecutive_tool_return_parts(bedrock_provider: BedrockProvider):
+    """
+    Test that consecutive ToolReturnPart objects are grouped into a single user message for Bedrock.
+    """
+    model = BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+    now = datetime.now()
+    # Create a ModelRequest with 3 consecutive ToolReturnParts
+    req = [
+        ModelRequest(parts=[UserPromptPart(content=['Hello'])], timestamp=IsDatetime()),
+        ModelResponse(parts=[TextPart(content='Hi')]),
+        ModelRequest(parts=[UserPromptPart(content=['How are you?'])], timestamp=IsDatetime()),
+        ModelResponse(parts=[TextPart(content='Cloudy')]),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name='tool1', content='result1', tool_call_id='id1', timestamp=now),
+                ToolReturnPart(tool_name='tool2', content='result2', tool_call_id='id2', timestamp=now),
+                ToolReturnPart(tool_name='tool3', content='result3', tool_call_id='id3', timestamp=now),
+            ],
+            timestamp=IsDatetime(),
+        ),
+    ]
+
+    # Call the mapping function directly
+    _, bedrock_messages = await model._map_messages(req, ModelRequestParameters(), BedrockModelSettings())  # type: ignore[reportPrivateUsage]
+
+    assert bedrock_messages == snapshot(
+        [
+            {'role': 'user', 'content': [{'text': 'Hello'}]},
+            {'role': 'assistant', 'content': [{'text': 'Hi'}]},
+            {'role': 'user', 'content': [{'text': 'How are you?'}]},
+            {'role': 'assistant', 'content': [{'text': 'Cloudy'}]},
+            {
+                'role': 'user',
+                'content': [
+                    {'toolResult': {'toolUseId': 'id1', 'content': [{'text': 'result1'}], 'status': 'success'}},
+                    {'toolResult': {'toolUseId': 'id2', 'content': [{'text': 'result2'}], 'status': 'success'}},
+                    {'toolResult': {'toolUseId': 'id3', 'content': [{'text': 'result3'}], 'status': 'success'}},
+                ],
+            },
+        ]
+    )
+
+## tests/models/test_download_item.py
+
+async def test_download_item_audio_mpeg(disable_ssrf_protection_for_vcr: None) -> None:
+    downloaded_item = await download_item(
+        AudioUrl(url='https://smokeshow.helpmanual.io/4l1l1s0s6q4741012x1w/common_voice_en_537507.mp3'),
+        data_format='bytes',
+    )
+    assert downloaded_item['data_type'] == 'audio/mpeg'
+    assert downloaded_item['data'] == IsInstance(bytes)
+
+## tests/models/test_model_function.py
+
+async def test_return_empty():
+    agent = Agent(FunctionModel(stream_function=stream_text_function_empty))
+    with pytest.raises(ValueError, match='Stream function must return at least one item'):
+        async with agent.run_stream(''):
+            pass
+
+## tests/test_agent.py
+
+def test_many_multimodal_tool_response():
+    """Test ToolReturn with custom content and tool return."""
+
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[TextPart('Starting analysis'), ToolCallPart('analyze_data', {})])
+        else:
+            return ModelResponse(  # pragma: no cover
+                parts=[
+                    TextPart('Analysis completed'),
+                ]
+            )
+
+    agent = Agent(FunctionModel(llm))
+
+    @agent.tool_plain
+    def analyze_data() -> list[Any]:
+        return [
+            ToolReturn(
+                return_value='Data analysis completed successfully',
+                content=[
+                    'Here are the analysis results:',
+                    ImageUrl('https://example.com/chart.jpg'),
+                    'The chart shows positive trends.',
+                ],
+                metadata={'foo': 'bar'},
+            ),
+            'Something else',
+        ]
+
+    with pytest.raises(
+        UserError,
+        match="The return value of tool 'analyze_data' contains invalid nested `ToolReturn` objects. `ToolReturn` should be used directly.",
+    ):
+        agent.run_sync('Please analyze the data')
+
+## tests/test_logfire.py
+
+def get_logfire_summary(capfire: CaptureLogfire) -> Callable[[], LogfireSummary]:
+    def get_summary() -> LogfireSummary:
+        return LogfireSummary(capfire)
+
+    return get_summary
+
+def _test_logfire_metadata_values_callable_dict(ctx: RunContext[Any]) -> dict[str, str]:
+    return {'model_name': ctx.model.model_name}
+
+def test_logfire_metadata_values(
+    get_logfire_summary: Callable[[], LogfireSummary],
+    metadata: dict[str, Any] | Callable[[RunContext[Any]], dict[str, Any]],
+    expected: dict[str, Any],
+) -> None:
+    agent = Agent(model=TestModel(), instrument=InstrumentationSettings(version=2), metadata=metadata)
+    agent.run_sync('Hello')
+
+    summary = get_logfire_summary()
+    assert summary.attributes[0]['metadata'] == expected
+
+## tests/test_mcp.py
+
+def test_load_mcp_servers_with_non_string_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test that non-string primitive values (int, bool, null) in nested structures are passed through unchanged."""
+    config = tmp_path / 'mcp.json'
+
+    # Create a config with environment variables and extra fields containing primitives
+    # The extra fields will be ignored during validation but go through _expand_env_vars
+    monkeypatch.setenv('PYTHON_CMD', 'python')
+    config.write_text(
+        '{"mcpServers": {"my_server": {"command": "${PYTHON_CMD}", "args": ["-m", "tests.mcp_server"], '
+        '"metadata": {"count": 42, "enabled": true, "value": null}}}}',
+        encoding='utf-8',
+    )
+
+    # This should successfully expand env vars and ignore the metadata field
+    servers = load_mcp_servers(config)
+
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == 'python'
+
+async def test_resource_methods_without_capability(mcp_server: MCPServerStdio) -> None:
+    """Test that resource list methods return empty values when resources capability is not available."""
+    async with mcp_server:
+        # Mock the capabilities to not support resources
+        mock_capabilities = ServerCapabilities(resources=False)
+        with patch.object(mcp_server, '_server_capabilities', mock_capabilities):
+            # list_resources should return empty list
+            result = await mcp_server.list_resources()
+            assert result == []
+
+            # list_resource_templates should return empty list
+            result = await mcp_server.list_resource_templates()
+            assert result == []
+
+## tests/test_tools.py
+
+def test_only_returns_type():
+    agent = Agent(FunctionModel(get_json_schema))
+    agent.tool_plain(only_returns_type)
+
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        {
+            'name': 'only_returns_type',
+            'description': """\
+<returns>
+<type>str</type>
+<description>The result as a string.</description>
+</returns>\
+""",
+            'parameters_json_schema': {'additionalProperties': False, 'properties': {}, 'type': 'object'},
+            'outer_typed_dict_key': None,
+            'strict': None,
+            'kind': 'function',
+            'sequential': False,
+            'metadata': None,
+            'timeout': None,
+        }
+    )

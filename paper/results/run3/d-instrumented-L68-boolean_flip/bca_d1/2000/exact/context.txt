@@ -1,0 +1,221 @@
+## pydantic_ai_slim/pydantic_ai/_instrumentation.py
+
+DEFAULT_INSTRUMENTATION_VERSION = 2
+
+## pydantic_ai_slim/pydantic_ai/agent/__init__.py
+
+    instrument: InstrumentationSettings | bool | None
+
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the instrumentation options for all agents where `instrument` is not set."""
+        Agent._instrument_default = instrument
+
+## pydantic_ai_slim/pydantic_ai/embeddings/__init__.py
+
+    instrument: InstrumentationSettings | bool | None
+
+## pydantic_ai_slim/pydantic_ai/embeddings/instrumented.py
+
+    instrumentation_settings: InstrumentationSettings
+
+## pydantic_ai_slim/pydantic_ai/models/instrumented.py
+
+    instrumentation_settings: InstrumentationSettings
+
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        options: InstrumentationSettings | None = None,
+    ) -> None:
+        super().__init__(wrapped)
+        self.instrumentation_settings = options or InstrumentationSettings()
+
+    def model_attributes(model: Model) -> dict[str, AttributeValue]:
+        attributes: dict[str, AttributeValue] = {
+            GEN_AI_PROVIDER_NAME_ATTRIBUTE: model.system,  # New OTel standard attribute
+            GEN_AI_SYSTEM_ATTRIBUTE: model.system,  # Preserved for backward compatibility (deprecated)
+            GEN_AI_REQUEST_MODEL_ATTRIBUTE: model.model_name,
+        }
+        if base_url := model.base_url:
+            try:
+                parsed = urlparse(base_url)
+            except Exception:  # pragma: no cover
+                pass
+            else:
+                if parsed.hostname:  # pragma: no branch
+                    attributes['server.address'] = parsed.hostname
+                if parsed.port:  # pragma: no branch
+                    attributes['server.port'] = parsed.port
+
+        return attributes
+
+    def event_to_dict(event: LogRecord) -> dict[str, Any]:
+        if not event.body:
+            body = {}  # pragma: no cover
+        elif isinstance(event.body, Mapping):
+            body = event.body
+        else:
+            body = {'body': event.body}
+        return {**body, **(event.attributes or {})}
+
+    def serialize_any(value: Any) -> str:
+        try:
+            return ANY_ADAPTER.dump_python(value, mode='json')
+        except Exception:
+            try:
+                return str(value)
+            except Exception as e:
+                return f'Unable to serialize: {e}'
+
+## pydantic_graph/pydantic_graph/beta/graph.py
+
+    auto_instrument: bool
+
+## pydantic_graph/pydantic_graph/beta/graph_builder.py
+
+    auto_instrument: bool
+
+## pydantic_graph/pydantic_graph/graph.py
+
+    auto_instrument: bool = field(repr=False)
+
+## tests/models/test_instrumented.py
+
+async def test_instrumented_model_not_recording():
+    model = InstrumentedModel(
+        MyModel(),
+        InstrumentationSettings(tracer_provider=NoOpTracerProvider(), logger_provider=NoOpLoggerProvider()),
+    )
+
+    messages: list[ModelMessage] = [ModelRequest(parts=[SystemPromptPart('system_prompt')], timestamp=IsDatetime())]
+    await model.request(
+        messages,
+        model_settings=ModelSettings(temperature=1),
+        model_request_parameters=ModelRequestParameters(
+            function_tools=[],
+            allow_text_output=True,
+            output_tools=[],
+            output_mode='text',
+            output_object=None,
+        ),
+    )
+
+async def test_instrumented_model_stream(capfire: CaptureLogfire):
+    model = InstrumentedModel(MyModel(), InstrumentationSettings(version=1, event_mode='logs'))
+
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                UserPromptPart('user_prompt'),
+            ],
+            timestamp=IsDatetime(),
+        ),
+    ]
+    async with model.request_stream(
+        messages,
+        model_settings=ModelSettings(temperature=1),
+        model_request_parameters=ModelRequestParameters(
+            function_tools=[],
+            allow_text_output=True,
+            output_tools=[],
+            output_mode='text',
+            output_object=None,
+        ),
+    ) as response_stream:
+        assert [event async for event in response_stream] == snapshot(
+            [
+                PartStartEvent(index=0, part=TextPart(content='text1')),
+                FinalResultEvent(tool_name=None, tool_call_id=None),
+                PartDeltaEvent(index=0, delta=TextPartDelta(content_delta='text2')),
+                PartEndEvent(index=0, part=TextPart(content='text1text2')),
+            ]
+        )
+
+    assert capfire.exporter.exported_spans_as_dict(parse_json_attributes=True) == snapshot(
+        [
+            {
+                'name': 'chat gpt-4o',
+                'context': {'trace_id': 1, 'span_id': 1, 'is_remote': False},
+                'parent': None,
+                'start_time': 1000000000,
+                'end_time': 6000000000,
+                'attributes': {
+                    'gen_ai.operation.name': 'chat',
+                    'gen_ai.provider.name': 'openai',
+                    'gen_ai.system': 'openai',
+                    'gen_ai.request.model': 'gpt-4o',
+                    'server.address': 'example.com',
+                    'server.port': 8000,
+                    'model_request_parameters': {
+                        'function_tools': [],
+                        'builtin_tools': [],
+                        'output_mode': 'text',
+                        'output_object': None,
+                        'output_tools': [],
+                        'prompted_output_template': None,
+                        'allow_text_output': True,
+                        'allow_image_output': False,
+                    },
+                    'logfire.json_schema': {
+                        'type': 'object',
+                        'properties': {'model_request_parameters': {'type': 'object'}},
+                    },
+                    'gen_ai.request.temperature': 1,
+                    'logfire.msg': 'chat gpt-4o',
+                    'logfire.span_type': 'span',
+                    'gen_ai.response.model': 'gpt-4o-2024-11-20',
+                    'gen_ai.usage.input_tokens': 300,
+                    'gen_ai.usage.output_tokens': 400,
+                    'operation.cost': 0.00475,
+                },
+            },
+        ]
+    )
+
+    assert capfire.log_exporter.exported_logs_as_dicts() == snapshot(
+        [
+            {
+                'body': {'content': 'user_prompt', 'role': 'user'},
+                'severity_number': None,
+                'severity_text': None,
+                'attributes': {
+                    'gen_ai.system': 'openai',
+                    'gen_ai.message.index': 0,
+                    'event.name': 'gen_ai.user.message',
+                },
+                'timestamp': 2000000000,
+                'observed_timestamp': 3000000000,
+                'trace_id': 1,
+                'span_id': 1,
+                'trace_flags': 1,
+            },
+            {
+                'body': {'index': 0, 'message': {'role': 'assistant', 'content': 'text1text2'}},
+                'severity_number': None,
+                'severity_text': None,
+                'attributes': {'gen_ai.system': 'openai', 'event.name': 'gen_ai.choice'},
+                'timestamp': 4000000000,
+                'observed_timestamp': 5000000000,
+                'trace_id': 1,
+                'span_id': 1,
+                'trace_flags': 1,
+            },
+        ]
+    )
+
+## tests/models/test_model_settings.py
+
+def test_instrumented_model_settings_delegation():
+    """Test that InstrumentedModel correctly delegates settings to wrapped model."""
+    # Create a base model with settings
+    base_settings = ModelSettings(max_tokens=100, temperature=0.5)
+    base_model = TestModel(settings=base_settings)
+
+    # InstrumentedModel should delegate settings to wrapped model
+    instrumented = InstrumentedModel(base_model)
+    assert instrumented.settings == base_settings
+
+    # Test with wrapped model without settings
+    base_model_no_settings = TestModel()
+    instrumented_no_settings = InstrumentedModel(base_model_no_settings)
+    assert instrumented_no_settings.settings is None

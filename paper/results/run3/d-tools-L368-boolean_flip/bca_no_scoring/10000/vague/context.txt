@@ -1,0 +1,993 @@
+## examples/pydantic_ai_examples/ag_ui/api/predictive_state_updates.py
+
+async def story_instructions(ctx: RunContext[StateDeps[DocumentState]]) -> str:
+    """Provide instructions for writing document if present.
+
+    Args:
+        ctx: The run context containing document state information.
+
+    Returns:
+        Instructions string for the document writing agent.
+    """
+    return dedent(
+        f"""You are a helpful assistant for writing documents.
+
+        Before you start writing, you MUST call the `document_predict_state`
+        tool to enable state prediction.
+
+        To present the document to the user for review, you MUST use the
+        `write_document` tool.
+
+        When you have written the document, DO NOT repeat it as a message.
+        If accepted briefly summarize the changes you made, 2 sentences
+        max, otherwise ask the user to clarify what they want to change.
+
+        This is the current document:
+
+        {ctx.deps.state.document}
+        """
+    )
+
+## examples/pydantic_ai_examples/bank_support.py
+
+class SupportOutput(BaseModel):
+    support_advice: str
+    """Advice returned to the customer"""
+    block_card: bool
+    """Whether to block their card or not"""
+    risk: int
+    """Risk level of query"""
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+def _clean_message_history(messages: list[_messages.ModelMessage]) -> list[_messages.ModelMessage]:
+    """Clean the message history by merging consecutive messages of the same type."""
+    clean_messages: list[_messages.ModelMessage] = []
+    for message in messages:
+        last_message = clean_messages[-1] if len(clean_messages) > 0 else None
+
+        if isinstance(message, _messages.ModelRequest):
+            if (
+                last_message
+                and isinstance(last_message, _messages.ModelRequest)
+                # Requests can only be merged if they have the same instructions
+                and (
+                    not last_message.instructions
+                    or not message.instructions
+                    or last_message.instructions == message.instructions
+                )
+            ):
+                parts = [*last_message.parts, *message.parts]
+                parts.sort(
+                    # Tool return parts always need to be at the start
+                    key=lambda x: 0 if isinstance(x, _messages.ToolReturnPart | _messages.RetryPromptPart) else 1
+                )
+                merged_message = _messages.ModelRequest(
+                    parts=parts,
+                    instructions=last_message.instructions or message.instructions,
+                    timestamp=message.timestamp or last_message.timestamp,
+                )
+                clean_messages[-1] = merged_message
+            else:
+                clean_messages.append(message)
+        elif isinstance(message, _messages.ModelResponse):  # pragma: no branch
+            if (
+                last_message
+                and isinstance(last_message, _messages.ModelResponse)
+                # Responses can only be merged if they didn't really come from an API
+                and last_message.provider_response_id is None
+                and last_message.provider_name is None
+                and last_message.model_name is None
+                and message.provider_response_id is None
+                and message.provider_name is None
+                and message.model_name is None
+            ):
+                merged_message = replace(last_message, parts=[*last_message.parts, *message.parts])
+                clean_messages[-1] = merged_message
+            else:
+                clean_messages.append(message)
+    return clean_messages
+
+## pydantic_ai_slim/pydantic_ai/_output.py
+
+class TextOutputProcessor(BaseOutputProcessor[OutputDataT]):
+    async def process(
+        self,
+        data: str,
+        *,
+        run_context: RunContext[AgentDepsT],
+        validation_context: Any | None = None,
+        allow_partial: bool = False,
+        wrap_validation_errors: bool = True,
+    ) -> OutputDataT:
+        return cast(OutputDataT, data)
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_mcp_server.py
+
+class TemporalMCPServer(TemporalMCPToolset[AgentDepsT]):
+    def __init__(
+        self,
+        server: MCPServer,
+        *,
+        activity_name_prefix: str,
+        activity_config: ActivityConfig,
+        tool_activity_config: dict[str, ActivityConfig | Literal[False]],
+        deps_type: type[AgentDepsT],
+        run_context_type: type[TemporalRunContext[AgentDepsT]] = TemporalRunContext[AgentDepsT],
+    ):
+        super().__init__(
+            server,
+            activity_name_prefix=activity_name_prefix,
+            activity_config=activity_config,
+            tool_activity_config=tool_activity_config,
+            deps_type=deps_type,
+            run_context_type=run_context_type,
+        )
+
+    def tool_for_tool_def(self, tool_def: ToolDefinition) -> ToolsetTool[AgentDepsT]:
+        assert isinstance(self.wrapped, MCPServer)
+        return self.wrapped.tool_for_tool_def(tool_def)
+
+## pydantic_ai_slim/pydantic_ai/providers/openrouter.py
+
+class _OpenRouterGoogleJsonSchemaTransformer(JsonSchemaTransformer):
+    """Legacy Google JSON schema transformer for OpenRouter compatibility.
+
+    OpenRouter's compatibility layer doesn't fully support modern JSON Schema features
+    like $defs/$ref and anyOf for nullable types. This transformer restores v1.19.0
+    behavior by inlining definitions and simplifying nullable unions.
+
+    See: https://github.com/pydantic/pydantic-ai/issues/3617
+    """
+
+    def __init__(self, schema: JsonSchema, *, strict: bool | None = None):
+        super().__init__(schema, strict=strict, prefer_inlined_defs=True, simplify_nullable_unions=True)
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        # Remove properties not supported by Gemini
+        schema.pop('$schema', None)
+        schema.pop('title', None)
+        schema.pop('discriminator', None)
+        schema.pop('examples', None)
+        schema.pop('exclusiveMaximum', None)
+        schema.pop('exclusiveMinimum', None)
+
+        if (const := schema.pop('const', None)) is not None:
+            schema['enum'] = [const]
+
+        # Convert enums to string type (legacy Gemini requirement)
+        if enum := schema.get('enum'):
+            schema['type'] = 'string'
+            schema['enum'] = [str(val) for val in enum]
+
+        # Convert oneOf to anyOf for discriminated unions
+        if 'oneOf' in schema and 'type' not in schema:
+            schema['anyOf'] = schema.pop('oneOf')
+
+        # Handle string format -> description
+        type_ = schema.get('type')
+        if type_ == 'string' and (fmt := schema.pop('format', None)):
+            description = schema.get('description')
+            if description:
+                schema['description'] = f'{description} (format: {fmt})'
+            else:
+                schema['description'] = f'Format: {fmt}'
+
+        return schema
+
+## pydantic_evals/pydantic_evals/evaluators/report_common.py
+
+class PrecisionRecallEvaluator(ReportEvaluator):
+    """Computes a precision-recall curve from case data."""
+
+    score_key: str
+    positive_from: Literal['expected_output', 'assertions', 'labels']
+    positive_key: str | None = None
+
+    score_from: Literal['scores', 'metrics'] = 'scores'
+
+    title: str = 'Precision-Recall Curve'
+    n_thresholds: int = 100
+
+    def evaluate(self, ctx: ReportEvaluatorContext[Any, Any, Any]) -> PrecisionRecall:
+        scored_cases: list[tuple[float, bool]] = []
+
+        for case in ctx.report.cases:
+            score = self._get_score(case)
+            is_positive = self._get_positive(case)
+            if score is None or is_positive is None:
+                continue
+            scored_cases.append((score, is_positive))
+
+        scored_cases.sort(key=lambda x: -x[0])
+
+        if not scored_cases:
+            return PrecisionRecall(title=self.title, curves=[])
+
+        scores = [s for s, _ in scored_cases]
+        min_score, max_score = min(scores), max(scores)
+        if min_score == max_score:
+            thresholds = [min_score]
+        else:
+            step = (max_score - min_score) / self.n_thresholds
+            thresholds = [min_score + i * step for i in range(self.n_thresholds + 1)]
+
+        points: list[PrecisionRecallPoint] = []
+        for threshold in thresholds:
+            tp = sum(1 for s, p in scored_cases if s >= threshold and p)
+            fp = sum(1 for s, p in scored_cases if s >= threshold and not p)
+            fn = sum(1 for s, p in scored_cases if s < threshold and p)
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 1.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            points.append(PrecisionRecallPoint(threshold=threshold, precision=precision, recall=recall))
+
+        # Compute AUC using trapezoidal rule
+        auc = 0.0
+        for i in range(1, len(points)):
+            auc += abs(points[i].recall - points[i - 1].recall) * (points[i].precision + points[i - 1].precision) / 2
+
+        curve = PrecisionRecallCurve(name=ctx.name, points=points, auc=auc)
+        return PrecisionRecall(title=self.title, curves=[curve])
+
+    def _get_score(self, case: ReportCase[Any, Any, Any]) -> float | None:
+        if self.score_from == 'scores':
+            result = case.scores.get(self.score_key)
+            return float(result.value) if result else None
+        elif self.score_from == 'metrics':
+            val = case.metrics.get(self.score_key)
+            return float(val) if val is not None else None
+        assert_never(self.score_from)
+
+    def _get_positive(self, case: ReportCase[Any, Any, Any]) -> bool | None:
+        if self.positive_from == 'expected_output':
+            return bool(case.expected_output) if case.expected_output is not None else None
+        elif self.positive_from == 'assertions':
+            if self.positive_key is None:
+                raise ValueError("'positive_key' is required when positive_from='assertions'")
+            assertion = case.assertions.get(self.positive_key)
+            return assertion.value if assertion else None
+        elif self.positive_from == 'labels':
+            if self.positive_key is None:
+                raise ValueError("'positive_key' is required when positive_from='labels'")
+            label = case.labels.get(self.positive_key)
+            return bool(label.value) if label else None
+        assert_never(self.positive_from)
+
+## pydantic_evals/pydantic_evals/otel/_context_in_memory_span_exporter.py
+
+def _set_exporter_context_id(context_id: str | None = None) -> typing.Iterator[str]:
+    context_id = context_id or str(uuid.uuid4())
+    token = _EXPORTER_CONTEXT_ID.set(context_id)
+    try:
+        yield context_id
+    finally:
+        _EXPORTER_CONTEXT_ID.reset(token)
+
+## pydantic_graph/pydantic_graph/_utils.py
+
+async def run_in_executor(func: Callable[_P, _R], *args: _P.args, **kwargs: _P.kwargs) -> _R:
+    if kwargs:
+        # noinspection PyTypeChecker
+        return await asyncio.get_running_loop().run_in_executor(None, partial(func, *args, **kwargs))
+    else:
+        return await asyncio.get_running_loop().run_in_executor(None, func, *args)  # type: ignore
+
+## tests/evals/test_dataset.py
+
+async def test_invalid_evaluator_output_type(example_dataset: Dataset[TaskInput, TaskOutput, TaskMetadata]):
+    """Test that an invalid evaluator output type raises an error."""
+    invalid_evaluator = Python(expression='...')
+    example_dataset.add_evaluator(invalid_evaluator)
+
+    async def mock_task(inputs: TaskInput) -> TaskOutput:
+        return TaskOutput(answer='4')
+
+    report = await example_dataset.evaluate(mock_task)
+    assert report.cases == snapshot(
+        [
+            ReportCase(
+                name='case1',
+                inputs=TaskInput(query='What is 2+2?'),
+                metadata=TaskMetadata(difficulty='easy', category='general'),
+                expected_output=TaskOutput(answer='4', confidence=1.0),
+                output=TaskOutput(answer='4', confidence=1.0),
+                metrics={},
+                attributes={},
+                scores={},
+                labels={},
+                assertions={},
+                task_duration=1.0,
+                total_duration=12.0,
+                trace_id='00000000000000000000000000000001',
+                span_id='0000000000000003',
+                evaluator_failures=[
+                    EvaluatorFailure(
+                        name='Python',
+                        error_message='ValueError: '
+                        "Python(expression='...').evaluate "
+                        'returned a value '
+                        'of an invalid '
+                        'type: Ellipsis.',
+                        error_stacktrace=IsStr(),
+                        source=Python(expression='...').as_spec(),
+                    )
+                ],
+            ),
+            ReportCase(
+                name='case2',
+                inputs=TaskInput(query='What is the capital of France?'),
+                metadata=TaskMetadata(difficulty='medium', category='geography'),
+                expected_output=TaskOutput(answer='Paris', confidence=1.0),
+                output=TaskOutput(answer='4', confidence=1.0),
+                metrics={},
+                attributes={},
+                scores={},
+                labels={},
+                assertions={},
+                task_duration=1.0,
+                total_duration=10.0,
+                trace_id='00000000000000000000000000000001',
+                span_id='0000000000000007',
+                evaluator_failures=[
+                    EvaluatorFailure(
+                        name='Python',
+                        error_message='ValueError: '
+                        "Python(expression='...').evaluate "
+                        'returned a value '
+                        'of an invalid '
+                        'type: Ellipsis.',
+                        error_stacktrace=IsStr(),
+                        source=Python(expression='...').as_spec(),
+                    )
+                ],
+            ),
+        ]
+    )
+    assert report.failures == snapshot([])
+
+## tests/evals/test_evaluator_spec.py
+
+def test_evaluator_spec_with_non_string_keys():
+    """Test EvaluatorSpec with non-string keys in arguments."""
+    # Test with non-string keys in dict
+    spec = _SerializedEvaluatorSpec.model_validate({'TestEvaluator': {1: 'value', 2: 'value2'}})
+    assert spec.to_evaluator_spec().name == 'TestEvaluator'
+    assert spec.to_evaluator_spec().arguments == (
+        {1: 'value', 2: 'value2'},
+    )  # Should be treated as a single positional argument
+
+    # Test with mixed keys
+    spec = _SerializedEvaluatorSpec.model_validate({'TestEvaluator': {'key': 'value', 1: 'value2'}})
+    assert spec.to_evaluator_spec().name == 'TestEvaluator'
+    assert spec.to_evaluator_spec().arguments == (
+        {'key': 'value', 1: 'value2'},
+    )  # Should be treated as a single positional argument
+
+## tests/evals/test_evaluators.py
+
+async def test_evaluator_error_handling(test_context: EvaluatorContext[TaskInput, TaskOutput, TaskMetadata]):
+    """Test error handling in evaluators."""
+
+    @dataclass
+    class FailingEvaluator(Evaluator[TaskInput, TaskOutput, TaskMetadata]):
+        def evaluate(self, ctx: EvaluatorContext[TaskInput, TaskOutput, TaskMetadata]) -> EvaluatorOutput:
+            raise ValueError('Simulated error')
+
+    evaluator = FailingEvaluator()
+
+    # When called directly, it should raise an error
+    result = await run_evaluator(evaluator, test_context)
+    assert result == EvaluatorFailure(
+        name='FailingEvaluator',
+        error_message='ValueError: Simulated error',
+        error_stacktrace=IsStr(),
+        source=FailingEvaluator().as_spec(),
+    )
+
+## tests/evals/test_report_evaluators.py
+
+def test_report_rendering_include_analyses_false():
+    cases = [
+        _make_report_case('c1', output='cat', expected_output='cat'),
+    ]
+    report = _make_report(cases)
+    report.analyses = [
+        ScalarResult(title='Accuracy', value=100.0, unit='%'),
+    ]
+
+    rendered = report.render(width=120, include_analyses=False)
+    assert 'Accuracy: 100.0 %' not in rendered
+
+def test_report_evaluator_build_serialization_arguments_excludes_defaults():
+    """ConfusionMatrixEvaluator with all defaults returns empty dict."""
+    evaluator = ConfusionMatrixEvaluator()
+    args = evaluator.build_serialization_arguments()
+    assert args == {}
+
+## tests/example_modules/fake_database.py
+
+class QueryError(RuntimeError):
+    pass
+
+## tests/models/test_anthropic.py
+
+def test_cache_control_unsupported_param_type():
+    """Test that cache control raises error for unsupported param types."""
+    from unittest.mock import MagicMock
+
+    from pydantic_ai.exceptions import UserError
+    from pydantic_ai.models.anthropic import AnthropicModel
+
+    # Create a mock model instance
+    mock_client = MagicMock()
+    mock_client.__class__.__name__ = 'AsyncAnthropic'
+    mock_client.base_url = 'https://api.anthropic.com'
+    m = AnthropicModel('claude-haiku-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+
+    # Create a list with an unsupported param type (thinking)
+    params: list[dict[str, Any]] = [{'type': 'thinking', 'source': {'data': 'test'}}]
+
+    with pytest.raises(UserError, match='Cache control not supported for param type: thinking'):
+        m._add_cache_control_to_last_param(params)  # type: ignore[arg-type]  # Testing internal method
+
+async def test_document_url_pdf_force_download() -> None:
+    """Test that force_download=True calls download_item for DocumentUrl (PDF)."""
+    from unittest.mock import AsyncMock, patch
+
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key='test-key'))
+
+    with patch('pydantic_ai.models.anthropic.download_item', new_callable=AsyncMock) as mock_download:
+        mock_download.return_value = {
+            'data': b'%PDF-1.4 fake pdf data',
+            'content_type': 'application/pdf',
+        }
+
+        messages = [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content=[
+                            'Test PDF',
+                            DocumentUrl(
+                                url='https://example.com/doc.pdf',
+                                media_type='application/pdf',
+                                force_download=True,
+                            ),
+                        ]
+                    )
+                ]
+            )
+        ]
+
+        await m._map_message(messages, ModelRequestParameters(), {})  # pyright: ignore[reportPrivateUsage,reportArgumentType]
+
+        mock_download.assert_called_once()
+        assert mock_download.call_args[0][0].url == 'https://example.com/doc.pdf'
+
+## tests/models/test_cerebras.py
+
+async def test_cerebras_settings_transformation():
+    """Test that CerebrasModelSettings are correctly transformed to OpenAIChatModelSettings."""
+    # Test with disable_reasoning
+    settings = CerebrasModelSettings(cerebras_disable_reasoning=True)
+    transformed = _cerebras_settings_to_openai_settings(settings)
+    extra_body = cast(dict[str, Any], transformed.get('extra_body', {}))
+    assert extra_body.get('disable_reasoning') is True
+
+    # Test without disable_reasoning (should not have extra_body)
+    settings_empty = CerebrasModelSettings()
+    transformed_empty = _cerebras_settings_to_openai_settings(settings_empty)
+    assert transformed_empty.get('extra_body') is None
+
+    # Test with disable_reasoning=False
+    settings_false = CerebrasModelSettings(cerebras_disable_reasoning=False)
+    transformed_false = _cerebras_settings_to_openai_settings(settings_false)
+    extra_body_false = cast(dict[str, Any], transformed_false.get('extra_body', {}))
+    assert extra_body_false.get('disable_reasoning') is False
+
+## tests/models/test_google.py
+
+async def test_google_image_and_text_output(allow_model_requests: None, google_provider: GoogleProvider):
+    m = GoogleModel('gemini-2.5-flash-image', provider=google_provider)
+    agent = Agent(m)
+
+    result = await agent.run('Tell me a two-sentence story about an axolotl with an illustration.')
+    assert result.output == snapshot(
+        'Once, in a hidden cenote, lived an axolotl named Pip who loved to collect shiny pebbles. One day, Pip found a pebble that glowed, illuminating his entire underwater world with a soft, warm light. '
+    )
+    assert result.response.files == snapshot([IsInstance(BinaryImage)])
+
+async def test_google_image_generation_auto_size_raises_error(google_provider: GoogleProvider) -> None:
+    """Test that 'auto' size raises an error for Google since it doesn't support intelligent size selection."""
+    model = GoogleModel('gemini-3-pro-image-preview', provider=google_provider)
+    params = ModelRequestParameters(builtin_tools=[ImageGenerationTool(size='auto')])
+
+    with pytest.raises(UserError, match='Google image generation only supports `size` values'):
+        model._get_tools(params)  # pyright: ignore[reportPrivateUsage]
+
+## tests/models/test_groq.py
+
+async def test_tool_regular_error(allow_model_requests: None, groq_api_key: str):
+    m = GroqModel('non-existent', provider=GroqProvider(api_key=groq_api_key))
+    agent = Agent(m)
+
+    with pytest.raises(
+        ModelHTTPError, match='The model `non-existent` does not exist or you do not have access to it.'
+    ):
+        await agent.run('hello')
+
+## tests/models/test_openai.py
+
+def test_model_connection_error(allow_model_requests: None) -> None:
+    mock_client = MockOpenAI.create_mock(
+        APIConnectionError(
+            message='Connection to http://localhost:11434/v1 timed out',
+            request=httpx.Request('POST', 'http://localhost:11434/v1'),
+        )
+    )
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(openai_client=mock_client))
+    agent = Agent(m)
+    with pytest.raises(ModelAPIError) as exc_info:
+        agent.run_sync('hello')
+    assert exc_info.value.model_name == 'gpt-4o'
+    assert 'Connection to http://localhost:11434/v1 timed out' in str(exc_info.value.message)
+
+async def test_openai_store_false(allow_model_requests: None):
+    """Test that openai_store=False is correctly passed to the OpenAI API."""
+    c = completion_message(ChatCompletionMessage(content='hello', role='assistant'))
+    mock_client = MockOpenAI.create_mock(c)
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(openai_client=mock_client))
+    agent = Agent(m, model_settings=OpenAIChatModelSettings(openai_store=False))
+
+    result = await agent.run('test')
+    assert result.output == 'hello'
+
+    # Verify the store parameter was passed to the mock
+    kwargs = get_mock_chat_completion_kwargs(mock_client)[0]
+    assert kwargs.get('store') is False
+
+## tests/models/test_xai.py
+
+async def test_xai_video_url_not_supported(allow_model_requests: None):
+    """Test that VideoUrl raises NotImplementedError."""
+    response = create_response(content='This should not be reached')
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    video_url = VideoUrl(url='https://example.com/video.mp4')
+
+    with pytest.raises(NotImplementedError, match='VideoUrl is not supported by xAI SDK'):
+        await agent.run(['What is in this video?', video_url])
+
+## tests/test_agent.py
+
+def test_run_with_history_ending_on_model_response_with_tool_calls_and_user_prompt():
+    """Test that an agent run raises error when message_history ends on ModelResponse with tool calls and there's a new prompt."""
+
+    def simple_response(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content='Final response')])  # pragma: no cover
+
+    agent = Agent(FunctionModel(simple_response))
+
+    message_history = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(parts=[ToolCallPart(tool_name='test_tool', args='{}', tool_call_id='call_123')]),
+    ]
+
+    with pytest.raises(
+        UserError,
+        match='Cannot provide a new user prompt when the message history contains unprocessed tool calls.',
+    ):
+        agent.run_sync(user_prompt='New question', message_history=message_history)
+
+## tests/test_builtin_tools.py
+
+async def test_builtin_tools_not_supported_code_execution(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[CodeExecutionTool()])
+
+    with pytest.raises(UserError):
+        await agent.run('What day is tomorrow?')
+
+## tests/test_dbos.py
+
+async def test_dbos_agent_run_stream_events_in_workflow(allow_model_requests: None, dbos: DBOS):
+    @DBOS.workflow()
+    async def run_stream_events_workflow():
+        return [event async for event in simple_dbos_agent.run_stream_events('What is the capital of Mexico?')]
+
+    with workflow_raises(
+        UserError,
+        snapshot(
+            '`agent.run_stream_events()` cannot be used with DBOS. Set an `event_stream_handler` on the agent and use `agent.run()` instead.'
+        ),
+    ):
+        await run_stream_events_workflow()
+
+async def test_dbos_agent_run_in_workflow_with_event_stream_handler(allow_model_requests: None, dbos: DBOS) -> None:
+    # DBOS workflow input must be serializable, so we cannot use an inner function as an argument.
+    # It's fine to pass in an event_stream_handler that is defined as a top-level function.
+    async def simple_event_stream_handler(
+        ctx: RunContext[None],
+        stream: AsyncIterable[AgentStreamEvent],
+    ):
+        pass
+
+    with pytest.raises(Exception) as exc_info:
+        await simple_dbos_agent.run('What is the capital of Mexico?', event_stream_handler=simple_event_stream_handler)
+
+    assert (
+        "local object 'test_dbos_agent_run_in_workflow_with_event_stream_handler.<locals>.simple_event_stream_handler'"
+        in str(exc_info.value)
+    )
+
+## tests/test_embeddings.py
+
+def test_infer_model_error():
+    with pytest.raises(ValueError, match='You must provide a provider prefix when specifying an embedding model name'):
+        infer_embedding_model('nonexistent')
+
+## tests/test_examples.py
+
+def mock_group_by_temporal(aiter: Any, soft_max_interval: float | None) -> Any:
+    """Mock group_by_temporal to avoid debouncing, since the iterators above have no delay."""
+    return group_by_temporal(aiter, None)
+
+## tests/test_history_processor.py
+
+async def test_history_processor_messages_sent_to_provider(
+    function_model: FunctionModel, received_messages: list[ModelMessage]
+):
+    """Test what messages are actually sent to the provider after processing."""
+
+    def capture_messages_processor(messages: list[ModelMessage]) -> list[ModelMessage]:
+        # Filter out ModelResponse messages
+        return [msg for msg in messages if isinstance(msg, ModelRequest)]
+
+    agent = Agent(function_model, history_processors=[capture_messages_processor])
+
+    message_history = [
+        ModelRequest(parts=[UserPromptPart(content='Previous question')]),
+        ModelResponse(parts=[TextPart(content='Previous answer')]),  # This should be filtered out
+    ]
+
+    with capture_run_messages() as captured_messages:
+        result = await agent.run('New question', message_history=message_history)
+
+    assert received_messages == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Previous question',
+                        timestamp=IsDatetime(),
+                    ),
+                    UserPromptPart(
+                        content='New question',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                timestamp=IsDatetime(),
+            )
+        ]
+    )
+    assert captured_messages == result.all_messages()
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(parts=[UserPromptPart(content='Previous question', timestamp=IsDatetime())]),
+            ModelRequest(
+                parts=[UserPromptPart(content='New question', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Provider response')],
+                usage=RequestUsage(input_tokens=54, output_tokens=2),
+                model_name='function:capture_model_function:capture_model_stream_function',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.new_messages() == result.all_messages()[-2:]
+
+async def test_multiple_history_processors(function_model: FunctionModel, received_messages: list[ModelMessage]):
+    """Test that multiple processors are applied in sequence."""
+
+    def first_processor(messages: list[ModelMessage]) -> list[ModelMessage]:
+        # Add a prefix to user prompts
+        processed: list[ModelMessage] = []
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                new_parts: list[ModelRequestPart] = []
+                for part in msg.parts:
+                    if isinstance(part, UserPromptPart):  # pragma: no branch
+                        new_parts.append(UserPromptPart(content=f'[FIRST] {part.content}'))
+                processed.append(ModelRequest(parts=new_parts))
+            else:
+                processed.append(msg)
+        return processed
+
+    def second_processor(messages: list[ModelMessage]) -> list[ModelMessage]:
+        # Add another prefix to user prompts
+        processed: list[ModelMessage] = []
+        for msg in messages:
+            if isinstance(msg, ModelRequest):
+                new_parts: list[ModelRequestPart] = []
+                for part in msg.parts:
+                    if isinstance(part, UserPromptPart):  # pragma: no branch
+                        new_parts.append(UserPromptPart(content=f'[SECOND] {part.content}'))
+                processed.append(ModelRequest(parts=new_parts))
+            else:
+                processed.append(msg)
+        return processed
+
+    agent = Agent(function_model, history_processors=[first_processor, second_processor])
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Question')]),
+        ModelResponse(parts=[TextPart(content='Answer')]),
+    ]
+
+    with capture_run_messages() as captured_messages:
+        result = await agent.run('New question', message_history=message_history)
+    assert received_messages == snapshot(
+        [
+            ModelRequest(parts=[UserPromptPart(content='[SECOND] [FIRST] Question', timestamp=IsDatetime())]),
+            ModelResponse(parts=[TextPart(content='Answer')], timestamp=IsDatetime()),
+            ModelRequest(
+                parts=[UserPromptPart(content='[SECOND] [FIRST] New question', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+            ),
+        ]
+    )
+    assert captured_messages == result.all_messages()
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='[SECOND] [FIRST] Question',
+                        timestamp=IsDatetime(),
+                    )
+                ]
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Answer')],
+                timestamp=IsDatetime(),
+            ),
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='[SECOND] [FIRST] New question',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Provider response')],
+                usage=RequestUsage(input_tokens=57, output_tokens=3),
+                model_name='function:capture_model_function:capture_model_stream_function',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.new_messages() == result.all_messages()[-2:]
+
+async def test_async_history_processor(function_model: FunctionModel, received_messages: list[ModelMessage]):
+    """Test that async processors work."""
+
+    async def async_processor(messages: list[ModelMessage]) -> list[ModelMessage]:
+        return [msg for msg in messages if isinstance(msg, ModelRequest)]
+
+    agent = Agent(function_model, history_processors=[async_processor])
+
+    message_history = [
+        ModelRequest(parts=[UserPromptPart(content='Question 1')]),
+        ModelResponse(parts=[TextPart(content='Answer 1')]),  # Should be filtered out
+    ]
+
+    with capture_run_messages() as captured_messages:
+        result = await agent.run('Question 2', message_history=message_history)
+    assert received_messages == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Question 1',
+                        timestamp=IsDatetime(),
+                    ),
+                    UserPromptPart(
+                        content='Question 2',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                timestamp=IsDatetime(),
+            )
+        ]
+    )
+    assert captured_messages == result.all_messages()
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Question 1',
+                        timestamp=IsDatetime(),
+                    )
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Question 2',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Provider response')],
+                usage=RequestUsage(input_tokens=54, output_tokens=2),
+                model_name='function:capture_model_function:capture_model_stream_function',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.new_messages() == result.all_messages()[-2:]
+
+async def test_callable_class_history_processor_with_ctx_no_op(
+    function_model: FunctionModel, received_messages: list[ModelMessage]
+):
+    class NoOpHistoryProcessorWithCtx:
+        def __call__(self, _: RunContext, messages: list[ModelMessage]) -> list[ModelMessage]:
+            return messages
+
+    agent = Agent(function_model, history_processors=[NoOpHistoryProcessorWithCtx()])
+
+    message_history = [
+        ModelRequest(parts=[UserPromptPart(content='Previous question')]),
+        ModelResponse(parts=[TextPart(content='Previous answer')]),
+    ]
+
+    with capture_run_messages() as captured_messages:
+        result = await agent.run('New question', message_history=message_history)
+
+    assert received_messages == snapshot(
+        [
+            ModelRequest(parts=[UserPromptPart(content='Previous question', timestamp=IsDatetime())]),
+            ModelResponse(parts=[TextPart(content='Previous answer')], timestamp=IsDatetime()),
+            ModelRequest(
+                parts=[UserPromptPart(content='New question', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert captured_messages == result.all_messages()
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(parts=[UserPromptPart(content='Previous question', timestamp=IsDatetime())]),
+            ModelResponse(parts=[TextPart(content='Previous answer')], timestamp=IsDatetime()),
+            ModelRequest(
+                parts=[UserPromptPart(content='New question', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Provider response')],
+                usage=RequestUsage(input_tokens=54, output_tokens=4),
+                model_name='function:capture_model_function:capture_model_stream_function',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.new_messages() == result.all_messages()[-2:]
+
+## tests/test_parts_manager.py
+
+def test_handle_thinking_delta_no_content_or_signature():
+    manager = ModelResponsePartsManager()
+
+    # Add a thinking part first
+    list(manager.handle_thinking_delta(vendor_part_id='thinking', content='initial', signature=None))
+
+    # Updating with no content, signature, or provider_details emits no event
+    events = list(manager.handle_thinking_delta(vendor_part_id='thinking', content=None, signature=None))
+    assert events == []
+
+## tests/test_temporal.py
+
+class SimpleAgentWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await simple_temporal_agent.run(prompt)
+        return result.output
+
+async def test_temporal_agent():
+    assert isinstance(complex_temporal_agent.model, TemporalModel)
+    assert complex_temporal_agent.model.wrapped == complex_agent.model
+
+    toolsets = complex_temporal_agent.toolsets
+    assert len(toolsets) == 5
+
+    # Empty function toolset for the agent's own tools
+    assert isinstance(toolsets[0], FunctionToolset)
+    assert toolsets[0].id == '<agent>'
+    assert toolsets[0].tools == {}
+
+    # Wrapped function toolset for the agent's own tools
+    assert isinstance(toolsets[1], TemporalFunctionToolset)
+    assert toolsets[1].id == '<agent>'
+    assert isinstance(toolsets[1].wrapped, FunctionToolset)
+    assert toolsets[1].wrapped.tools.keys() == {'get_weather'}
+
+    # Wrapped 'country' toolset
+    assert isinstance(toolsets[2], TemporalFunctionToolset)
+    assert toolsets[2].id == 'country'
+    assert toolsets[2].wrapped == complex_agent.toolsets[1]
+    assert isinstance(toolsets[2].wrapped, FunctionToolset)
+    assert toolsets[2].wrapped.tools.keys() == {'get_country'}
+
+    # Wrapped 'mcp' MCP server
+    assert isinstance(toolsets[3], TemporalMCPServer)
+    assert toolsets[3].id == 'mcp'
+    assert toolsets[3].wrapped == complex_agent.toolsets[2]
+
+    # Unwrapped 'external' toolset
+    assert isinstance(toolsets[4], ExternalToolset)
+    assert toolsets[4].id == 'external'
+    assert toolsets[4] == complex_agent.toolsets[3]
+
+    assert [
+        ActivityDefinition.must_from_callable(activity).name  # pyright: ignore[reportUnknownMemberType]
+        for activity in complex_temporal_agent.temporal_activities
+    ] == snapshot(
+        [
+            'agent__complex_agent__event_stream_handler',
+            'agent__complex_agent__model_request',
+            'agent__complex_agent__model_request_stream',
+            'agent__complex_agent__toolset__<agent>__call_tool',
+            'agent__complex_agent__toolset__country__call_tool',
+            'agent__complex_agent__mcp_server__mcp__get_tools',
+            'agent__complex_agent__mcp_server__mcp__call_tool',
+        ]
+    )
+
+class SimpleAgentWorkflowWithRunStreamEvents:
+    @workflow.run
+    async def run(self, prompt: str) -> list[AgentStreamEvent | AgentRunResultEvent]:
+        return [event async for event in simple_temporal_agent.run_stream_events(prompt)]
+
+class DirectStreamWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        messages: list[ModelMessage] = [ModelRequest.user_text_prompt(prompt)]
+        async with model_request_stream(complex_temporal_agent.model, messages) as stream:
+            async for _ in stream:
+                pass
+        return 'done'  # pragma: no cover
+
+def test_temporal_run_context_preserves_run_id():
+    ctx = RunContext(
+        deps=None,
+        model=TestModel(),
+        usage=RunUsage(),
+        run_id='run-123',
+    )
+
+    serialized = TemporalRunContext.serialize_run_context(ctx)
+    assert serialized['run_id'] == 'run-123'
+
+    reconstructed = TemporalRunContext.deserialize_run_context(serialized, deps=None)
+    assert reconstructed.run_id == 'run-123'
+
+## tests/typed_agent.py
+
+def ok_validator_simple(data: str) -> str:
+    return data

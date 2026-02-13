@@ -1,0 +1,217 @@
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+def is_cloud_metadata_ip(ip_str: str) -> bool:
+    """Check if an IP address is a cloud metadata endpoint.
+
+    These are always blocked for security reasons, even with allow_local=True.
+    """
+    return ip_str in _CLOUD_METADATA_IPS
+
+async def validate_and_resolve_url(url: str, allow_local: bool) -> ResolvedUrl:
+    """Validate URL and resolve hostname to IP addresses.
+
+    Performs protocol validation, DNS resolution, and IP validation.
+
+    Args:
+        url: The URL to validate.
+        allow_local: Whether to allow private/internal IP addresses.
+
+    Returns:
+        ResolvedUrl with all the information needed to make the request.
+
+    Raises:
+        ValueError: If the URL fails validation.
+    """
+    hostname, path, port, is_https = extract_host_and_port(url)
+
+    # Check if hostname is already an IP address
+    try:
+        # Handle IPv6 addresses in brackets
+        ip_str = hostname.strip('[]')
+        ipaddress.ip_address(ip_str)
+        ips = [ip_str]
+    except ValueError:
+        # It's a hostname, resolve it
+        ips = await resolve_hostname(hostname)
+
+    # Validate all resolved IPs
+    for ip in ips:
+        # Cloud metadata IPs are always blocked
+        if is_cloud_metadata_ip(ip):
+            raise ValueError(f'Access to cloud metadata service ({ip}) is blocked for security reasons.')
+
+        # Private IPs are blocked unless allow_local is True
+        if not allow_local and is_private_ip(ip):
+            raise ValueError(
+                f'Access to private/internal IP address ({ip}) is blocked. '
+                f'Use force_download="allow-local" to allow local network access.'
+            )
+
+    # Use the first resolved IP
+    return ResolvedUrl(
+        resolved_ip=ips[0],
+        hostname=hostname,
+        port=port,
+        is_https=is_https,
+        path=path,
+    )
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py
+
+    def _temporal_overrides(
+        self, *, model: models.Model | models.KnownModelName | str | None = None, force: bool = False
+    ) -> Iterator[None]:
+        """Context manager for workflow-specific overrides.
+
+        When called outside a workflow, this is a no-op.
+        When called inside a workflow, it overrides the model and toolsets.
+        """
+        if not workflow.in_workflow() and not force:
+            yield
+            return
+
+        # We reset tools here as the temporalized function toolset is already in self._toolsets.
+        # Override model and set the model for workflow execution
+        with (
+            super().override(model=self._temporal_model, toolsets=self._toolsets, tools=[]),
+            self._temporal_model.using_model(model),
+            _utils.disable_threads(),
+        ):
+            temporal_active_token = self._temporal_overrides_active.set(True)
+            try:
+                yield
+            except PydanticSerializationError as e:
+                raise UserError(
+                    "The `deps` object failed to be serialized. Temporal requires all objects that are passed to activities to be serializable using Pydantic's `TypeAdapter`."
+                ) from e
+            finally:
+                self._temporal_overrides_active.reset(temporal_active_token)
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+class ToolsetTool(Generic[AgentDepsT]):
+    """Definition of a tool available on a toolset.
+
+    This is a wrapper around a plain tool definition that includes information about:
+
+    - the toolset that provided it, for use in error messages
+    - the maximum number of retries to attempt if the tool call fails
+    - the validator for the tool's arguments
+    """
+
+    toolset: AbstractToolset[AgentDepsT]
+    """The toolset that provided this tool, for use in error messages."""
+    tool_def: ToolDefinition
+    """The tool definition for this tool, including the name, description, and parameters."""
+    max_retries: int
+    """The maximum number of retries to attempt if the tool call fails."""
+    args_validator: SchemaValidator | SchemaValidatorProt
+    """The Pydantic Core validator for the tool's arguments.
+
+    For example, a [`pydantic.TypeAdapter(...).validator`](https://docs.pydantic.dev/latest/concepts/type_adapter/) or [`pydantic_core.SchemaValidator`](https://docs.pydantic.dev/latest/api/pydantic_core/#pydantic_core.SchemaValidator).
+    """
+
+## pydantic_evals/pydantic_evals/otel/_context_in_memory_span_exporter.py
+
+    def shutdown(self) -> None:
+        """Shut downs the exporter.
+
+        Calls to export after the exporter has been shut down will fail.
+        """
+        self._stopped = True
+
+## tests/models/test_google.py
+
+async def test_http_video_url_downloads_on_google_gla(mocker: MockerFixture):
+    """HTTP VideoUrls are downloaded on google-gla with video_metadata preserved."""
+    model = GoogleModel('gemini-1.5-flash', provider=GoogleProvider(api_key='test-key'))
+
+    mock_download = mocker.patch(
+        'pydantic_ai.models.google.download_item',
+        return_value={'data': b'fake video data', 'data_type': 'video/mp4'},
+    )
+
+    video = VideoUrl(
+        url='https://example.com/video.mp4',
+        vendor_metadata={'start_offset': '10s', 'end_offset': '20s'},
+    )
+    content = await model._map_user_prompt(UserPromptPart(content=[video]))  # pyright: ignore[reportPrivateUsage]
+
+    mock_download.assert_called_once()
+    assert len(content) == 1
+    assert 'inline_data' in content[0]
+    assert 'file_data' not in content[0]
+    # video_metadata is preserved even when video is downloaded
+    assert content[0].get('video_metadata') == {'start_offset': '10s', 'end_offset': '20s'}
+
+## tests/models/test_model_test.py
+
+def test_different_content_input(content: AudioUrl | VideoUrl | ImageUrl | BinaryContent):
+    agent = Agent()
+    result = agent.run_sync(['x', content], model=TestModel(custom_output_text='custom'))
+    assert result.output == snapshot('custom')
+    assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=1))
+
+## tests/test_ag_ui.py
+
+class StateInt(BaseModel):
+    """Example state class for testing purposes."""
+
+    value: int = 0
+
+## tests/test_prefect.py
+
+def test_prefect_agent_run_sync(allow_model_requests: None):
+    """Test that agent.run_sync() works."""
+    result = simple_prefect_agent.run_sync('What is the capital of Mexico?')
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_prefect_agent_iter(allow_model_requests: None):
+    """Test that agent.iter() works."""
+    outputs: list[str] = []
+    async with simple_prefect_agent.iter('What is the capital of Mexico?') as run:
+        async for node in run:
+            if Agent.is_model_request_node(node):
+                async with node.stream(run.ctx) as stream:
+                    async for chunk in stream.stream_text(debounce_by=None):
+                        outputs.append(chunk)
+    assert outputs == snapshot(
+        [
+            'The',
+            'The capital',
+            'The capital of',
+            'The capital of Mexico',
+            'The capital of Mexico is',
+            'The capital of Mexico is Mexico',
+            'The capital of Mexico is Mexico City',
+            'The capital of Mexico is Mexico City.',
+        ]
+    )
+
+async def test_iter_in_flow(allow_model_requests: None) -> None:
+    """Test that iter works inside a Prefect flow."""
+
+    @flow(name='test_iter_in_flow')
+    async def run_iter_workflow():
+        outputs: list[str] = []
+        async with simple_prefect_agent.iter('What is the capital of Mexico?') as run:
+            async for node in run:
+                if Agent.is_model_request_node(node):
+                    async with node.stream(run.ctx) as stream:
+                        async for chunk in stream.stream_text(debounce_by=None):
+                            outputs.append(chunk)
+        return outputs
+
+    outputs = await run_iter_workflow()
+    # If called in a workflow, the output is a single concatenated string.
+    assert outputs == snapshot(
+        [
+            'The capital of Mexico is Mexico City.',
+        ]
+    )
+
+## tests/test_tools.py
+
+def test_output_type_empty():
+    with pytest.raises(UserError, match='At least one output type must be provided.'):
+        Agent(TestModel(), output_type=[])

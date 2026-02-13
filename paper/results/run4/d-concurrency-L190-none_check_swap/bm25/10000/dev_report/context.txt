@@ -1,0 +1,1078 @@
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/__init__.py:36-36
+import anyio._backends._asyncio  # pyright: ignore[reportUnusedImport]  #noqa: F401
+
+# tests/test_concurrency.py:44-60
+    async def test_basic_acquisition(self):
+        """Test that limiter limits concurrent access."""
+        limiter = ConcurrencyLimiter(max_running=2)
+        acquired: list[int] = []
+
+        async def acquire_and_hold(id: int, hold_time: float):
+            async with get_concurrency_context(limiter, 'test'):
+                acquired.append(id)
+                await anyio.sleep(hold_time)
+
+        # Start 3 tasks with limit of 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(acquire_and_hold, i, 0.1)
+            await anyio.sleep(0.05)
+            assert len(acquired) == 2  # Only 2 can proceed
+        assert len(acquired) == 3
+
+# tests/test_concurrency.py:571-590
+class TestConcurrencyLimiterWithTracer:
+    """Tests for ConcurrencyLimiter with custom tracer."""
+
+    async def test_custom_tracer_is_stored(self):
+        """Test that custom tracer is stored and returned by _get_tracer."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter(max_running=5, tracer=custom_tracer)
+
+        # Verify the tracer is stored and returned
+        assert limiter._get_tracer() is custom_tracer
+
+    async def test_from_limit_with_tracer(self):
+        """Test that from_limit passes tracer to the created limiter."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter.from_limit(5, tracer=custom_tracer)
+        assert limiter._get_tracer() is custom_tracer
+
+# tests/test_concurrency.py:41-204
+class TestConcurrencyLimiter:
+    """Tests for the ConcurrencyLimiter class."""
+
+    async def test_basic_acquisition(self):
+        """Test that limiter limits concurrent access."""
+        limiter = ConcurrencyLimiter(max_running=2)
+        acquired: list[int] = []
+
+        async def acquire_and_hold(id: int, hold_time: float):
+            async with get_concurrency_context(limiter, 'test'):
+                acquired.append(id)
+                await anyio.sleep(hold_time)
+
+        # Start 3 tasks with limit of 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(acquire_and_hold, i, 0.1)
+            await anyio.sleep(0.05)
+            assert len(acquired) == 2  # Only 2 can proceed
+        assert len(acquired) == 3
+
+    async def test_nowait_acquisition(self):
+        """Test that immediate acquisition works."""
+        limiter = ConcurrencyLimiter(max_running=10)
+        # With high limit, should acquire immediately
+        async with get_concurrency_context(limiter, 'test'):
+            pass  # No waiting
+
+    async def test_waiting_count_tracking(self):
+        """Test that waiting_count is accurately tracked."""
+        limiter = ConcurrencyLimiter(max_running=1)
+        started = anyio.Event()
+        release = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                started.set()
+                await release.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Now limiter is held, check waiting count as we add waiters
+            assert limiter.waiting_count == 0
+
+            for _ in range(3):
+                tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+            assert limiter.waiting_count == 3
+
+            release.set()
+        assert limiter.waiting_count == 0
+
+    async def test_backpressure_raises(self):
+        """Test that exceeding max_queued raises ConcurrencyLimitExceeded."""
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=2)
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                await hold.wait()
+
+        async with anyio.create_task_group() as tg:
+            # Fill the running slot
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            # Fill the queue (2 allowed)
+            tg.start_soon(holder)
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            # This should raise - queue is full
+            with pytest.raises(ConcurrencyLimitExceeded):
+                async with get_concurrency_context(limiter, 'test'):
+                    pass
+
+            hold.set()
+
+    async def test_backpressure_race_condition(self):
+        """Test that max_queued is enforced atomically under concurrent load.
+
+        This test verifies the fix for a race condition where multiple tasks could
+        simultaneously pass the max_queued check before any of them actually started
+        waiting on the limiter.
+        """
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=1)
+        hold = anyio.Event()
+        started = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'holder'):
+                started.set()
+                await hold.wait()
+
+        # Now launch multiple tasks simultaneously that all try to queue.
+        # With max_queued=1, exactly one should succeed in queuing.
+        num_concurrent = 5
+        results: list[str] = []
+        barrier = AsyncBarrier(num_concurrent)
+
+        async def try_acquire(idx: int):
+            # Use barrier to ensure all tasks try to acquire at the same time
+            await barrier.wait()
+            try:
+                async with get_concurrency_context(limiter, f'task-{idx}'):
+                    results.append(f'acquired-{idx}')
+            except ConcurrencyLimitExceeded:
+                results.append(f'rejected-{idx}')
+
+        async with anyio.create_task_group() as tg:
+            # Fill the running slot and wait for it to be held
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Launch all tasks simultaneously
+            for i in range(num_concurrent):
+                tg.start_soon(try_acquire, i)
+            await anyio.sleep(0.1)  # Give tasks time to hit the barrier and try to acquire
+
+            # Release the holder
+            hold.set()
+
+        # Verify: exactly one task should have been allowed to queue and acquire
+        # The rest should have been rejected
+        acquired = [r for r in results if r.startswith('acquired-')]
+        rejected = [r for r in results if r.startswith('rejected-')]
+        assert len(acquired) == 1, f'Expected exactly 1 acquired, got {len(acquired)}: {acquired}'
+        assert len(rejected) == num_concurrent - 1, f'Expected {num_concurrent - 1} rejected, got {len(rejected)}'
+
+    async def test_from_int_limit(self):
+        """Test creating from simple int."""
+        limiter = ConcurrencyLimiter.from_limit(5)
+        assert limiter.max_running == 5
+        assert limiter._max_queued is None
+
+    async def test_from_limiter_config(self):
+        """Test creating from ConcurrencyLimit."""
+        config = ConcurrencyLimit(max_running=5, max_queued=10)
+        limiter = ConcurrencyLimiter.from_limit(config)
+        assert limiter.max_running == 5
+        assert limiter._max_queued == 10
+
+    async def test_properties(self):
+        """Test the various properties of ConcurrencyLimiter."""
+        limiter = ConcurrencyLimiter(max_running=5, name='test-limiter')
+        assert limiter.max_running == 5
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+        assert limiter.waiting_count == 0
+        assert limiter.name == 'test-limiter'
+
+        # After acquiring one slot
+        await limiter.acquire('test')
+        assert limiter.running_count == 1
+        assert limiter.available_count == 4
+        limiter.release()
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+
+# tests/test_concurrency.py:453-568
+class TestConcurrencyLimiterName:
+    """Tests for ConcurrencyLimiter name parameter."""
+
+    async def test_limiter_with_name(self):
+        """Test that limiter name is properly set and accessible."""
+        limiter = ConcurrencyLimiter(max_running=5, name='my-limiter')
+        assert limiter.name == 'my-limiter'
+
+    async def test_limiter_without_name(self):
+        """Test that limiter name is None by default."""
+        limiter = ConcurrencyLimiter(max_running=5)
+        assert limiter.name is None
+
+    async def test_from_limit_with_name(self):
+        """Test creating limiter from limit with name."""
+        limiter = ConcurrencyLimiter.from_limit(5, name='my-limit')
+        assert limiter.name == 'my-limit'
+        assert limiter.max_running == 5
+
+    @pytest.mark.skipif(not logfire_installed, reason='logfire not installed')
+    async def test_named_limiter_waiting_adds_limiter_name_attribute(self, capfire: CaptureLogfire):
+        """Test that waiting with a named limiter adds limiter_name to span attributes."""
+        limiter = ConcurrencyLimiter(max_running=1, name='test-pool')
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test-source'):
+                await hold.wait()
+
+        # Start a waiter - this will trigger the span with limiter_name attribute
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test-source'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            # Start holder to occupy the slot
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span was created with the correct attributes
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for test-pool concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'test-source'
+        assert attrs['limiter_name'] == 'test-pool'
+        assert attrs['max_running'] == 1
+        assert 'waiting_count' in attrs
+
+    @pytest.mark.skipif(not logfire_installed, reason='logfire not installed')
+    async def test_unnamed_limiter_waiting_uses_source_in_span_name(self, capfire: CaptureLogfire):
+        """Test that waiting without a limiter name uses source for span name."""
+        limiter = ConcurrencyLimiter(max_running=1)  # No name
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span uses source in name when limiter has no name
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for model:gpt-4 concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'model:gpt-4'
+        assert 'limiter_name' not in attrs  # Should not be present when name is None
+        assert attrs['max_running'] == 1
+
+    @pytest.mark.skipif(not logfire_installed, reason='logfire not installed')
+    async def test_limiter_with_max_queued_includes_attribute_in_span(self, capfire: CaptureLogfire):
+        """Test that max_queued is included in span attributes when set."""
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=5, name='queued-pool')
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify max_queued is in span attributes
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        attrs = spans[0]['attributes']
+        assert attrs['max_queued'] == 5
+
+# tests/test_concurrency.py:461-464
+    async def test_limiter_without_name(self):
+        """Test that limiter name is None by default."""
+        limiter = ConcurrencyLimiter(max_running=5)
+        assert limiter.name is None
+
+# tests/test_concurrency.py:456-459
+    async def test_limiter_with_name(self):
+        """Test that limiter name is properly set and accessible."""
+        limiter = ConcurrencyLimiter(max_running=5, name='my-limiter')
+        assert limiter.name == 'my-limiter'
+
+# tests/test_concurrency.py:439-450
+class TestAgentWithSharedLimiter:
+    """Tests for agent with shared ConcurrencyLimiter."""
+
+    async def test_agent_with_shared_limiter(self):
+        """Test that agents can share a ConcurrencyLimiter."""
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        agent1 = Agent(TestModel(), max_concurrency=shared_limiter)
+        agent2 = Agent(TestModel(), max_concurrency=shared_limiter)
+
+        # Both agents should share the same limiter
+        assert agent1._concurrency_limiter is agent2._concurrency_limiter
+
+# tests/test_concurrency.py:176-180
+    async def test_from_int_limit(self):
+        """Test creating from simple int."""
+        limiter = ConcurrencyLimiter.from_limit(5)
+        assert limiter.max_running == 5
+        assert limiter._max_queued is None
+
+# tests/test_concurrency.py:338-344
+    async def test_with_int_limiter(self):
+        """Test ConcurrencyLimitedModel with int limiter."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        model = ConcurrencyLimitedModel(TestModel(), limiter=5)
+        assert model._limiter.max_running == 5
+        assert model._limiter._max_queued is None
+
+# pydantic_ai_slim/pydantic_ai/retries.py:61-61
+    sleep: Callable[[int | float], None | Awaitable[None]]
+
+# pydantic_ai_slim/pydantic_ai/retries.py:95-95
+    before_sleep: Callable[[RetryCallState], None | Awaitable[None]] | None
+
+# tests/test_concurrency.py:466-470
+    async def test_from_limit_with_name(self):
+        """Test creating limiter from limit with name."""
+        limiter = ConcurrencyLimiter.from_limit(5, name='my-limit')
+        assert limiter.name == 'my-limit'
+        assert limiter.max_running == 5
+
+# tests/test_concurrency.py:584-590
+    async def test_from_limit_with_tracer(self):
+        """Test that from_limit passes tracer to the created limiter."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter.from_limit(5, tracer=custom_tracer)
+        assert limiter._get_tracer() is custom_tracer
+
+# tests/test_concurrency.py:182-187
+    async def test_from_limiter_config(self):
+        """Test creating from ConcurrencyLimit."""
+        config = ConcurrencyLimit(max_running=5, max_queued=10)
+        limiter = ConcurrencyLimiter.from_limit(config)
+        assert limiter.max_running == 5
+        assert limiter._max_queued == 10
+
+# tests/test_concurrency.py:473-506
+    async def test_named_limiter_waiting_adds_limiter_name_attribute(self, capfire: CaptureLogfire):
+        """Test that waiting with a named limiter adds limiter_name to span attributes."""
+        limiter = ConcurrencyLimiter(max_running=1, name='test-pool')
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test-source'):
+                await hold.wait()
+
+        # Start a waiter - this will trigger the span with limiter_name attribute
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test-source'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            # Start holder to occupy the slot
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span was created with the correct attributes
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for test-pool concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'test-source'
+        assert attrs['limiter_name'] == 'test-pool'
+        assert attrs['max_running'] == 1
+        assert 'waiting_count' in attrs
+
+# tests/test_concurrency.py:189-204
+    async def test_properties(self):
+        """Test the various properties of ConcurrencyLimiter."""
+        limiter = ConcurrencyLimiter(max_running=5, name='test-limiter')
+        assert limiter.max_running == 5
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+        assert limiter.waiting_count == 0
+        assert limiter.name == 'test-limiter'
+
+        # After acquiring one slot
+        await limiter.acquire('test')
+        assert limiter.running_count == 1
+        assert limiter.available_count == 4
+        limiter.release()
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+
+# tests/test_concurrency.py:442-450
+    async def test_agent_with_shared_limiter(self):
+        """Test that agents can share a ConcurrencyLimiter."""
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        agent1 = Agent(TestModel(), max_concurrency=shared_limiter)
+        agent2 = Agent(TestModel(), max_concurrency=shared_limiter)
+
+        # Both agents should share the same limiter
+        assert agent1._concurrency_limiter is agent2._concurrency_limiter
+
+# tests/test_concurrency.py:509-539
+    async def test_unnamed_limiter_waiting_uses_source_in_span_name(self, capfire: CaptureLogfire):
+        """Test that waiting without a limiter name uses source for span name."""
+        limiter = ConcurrencyLimiter(max_running=1)  # No name
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'model:gpt-4'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify span uses source in name when limiter has no name
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        span = spans[0]
+        assert span['name'] == 'waiting for model:gpt-4 concurrency'
+        attrs = span['attributes']
+        assert attrs['source'] == 'model:gpt-4'
+        assert 'limiter_name' not in attrs  # Should not be present when name is None
+        assert attrs['max_running'] == 1
+
+# tests/test_concurrency.py:24-38
+class AsyncBarrier:
+    """A simple asyncio.Barrier-like implementation compatible with Python 3.10 using anyio."""
+
+    def __init__(self, parties: int):
+        self._parties = parties
+        self._count = 0
+        self._lock = anyio.Lock()
+        self._event = anyio.Event()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            self._count += 1
+            if self._count >= self._parties:
+                self._event.set()
+        await self._event.wait()
+
+# tests/test_concurrency.py:354-364
+    async def test_with_shared_limiter(self):
+        """Test ConcurrencyLimitedModel with shared ConcurrencyLimiter."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        shared_limiter = ConcurrencyLimiter(max_running=3, name='shared-pool')
+        model1 = ConcurrencyLimitedModel(TestModel(), limiter=shared_limiter)
+        model2 = ConcurrencyLimitedModel(TestModel(), limiter=shared_limiter)
+
+        # Both models should share the same limiter
+        assert model1._limiter is model2._limiter
+        assert model1._limiter.name == 'shared-pool'
+
+# tests/test_concurrency.py:542-568
+    async def test_limiter_with_max_queued_includes_attribute_in_span(self, capfire: CaptureLogfire):
+        """Test that max_queued is included in span attributes when set."""
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=5, name='queued-pool')
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                await hold.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+
+            hold.set()
+
+        # Verify max_queued is in span attributes
+        spans = capfire.exporter.exported_spans_as_dict()
+        assert len(spans) == 1
+        attrs = spans[0]['attributes']
+        assert attrs['max_queued'] == 5
+
+# tests/models/test_outlines.py:434-443
+async def test_tool_definition_error_async_model(mock_async_model: OutlinesModel) -> None:
+    """Test that function tools raise UserError with async model."""
+    agent = Agent(mock_async_model)
+
+    @agent.tool_plain
+    def dummy_tool() -> str:  # pragma: no cover
+        return 'dummy'
+
+    with pytest.raises(UserError, match='Outlines does not support function tools yet.'):
+        await agent.run('Hello')
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# tests/test_tenacity.py:189-344
+class TestAsyncTenacityTransport:
+    """Tests for the asynchronous AsyncTenacityTransport."""
+
+    async def test_successful_request(self):
+        """Test that successful requests pass through without retry."""
+        mock_transport = AsyncMock(spec=httpx.AsyncBaseTransport)
+        mock_response = Mock(spec=httpx.Response)
+        mock_transport.handle_async_request.return_value = mock_response
+
+        config = RetryConfig(stop=stop_after_attempt(3), reraise=True)
+        transport = AsyncTenacityTransport(config, mock_transport)
+
+        request = httpx.Request('GET', 'https://example.com')
+        async with transport:
+            result = await transport.handle_async_request(request)
+
+        assert result is mock_response
+        mock_transport.handle_async_request.assert_called_once_with(request)
+
+    async def test_retry_on_exception(self):
+        """Test that exceptions trigger retries."""
+        mock_transport = AsyncMock(spec=httpx.AsyncBaseTransport)
+        mock_response = Mock(spec=httpx.Response)
+
+        # Fail twice, succeed on third attempt
+        mock_transport.handle_async_request.side_effect = [
+            httpx.ConnectError('Connection failed'),
+            httpx.ConnectError('Connection failed again'),
+            mock_response,
+        ]
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.ConnectError),
+            stop=stop_after_attempt(3),
+            wait=wait_fixed(0.001),
+            reraise=True,
+        )
+        transport = AsyncTenacityTransport(config, mock_transport)
+
+        request = httpx.Request('GET', 'https://example.com')
+        result = await transport.handle_async_request(request)
+
+        assert result is mock_response
+        assert mock_transport.handle_async_request.call_count == 3
+
+    async def test_retry_exhausted(self):
+        """Test that retry exhaustion re-raises the last exception."""
+        mock_transport = AsyncMock(spec=httpx.AsyncBaseTransport)
+        mock_transport.handle_async_request.side_effect = httpx.ConnectError('Connection failed')
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.ConnectError),
+            stop=stop_after_attempt(2),
+            wait=wait_fixed(0.001),
+            reraise=True,
+        )
+        transport = AsyncTenacityTransport(config, mock_transport)
+
+        request = httpx.Request('GET', 'https://example.com')
+        with pytest.raises(httpx.ConnectError, match='Connection failed'):
+            await transport.handle_async_request(request)
+
+        assert mock_transport.handle_async_request.call_count == 2
+
+    async def test_validate_response_success(self):
+        """Test that validate_response is called and doesn't raise."""
+        mock_transport = AsyncMock(spec=httpx.AsyncBaseTransport)
+        mock_response = Mock(spec=httpx.Response)
+        mock_response.status_code = 200
+        mock_transport.handle_async_request.return_value = mock_response
+
+        validate_response = Mock()
+        config = RetryConfig(stop=stop_after_attempt(3), reraise=True)
+        transport = AsyncTenacityTransport(config, mock_transport, validate_response)
+
+        request = httpx.Request('GET', 'https://example.com')
+        result = await transport.handle_async_request(request)
+
+        assert result is mock_response
+        validate_response.assert_called_once_with(mock_response)
+
+    async def test_validate_response_triggers_retry(self):
+        """Test that validate_response can trigger retries."""
+        mock_transport = AsyncMock(spec=httpx.AsyncBaseTransport)
+        mock_response_fail = Mock(spec=httpx.Response)
+        mock_response_fail.status_code = 429
+        mock_response_success = Mock(spec=httpx.Response)
+        mock_response_success.status_code = 200
+
+        mock_transport.handle_async_request.side_effect = [mock_response_fail, mock_response_success]
+
+        def validate_response(response: httpx.Response):
+            if response.status_code == 429:
+                raise httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            stop=stop_after_attempt(3),
+            wait=wait_fixed(0.001),
+            reraise=True,
+        )
+        transport = AsyncTenacityTransport(config, mock_transport, validate_response)
+
+        request = httpx.Request('GET', 'https://example.com')
+        result = await transport.handle_async_request(request)
+
+        assert result is mock_response_success
+        assert mock_transport.handle_async_request.call_count == 2
+
+    async def test_raise_for_status_in_validate_response(self):
+        """Test that response.raise_for_status() works in validate_response callback."""
+        mock_transport = AsyncMock(spec=httpx.AsyncBaseTransport)
+        mock_response_fail = Mock(spec=httpx.Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.is_success = False
+        mock_response_fail.is_error = True
+        mock_response_fail.request = None  # Initially None, will be set by transport
+
+        # Mock raise_for_status to check if request is set
+        def mock_raise_for_status():
+            if mock_response_fail.request is None:
+                raise RuntimeError(  # pragma: no cover
+                    'Cannot call `raise_for_status` as the request instance has not been set on this response.'
+                )
+            raise httpx.HTTPStatusError(
+                'Too Many Requests', request=mock_response_fail.request, response=mock_response_fail
+            )
+
+        mock_response_fail.raise_for_status = mock_raise_for_status
+
+        mock_response_success = Mock(spec=httpx.Response)
+        mock_response_success.status_code = 200
+        mock_response_success.is_success = True
+        mock_response_success.is_error = False
+        mock_response_success.raise_for_status = Mock()  # Should not raise
+
+        mock_transport.handle_async_request.side_effect = [mock_response_fail, mock_response_success]
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            stop=stop_after_attempt(3),
+            wait=wait_fixed(0.001),
+            reraise=True,
+        )
+        transport = AsyncTenacityTransport(
+            config, mock_transport, validate_response=lambda response: response.raise_for_status()
+        )
+
+        request = httpx.Request('GET', 'https://example.com')
+        result = await transport.handle_async_request(request)
+
+        assert result is mock_response_success
+        assert mock_transport.handle_async_request.call_count == 2
+        # Verify that the request was set on the failed response before raise_for_status was called
+        assert mock_response_fail.request is request
+        mock_response_success.raise_for_status.assert_called_once()
+
+# tests/test_concurrency.py:62-67
+    async def test_nowait_acquisition(self):
+        """Test that immediate acquisition works."""
+        limiter = ConcurrencyLimiter(max_running=10)
+        # With high limit, should acquire immediately
+        async with get_concurrency_context(limiter, 'test'):
+            pass  # No waiting
+
+# tests/test_concurrency.py:574-582
+    async def test_custom_tracer_is_stored(self):
+        """Test that custom tracer is stored and returned by _get_tracer."""
+        from opentelemetry.trace import NoOpTracer
+
+        custom_tracer = NoOpTracer()
+        limiter = ConcurrencyLimiter(max_running=5, tracer=custom_tracer)
+
+        # Verify the tracer is stored and returned
+        assert limiter._get_tracer() is custom_tracer
+
+# tests/conftest.py:172-173
+def anyio_backend():
+    return 'asyncio'
+
+# tests/test_concurrency.py:366-409
+    async def test_shared_limiter_limits_across_models(self):
+        """Test that shared limiter limits concurrent requests across multiple models."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        request_count = 0
+        max_concurrent = 0
+        lock = anyio.Lock()
+
+        shared_limiter = ConcurrencyLimiter(max_running=2)
+
+        def create_tracking_model():
+            base_model = TestModel()
+            original_request = TestModel.request.__get__(base_model)
+
+            async def tracking_request(*args: Any, **kwargs: Any):
+                nonlocal request_count, max_concurrent
+                async with lock:
+                    request_count += 1
+                    max_concurrent = max(max_concurrent, request_count)
+                try:
+                    await anyio.sleep(0.1)
+                    return await original_request(*args, **kwargs)
+                finally:
+                    async with lock:
+                        request_count -= 1
+
+            base_model.request = tracking_request
+            return ConcurrencyLimitedModel(base_model, limiter=shared_limiter)
+
+        model1 = create_tracking_model()
+        model2 = create_tracking_model()
+
+        agent1 = Agent(model1)
+        agent2 = Agent(model2)
+
+        # Run 3 requests on each agent (6 total), but limit is 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(agent1.run, f'prompt {i}')
+            for i in range(3):
+                tg.start_soon(agent2.run, f'prompt {i}')
+
+        # Should never exceed 2 concurrent requests across both models
+        assert max_concurrent <= 2
+
+# tests/evals/test_report_evaluators.py:716-730
+async def test_async_report_evaluator():
+    """Async report evaluator is awaited through evaluate_async."""
+
+    @dataclass
+    class AsyncEvaluator(ReportEvaluator):
+        async def evaluate(self, ctx: ReportEvaluatorContext) -> ScalarResult:
+            return ScalarResult(title='Async Result', value=42)
+
+    evaluator = AsyncEvaluator()
+    report = _make_report([_make_report_case('c1', output='x')])
+    ctx = ReportEvaluatorContext(name='test', report=report, experiment_metadata=None)
+    result = await evaluator.evaluate_async(ctx)
+
+    assert isinstance(result, ScalarResult)
+    assert result.value == 42
+
+# pydantic_ai_slim/pydantic_ai/common_tools/duckduckgo.py:4-4
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/common_tools/duckduckgo.py:4-4
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/common_tools/duckduckgo.py:4-4
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/common_tools/duckduckgo.py:4-4
+import anyio.to_thread
+
+# tests/test_agent.py:7188-7202
+async def test_override_instructions_async_callable():
+    """Override with an async callable should be awaited."""
+    agent = Agent('test')
+
+    async def override_fn() -> str:
+        await asyncio.sleep(0)
+        return 'ASYNC_FN'
+
+    with agent.override(instructions=override_fn):
+        with capture_run_messages() as messages:
+            await agent.run('Hi', model=TestModel(custom_output_text='ok'))
+
+    req = messages[0]
+    assert isinstance(req, ModelRequest)
+    assert req.instructions == 'ASYNC_FN'
+
+# tests/test_tenacity.py:599-637
+    async def test_async_transport_with_wait_retry_after(self):
+        """Test AsyncTenacityTransport with wait_retry_after strategy."""
+        mock_transport = AsyncMock(spec=httpx.AsyncBaseTransport)
+        mock_response_fail = Mock(spec=httpx.Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.headers = {'retry-after': '1'}
+        mock_response_success = Mock(spec=httpx.Response)
+        mock_response_success.status_code = 200
+
+        mock_transport.handle_async_request.side_effect = [mock_response_fail, mock_response_success]
+
+        # Track validation calls
+        validation_calls: list[int] = []
+
+        def validate_response(response: httpx.Response):
+            validation_calls.append(response.status_code)
+            if response.status_code == 429:
+                raise httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            wait=wait_retry_after(max_wait=5),  # Short max_wait for tests
+            stop=stop_after_attempt(3),
+            reraise=True,
+        )
+        transport = AsyncTenacityTransport(config, mock_transport, validate_response)
+
+        request = httpx.Request('GET', 'https://example.com')
+
+        # Time the request to ensure retry-after wait was respected
+        start_time = asyncio.get_event_loop().time()
+        result = await transport.handle_async_request(request)
+        end_time = asyncio.get_event_loop().time()
+
+        assert result is mock_response_success
+        assert mock_transport.handle_async_request.call_count == 2
+        assert validation_calls == [429, 200]  # First call failed, second succeeded
+        # Should have waited approximately 1 second (allow some tolerance)
+        assert 0.8 <= (end_time - start_time) <= 2.0
+
+# tests/test_tenacity.py:596-673
+class TestIntegration:
+    """Integration tests combining transports with wait strategies."""
+
+    async def test_async_transport_with_wait_retry_after(self):
+        """Test AsyncTenacityTransport with wait_retry_after strategy."""
+        mock_transport = AsyncMock(spec=httpx.AsyncBaseTransport)
+        mock_response_fail = Mock(spec=httpx.Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.headers = {'retry-after': '1'}
+        mock_response_success = Mock(spec=httpx.Response)
+        mock_response_success.status_code = 200
+
+        mock_transport.handle_async_request.side_effect = [mock_response_fail, mock_response_success]
+
+        # Track validation calls
+        validation_calls: list[int] = []
+
+        def validate_response(response: httpx.Response):
+            validation_calls.append(response.status_code)
+            if response.status_code == 429:
+                raise httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            wait=wait_retry_after(max_wait=5),  # Short max_wait for tests
+            stop=stop_after_attempt(3),
+            reraise=True,
+        )
+        transport = AsyncTenacityTransport(config, mock_transport, validate_response)
+
+        request = httpx.Request('GET', 'https://example.com')
+
+        # Time the request to ensure retry-after wait was respected
+        start_time = asyncio.get_event_loop().time()
+        result = await transport.handle_async_request(request)
+        end_time = asyncio.get_event_loop().time()
+
+        assert result is mock_response_success
+        assert mock_transport.handle_async_request.call_count == 2
+        assert validation_calls == [429, 200]  # First call failed, second succeeded
+        # Should have waited approximately 1 second (allow some tolerance)
+        assert 0.8 <= (end_time - start_time) <= 2.0
+
+    def test_sync_transport_with_wait_retry_after(self):
+        """Test TenacityTransport with wait_retry_after strategy."""
+        mock_transport = Mock(spec=httpx.BaseTransport)
+        mock_response_fail = Mock(spec=httpx.Response)
+        mock_response_fail.status_code = 429
+        mock_response_fail.headers = {'retry-after': '30'}  # 30 seconds, will be capped
+        mock_response_success = Mock(spec=httpx.Response)
+        mock_response_success.status_code = 200
+
+        mock_transport.handle_request.side_effect = [mock_response_fail, mock_response_success]
+
+        def validate_response(response: httpx.Response):
+            if response.status_code == 429:
+                raise httpx.HTTPStatusError('Rate limited', request=request, response=response)
+
+        config = RetryConfig(
+            retry=retry_if_exception_type(httpx.HTTPStatusError),
+            wait=wait_retry_after(max_wait=0.1),  # Cap at 0.1 seconds for tests
+            stop=stop_after_attempt(3),
+            reraise=True,
+        )
+        transport = TenacityTransport(config, mock_transport, validate_response)
+
+        request = httpx.Request('GET', 'https://example.com')
+
+        # Time the request to ensure max_wait was respected
+        start_time = time.time()
+        result = transport.handle_request(request)
+        end_time = time.time()
+
+        assert result is mock_response_success
+        assert mock_transport.handle_request.call_count == 2
+        # Should have waited approximately 0.2 seconds (capped by max_wait)
+        duration = end_time - start_time
+        assert 0.1 <= duration <= 0.2
+
+# tests/test_concurrency.py:99-123
+    async def test_backpressure_raises(self):
+        """Test that exceeding max_queued raises ConcurrencyLimitExceeded."""
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=2)
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                await hold.wait()
+
+        async with anyio.create_task_group() as tg:
+            # Fill the running slot
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            # Fill the queue (2 allowed)
+            tg.start_soon(holder)
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            # This should raise - queue is full
+            with pytest.raises(ConcurrencyLimitExceeded):
+                async with get_concurrency_context(limiter, 'test'):
+                    pass
+
+            hold.set()
+
+# tests/test_concurrency.py:69-97
+    async def test_waiting_count_tracking(self):
+        """Test that waiting_count is accurately tracked."""
+        limiter = ConcurrencyLimiter(max_running=1)
+        started = anyio.Event()
+        release = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                started.set()
+                await release.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Now limiter is held, check waiting count as we add waiters
+            assert limiter.waiting_count == 0
+
+            for _ in range(3):
+                tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+            assert limiter.waiting_count == 3
+
+            release.set()
+        assert limiter.waiting_count == 0
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:23-28
+from .concurrency import (
+    AbstractConcurrencyLimiter,
+    AnyConcurrencyLimit,
+    ConcurrencyLimit,
+    ConcurrencyLimiter,
+)
+
+# pydantic_ai_slim/pydantic_ai/__init__.py:23-28
+from .concurrency import (
+    AbstractConcurrencyLimiter,
+    AnyConcurrencyLimit,
+    ConcurrencyLimit,
+    ConcurrencyLimiter,
+)
+
+# pydantic_ai_slim/pydantic_ai/_cli/__init__.py:6-6
+from asyncio import CancelledError
+
+# examples/pydantic_ai_examples/chat_app.py:10-10
+import asyncio
+
+# examples/pydantic_ai_examples/chat_app.py:10-10
+import asyncio
+
+# examples/pydantic_ai_examples/chat_app.py:10-10
+import asyncio

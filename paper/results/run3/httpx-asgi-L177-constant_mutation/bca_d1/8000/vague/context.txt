@@ -1,0 +1,971 @@
+## httpx/_auth.py
+
+class Auth:
+    """
+    Base class for all authentication schemes.
+
+    To implement a custom authentication scheme, subclass `Auth` and override
+    the `.auth_flow()` method.
+
+    If the authentication scheme does I/O such as disk access or network calls, or uses
+    synchronization primitives such as locks, you should override `.sync_auth_flow()`
+    and/or `.async_auth_flow()` instead of `.auth_flow()` to provide specialized
+    implementations that will be used by `Client` and `AsyncClient` respectively.
+    """
+
+    requires_request_body = False
+    requires_response_body = False
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow.
+
+        To dispatch a request, `yield` it:
+
+        ```
+        yield request
+        ```
+
+        The client will `.send()` the response back into the flow generator. You can
+        access it like so:
+
+        ```
+        response = yield request
+        ```
+
+        A `return` (or reaching the end of the generator) will result in the
+        client returning the last response obtained from the server.
+
+        You can dispatch as many requests as is necessary.
+        """
+        yield request
+
+    def sync_auth_flow(
+        self, request: Request
+    ) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow synchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            request.read()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                response.read()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+    async def async_auth_flow(
+        self, request: Request
+    ) -> typing.AsyncGenerator[Request, Response]:
+        """
+        Execute the authentication flow asynchronously.
+
+        By default, this defers to `.auth_flow()`. You should override this method
+        when the authentication scheme does I/O and/or uses concurrency primitives.
+        """
+        if self.requires_request_body:
+            await request.aread()
+
+        flow = self.auth_flow(request)
+        request = next(flow)
+
+        while True:
+            response = yield request
+            if self.requires_response_body:
+                await response.aread()
+
+            try:
+                request = flow.send(response)
+            except StopIteration:
+                break
+
+class NetRCAuth(Auth):
+    """
+    Use a 'netrc' file to lookup basic auth credentials based on the url host.
+    """
+
+    def __init__(self, file: str | None = None) -> None:
+        # Lazily import 'netrc'.
+        # There's no need for us to load this module unless 'NetRCAuth' is being used.
+        import netrc
+
+        self._netrc_info = netrc.netrc(file)
+
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        auth_info = self._netrc_info.authenticators(request.url.host)
+        if auth_info is None or not auth_info[2]:
+            # The netrc file did not have authentication credentials for this host.
+            yield request
+        else:
+            # Build a basic auth header with credentials from the netrc file.
+            request.headers["Authorization"] = self._build_auth_header(
+                username=auth_info[0], password=auth_info[2]
+            )
+            yield request
+
+    def _build_auth_header(self, username: str | bytes, password: str | bytes) -> str:
+        userpass = b":".join((to_bytes(username), to_bytes(password)))
+        token = b64encode(userpass).decode()
+        return f"Basic {token}"
+
+    _ALGORITHM_TO_HASH_FUNCTION: dict[str, typing.Callable[[bytes], _Hash]] = {
+        "MD5": hashlib.md5,
+        "MD5-SESS": hashlib.md5,
+        "SHA": hashlib.sha1,
+        "SHA-SESS": hashlib.sha1,
+        "SHA-256": hashlib.sha256,
+        "SHA-256-SESS": hashlib.sha256,
+        "SHA-512": hashlib.sha512,
+        "SHA-512-SESS": hashlib.sha512,
+    }
+
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+class UseClientDefault:
+    """
+    For some parameters such as `auth=...` and `timeout=...` we need to be able
+    to indicate the default "unset" state, in a way that is distinctly different
+    to using `None`.
+
+    The default "unset" state indicates that whatever default is set on the
+    client should be used. This is different to setting `None`, which
+    explicitly disables the parameter, possibly overriding a client default.
+
+    For example we use `timeout=USE_CLIENT_DEFAULT` in the `request()` signature.
+    Omitting the `timeout` parameter will send a request using whatever default
+    timeout has been configured on the client. Including `timeout=None` will
+    ensure no timeout is used.
+
+    Note that user code shouldn't need to use the `USE_CLIENT_DEFAULT` constant,
+    but it is used internally when a parameter is not included.
+    """
+
+USE_CLIENT_DEFAULT = UseClientDefault()
+
+    def __init__(
+        self,
+        *,
+        auth: AuthTypes | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+        follow_redirects: bool = False,
+        max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
+        base_url: URL | str = "",
+        trust_env: bool = True,
+        default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+    ) -> None:
+        event_hooks = {} if event_hooks is None else event_hooks
+
+        self._base_url = self._enforce_trailing_slash(URL(base_url))
+
+        self._auth = self._build_auth(auth)
+        self._params = QueryParams(params)
+        self.headers = Headers(headers)
+        self._cookies = Cookies(cookies)
+        self._timeout = Timeout(timeout)
+        self.follow_redirects = follow_redirects
+        self.max_redirects = max_redirects
+        self._event_hooks = {
+            "request": list(event_hooks.get("request", [])),
+            "response": list(event_hooks.get("response", [])),
+        }
+        self._trust_env = trust_env
+        self._default_encoding = default_encoding
+        self._state = ClientState.UNOPENED
+
+    def event_hooks(self, event_hooks: dict[str, list[EventHook]]) -> None:
+        self._event_hooks = {
+            "request": list(event_hooks.get("request", [])),
+            "response": list(event_hooks.get("response", [])),
+        }
+
+    def request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Build and send a request.
+
+        Equivalent to:
+
+        ```python
+        request = client.build_request(...)
+        response = client.send(request, ...)
+        ```
+
+        See `Client.build_request()`, `Client.send()` and
+        [Merging of configuration][0] for how the various parameters
+        are merged with client-level configuration.
+
+        [0]: /advanced/clients/#merging-of-configuration
+        """
+        if cookies is not None:
+            message = (
+                "Setting per-request cookies=<...> is being deprecated, because "
+                "the expected behaviour on cookie persistence is ambiguous. Set "
+                "cookies directly on the client instance instead."
+            )
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        return self.send(request, auth=auth, follow_redirects=follow_redirects)
+
+    def get(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `GET` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return self.request(
+            "GET",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+    def options(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send an `OPTIONS` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return self.request(
+            "OPTIONS",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+    def head(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `HEAD` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return self.request(
+            "HEAD",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+    def delete(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `DELETE` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return self.request(
+            "DELETE",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+    async def get(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `GET` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return await self.request(
+            "GET",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+    async def options(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send an `OPTIONS` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return await self.request(
+            "OPTIONS",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+    async def head(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `HEAD` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return await self.request(
+            "HEAD",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+    async def delete(
+        self,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Send a `DELETE` request.
+
+        **Parameters**: See `httpx.request`.
+        """
+        return await self.request(
+            "DELETE",
+            url,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            timeout=timeout,
+            extensions=extensions,
+        )
+
+## httpx/_config.py
+
+DEFAULT_TIMEOUT_CONFIG = Timeout(timeout=5.0)
+
+DEFAULT_LIMITS = Limits(max_connections=100, max_keepalive_connections=20)
+
+DEFAULT_MAX_REDIRECTS = 20
+
+## httpx/_main.py
+
+def print_help() -> None:
+    console = rich.console.Console()
+
+    console.print("[bold]HTTPX :butterfly:", justify="center")
+    console.print()
+    console.print("A next generation HTTP client.", justify="center")
+    console.print()
+    console.print(
+        "Usage: [bold]httpx[/bold] [cyan]<URL> [OPTIONS][/cyan] ", justify="left"
+    )
+    console.print()
+
+    table = rich.table.Table.grid(padding=1, pad_edge=True)
+    table.add_column("Parameter", no_wrap=True, justify="left", style="bold")
+    table.add_column("Description")
+    table.add_row(
+        "-m, --method [cyan]METHOD",
+        "Request method, such as GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD.\n"
+        "[Default: GET, or POST if a request body is included]",
+    )
+    table.add_row(
+        "-p, --params [cyan]<NAME VALUE> ...",
+        "Query parameters to include in the request URL.",
+    )
+    table.add_row(
+        "-c, --content [cyan]TEXT", "Byte content to include in the request body."
+    )
+    table.add_row(
+        "-d, --data [cyan]<NAME VALUE> ...", "Form data to include in the request body."
+    )
+    table.add_row(
+        "-f, --files [cyan]<NAME FILENAME> ...",
+        "Form files to include in the request body.",
+    )
+    table.add_row("-j, --json [cyan]TEXT", "JSON data to include in the request body.")
+    table.add_row(
+        "-h, --headers [cyan]<NAME VALUE> ...",
+        "Include additional HTTP headers in the request.",
+    )
+    table.add_row(
+        "--cookies [cyan]<NAME VALUE> ...", "Cookies to include in the request."
+    )
+    table.add_row(
+        "--auth [cyan]<USER PASS>",
+        "Username and password to include in the request. Specify '-' for the password"
+        " to use a password prompt. Note that using --verbose/-v will expose"
+        " the Authorization header, including the password encoding"
+        " in a trivially reversible format.",
+    )
+
+    table.add_row(
+        "--proxy [cyan]URL",
+        "Send the request via a proxy. Should be the URL giving the proxy address.",
+    )
+
+    table.add_row(
+        "--timeout [cyan]FLOAT",
+        "Timeout value to use for network operations, such as establishing the"
+        " connection, reading some data, etc... [Default: 5.0]",
+    )
+
+    table.add_row("--follow-redirects", "Automatically follow redirects.")
+    table.add_row("--no-verify", "Disable SSL verification.")
+    table.add_row(
+        "--http2", "Send the request using HTTP/2, if the remote server supports it."
+    )
+
+    table.add_row(
+        "--download [cyan]FILE",
+        "Save the response content as a file, rather than displaying it.",
+    )
+
+    table.add_row("-v, --verbose", "Verbose output. Show request as well as response.")
+    table.add_row("--help", "Show this message and exit.")
+    console.print(table)
+
+def validate_json(
+    ctx: click.Context,
+    param: click.Option | click.Parameter,
+    value: typing.Any,
+) -> typing.Any:
+    if value is None:
+        return None
+
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:  # pragma: no cover
+        raise click.BadParameter("Not valid JSON")
+
+def validate_auth(
+    ctx: click.Context,
+    param: click.Option | click.Parameter,
+    value: typing.Any,
+) -> typing.Any:
+    if value == (None, None):
+        return None
+
+    username, password = value
+    if password == "-":  # pragma: no cover
+        password = click.prompt("Password", hide_input=True)
+    return (username, password)
+
+def handle_help(
+    ctx: click.Context,
+    param: click.Option | click.Parameter,
+    value: typing.Any,
+) -> None:
+    if not value or ctx.resilient_parsing:
+        return
+
+    print_help()
+    ctx.exit()
+
+## httpx/_models.py
+
+def _normalize_header_value(value: str | bytes, encoding: str | None = None) -> bytes:
+    """
+    Coerce str/bytes into a strictly byte-wise HTTP header value.
+    """
+    if isinstance(value, bytes):
+        return value
+    if not isinstance(value, str):
+        raise TypeError(f"Header value must be str or bytes, not {type(value)}")
+    return value.encode(encoding or "ascii")
+
+    def values(self) -> typing.ValuesView[str]:
+        values_dict: dict[str, str] = {}
+        for _, key, value in self._list:
+            str_key = key.decode(self.encoding)
+            str_value = value.decode(self.encoding)
+            if str_key in values_dict:
+                values_dict[str_key] += f", {str_value}"
+            else:
+                values_dict[str_key] = str_value
+        return values_dict.values()
+
+    def get(self, key: str, default: typing.Any = None) -> typing.Any:
+        """
+        Return a header value. If multiple occurrences of the header occur
+        then concatenate them together with commas.
+        """
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def encoding(self, value: str) -> None:
+        """
+        Set the encoding to use for decoding the byte content into text.
+
+        If the `text` attribute has been accessed, attempting to set the
+        encoding will throw a ValueError.
+        """
+        if hasattr(self, "_text"):
+            raise ValueError(
+                "Setting encoding after `text` has been accessed is not allowed."
+            )
+        self._encoding = value
+
+    def has_redirect_location(self) -> bool:
+        """
+        Returns True for 3xx responses with a properly formed URL redirection,
+        `False` otherwise.
+        """
+        return (
+            self.status_code
+            in (
+                # 301 (Cacheable redirect. Method may change to GET.)
+                codes.MOVED_PERMANENTLY,
+                # 302 (Uncacheable redirect. Method may change to GET.)
+                codes.FOUND,
+                # 303 (Client should make a GET or HEAD request.)
+                codes.SEE_OTHER,
+                # 307 (Equiv. 302, but retain method)
+                codes.TEMPORARY_REDIRECT,
+                # 308 (Equiv. 301, but retain method)
+                codes.PERMANENT_REDIRECT,
+            )
+            and "Location" in self.headers
+        )
+
+## httpx/_urls.py
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+    def values(self) -> typing.ValuesView[str]:
+        """
+        Return all the values in the query params. If a key occurs more than once
+        only the first item for that key is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert list(q.values()) == ["123", "789"]
+        """
+        return {k: v[0] for k, v in self._dict.items()}.values()
+
+    def get(self, key: typing.Any, default: typing.Any = None) -> typing.Any:
+        """
+        Get a value from the query param for a given key. If the key occurs
+        more than once, then only the first value is returned.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123&a=456&b=789")
+        assert q.get("a") == "123"
+        """
+        if key in self._dict:
+            return self._dict[str(key)][0]
+        return default
+
+    def set(self, key: str, value: typing.Any = None) -> QueryParams:
+        """
+        Return a new QueryParams instance, setting the value of a key.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123")
+        q = q.set("a", "456")
+        assert q == httpx.QueryParams("a=456")
+        """
+        q = QueryParams()
+        q._dict = dict(self._dict)
+        q._dict[str(key)] = [primitive_value_to_str(value)]
+        return q
+
+    def add(self, key: str, value: typing.Any = None) -> QueryParams:
+        """
+        Return a new QueryParams instance, setting or appending the value of a key.
+
+        Usage:
+
+        q = httpx.QueryParams("a=123")
+        q = q.add("a", "456")
+        assert q == httpx.QueryParams("a=123&a=456")
+        """
+        q = QueryParams()
+        q._dict = dict(self._dict)
+        q._dict[str(key)] = q.get_list(key) + [primitive_value_to_str(value)]
+        return q
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+## httpx/_utils.py
+
+def primitive_value_to_str(value: PrimitiveData) -> str:
+    """
+    Coerce a primitive data type into a string value.
+
+    Note that we prefer JSON-style 'true'/'false' for boolean values here.
+    """
+    if value is True:
+        return "true"
+    elif value is False:
+        return "false"
+    elif value is None:
+        return ""
+    return str(value)
+
+    def __hash__(self) -> int:
+        return hash(self.pattern)
+
+## tests/client/test_auth.py
+
+def test_netrc_auth_nopassword_parse_error() -> None:  # pragma: no cover
+    """
+    Python has different netrc parsing behaviours with different versions.
+    For Python < 3.11 a netrc file with no password is invalid. In this case
+    we want to allow the parse error to be raised.
+    """
+    netrc_file = str(FIXTURES_DIR / ".netrc-nopassword")
+    with pytest.raises(netrc.NetrcParseError):
+        httpx.NetRCAuth(netrc_file)
+
+## tests/client/test_cookies.py
+
+def test_setting_client_cookies_to_cookiejar() -> None:
+    """
+    Send a request including a cookie, using a `CookieJar` instance.
+    """
+
+    url = "http://example.org/echo_cookies"
+    cookies = CookieJar()
+    cookie = Cookie(
+        version=0,
+        name="example-name",
+        value="example-value",
+        port=None,
+        port_specified=False,
+        domain="",
+        domain_specified=False,
+        domain_initial_dot=False,
+        path="/",
+        path_specified=True,
+        secure=False,
+        expires=None,
+        discard=True,
+        comment=None,
+        comment_url=None,
+        rest={"HttpOnly": ""},
+        rfc2109=False,
+    )
+    cookies.set_cookie(cookie)
+
+    client = httpx.Client(
+        cookies=cookies, transport=httpx.MockTransport(get_and_set_cookies)
+    )
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {"cookies": "example-name=example-value"}
+
+## tests/client/test_headers.py
+
+def test_remove_default_header():
+    """
+    Remove a default header from the Client.
+    """
+    url = "http://example.org/echo_headers"
+
+    client = httpx.Client(transport=httpx.MockTransport(echo_headers))
+    del client.headers["User-Agent"]
+
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org",
+        }
+    }
+
+def test_header_with_incorrect_value():
+    with pytest.raises(
+        TypeError,
+        match=f"Header value must be str or bytes, not {type(None)}",
+    ):
+        httpx.Headers({"foo": None})  # type: ignore
+
+def test_host_with_non_default_port_in_url():
+    """
+    If the URL includes a non-default port, then it should be included in
+    the Host header.
+    """
+    url = "http://username:password@example.org:123/echo_headers"
+
+    client = httpx.Client(transport=httpx.MockTransport(echo_headers))
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org:123",
+            "user-agent": f"python-httpx/{httpx.__version__}",
+            "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+        }
+    }
+
+def test_is_not_https_redirect_if_not_default_ports():
+    url = httpx.URL("https://example.com:1337")
+    request = httpx.Request(
+        "GET", "http://example.com:9999", headers={"Authorization": "empty"}
+    )
+
+    client = httpx.Client()
+    headers = client._redirect_headers(request, url, "GET")
+
+    assert "Authorization" not in headers
+
+## tests/models/test_queryparams.py
+
+def test_queryparams_are_hashable():
+    params = (
+        httpx.QueryParams("a=123"),
+        httpx.QueryParams({"a": 123}),
+        httpx.QueryParams("b=456"),
+        httpx.QueryParams({"b": 456}),
+    )
+
+    assert len(set(params)) == 2
+
+## tests/models/test_responses.py
+
+def test_response_default_to_utf8_encoding():
+    """
+    Default to utf-8 encoding if there is no Content-Type header.
+    """
+    content = "おはようございます。".encode("utf-8")
+    response = httpx.Response(
+        200,
+        content=content,
+    )
+    assert response.text == "おはようございます。"
+    assert response.encoding == "utf-8"
+
+def test_value_error_without_request(header_value):
+    headers = [(b"Content-Encoding", header_value)]
+    broken_compressed_body = b"xxxxxxxxxxxxxx"
+    with pytest.raises(httpx.DecodingError):
+        httpx.Response(200, headers=headers, content=broken_compressed_body)
+
+## tests/test_auth.py
+
+def test_digest_auth_setting_cookie_in_request():
+    url = "https://www.example.com/auth"
+    client = httpx.Client(transport=httpx.MockTransport(set_cookies))
+    request = client.build_request("GET", url)
+
+    auth = httpx.DigestAuth(username="user", password="pass")
+    flow = auth.sync_auth_flow(request)
+    request = next(flow)
+    assert "Authorization" not in request.headers
+
+    response = client.get(url)
+    assert len(response.cookies) > 0
+    assert response.cookies["session"] == ".session_value..."
+
+    request = flow.send(response)
+    assert request.headers["Authorization"].startswith("Digest")
+    assert request.headers["Cookie"] == "session=.session_value..."
+
+    # No other requests are made.
+    response = httpx.Response(
+        content=b"Hello, world!", status_code=200, request=request
+    )
+    with pytest.raises(StopIteration):
+        flow.send(response)
+
+## tests/test_config.py
+
+def test_timeout_all_parameters_set():
+    timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
+    assert timeout == httpx.Timeout(timeout=5.0)
+
+def test_timeout_from_one_none_value():
+    timeout = httpx.Timeout(None, read=None)
+    assert timeout == httpx.Timeout(None)
+
+def test_timeout_from_one_value():
+    timeout = httpx.Timeout(None, read=5.0)
+    assert timeout == httpx.Timeout(timeout=(None, 5.0, None, None))
+
+def test_timeout_from_one_value_and_default():
+    timeout = httpx.Timeout(5.0, pool=60.0)
+    assert timeout == httpx.Timeout(timeout=(5.0, 5.0, 5.0, 60.0))
+
+def test_timeout_missing_default():
+    with pytest.raises(ValueError):
+        httpx.Timeout(pool=60.0)
+
+## tests/test_multipart.py
+
+def test_multipart_invalid_value(value):
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    data = {"text": value}
+    files = {"file": io.BytesIO(b"<file content>")}
+    with pytest.raises(TypeError) as e:
+        client.post("http://127.0.0.1:8000/", data=data, files=files)
+    assert "Invalid type for value" in str(e.value)
+
+## tests/test_status_codes.py
+
+def test_status_code_value_lookup():
+    assert httpx.codes(404) == 404

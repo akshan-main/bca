@@ -1,0 +1,996 @@
+## examples/pydantic_ai_examples/rag.py
+
+    def url(self) -> str:
+        url_path = re.sub(r'\.md$', '', self.path)
+        return (
+            f'https://logfire.pydantic.dev/docs/{url_path}/#{slugify(self.title, "-")}'
+        )
+
+def slugify(value: str, separator: str, unicode: bool = False) -> str:
+    """Slugify a string, to make it URL friendly."""
+    # Taken unchanged from https://github.com/Python-Markdown/markdown/blob/3.7/markdown/extensions/toc.py#L38
+    if not unicode:
+        # Replace Extended Latin characters with ASCII, i.e. `žlutý` => `zluty`
+        value = unicodedata.normalize('NFKD', value)
+        value = value.encode('ascii', 'ignore').decode('ascii')
+    value = re.sub(r'[^\w\s-]', '', value).strip().lower()
+    return re.sub(rf'[{separator}\s]+', separator, value)
+
+## pydantic_ai_slim/pydantic_ai/__init__.py
+
+from .embeddings import (
+    Embedder,
+    EmbeddingModel,
+    EmbeddingResult,
+    EmbeddingSettings,
+)
+
+## pydantic_ai_slim/pydantic_ai/_ssrf.py
+
+def resolve_redirect_url(current_url: str, location: str) -> str:
+    """Resolve a redirect location against the current URL.
+
+    Args:
+        current_url: The URL that returned the redirect.
+        location: The Location header value (absolute or relative).
+
+    Returns:
+        The absolute URL to follow.
+    """
+    parsed_location = urlparse(location)
+
+    # Check if it's an absolute URL (has scheme) or protocol-relative URL (has netloc but no scheme)
+    if parsed_location.scheme:
+        return location
+    if parsed_location.netloc:
+        # Protocol-relative URL (e.g., "//example.com/path") - use current scheme
+        parsed_current = urlparse(current_url)
+        return urlunparse(
+            (
+                parsed_current.scheme,
+                parsed_location.netloc,
+                parsed_location.path,
+                '',
+                parsed_location.query,
+                parsed_location.fragment,
+            )
+        )
+
+    # Relative URL - resolve against current URL
+    parsed_current = urlparse(current_url)
+    if location.startswith('/'):
+        # Absolute path
+        return urlunparse((parsed_current.scheme, parsed_current.netloc, location, '', '', ''))
+    else:
+        # Relative path
+        base_path = parsed_current.path.rsplit('/', 1)[0]
+        return urlunparse((parsed_current.scheme, parsed_current.netloc, f'{base_path}/{location}', '', '', ''))
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_model.py
+
+from pydantic_ai.models.wrapper import WrapperModel
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py
+
+from pydantic_ai.providers import Provider
+
+## pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py
+
+class BedrockEmbeddingModel(EmbeddingModel):
+    """Bedrock embedding model implementation.
+
+    This model works with AWS Bedrock's embedding models including
+    Amazon Titan Embeddings and Cohere Embed models.
+
+    Example:
+    ```python
+    from pydantic_ai.embeddings.bedrock import BedrockEmbeddingModel
+    from pydantic_ai.providers.bedrock import BedrockProvider
+
+    # Using default AWS credentials
+    model = BedrockEmbeddingModel('amazon.titan-embed-text-v2:0')
+
+    # Using explicit credentials
+    model = BedrockEmbeddingModel(
+        'cohere.embed-english-v3',
+        provider=BedrockProvider(
+            region_name='us-east-1',
+            aws_access_key_id='...',
+            aws_secret_access_key='...',
+        ),
+    )
+    ```
+    """
+
+    client: BedrockRuntimeClient
+
+    _model_name: BedrockEmbeddingModelName = field(repr=False)
+    _provider: Provider[BaseClient] = field(repr=False)
+    _handler: _BedrockEmbeddingHandler = field(repr=False)
+
+    def __init__(
+        self,
+        model_name: BedrockEmbeddingModelName,
+        *,
+        provider: Literal['bedrock'] | Provider[BaseClient] = 'bedrock',
+        settings: EmbeddingSettings | None = None,
+    ):
+        """Initialize a Bedrock embedding model.
+
+        Args:
+            model_name: The name of the Bedrock embedding model to use.
+                See [Bedrock embedding models](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html)
+                for available options.
+            provider: The provider to use for authentication and API access. Can be:
+
+                - `'bedrock'` (default): Uses default AWS credentials
+                - A [`BedrockProvider`][pydantic_ai.providers.bedrock.BedrockProvider] instance
+                  for custom configuration
+
+            settings: Model-specific [`EmbeddingSettings`][pydantic_ai.embeddings.EmbeddingSettings]
+                to use as defaults for this model.
+        """
+        self._model_name = model_name
+
+        if isinstance(provider, str):
+            provider = infer_provider(provider)
+        self._provider = provider
+        self.client = cast('BedrockRuntimeClient', provider.client)
+        self._handler = _get_handler_for_model(model_name)
+
+        super().__init__(settings=settings)
+
+    @property
+    def base_url(self) -> str:
+        """The base URL for the provider API."""
+        return str(self.client.meta.endpoint_url)
+
+    @property
+    def model_name(self) -> BedrockEmbeddingModelName:
+        """The embedding model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The embedding model provider."""
+        return self._provider.name
+
+    async def embed(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        inputs_list, settings_dict = self.prepare_embed(inputs, settings)
+        settings_typed = cast(BedrockEmbeddingSettings, settings_dict)
+
+        if self._handler.supports_batch:
+            # Models like Cohere support batch requests
+            return await self._embed_batch(inputs_list, input_type, settings_typed)
+        else:
+            # Models like Titan require individual requests
+            return await self._embed_concurrent(inputs_list, input_type, settings_typed)
+
+    async def _embed_batch(
+        self,
+        inputs: list[str],
+        input_type: EmbedInputType,
+        settings: BedrockEmbeddingSettings,
+    ) -> EmbeddingResult:
+        """Embed all inputs in a single batch request."""
+        body = self._handler.prepare_request(inputs, input_type, settings)
+        response, input_tokens = await self._invoke_model(body)
+        embeddings, response_id = self._handler.parse_response(response)
+
+        return EmbeddingResult(
+            embeddings=embeddings,
+            inputs=inputs,
+            input_type=input_type,
+            usage=RequestUsage(input_tokens=input_tokens),
+            model_name=self.model_name,
+            provider_name=self.system,
+            provider_response_id=response_id,
+        )
+
+    async def _embed_concurrent(
+        self,
+        inputs: list[str],
+        input_type: EmbedInputType,
+        settings: BedrockEmbeddingSettings,
+    ) -> EmbeddingResult:
+        """Embed inputs concurrently with controlled parallelism and combine results."""
+        max_concurrency = settings.get('bedrock_max_concurrency', 5)
+        semaphore = anyio.Semaphore(max_concurrency)
+
+        results: list[tuple[Sequence[float], int]] = [None] * len(inputs)  # type: ignore[list-item]
+
+        async def embed_single(index: int, text: str) -> None:
+            async with semaphore:
+                body = self._handler.prepare_request([text], input_type, settings)
+                response, input_tokens = await self._invoke_model(body)
+                embeddings, _ = self._handler.parse_response(response)
+                results[index] = (embeddings[0], input_tokens)
+
+        async with anyio.create_task_group() as tg:
+            for i, text in enumerate(inputs):
+                tg.start_soon(embed_single, i, text)
+
+        all_embeddings = [embedding for embedding, _ in results]
+        total_input_tokens = sum(tokens for _, tokens in results)
+
+        return EmbeddingResult(
+            embeddings=all_embeddings,
+            inputs=inputs,
+            input_type=input_type,
+            usage=RequestUsage(input_tokens=total_input_tokens),
+            model_name=self.model_name,
+            provider_name=self.system,
+        )
+
+    async def _invoke_model(self, body: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """Invoke the Bedrock model and return parsed response with token count.
+
+        Returns:
+            A tuple of (response_body, input_token_count).
+        """
+        try:
+            response: InvokeModelResponseTypeDef = await anyio.to_thread.run_sync(
+                functools.partial(
+                    self.client.invoke_model,
+                    modelId=self._model_name,
+                    body=json.dumps(body),
+                    contentType='application/json',
+                    accept='application/json',
+                )
+            )
+        except ClientError as e:
+            status_code = e.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+            if isinstance(status_code, int):
+                raise ModelHTTPError(status_code=status_code, model_name=self.model_name, body=e.response) from e
+            raise ModelAPIError(model_name=self.model_name, message=str(e)) from e
+
+        # Extract input token count from HTTP headers
+        input_tokens = int(
+            response.get('ResponseMetadata', {}).get('HTTPHeaders', {}).get('x-amzn-bedrock-input-token-count', '0')
+        )
+
+        response_body = json.loads(response['body'].read())
+        return response_body, input_tokens
+
+    async def max_input_tokens(self) -> int | None:
+        """Get the maximum number of tokens that can be input to the model."""
+        return _MAX_INPUT_TOKENS.get(self._handler.model_name, None)
+
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+from typing import Any, Protocol
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+    url: str
+
+    _identifier: Annotated[str | None, pydantic.Field(alias='identifier', default=None, exclude=True)] = field(
+        compare=False, default=None
+    )
+
+## pydantic_ai_slim/pydantic_ai/models/cohere.py
+
+    def base_url(self) -> str:
+        client_wrapper = self.client._client_wrapper  # type: ignore
+        return str(client_wrapper.get_base_url())
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+    def base_url(self) -> str:
+        assert self._url is not None, 'URL not initialized'
+        return self._url
+
+## pydantic_ai_slim/pydantic_ai/models/google.py
+
+    def base_url(self) -> str:
+        return self._provider.base_url
+
+## pydantic_ai_slim/pydantic_ai/models/groq.py
+
+    def base_url(self) -> str:
+        return str(self.client.base_url)
+
+## pydantic_ai_slim/pydantic_ai/models/instrumented.py
+
+class InstrumentationSettings
+    """Options for instrumenting models and agents with OpenTelemetry.
+
+    Used in:
+
+    - `Agent(instrument=...)`
+    - [`Agent.instrument_all()`][pydantic_ai.agent.Agent.instrument_all]
+    - [`InstrumentedModel`][pydantic_ai.models.instrumented.InstrumentedModel]
+
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def messages_to_otel_events(
+        self, messages: list[ModelMessage], parameters: ModelRequestParameters | None = None
+    ) -> list[LogRecord]:
+        """Convert a list of model messages to OpenTelemetry events.
+
+        Args:
+            messages: The messages to convert.
+            parameters: The model request parameters.
+
+        Returns:
+            A list of OpenTelemetry events.
+        """
+        events: list[LogRecord] = []
+        instructions = InstrumentedModel._get_instructions(messages, parameters)  # pyright: ignore [reportPrivateUsage]
+        if instructions is not None:
+            events.append(
+                LogRecord(
+                    attributes={'event.name': 'gen_ai.system.message'},
+                    body={**({'content': instructions} if self.include_content else {}), 'role': 'system'},
+                )
+            )
+
+        for message_index, message in enumerate(messages):
+            message_events: list[LogRecord] = []
+            if isinstance(message, ModelRequest):
+                for part in message.parts:
+                    if hasattr(part, 'otel_event'):
+                        message_events.append(part.otel_event(self))
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                message_events = message.otel_events(self)
+            for event in message_events:
+                event.attributes = {
+                    'gen_ai.message.index': message_index,
+                    **(event.attributes or {}),
+                }
+            events.extend(message_events)
+
+        for event in events:
+            event.body = InstrumentedModel.serialize_any(event.body)
+        return events
+
+    def messages_to_otel_messages(self, messages: list[ModelMessage]) -> list[_otel_messages.ChatMessage]:
+        result: list[_otel_messages.ChatMessage] = []
+        for message in messages:
+            if isinstance(message, ModelRequest):
+                for is_system, group in itertools.groupby(message.parts, key=lambda p: isinstance(p, SystemPromptPart)):
+                    message_parts: list[_otel_messages.MessagePart] = []
+                    for part in group:
+                        if hasattr(part, 'otel_message_parts'):
+                            message_parts.extend(part.otel_message_parts(self))
+
+                    result.append(
+                        _otel_messages.ChatMessage(role='system' if is_system else 'user', parts=message_parts)
+                    )
+            elif isinstance(message, ModelResponse):  # pragma: no branch
+                otel_message = _otel_messages.OutputMessage(role='assistant', parts=message.otel_message_parts(self))
+                if message.finish_reason is not None:
+                    otel_message['finish_reason'] = message.finish_reason
+                result.append(otel_message)
+        return result
+
+class InstrumentedModel(WrapperModel):
+    """Model which wraps another model so that requests are instrumented with OpenTelemetry.
+
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    instrumentation_settings: InstrumentationSettings
+    """Instrumentation settings for this model."""
+
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        options: InstrumentationSettings | None = None,
+    ) -> None:
+        super().__init__(wrapped)
+        self.instrumentation_settings = options or InstrumentationSettings()
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        prepared_settings, prepared_parameters = self.wrapped.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        with self._instrument(messages, prepared_settings, prepared_parameters) as finish:
+            response = await self.wrapped.request(messages, model_settings, model_request_parameters)
+            finish(response, prepared_parameters)
+            return response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        prepared_settings, prepared_parameters = self.wrapped.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        with self._instrument(messages, prepared_settings, prepared_parameters) as finish:
+            response_stream: StreamedResponse | None = None
+            try:
+                async with self.wrapped.request_stream(
+                    messages, model_settings, model_request_parameters, run_context
+                ) as response_stream:
+                    yield response_stream
+            finally:
+                if response_stream:  # pragma: no branch
+                    finish(response_stream.get(), prepared_parameters)
+
+    @contextmanager
+    def _instrument(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> Iterator[Callable[[ModelResponse, ModelRequestParameters], None]]:
+        operation = 'chat'
+        span_name = f'{operation} {self.model_name}'
+        # TODO Missing attributes:
+        #  - error.type: unclear if we should do something here or just always rely on span exceptions
+        #  - gen_ai.request.stop_sequences/top_k: model_settings doesn't include these
+        attributes: dict[str, AttributeValue] = {
+            'gen_ai.operation.name': operation,
+            **self.model_attributes(self.wrapped),
+            **self.model_request_parameters_attributes(model_request_parameters),
+            'logfire.json_schema': json.dumps(
+                {
+                    'type': 'object',
+                    'properties': {'model_request_parameters': {'type': 'object'}},
+                }
+            ),
+        }
+
+        tool_definitions = _build_tool_definitions(model_request_parameters)
+        if tool_definitions:
+            attributes['gen_ai.tool.definitions'] = json.dumps(tool_definitions)
+
+        if model_settings:
+            for key in MODEL_SETTING_ATTRIBUTES:
+                if isinstance(value := model_settings.get(key), float | int):
+                    attributes[f'gen_ai.request.{key}'] = value
+
+        record_metrics: Callable[[], None] | None = None
+        try:
+            with self.instrumentation_settings.tracer.start_as_current_span(
+                span_name, attributes=attributes, kind=SpanKind.CLIENT
+            ) as span:
+
+                def finish(response: ModelResponse, parameters: ModelRequestParameters):
+                    # FallbackModel updates these span attributes.
+                    attributes.update(getattr(span, 'attributes', {}))
+                    request_model = attributes[GEN_AI_REQUEST_MODEL_ATTRIBUTE]
+                    system = cast(str, attributes[GEN_AI_SYSTEM_ATTRIBUTE])
+
+                    response_model = response.model_name or request_model
+                    price_calculation = None
+
+                    def _record_metrics():
+                        metric_attributes = {
+                            GEN_AI_PROVIDER_NAME_ATTRIBUTE: system,  # New OTel standard attribute
+                            GEN_AI_SYSTEM_ATTRIBUTE: system,  # Preserved for backward compatibility (deprecated)
+                            'gen_ai.operation.name': operation,
+                            'gen_ai.request.model': request_model,
+                            'gen_ai.response.model': response_model,
+                        }
+                        self.instrumentation_settings.record_metrics(response, price_calculation, metric_attributes)
+
+                    nonlocal record_metrics
+                    record_metrics = _record_metrics
+
+                    if not span.is_recording():
+                        return
+
+                    self.instrumentation_settings.handle_messages(messages, response, system, span, parameters)
+
+                    attributes_to_set = {
+                        **response.usage.opentelemetry_attributes(),
+                        'gen_ai.response.model': response_model,
+                    }
+                    try:
+                        price_calculation = response.cost()
+                    except LookupError:
+                        # The cost of this provider/model is unknown, which is common.
+                        pass
+                    except Exception as e:
+                        warnings.warn(
+                            f'Failed to get cost from response: {type(e).__name__}: {e}', CostCalculationFailedWarning
+                        )
+                    else:
+                        attributes_to_set['operation.cost'] = float(price_calculation.total_price)
+
+                    if response.provider_response_id is not None:
+                        attributes_to_set['gen_ai.response.id'] = response.provider_response_id
+                    if response.finish_reason is not None:
+                        attributes_to_set['gen_ai.response.finish_reasons'] = [response.finish_reason]
+                    span.set_attributes(attributes_to_set)
+                    span.update_name(f'{operation} {request_model}')
+
+                yield finish
+        finally:
+            if record_metrics:
+                # We only want to record metrics after the span is finished,
+                # to prevent them from being redundantly recorded in the span itself by logfire.
+                record_metrics()
+
+    @staticmethod
+    def model_attributes(model: Model) -> dict[str, AttributeValue]:
+        attributes: dict[str, AttributeValue] = {
+            GEN_AI_PROVIDER_NAME_ATTRIBUTE: model.system,  # New OTel standard attribute
+            GEN_AI_SYSTEM_ATTRIBUTE: model.system,  # Preserved for backward compatibility (deprecated)
+            GEN_AI_REQUEST_MODEL_ATTRIBUTE: model.model_name,
+        }
+        if base_url := model.base_url:
+            try:
+                parsed = urlparse(base_url)
+            except Exception:  # pragma: no cover
+                pass
+            else:
+                if parsed.hostname:  # pragma: no branch
+                    attributes['server.address'] = parsed.hostname
+                if parsed.port:  # pragma: no branch
+                    attributes['server.port'] = parsed.port
+
+        return attributes
+
+    @staticmethod
+    def model_request_parameters_attributes(
+        model_request_parameters: ModelRequestParameters,
+    ) -> dict[str, AttributeValue]:
+        return {'model_request_parameters': json.dumps(InstrumentedModel.serialize_any(model_request_parameters))}
+
+    @staticmethod
+    def event_to_dict(event: LogRecord) -> dict[str, Any]:
+        if not event.body:
+            body = {}  # pragma: no cover
+        elif isinstance(event.body, Mapping):
+            body = event.body
+        else:
+            body = {'body': event.body}
+        return {**body, **(event.attributes or {})}
+
+    @staticmethod
+    def serialize_any(value: Any) -> str:
+        try:
+            return ANY_ADAPTER.dump_python(value, mode='json')
+        except Exception:
+            try:
+                return str(value)
+            except Exception as e:
+                return f'Unable to serialize: {e}'
+
+    def event_to_dict(event: LogRecord) -> dict[str, Any]:
+        if not event.body:
+            body = {}  # pragma: no cover
+        elif isinstance(event.body, Mapping):
+            body = event.body
+        else:
+            body = {'body': event.body}
+        return {**body, **(event.attributes or {})}
+
+## pydantic_ai_slim/pydantic_ai/providers/sambanova.py
+
+class SambaNovaProvider(Provider[AsyncOpenAI]):
+    """Provider for SambaNova AI models.
+
+    SambaNova uses an OpenAI-compatible API.
+    """
+
+    @property
+    def name(self) -> str:
+        """Return the provider name."""
+        return 'sambanova'
+
+    @property
+    def base_url(self) -> str:
+        """Return the base URL."""
+        return self._base_url
+
+    @property
+    def client(self) -> AsyncOpenAI:
+        """Return the AsyncOpenAI client."""
+        return self._client
+
+    def model_profile(self, model_name: str) -> ModelProfile | None:
+        """Get model profile for SambaNova models.
+
+        SambaNova serves models from multiple families including Meta Llama,
+        DeepSeek, Qwen, and Mistral. Model profiles are matched based on
+        model name prefixes.
+        """
+        prefix_to_profile = {
+            'deepseek-': deepseek_model_profile,
+            'meta-llama-': meta_model_profile,
+            'llama-': meta_model_profile,
+            'qwen': qwen_model_profile,
+            'mistral': mistral_model_profile,
+        }
+
+        profile = None
+        model_name_lower = model_name.lower()
+
+        for prefix, profile_func in prefix_to_profile.items():
+            if model_name_lower.startswith(prefix):
+                profile = profile_func(model_name)
+                break
+
+        # Wrap into OpenAIModelProfile since SambaNova is OpenAI-compatible
+        return OpenAIModelProfile(json_schema_transformer=OpenAIJsonSchemaTransformer).update(profile)
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        openai_client: AsyncOpenAI | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        """Initialize SambaNova provider.
+
+        Args:
+            api_key: SambaNova API key. If not provided, reads from SAMBANOVA_API_KEY env var.
+            base_url: Custom API base URL. Defaults to https://api.sambanova.ai/v1
+            openai_client: Optional pre-configured OpenAI client
+            http_client: Optional custom httpx.AsyncClient for making HTTP requests
+
+        Raises:
+            UserError: If API key is not provided and SAMBANOVA_API_KEY env var is not set
+        """
+        if openai_client is not None:
+            self._client = openai_client
+            self._base_url = str(openai_client.base_url)
+        else:
+            # Get API key from parameter or environment
+            api_key = api_key or os.getenv('SAMBANOVA_API_KEY')
+            if not api_key:
+                raise UserError(
+                    'Set the `SAMBANOVA_API_KEY` environment variable or pass it via '
+                    '`SambaNovaProvider(api_key=...)` to use the SambaNova provider.'
+                )
+
+            # Set base URL (default to SambaNova API endpoint)
+            self._base_url = base_url or os.getenv('SAMBANOVA_BASE_URL', 'https://api.sambanova.ai/v1')
+
+            # Create http client and AsyncOpenAI client
+            http_client = http_client or cached_async_http_client(provider='sambanova')
+            self._client = AsyncOpenAI(base_url=self._base_url, api_key=api_key, http_client=http_client)
+
+    def base_url(self) -> str:
+        """Return the base URL."""
+        return self._base_url
+
+## pydantic_ai_slim/pydantic_ai/toolsets/abstract.py
+
+class SchemaValidatorProt(Protocol):
+    """Protocol for a Pydantic Core `SchemaValidator` or `PluggableSchemaValidator` (which is private but API-compatible)."""
+
+    def validate_json(
+        self,
+        input: str | bytes | bytearray,
+        *,
+        allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False,
+        **kwargs: Any,
+    ) -> Any: ...
+
+    def validate_python(
+        self, input: Any, *, allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False, **kwargs: Any
+    ) -> Any: ...
+
+    def validate_python(
+        self, input: Any, *, allow_partial: bool | Literal['off', 'on', 'trailing-strings'] = False, **kwargs: Any
+    ) -> Any: ...
+
+## pydantic_ai_slim/pydantic_ai/ui/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the protocol-specific run input."""
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_adapter.py
+
+    def messages(self) -> list[ModelMessage]:
+        """Pydantic AI messages from the Vercel AI run input."""
+        return self.load_messages(self.run_input.messages)
+
+## tests/models/test_anthropic.py
+
+    def messages(self) -> Any:
+        return type('Messages', (), {'create': self.messages_create, 'count_tokens': self.messages_count_tokens})
+
+## tests/models/test_cohere.py
+
+class MockClientWrapper:
+    def get_base_url(self) -> str:
+        return 'https://api.cohere.com'
+
+    def get_base_url(self) -> str:
+        return 'https://api.cohere.com'
+
+## tests/models/test_instrumented.py
+
+    def base_url(self) -> str:
+        return 'https://example.com:8000/foo'
+
+def test_messages_to_otel_events_image_url(document_content: BinaryContent):
+    messages = [
+        ModelRequest(
+            parts=[UserPromptPart(content=['user_prompt', ImageUrl('https://example.com/image.png')])],
+            timestamp=IsDatetime(),
+        ),
+        ModelRequest(
+            parts=[UserPromptPart(content=['user_prompt2', AudioUrl('https://example.com/audio.mp3')])],
+            timestamp=IsDatetime(),
+        ),
+        ModelRequest(
+            parts=[UserPromptPart(content=['user_prompt3', DocumentUrl('https://example.com/document.pdf')])],
+            timestamp=IsDatetime(),
+        ),
+        ModelRequest(
+            parts=[UserPromptPart(content=['user_prompt4', VideoUrl('https://example.com/video.mp4')])],
+            timestamp=IsDatetime(),
+        ),
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=[
+                        'user_prompt5',
+                        ImageUrl('https://example.com/image2.png'),
+                        AudioUrl('https://example.com/audio2.mp3'),
+                        DocumentUrl('https://example.com/document2.pdf'),
+                        VideoUrl('https://example.com/video2.mp4'),
+                    ]
+                )
+            ],
+            timestamp=IsDatetime(),
+        ),
+        ModelRequest(parts=[UserPromptPart(content=['user_prompt6', document_content])], timestamp=IsDatetime()),
+        ModelResponse(parts=[TextPart('text1')]),
+        ModelResponse(parts=[FilePart(content=document_content)]),
+    ]
+    settings = InstrumentationSettings()
+    assert [InstrumentedModel.event_to_dict(e) for e in settings.messages_to_otel_events(messages)] == snapshot(
+        [
+            {
+                'content': ['user_prompt', {'kind': 'image-url', 'url': 'https://example.com/image.png'}],
+                'role': 'user',
+                'gen_ai.message.index': 0,
+                'event.name': 'gen_ai.user.message',
+            },
+            {
+                'content': ['user_prompt2', {'kind': 'audio-url', 'url': 'https://example.com/audio.mp3'}],
+                'role': 'user',
+                'gen_ai.message.index': 1,
+                'event.name': 'gen_ai.user.message',
+            },
+            {
+                'content': ['user_prompt3', {'kind': 'document-url', 'url': 'https://example.com/document.pdf'}],
+                'role': 'user',
+                'gen_ai.message.index': 2,
+                'event.name': 'gen_ai.user.message',
+            },
+            {
+                'content': ['user_prompt4', {'kind': 'video-url', 'url': 'https://example.com/video.mp4'}],
+                'role': 'user',
+                'gen_ai.message.index': 3,
+                'event.name': 'gen_ai.user.message',
+            },
+            {
+                'content': [
+                    'user_prompt5',
+                    {'kind': 'image-url', 'url': 'https://example.com/image2.png'},
+                    {'kind': 'audio-url', 'url': 'https://example.com/audio2.mp3'},
+                    {'kind': 'document-url', 'url': 'https://example.com/document2.pdf'},
+                    {'kind': 'video-url', 'url': 'https://example.com/video2.mp4'},
+                ],
+                'role': 'user',
+                'gen_ai.message.index': 4,
+                'event.name': 'gen_ai.user.message',
+            },
+            {
+                'content': [
+                    'user_prompt6',
+                    {'kind': 'binary', 'binary_content': IsStr(), 'media_type': 'application/pdf'},
+                ],
+                'role': 'user',
+                'gen_ai.message.index': 5,
+                'event.name': 'gen_ai.user.message',
+            },
+            {
+                'role': 'assistant',
+                'content': 'text1',
+                'gen_ai.message.index': 6,
+                'event.name': 'gen_ai.assistant.message',
+            },
+            {
+                'role': 'assistant',
+                'content': [
+                    {
+                        'kind': 'binary',
+                        'media_type': 'application/pdf',
+                        'binary_content': IsStr(),
+                    }
+                ],
+                'gen_ai.message.index': 7,
+                'event.name': 'gen_ai.assistant.message',
+            },
+        ]
+    )
+    assert settings.messages_to_otel_messages(messages) == snapshot(
+        [
+            {
+                'role': 'user',
+                'parts': [
+                    {'type': 'text', 'content': 'user_prompt'},
+                    {'type': 'image-url', 'url': 'https://example.com/image.png'},
+                ],
+            },
+            {
+                'role': 'user',
+                'parts': [
+                    {'type': 'text', 'content': 'user_prompt2'},
+                    {'type': 'audio-url', 'url': 'https://example.com/audio.mp3'},
+                ],
+            },
+            {
+                'role': 'user',
+                'parts': [
+                    {'type': 'text', 'content': 'user_prompt3'},
+                    {'type': 'document-url', 'url': 'https://example.com/document.pdf'},
+                ],
+            },
+            {
+                'role': 'user',
+                'parts': [
+                    {'type': 'text', 'content': 'user_prompt4'},
+                    {'type': 'video-url', 'url': 'https://example.com/video.mp4'},
+                ],
+            },
+            {
+                'role': 'user',
+                'parts': [
+                    {'type': 'text', 'content': 'user_prompt5'},
+                    {'type': 'image-url', 'url': 'https://example.com/image2.png'},
+                    {'type': 'audio-url', 'url': 'https://example.com/audio2.mp3'},
+                    {'type': 'document-url', 'url': 'https://example.com/document2.pdf'},
+                    {'type': 'video-url', 'url': 'https://example.com/video2.mp4'},
+                ],
+            },
+            {
+                'role': 'user',
+                'parts': [
+                    {'type': 'text', 'content': 'user_prompt6'},
+                    {
+                        'type': 'binary',
+                        'media_type': 'application/pdf',
+                        'content': IsStr(),
+                    },
+                ],
+            },
+            {'role': 'assistant', 'parts': [{'type': 'text', 'content': 'text1'}]},
+            {
+                'role': 'assistant',
+                'parts': [
+                    {
+                        'type': 'binary',
+                        'media_type': 'application/pdf',
+                        'content': IsStr(),
+                    }
+                ],
+            },
+        ]
+    )
+
+## tests/test_agent.py
+
+def test_tool_returning_file_url_with_identifier():
+    """Test that a tool returning FileUrl subclasses with identifiers works correctly."""
+
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(parts=[ToolCallPart('get_files', {})])
+        else:
+            return ModelResponse(parts=[TextPart('Files received')])
+
+    agent = Agent(FunctionModel(llm))
+
+    @agent.tool_plain
+    def get_files():
+        """Return various file URLs with custom identifiers."""
+        return [
+            ImageUrl(url='https://example.com/image.jpg', identifier='img_001'),
+            VideoUrl(url='https://example.com/video.mp4', identifier='vid_002'),
+            AudioUrl(url='https://example.com/audio.mp3', identifier='aud_003'),
+            DocumentUrl(url='https://example.com/document.pdf', identifier='doc_004'),
+        ]
+
+    result = agent.run_sync('Get some files')
+    assert result.all_messages()[2] == snapshot(
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='get_files',
+                    content=['See file img_001', 'See file vid_002', 'See file aud_003', 'See file doc_004'],
+                    tool_call_id=IsStr(),
+                    timestamp=IsNow(tz=timezone.utc),
+                ),
+                UserPromptPart(
+                    content=[
+                        'This is file img_001:',
+                        ImageUrl(url='https://example.com/image.jpg', _identifier='img_001', identifier='img_001'),
+                        'This is file vid_002:',
+                        VideoUrl(url='https://example.com/video.mp4', _identifier='vid_002', identifier='vid_002'),
+                        'This is file aud_003:',
+                        AudioUrl(url='https://example.com/audio.mp3', _identifier='aud_003', identifier='aud_003'),
+                        'This is file doc_004:',
+                        DocumentUrl(
+                            url='https://example.com/document.pdf', _identifier='doc_004', identifier='doc_004'
+                        ),
+                    ],
+                    timestamp=IsNow(tz=timezone.utc),
+                ),
+            ],
+            timestamp=IsNow(tz=timezone.utc),
+            run_id=IsStr(),
+        )
+    )
+
+## tests/test_embeddings.py
+
+    async def test_base_url_property(self, bedrock_provider: BedrockProvider):
+        """Test that base_url property returns the endpoint URL."""
+        model = BedrockEmbeddingModel('amazon.titan-embed-text-v2:0', provider=bedrock_provider)
+        assert model.base_url is not None
+        assert isinstance(model.base_url, str)
+
+## tests/test_messages.py
+
+def test_image_url_validation_with_optional_identifier():
+    image_url_ta = TypeAdapter(ImageUrl)
+    image = image_url_ta.validate_python({'url': 'https://example.com/image.jpg'})
+    assert image.url == snapshot('https://example.com/image.jpg')
+    assert image.identifier == snapshot('39cfc4')
+    assert image.media_type == snapshot('image/jpeg')
+    assert image_url_ta.dump_python(image) == snapshot(
+        {
+            'url': 'https://example.com/image.jpg',
+            'force_download': False,
+            'vendor_metadata': None,
+            'kind': 'image-url',
+            'media_type': 'image/jpeg',
+            'identifier': '39cfc4',
+        }
+    )
+
+    image = image_url_ta.validate_python(
+        {'url': 'https://example.com/image.jpg', 'identifier': 'foo', 'media_type': 'image/png'}
+    )
+    assert image.url == snapshot('https://example.com/image.jpg')
+    assert image.identifier == snapshot('foo')
+    assert image.media_type == snapshot('image/png')
+    assert image_url_ta.dump_python(image) == snapshot(
+        {
+            'url': 'https://example.com/image.jpg',
+            'force_download': False,
+            'vendor_metadata': None,
+            'kind': 'image-url',
+            'media_type': 'image/png',
+            'identifier': 'foo',
+        }
+    )
+
+## tests/test_ssrf.py
+
+    def test_absolute_url(self) -> None:
+        """Test that absolute URLs are returned as-is."""
+        result = resolve_redirect_url('https://example.com/path', 'https://other.com/new-path')
+        assert result == 'https://other.com/new-path'
+
+## tests/test_ui.py
+
+    def messages(self) -> list[ModelMessage]:
+        return self.load_messages(self.run_input.messages)

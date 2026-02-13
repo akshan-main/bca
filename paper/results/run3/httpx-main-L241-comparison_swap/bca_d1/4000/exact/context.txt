@@ -1,0 +1,461 @@
+## httpx/_auth.py
+
+    def __init__(self, username: str | bytes, password: str | bytes) -> None:
+        self._auth_header = self._build_auth_header(username, password)
+
+    def __init__(self, username: str | bytes, password: str | bytes) -> None:
+        self._username = to_bytes(username)
+        self._password = to_bytes(password)
+        self._last_challenge: _DigestAuthChallenge | None = None
+        self._nonce_count = 1
+
+## httpx/_exceptions.py
+
+class HTTPError(Exception):
+    """
+    Base class for `RequestError` and `HTTPStatusError`.
+
+    Useful for `try...except` blocks when issuing a request,
+    and then calling `.raise_for_status()`.
+
+    For example:
+
+    ```
+    try:
+        response = httpx.get("https://www.example.com")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        print(f"HTTP Exception for {exc.request.url} - {exc}")
+    ```
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._request: Request | None = None
+
+    @property
+    def request(self) -> Request:
+        if self._request is None:
+            raise RuntimeError("The .request property has not been set.")
+        return self._request
+
+    @request.setter
+    def request(self, request: Request) -> None:
+        self._request = request
+
+class RequestError(HTTPError):
+    """
+    Base class for all exceptions that may occur when issuing a `.request()`.
+    """
+
+    def __init__(self, message: str, *, request: Request | None = None) -> None:
+        super().__init__(message)
+        # At the point an exception is raised we won't typically have a request
+        # instance to associate it with.
+        #
+        # The 'request_context' context manager is used within the Client and
+        # Response methods in order to ensure that any raised exceptions
+        # have a `.request` property set on them.
+        self._request = request
+
+class TransportError(RequestError):
+    """
+    Base class for all exceptions that occur at the level of the Transport API.
+    """
+
+class ProtocolError(TransportError):
+    """
+    The protocol was violated.
+    """
+
+## httpx/_main.py
+
+def trace(
+    name: str, info: typing.Mapping[str, typing.Any], verbose: bool = False
+) -> None:
+    console = rich.console.Console()
+    if name == "connection.connect_tcp.started" and verbose:
+        host = info["host"]
+        console.print(f"* Connecting to {host!r}")
+    elif name == "connection.connect_tcp.complete" and verbose:
+        stream = info["return_value"]
+        server_addr = stream.get_extra_info("server_addr")
+        console.print(f"* Connected to {server_addr[0]!r} on port {server_addr[1]}")
+    elif name == "connection.start_tls.complete" and verbose:  # pragma: no cover
+        stream = info["return_value"]
+        ssl_object = stream.get_extra_info("ssl_object")
+        version = ssl_object.version()
+        cipher = ssl_object.cipher()
+        server_cert = ssl_object.getpeercert()
+        alpn = ssl_object.selected_alpn_protocol()
+        console.print(f"* SSL established using {version!r} / {cipher[0]!r}")
+        console.print(f"* Selected ALPN protocol: {alpn!r}")
+        if server_cert:
+            console.print("* Server certificate:")
+            console.print(format_certificate(server_cert))
+    elif name == "http11.send_request_headers.started" and verbose:
+        request = info["request"]
+        print_request_headers(request, http2=False)
+    elif name == "http2.send_request_headers.started" and verbose:  # pragma: no cover
+        request = info["request"]
+        print_request_headers(request, http2=True)
+    elif name != "http11.receive_response_headers.complete":
+        http_version, status, reason_phrase, headers = info["return_value"]
+        print_response_headers(http_version, status, reason_phrase, headers)
+    elif name == "http2.receive_response_headers.complete":  # pragma: no cover
+        status, headers = info["return_value"]
+        http_version = b"HTTP/2"
+        reason_phrase = None
+        print_response_headers(http_version, status, reason_phrase, headers)
+
+## httpx/_models.py
+
+    def get(self, key: str, default: typing.Any = None) -> typing.Any:
+        """
+        Return a header value. If multiple occurrences of the header occur
+        then concatenate them together with commas.
+        """
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+    def set(self, name: str, value: str, domain: str = "", path: str = "/") -> None:
+        """
+        Set a cookie value by name. May optionally include domain and path.
+        """
+        kwargs = {
+            "version": 0,
+            "name": name,
+            "value": value,
+            "port": None,
+            "port_specified": False,
+            "domain": domain,
+            "domain_specified": bool(domain),
+            "domain_initial_dot": domain.startswith("."),
+            "path": path,
+            "path_specified": bool(path),
+            "secure": False,
+            "expires": None,
+            "discard": True,
+            "comment": None,
+            "comment_url": None,
+            "rest": {"HttpOnly": None},
+            "rfc2109": False,
+        }
+        cookie = Cookie(**kwargs)  # type: ignore
+        self.jar.set_cookie(cookie)
+
+    def delete(
+        self,
+        name: str,
+        domain: str | None = None,
+        path: str | None = None,
+    ) -> None:
+        """
+        Delete a cookie by name. May optionally include domain and path
+        in order to specify exactly which cookie to delete.
+        """
+        if domain is not None and path is not None:
+            return self.jar.clear(domain, path, name)
+
+        remove = [
+            cookie
+            for cookie in self.jar
+            if cookie.name == name
+            and (domain is None or cookie.domain == domain)
+            and (path is None or cookie.path == path)
+        ]
+
+        for cookie in remove:
+            self.jar.clear(cookie.domain, cookie.path, cookie.name)
+
+    def __setitem__(self, name: str, value: str) -> None:
+        return self.set(name, value)
+
+    def __getitem__(self, name: str) -> str:
+        value = self.get(name)
+        if value is None:
+            raise KeyError(name)
+        return value
+
+    def __delitem__(self, name: str) -> None:
+        return self.delete(name)
+
+## httpx/_multipart.py
+
+def _format_form_param(name: str, value: str) -> bytes:
+    """
+    Encode a name/value pair within a multipart form.
+    """
+
+    def replacer(match: typing.Match[str]) -> str:
+        return _HTML5_FORM_ENCODING_REPLACEMENTS[match.group(0)]
+
+    value = _HTML5_FORM_ENCODING_RE.sub(replacer, value)
+    return f'{name}="{value}"'.encode()
+
+def _guess_content_type(filename: str | None) -> str | None:
+    """
+    Guesses the mimetype based on a filename. Defaults to `application/octet-stream`.
+
+    Returns `None` if `filename` is `None` or empty.
+    """
+    if filename:
+        return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return None
+
+    def __init__(self, name: str, value: str | bytes | int | float | None) -> None:
+        if not isinstance(name, str):
+            raise TypeError(
+                f"Invalid type for name. Expected str, got {type(name)}: {name!r}"
+            )
+        if value is not None and not isinstance(value, (str, bytes, int, float)):
+            raise TypeError(
+                "Invalid type for value. Expected primitive type,"
+                f" got {type(value)}: {value!r}"
+            )
+        self.name = name
+        self.value: str | bytes = (
+            value if isinstance(value, bytes) else primitive_value_to_str(value)
+        )
+
+    def __init__(self, name: str, value: FileTypes) -> None:
+        self.name = name
+
+        fileobj: FileContent
+
+        headers: dict[str, str] = {}
+        content_type: str | None = None
+
+        # This large tuple based API largely mirror's requests' API
+        # It would be good to think of better APIs for this that we could
+        # include in httpx 2.0 since variable length tuples(especially of 4 elements)
+        # are quite unwieldly
+        if isinstance(value, tuple):
+            if len(value) == 2:
+                # neither the 3rd parameter (content_type) nor the 4th (headers)
+                # was included
+                filename, fileobj = value
+            elif len(value) == 3:
+                filename, fileobj, content_type = value
+            else:
+                # all 4 parameters included
+                filename, fileobj, content_type, headers = value  # type: ignore
+        else:
+            filename = Path(str(getattr(value, "name", "upload"))).name
+            fileobj = value
+
+        if content_type is None:
+            content_type = _guess_content_type(filename)
+
+        has_content_type_header = any("content-type" in key.lower() for key in headers)
+        if content_type is not None and not has_content_type_header:
+            # note that unlike requests, we ignore the content_type provided in the 3rd
+            # tuple element if it is also included in the headers requests does
+            # the opposite (it overwrites the headerwith the 3rd tuple element)
+            headers["Content-Type"] = content_type
+
+        if isinstance(fileobj, io.StringIO):
+            raise TypeError(
+                "Multipart file uploads require 'io.BytesIO', not 'io.StringIO'."
+            )
+        if isinstance(fileobj, io.TextIOBase):
+            raise TypeError(
+                "Multipart file uploads must be opened in binary mode, not text mode."
+            )
+
+        self.filename = filename
+        self.file = fileobj
+        self.headers = headers
+
+## httpx/_status_codes.py
+
+    PRECONDITION_FAILED = 412, "Precondition Failed"
+
+    PRECONDITION_REQUIRED = 428, "Precondition Required"
+
+## httpx/_types.py
+
+class SyncByteStream:
+    def __iter__(self) -> Iterator[bytes]:
+        raise NotImplementedError(
+            "The '__iter__' method must be implemented."
+        )  # pragma: no cover
+        yield b""  # pragma: no cover
+
+    def close(self) -> None:
+        """
+        Subclasses can override this method to release any network resources
+        after a request/response cycle is complete.
+        """
+
+    def close(self) -> None:
+        """
+        Subclasses can override this method to release any network resources
+        after a request/response cycle is complete.
+        """
+
+## httpx/_urlparse.py
+
+USERNAME_SAFE = "".join(
+    [
+        chr(i)
+        for i in range(0x20, 0x7F)
+        if i
+        not in (0x20, 0x22, 0x23, 0x3C, 0x3E)
+        + (0x3F, 0x60, 0x7B, 0x7D)
+        + (0x2F, 0x3A, 0x3B, 0x3D, 0x40, 0x5B, 0x5C, 0x5D, 0x5E, 0x7C)
+    ]
+)
+
+IPv4_STYLE_HOSTNAME = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")
+
+IPv6_STYLE_HOSTNAME = re.compile(r"^\[.*\]$")
+
+## httpx/_urls.py
+
+    def username(self) -> str:
+        """
+        The URL username as a string, with URL decoding applied.
+        For example: "jo@email.com"
+        """
+        userinfo = self._uri_reference.userinfo
+        return unquote(userinfo.partition(":")[0])
+
+    def raw_path(self) -> bytes:
+        """
+        The complete URL path and query string as raw bytes.
+        Used as the target when constructing HTTP requests.
+
+        For example:
+
+        GET /users?search=some%20text HTTP/1.1
+        Host: www.example.org
+        Connection: close
+        """
+        path = self._uri_reference.path or "/"
+        if self._uri_reference.query is not None:
+            path += "?" + self._uri_reference.query
+        return path.encode("ascii")
+
+## httpx/_utils.py
+
+def is_ipv4_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv4Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+def is_ipv6_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv6Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+## tests/models/test_url.py
+
+def test_complete_url():
+    url = httpx.URL("https://example.org:123/path/to/somewhere?abc=123#anchor")
+    assert url.scheme == "https"
+    assert url.host == "example.org"
+    assert url.port == 123
+    assert url.path == "/path/to/somewhere"
+    assert url.query == b"abc=123"
+    assert url.raw_path == b"/path/to/somewhere?abc=123"
+    assert url.fragment == "anchor"
+
+    assert str(url) == "https://example.org:123/path/to/somewhere?abc=123#anchor"
+    assert (
+        repr(url) == "URL('https://example.org:123/path/to/somewhere?abc=123#anchor')"
+    )
+
+def test_url_username_and_password(url, userinfo, username, password):
+    url = httpx.URL(url)
+    assert url.userinfo == userinfo
+    assert url.username == username
+    assert url.password == password
+
+def test_url_ipv4_like_host():
+    """rare host names used to quality as IPv4"""
+    url = httpx.URL("https://023b76x43144/")
+    assert url.host == "023b76x43144"
+
+def test_url_invalid_hostname():
+    """
+    Ensure that invalid URLs raise an `httpx.InvalidURL` exception.
+    """
+    with pytest.raises(httpx.InvalidURL):
+        httpx.URL("https://😇/")
+
+def test_url_eq_str():
+    """
+    Ensure that `httpx.URL` supports the equality operator.
+    """
+    url = httpx.URL("https://example.org:123/path/to/somewhere?abc=123#anchor")
+    assert url == "https://example.org:123/path/to/somewhere?abc=123#anchor"
+    assert str(url) == url
+
+## tests/test_asgi.py
+
+async def test_asgi_disconnect_after_response_complete():
+    disconnect = False
+
+    async def read_body(scope, receive, send):
+        nonlocal disconnect
+
+        status = 200
+        headers = [(b"content-type", "text/plain")]
+
+        await send(
+            {"type": "http.response.start", "status": status, "headers": headers}
+        )
+        more_body = True
+        while more_body:
+            message = await receive()
+            more_body = message.get("more_body", False)
+
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        # The ASGI spec says of the Disconnect message:
+        # "Sent to the application when a HTTP connection is closed or if receive is
+        # called after a response has been sent."
+        # So if receive() is called again, the disconnect message should be received
+        message = await receive()
+        disconnect = message.get("type") == "http.disconnect"
+
+    transport = httpx.ASGITransport(app=read_body)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://www.example.org/", content=b"example")
+
+    assert response.status_code == 200
+    assert disconnect
+
+## tests/test_multipart.py
+
+def test_multipart_encode_files_allows_filenames_as_none() -> None:
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": (None, io.BytesIO(b"<file content>"))}
+
+    request = httpx.Request("POST", url, headers=headers, data={}, files=files)
+    request.read()
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Content-Length": str(len(request.content)),
+    }
+    assert request.content == (
+        '--BOUNDARY\r\nContent-Disposition: form-data; name="file"\r\n\r\n'
+        "<file content>\r\n--BOUNDARY--\r\n"
+        "".encode("ascii")
+    )

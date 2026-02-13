@@ -1,0 +1,438 @@
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:82-97
+def is_private_ip(ip_str: str) -> bool:
+    """Check if an IP address is in a private/internal range.
+
+    Handles both IPv4 and IPv6 addresses, including IPv4-mapped IPv6 addresses.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+
+        # Handle IPv4-mapped IPv6 addresses (e.g., ::ffff:192.168.1.1)
+        if isinstance(ip, ipaddress.IPv6Address) and not ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+
+        return any(ip in network for network in _PRIVATE_NETWORKS)
+    except ValueError:
+        # Invalid IP address, treat as potentially dangerous
+        return True
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:297-368
+async def safe_download(
+    url: str,
+    allow_local: bool = False,
+    max_redirects: int = _MAX_REDIRECTS,
+    timeout: int = _DEFAULT_TIMEOUT,
+) -> httpx.Response:
+    """Download content from a URL with SSRF protection.
+
+    This function:
+    1. Validates the URL protocol (only http/https allowed)
+    2. Resolves the hostname to IP addresses
+    3. Validates that no resolved IP is private (unless allow_local=True)
+    4. Always blocks cloud metadata endpoints
+    5. Makes the request to the resolved IP with the Host header set
+    6. Manually follows redirects, validating each hop
+
+    Args:
+        url: The URL to download from.
+        allow_local: If True, allows requests to private/internal IP addresses.
+                    Cloud metadata endpoints are always blocked regardless.
+        max_redirects: Maximum number of redirects to follow (default: 10).
+        timeout: Request timeout in seconds (default: 30).
+
+    Returns:
+        The httpx.Response object.
+
+    Raises:
+        ValueError: If the URL fails SSRF validation or too many redirects occur.
+        httpx.HTTPStatusError: If the response has an error status code.
+    """
+    current_url = url
+    redirects_followed = 0
+
+    client = cached_async_http_client(timeout=timeout)
+    while True:
+        # Validate and resolve the current URL
+        resolved = await validate_and_resolve_url(current_url, allow_local)
+
+        # Build URL with resolved IP
+        request_url = build_url_with_ip(resolved)
+
+        # For HTTPS, set sni_hostname so TLS uses the original hostname for SNI
+        # and certificate validation, even though we're connecting to the resolved IP.
+        extensions: dict[str, str] = {}
+        if resolved.is_https:
+            extensions['sni_hostname'] = resolved.hostname
+
+        # Make request with Host header set to original hostname
+        response = await client.get(
+            request_url,
+            headers={'Host': resolved.hostname},
+            extensions=extensions,
+            follow_redirects=False,
+        )
+
+        # Check if we need to follow a redirect
+        if response.is_redirect:
+            redirects_followed += 1
+            if redirects_followed > max_redirects:
+                raise ValueError(f'Too many redirects ({redirects_followed}). Maximum allowed: {max_redirects}')
+
+            # Get redirect location
+            location = response.headers.get('location')
+            if not location:
+                raise ValueError('Redirect response missing Location header')
+
+            current_url = resolve_redirect_url(current_url, location)
+            continue
+
+        # Not a redirect, we're done
+        response.raise_for_status()
+        return response
+
+# pydantic_ai_slim/pydantic_ai/models/gemini.py:967-967
+    blocked: NotRequired[bool]
+
+# tests/conftest.py:674-694
+def disable_ssrf_protection_for_vcr():
+    """Disable SSRF protection for VCR compatibility.
+
+    VCR cassettes record requests with the original hostname. Since SSRF protection
+    resolves hostnames to IPs before making requests, we need to disable the validation
+    for VCR tests to match the pre-recorded cassettes.
+
+    This fixture patches validate_and_resolve_url to return the hostname in place
+    of the resolved IP, allowing the request URL to use the original hostname.
+    """
+    from unittest.mock import patch
+
+    from pydantic_ai._ssrf import ResolvedUrl, extract_host_and_port
+
+    async def mock_validate_and_resolve(url: str, allow_local: bool) -> ResolvedUrl:
+        hostname, path, port, is_https = extract_host_and_port(url)
+        # Return hostname in place of resolved IP - this allows VCR matching
+        return ResolvedUrl(resolved_ip=hostname, hostname=hostname, port=port, is_https=is_https, path=path)
+
+    with patch('pydantic_ai._ssrf.validate_and_resolve_url', mock_validate_and_resolve):
+        yield
+
+# tests/test_ssrf.py:694-703
+    async def test_multiple_ips_with_any_private_blocked(self) -> None:
+        """Test that if any IP in the resolution is private, request is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # DNS returns multiple IPs, one of which is private
+            mock_executor.return_value = [
+                (2, 1, 6, '', ('8.8.8.8', 0)),  # Public
+                (10, 1, 6, '', ('::1', 0)),  # Private IPv6 loopback
+            ]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=False)
+
+# pydantic_ai_slim/pydantic_ai/models/__init__.py:1274-1333
+async def download_item(
+    item: FileUrl,
+    data_format: Literal['bytes', 'base64', 'base64_uri', 'text'] = 'bytes',
+    type_format: Literal['mime', 'extension'] = 'mime',
+) -> DownloadedItem[str] | DownloadedItem[bytes]:
+    """Download an item by URL and return the content as a bytes object or a (base64-encoded) string.
+
+    This function includes SSRF (Server-Side Request Forgery) protection:
+    - Only http:// and https:// protocols are allowed
+    - Private/internal IP addresses are blocked by default
+    - Cloud metadata endpoints (169.254.169.254) are always blocked
+    - Hostnames are resolved before requests to prevent DNS rebinding
+
+    Set `item.force_download='allow-local'` to allow private IP addresses.
+
+    Args:
+        item: The item to download.
+        data_format: The format to return the content in:
+            - `bytes`: The raw bytes of the content.
+            - `base64`: The base64-encoded content.
+            - `base64_uri`: The base64-encoded content as a data URI.
+            - `text`: The content as a string.
+        type_format: The format to return the media type in:
+            - `mime`: The media type as a MIME type.
+            - `extension`: The media type as an extension.
+
+    Raises:
+        UserError: If the URL points to a YouTube video.
+        ValueError: If the URL uses an unsupported protocol or targets a private/internal
+            IP address (unless allow-local is set).
+    """
+    if isinstance(item, VideoUrl) and item.is_youtube:
+        raise UserError('Downloading YouTube videos is not supported.')
+
+    from .._ssrf import safe_download
+
+    allow_local = item.force_download == 'allow-local'
+    response = await safe_download(item.url, allow_local=allow_local)
+
+    if content_type := response.headers.get('content-type'):
+        content_type = content_type.split(';')[0]
+        if content_type == 'application/octet-stream':
+            content_type = None
+
+    media_type = content_type or item.media_type
+
+    data_type = media_type
+    if type_format == 'extension':
+        data_type = item.format
+
+    data = response.content
+    if data_format in ('base64', 'base64_uri'):
+        data = base64.b64encode(data).decode('utf-8')
+        if data_format == 'base64_uri':
+            data = f'data:{media_type};base64,{data}'
+        return DownloadedItem[str](data=data, data_type=data_type)
+    elif data_format == 'text':
+        return DownloadedItem[str](data=data.decode('utf-8'), data_type=data_type)
+    else:
+        return DownloadedItem[bytes](data=data, data_type=data_type)
+
+# pydantic_ai_slim/pydantic_ai/toolsets/wrapper.py:20-20
+    wrapped: AbstractToolset[AgentDepsT]
+
+# pydantic_ai_slim/pydantic_ai/models/wrapper.py:24-24
+    wrapped: Model
+
+# pydantic_ai_slim/pydantic_ai/embeddings/wrapper.py:27-27
+    wrapped: EmbeddingModel
+
+# tests/test_ssrf.py:377-386
+    async def test_any_private_ip_blocks_request(self) -> None:
+        """Test that if any resolved IP is private, the request is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Return both public and private IPs
+            mock_executor.return_value = [
+                (2, 1, 6, '', ('93.184.215.14', 0)),
+                (2, 1, 6, '', ('192.168.1.1', 0)),
+            ]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://example.com/path', allow_local=False)
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:207-254
+async def validate_and_resolve_url(url: str, allow_local: bool) -> ResolvedUrl:
+    """Validate URL and resolve hostname to IP addresses.
+
+    Performs protocol validation, DNS resolution, and IP validation.
+
+    Args:
+        url: The URL to validate.
+        allow_local: Whether to allow private/internal IP addresses.
+
+    Returns:
+        ResolvedUrl with all the information needed to make the request.
+
+    Raises:
+        ValueError: If the URL fails validation.
+    """
+    hostname, path, port, is_https = extract_host_and_port(url)
+
+    # Check if hostname is already an IP address
+    try:
+        # Handle IPv6 addresses in brackets
+        ip_str = hostname.strip('[]')
+        ipaddress.ip_address(ip_str)
+        ips = [ip_str]
+    except ValueError:
+        # It's a hostname, resolve it
+        ips = await resolve_hostname(hostname)
+
+    # Validate all resolved IPs
+    for ip in ips:
+        # Cloud metadata IPs are always blocked
+        if is_cloud_metadata_ip(ip):
+            raise ValueError(f'Access to cloud metadata service ({ip}) is blocked for security reasons.')
+
+        # Private IPs are blocked unless allow_local is True
+        if not allow_local and is_private_ip(ip):
+            raise ValueError(
+                f'Access to private/internal IP address ({ip}) is blocked. '
+                f'Use force_download="allow-local" to allow local network access.'
+            )
+
+    # Use the first resolved IP
+    return ResolvedUrl(
+        resolved_ip=ips[0],
+        hostname=hostname,
+        port=port,
+        is_https=is_https,
+        path=path,
+    )
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:182-204
+def build_url_with_ip(resolved: ResolvedUrl) -> str:
+    """Build a URL using a resolved IP address instead of the hostname.
+
+    For IPv6 addresses, wraps them in brackets as required by URL syntax.
+    """
+    scheme = 'https' if resolved.is_https else 'http'
+    default_port = 443 if resolved.is_https else 80
+
+    # IPv6 addresses need brackets in URLs
+    try:
+        ip_obj = ipaddress.ip_address(resolved.resolved_ip)
+        if isinstance(ip_obj, ipaddress.IPv6Address):
+            host_part = f'[{resolved.resolved_ip}]'
+        else:
+            host_part = resolved.resolved_ip
+    except ValueError:
+        host_part = resolved.resolved_ip
+
+    # Only include port if non-default
+    if resolved.port != default_port:
+        host_part = f'{host_part}:{resolved.port}'
+
+    return urlunparse((scheme, host_part, resolved.path, '', '', ''))
+
+# tests/test_ssrf.py:678-684
+    async def test_hostname_resolving_to_private_ip_blocked(self) -> None:
+        """Test that a hostname resolving to a private IP is blocked."""
+        with patch('pydantic_ai._ssrf.run_in_executor') as mock_executor:
+            # Attacker's DNS returns private IP
+            mock_executor.return_value = [(2, 1, 6, '', ('127.0.0.1', 0))]
+            with pytest.raises(ValueError, match='Access to private/internal IP address'):
+                await validate_and_resolve_url('http://attacker.com/path', allow_local=False)
+
+# tests/test_ssrf.py:388-392
+    async def test_6to4_address_blocked(self) -> None:
+        """Test that 6to4 addresses (which can embed private IPv4) are blocked."""
+        # 2002:c0a8:0101::1 embeds 192.168.1.1
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://[2002:c0a8:0101::1]/path', allow_local=False)
+
+# pydantic_ai_slim/pydantic_ai/models/instrumented.py:97-179
+    def __init__(
+        self,
+        *,
+        tracer_provider: TracerProvider | None = None,
+        meter_provider: MeterProvider | None = None,
+        include_binary_content: bool = True,
+        include_content: bool = True,
+        version: Literal[1, 2, 3] = DEFAULT_INSTRUMENTATION_VERSION,
+        event_mode: Literal['attributes', 'logs'] = 'attributes',
+        logger_provider: LoggerProvider | None = None,
+    ):
+        """Create instrumentation options.
+
+        Args:
+            tracer_provider: The OpenTelemetry tracer provider to use.
+                If not provided, the global tracer provider is used.
+                Calling `logfire.configure()` sets the global tracer provider, so most users don't need this.
+            meter_provider: The OpenTelemetry meter provider to use.
+                If not provided, the global meter provider is used.
+                Calling `logfire.configure()` sets the global meter provider, so most users don't need this.
+            include_binary_content: Whether to include binary content in the instrumentation events.
+            include_content: Whether to include prompts, completions, and tool call arguments and responses
+                in the instrumentation events.
+            version: Version of the data format. This is unrelated to the Pydantic AI package version.
+                Version 1 is based on the legacy event-based OpenTelemetry GenAI spec
+                    and will be removed in a future release.
+                    The parameters `event_mode` and `logger_provider` are only relevant for version 1.
+                Version 2 uses the newer OpenTelemetry GenAI spec and stores messages in the following attributes:
+                    - `gen_ai.system_instructions` for instructions passed to the agent.
+                    - `gen_ai.input.messages` and `gen_ai.output.messages` on model request spans.
+                    - `pydantic_ai.all_messages` on agent run spans.
+            event_mode: The mode for emitting events in version 1.
+                If `'attributes'`, events are attached to the span as attributes.
+                If `'logs'`, events are emitted as OpenTelemetry log-based events.
+            logger_provider: The OpenTelemetry logger provider to use.
+                If not provided, the global logger provider is used.
+                Calling `logfire.configure()` sets the global logger provider, so most users don't need this.
+                This is only used if `event_mode='logs'` and `version=1`.
+        """
+        from pydantic_ai import __version__
+
+        tracer_provider = tracer_provider or get_tracer_provider()
+        meter_provider = meter_provider or get_meter_provider()
+        logger_provider = logger_provider or get_logger_provider()
+        scope_name = 'pydantic-ai'
+        self.tracer = tracer_provider.get_tracer(scope_name, __version__)
+        self.meter = meter_provider.get_meter(scope_name, __version__)
+        self.logger = logger_provider.get_logger(scope_name, __version__)
+        self.event_mode = event_mode
+        self.include_binary_content = include_binary_content
+        self.include_content = include_content
+
+        if event_mode == 'logs' and version != 1:
+            warnings.warn(
+                'event_mode is only relevant for version=1 which is deprecated and will be removed in a future release.',
+                stacklevel=2,
+            )
+            version = 1
+
+        self.version = version
+
+        # As specified in the OpenTelemetry GenAI metrics spec:
+        # https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-metrics/#metric-gen_aiclienttokenusage
+        tokens_histogram_kwargs = dict(
+            name='gen_ai.client.token.usage',
+            unit='{token}',
+            description='Measures number of input and output tokens used',
+        )
+        try:
+            self.tokens_histogram = self.meter.create_histogram(
+                **tokens_histogram_kwargs,
+                explicit_bucket_boundaries_advisory=TOKEN_HISTOGRAM_BOUNDARIES,
+            )
+        except TypeError:  # pragma: lax no cover
+            # Older OTel/logfire versions don't support explicit_bucket_boundaries_advisory
+            self.tokens_histogram = self.meter.create_histogram(
+                **tokens_histogram_kwargs,  # pyright: ignore
+            )
+        self.cost_histogram = self.meter.create_histogram(
+            'operation.cost',
+            unit='{USD}',
+            description='Monetary cost',
+        )
+
+# tests/models/test_gemini_vertex.py:6-6
+from inline_snapshot import Is, snapshot
+
+# tests/models/test_google.py:16-16
+from inline_snapshot import Is, snapshot
+
+# tests/test_ssrf.py:365-370
+    async def test_literal_ip_address_in_url(self) -> None:
+        """Test handling of literal IP addresses in URLs."""
+        # Public IP - should work
+        resolved = await validate_and_resolve_url('http://8.8.8.8/path', allow_local=False)
+        assert resolved.resolved_ip == '8.8.8.8'
+        assert resolved.hostname == '8.8.8.8'
+
+# tests/test_ssrf.py:372-375
+    async def test_literal_private_ip_blocked(self) -> None:
+        """Test that literal private IPs in URLs are blocked."""
+        with pytest.raises(ValueError, match='Access to private/internal IP address'):
+            await validate_and_resolve_url('http://192.168.1.1/path', allow_local=False)
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_utils.py:18-45
+def dump_provider_metadata(
+    wrapper_key: str | None = PROVIDER_METADATA_KEY,
+    **kwargs: ProviderDetailsDelta | str,
+) -> dict[str, Any] | None:
+    """Dump provider metadata from keyword arguments.
+
+    Args:
+        wrapper_key: The key to wrap the metadata in. Defaults to 'pydantic_ai'.
+        **kwargs: The keyword arguments to dump.
+
+    Returns:
+        The dumped provider metadata.
+
+    Examples:
+        >>> dump_provider_metadata(id='test_id', provider_name='test_provider', provider_details={'test_detail': 1})
+        {'pydantic_ai': {'id': 'test_id', 'provider_name': 'test_provider', 'provider_details': {'test_detail': 1}}}
+
+        >>> dump_provider_metadata(wrapper_key='test', id='test_id', provider_name='test_provider', provider_details={'test_detail': 1})
+        {'test': {'id': 'test_id', 'provider_name': 'test_provider', 'provider_details': {'test_detail': 1}}}
+
+        >>> dump_provider_metadata(wrapper_key=None, id='test_id', provider_name='test_provider', provider_details={'test_detail': 1})
+        {'id': 'test_id', 'provider_name': 'test_provider', 'provider_details': {'test_detail': 1}}
+    """
+    filtered = {k: v for k, v in kwargs.items() if v is not None}
+    if wrapper_key:
+        return {wrapper_key: filtered} if filtered else None
+    else:
+        return filtered if filtered else None

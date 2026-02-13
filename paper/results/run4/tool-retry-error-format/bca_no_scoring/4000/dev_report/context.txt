@@ -1,0 +1,538 @@
+## pydantic_ai_slim/pydantic_ai/agent/__init__.py
+
+    def name(self, value: str | None) -> None:
+        """Set the name of the agent, used for logging."""
+        self._name = value
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    def name(self, value: str | None) -> None:
+        """Set the name of the agent, used for logging."""
+        raise NotImplementedError
+
+## pydantic_ai_slim/pydantic_ai/agent/wrapper.py
+
+    def name(self, value: str | None) -> None:
+        self.wrapped.name = value
+
+## pydantic_ai_slim/pydantic_ai/concurrency.py
+
+    def name(self) -> str | None:
+        """Name of the limiter for observability."""
+        return self._name
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/dbos/_agent.py
+
+    def name(self, value: str | None) -> None:  # pragma: no cover
+        raise UserError(
+            'The agent name cannot be changed after creation. If you need to change the name, create a new agent.'
+        )
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_agent.py
+
+    def name(self, value: str | None) -> None:  # pragma: no cover
+        raise UserError(
+            'The agent name cannot be changed after creation. If you need to change the name, create a new agent.'
+        )
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_agent.py
+
+    def name(self, value: str | None) -> None:  # pragma: no cover
+        raise UserError(
+            'The agent name cannot be changed after creation. If you need to change the name, create a new agent.'
+        )
+
+## pydantic_ai_slim/pydantic_ai/exceptions.py
+
+class ToolRetryError(Exception):
+    """Exception used to signal a `ToolRetry` message should be returned to the LLM."""
+
+    def __init__(self, tool_retry: RetryPromptPart):
+        self.tool_retry = tool_retry
+        message = (
+            tool_retry.content
+            if isinstance(tool_retry.content, str)
+            else self._format_error_details(tool_retry.content, tool_retry.tool_name)
+        )
+        super().__init__(message)
+
+    @staticmethod
+    def _format_error_details(errors: list[pydantic_core.ErrorDetails], tool_name: str | None) -> str:
+        """Format ErrorDetails as a human-readable message.
+
+        We format manually rather than using ValidationError.from_exception_data because
+        some error types (value_error, assertion_error, etc.) require an 'error' key in ctx,
+        but when ErrorDetails are serialized, exception objects are stripped from ctx.
+        The 'msg' field already contains the human-readable message, so we use that directly.
+        """
+        error_count = len(errors)
+        lines = [
+            f'{error_count} validation error{"s" if error_count == 1 else ""}{f" for {tool_name!r}" if tool_name else ""}'
+        ]
+        for e in errors:
+            loc = '.'.join(str(x) for x in e['loc']) if e['loc'] else '__root__'
+            lines.append(loc)
+            lines.append(f'  {e["msg"]} [type={e["type"]}, input_value={e["input"]!r}]')
+        return '\n'.join(lines)
+
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+    def name(self) -> str: ...
+
+## pydantic_ai_slim/pydantic_ai/messages.py
+
+class RetryPromptPart:
+    """A message back to a model asking it to try again.
+
+    This can be sent for a number of reasons:
+
+    * Pydantic validation of tool arguments failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * a tool raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    * no tool was found for the tool name
+    * the model returned plain text when a structured response was expected
+    * Pydantic validation of a structured response failed, here content is derived from a Pydantic
+      [`ValidationError`][pydantic_core.ValidationError]
+    * an output validator raised a [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] exception
+    """
+
+    content: list[pydantic_core.ErrorDetails] | str
+    """Details of why and how the model should retry.
+
+    If the retry was triggered by a [`ValidationError`][pydantic_core.ValidationError], this will be a list of
+    error details.
+    """
+
+    _: KW_ONLY
+
+    tool_name: str | None = None
+    """The name of the tool that was called, if any."""
+
+    tool_call_id: str = field(default_factory=_generate_tool_call_id)
+    """The tool call identifier, this is used by some models including OpenAI.
+
+    In case the tool call id is not provided by the model, Pydantic AI will generate a random one.
+    """
+
+    timestamp: datetime = field(default_factory=_now_utc)
+    """The timestamp, when the retry was triggered."""
+
+    part_kind: Literal['retry-prompt'] = 'retry-prompt'
+    """Part type identifier, this is available on all parts as a discriminator."""
+
+    def model_response(self) -> str:
+        """Return a string message describing why the retry is requested."""
+        if isinstance(self.content, str):
+            if self.tool_name is None:
+                description = f'Validation feedback:\n{self.content}'
+            else:
+                description = self.content
+        else:
+            json_errors = error_details_ta.dump_json(self.content, exclude={'__all__': {'ctx'}}, indent=2)
+            plural = isinstance(self.content, list) and len(self.content) != 1
+            description = (
+                f'{len(self.content)} validation error{"s" if plural else ""}:\n```json\n{json_errors.decode()}\n```'
+            )
+        return f'{description}\n\nFix the errors and try again.'
+
+    def otel_event(self, settings: InstrumentationSettings) -> LogRecord:
+        if self.tool_name is None:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.user.message'},
+                body={'content': self.model_response(), 'role': 'user'},
+            )
+        else:
+            return LogRecord(
+                attributes={'event.name': 'gen_ai.tool.message'},
+                body={
+                    **({'content': self.model_response()} if settings.include_content else {}),
+                    'role': 'tool',
+                    'id': self.tool_call_id,
+                    'name': self.tool_name,
+                },
+            )
+
+    def otel_message_parts(self, settings: InstrumentationSettings) -> list[_otel_messages.MessagePart]:
+        if self.tool_name is None:
+            return [_otel_messages.TextPart(type='text', content=self.model_response())]
+        else:
+            part = _otel_messages.ToolCallResponsePart(
+                type='tool_call_response',
+                id=self.tool_call_id,
+                name=self.tool_name,
+            )
+
+            if settings.include_content:
+                part['result'] = self.model_response()
+
+            return [part]
+
+    __repr__ = _utils.dataclasses_no_defaults_repr
+
+## pydantic_ai_slim/pydantic_ai/providers/__init__.py
+
+    def name(self) -> str:
+        """The provider name."""
+        raise NotImplementedError()
+
+## pydantic_ai_slim/pydantic_ai/providers/alibaba.py
+
+    def name(self) -> str:
+        return 'alibaba'
+
+## pydantic_ai_slim/pydantic_ai/providers/anthropic.py
+
+    def name(self) -> str:
+        return 'anthropic'
+
+## pydantic_ai_slim/pydantic_ai/providers/azure.py
+
+    def name(self) -> str:
+        return 'azure'
+
+## pydantic_ai_slim/pydantic_ai/providers/bedrock.py
+
+    def name(self) -> str:
+        return 'bedrock'
+
+## pydantic_ai_slim/pydantic_ai/providers/cerebras.py
+
+    def name(self) -> str:
+        return 'cerebras'
+
+## pydantic_ai_slim/pydantic_ai/providers/cohere.py
+
+    def name(self) -> str:
+        return 'cohere'
+
+## pydantic_ai_slim/pydantic_ai/providers/deepseek.py
+
+    def name(self) -> str:
+        return 'deepseek'
+
+## pydantic_ai_slim/pydantic_ai/providers/fireworks.py
+
+    def name(self) -> str:
+        return 'fireworks'
+
+## pydantic_ai_slim/pydantic_ai/providers/github.py
+
+    def name(self) -> str:
+        return 'github'
+
+## pydantic_ai_slim/pydantic_ai/providers/google.py
+
+    def name(self) -> str:
+        return 'google-vertex' if self._client._api_client.vertexai else 'google-gla'  # type: ignore[reportPrivateUsage]
+
+## pydantic_ai_slim/pydantic_ai/providers/google_gla.py
+
+    def name(self):
+        return 'google-gla'
+
+## pydantic_ai_slim/pydantic_ai/providers/google_vertex.py
+
+    def name(self) -> str:
+        return 'google-vertex'
+
+## pydantic_ai_slim/pydantic_ai/providers/grok.py
+
+    def name(self) -> str:
+        return 'grok'
+
+## pydantic_ai_slim/pydantic_ai/providers/groq.py
+
+    def name(self) -> str:
+        return 'groq'
+
+## pydantic_ai_slim/pydantic_ai/providers/heroku.py
+
+    def name(self) -> str:
+        return 'heroku'
+
+## pydantic_ai_slim/pydantic_ai/providers/huggingface.py
+
+    def name(self) -> str:
+        return 'huggingface'
+
+## pydantic_ai_slim/pydantic_ai/providers/litellm.py
+
+    def name(self) -> str:
+        return 'litellm'
+
+## pydantic_ai_slim/pydantic_ai/providers/mistral.py
+
+    def name(self) -> str:
+        return 'mistral'
+
+## pydantic_ai_slim/pydantic_ai/providers/moonshotai.py
+
+    def name(self) -> str:
+        return 'moonshotai'
+
+## pydantic_ai_slim/pydantic_ai/providers/nebius.py
+
+    def name(self) -> str:
+        return 'nebius'
+
+## pydantic_ai_slim/pydantic_ai/providers/ollama.py
+
+    def name(self) -> str:
+        return 'ollama'
+
+## pydantic_ai_slim/pydantic_ai/providers/openai.py
+
+    def name(self) -> str:
+        return 'openai'
+
+## pydantic_ai_slim/pydantic_ai/providers/openrouter.py
+
+    def name(self) -> str:
+        return 'openrouter'
+
+## pydantic_ai_slim/pydantic_ai/providers/outlines.py
+
+    def name(self) -> str:
+        """The provider name."""
+        return 'outlines'
+
+## pydantic_ai_slim/pydantic_ai/providers/ovhcloud.py
+
+    def name(self) -> str:
+        return 'ovhcloud'
+
+## pydantic_ai_slim/pydantic_ai/providers/sambanova.py
+
+    def name(self) -> str:
+        """Return the provider name."""
+        return 'sambanova'
+
+## pydantic_ai_slim/pydantic_ai/providers/sentence_transformers.py
+
+    def name(self) -> str:
+        """The provider name."""
+        return 'sentence-transformers'  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/providers/together.py
+
+    def name(self) -> str:
+        return 'together'
+
+## pydantic_ai_slim/pydantic_ai/providers/vercel.py
+
+    def name(self) -> str:
+        return 'vercel'
+
+## pydantic_ai_slim/pydantic_ai/providers/voyageai.py
+
+    def name(self) -> str:
+        return 'voyageai'
+
+## pydantic_ai_slim/pydantic_ai/providers/xai.py
+
+    def name(self) -> str:
+        return 'xai'
+
+## pydantic_evals/pydantic_evals/evaluators/evaluator.py
+
+    def name(cls) -> str:
+        """`name` has been renamed, use `get_serialization_name` instead."""
+        return cls.get_serialization_name()
+
+## tests/models/test_bedrock.py
+
+    def name(self) -> str:
+        return 'bedrock-stub'
+
+## tests/models/test_huggingface.py
+
+async def test_stream_text(allow_model_requests: None):
+    stream = [text_chunk('hello '), text_chunk('world'), chunk([])]
+    mock_client = MockHuggingFace.create_stream_mock(stream)
+    m = HuggingFaceModel('hf-model', provider=HuggingFaceProvider(hf_client=mock_client, api_key='x'))
+    agent = Agent(m)
+
+    async with agent.run_stream('') as result:
+        assert not result.is_complete
+        assert [c async for c in result.stream_text(debounce_by=None)] == snapshot(['hello ', 'hello world'])
+        assert result.is_complete
+        assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=6, output_tokens=3))
+
+## tests/models/test_model_settings.py
+
+def test_settings_merge_hierarchy():
+    """Test the complete settings merge hierarchy: model -> agent -> run."""
+    # Create a function that captures the merged settings
+    captured_settings = None
+
+    def capture_settings(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+        nonlocal captured_settings
+        captured_settings = agent_info.model_settings
+        return ModelResponse(parts=[TextPart('captured')])
+
+    # Model settings (lowest priority)
+    model_settings = ModelSettings(max_tokens=100, temperature=0.5, top_p=0.8, seed=123)
+    model = FunctionModel(capture_settings, settings=model_settings)
+
+    # Agent settings (medium priority)
+    agent_settings = ModelSettings(
+        max_tokens=200,  # overrides model
+        temperature=0.6,  # overrides model
+        frequency_penalty=0.1,  # new setting
+    )
+    agent = Agent(model=model, model_settings=agent_settings)
+
+    # Run settings (highest priority)
+    run_settings = ModelSettings(
+        temperature=0.7,  # overrides agent and model
+        presence_penalty=0.2,  # new setting
+        seed=456,  # overrides model
+    )
+
+    # Run the agent
+    result = agent.run_sync('test', model_settings=run_settings)
+    assert result.output == 'captured'
+
+    # Verify the merged settings follow the correct precedence
+    assert captured_settings is not None
+    assert captured_settings['temperature'] == 0.7  # from run_settings
+    assert captured_settings['max_tokens'] == 200  # from agent_settings
+    assert captured_settings['top_p'] == 0.8  # from model_settings
+    assert captured_settings['seed'] == 456  # from run_settings
+    assert captured_settings['frequency_penalty'] == 0.1  # from agent_settings
+    assert captured_settings['presence_penalty'] == 0.2  # from run_settings
+
+## tests/providers/test_fireworks.py
+
+def test_fireworks_provider():
+    provider = FireworksProvider(api_key='api-key')
+    assert provider.name == 'fireworks'
+    assert provider.base_url == 'https://api.fireworks.ai/inference/v1'
+    assert isinstance(provider.client, openai.AsyncOpenAI)
+    assert provider.client.api_key == 'api-key'
+
+## tests/test_exceptions.py
+
+def test_tool_retry_error_str_with_string_content():
+    """Test that ToolRetryError uses string content as message automatically."""
+    part = RetryPromptPart(content='error from tool', tool_name='my_tool')
+    error = ToolRetryError(part)
+    assert str(error) == 'error from tool'
+
+def test_tool_retry_error_str_with_error_details():
+    """Test that ToolRetryError formats ErrorDetails automatically."""
+    validation_error = ValidationError.from_exception_data(
+        'Test', [{'type': 'string_type', 'loc': ('name',), 'input': 123}]
+    )
+    part = RetryPromptPart(content=validation_error.errors(include_url=False), tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nname\n  Input should be a valid string [type=string_type, input_value=123]"
+    )
+
+def test_tool_retry_error_str_with_value_error_type():
+    """Test that ToolRetryError handles value_error type without ctx.error.
+
+    When ErrorDetails are serialized, the exception object in ctx is stripped.
+    This test ensures we handle error types that normally require ctx.error.
+    """
+    # Simulate serialized ErrorDetails where ctx.error has been stripped
+    error_details: list[ErrorDetails] = [
+        {
+            'type': 'value_error',
+            'loc': ('field',),
+            'msg': 'Value error, must not be foo',
+            'input': 'foo',
+        }
+    ]
+    part = RetryPromptPart(content=error_details, tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nfield\n  Value error, must not be foo [type=value_error, input_value='foo']"
+    )
+
+## tests/test_streaming.py
+
+async def test_iter_stream_responses():
+    m = TestModel(custom_output_text='The cat sat on the mat.')
+
+    agent = Agent(m)
+
+    @agent.output_validator
+    def output_validator_simple(data: str) -> str:
+        # Make a substitution in the validated results
+        return re.sub('cat sat', 'bat sat', data)
+
+    run: AgentRun
+    stream: AgentStream
+    messages: list[ModelResponse] = []
+    async with agent.iter('Hello') as run:
+        assert isinstance(run.run_id, str)
+        async for node in run:
+            if agent.is_model_request_node(node):
+                async with node.stream(run.ctx) as stream:
+                    async for chunk in stream.stream_responses(debounce_by=None):
+                        messages.append(chunk)
+
+    assert messages == [
+        ModelResponse(
+            parts=[TextPart(content=text)],
+            usage=RequestUsage(input_tokens=IsInt(), output_tokens=IsInt()),
+            model_name='test',
+            timestamp=IsNow(tz=timezone.utc),
+            provider_name='test',
+        )
+        for text in [
+            '',
+            '',
+            'The ',
+            'The cat ',
+            'The cat sat ',
+            'The cat sat on ',
+            'The cat sat on the ',
+            'The cat sat on the mat.',
+            'The cat sat on the mat.',
+        ]
+    ]
+
+    # Note: as you can see above, the output validator is not applied to the streamed responses, just the final result:
+    assert run.result is not None
+    assert run.result.output == 'The bat sat on the mat.'
+
+async def test_tool_raises_call_deferred():
+    agent = Agent(TestModel(), output_type=[str, DeferredToolRequests])
+
+    @agent.tool_plain()
+    def my_tool(x: int) -> int:
+        raise CallDeferred
+
+    async with agent.run_stream('Hello') as result:
+        assert not result.is_complete
+        assert isinstance(result.run_id, str)
+        assert [c async for c in result.stream_output(debounce_by=None)] == snapshot(
+            [DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])]
+        )
+        assert await result.get_output() == snapshot(
+            DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])
+        )
+        responses = [c async for c, _is_last in result.stream_responses(debounce_by=None)]
+        assert responses == snapshot(
+            [
+                ModelResponse(
+                    parts=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())],
+                    usage=RequestUsage(input_tokens=51),
+                    model_name='test',
+                    timestamp=IsDatetime(),
+                    provider_name='test',
+                    run_id=IsStr(),
+                )
+            ]
+        )
+        assert await result.validate_response_output(responses[0]) == snapshot(
+            DeferredToolRequests(calls=[ToolCallPart(tool_name='my_tool', args={'x': 0}, tool_call_id=IsStr())])
+        )
+        assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=0))
+        assert result.timestamp() == IsNow(tz=timezone.utc)
+        assert result.is_complete

@@ -1,0 +1,821 @@
+## examples/pydantic_ai_examples/chat_app.py
+
+async def index() -> FileResponse:
+    return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
+
+async def main_ts() -> FileResponse:
+    """Get the raw typescript code, it's compiled in the browser, forgive me."""
+    return FileResponse((THIS_DIR / 'chat_app.ts'), media_type='text/plain')
+
+async def get_chat(database: Database = Depends(get_db)) -> Response:
+    msgs = await database.get_messages()
+    return Response(
+        b'\n'.join(json.dumps(to_chat_message(m)).encode('utf-8') for m in msgs),
+        media_type='text/plain',
+    )
+
+## examples/pydantic_ai_examples/data_analyst.py
+
+def display(ctx: RunContext[AnalystAgentDeps], name: str) -> str:
+    """Display at most 5 rows of the dataframe."""
+    dataset = ctx.deps.get(name)
+    return dataset.head().to_string()  # pyright: ignore[reportUnknownMemberType]
+
+## examples/pydantic_ai_examples/evals/agent.py
+
+async def infer_time_range(inputs: TimeRangeInputs) -> TimeRangeResponse:
+    """Infer a time range from a user prompt."""
+    deps = TimeRangeDeps(now=inputs['now'])
+    return (await time_range_agent.run(inputs['prompt'], deps=deps)).output
+
+## examples/pydantic_ai_examples/flight_booking.py
+
+async def extract_flights(ctx: RunContext[Deps]) -> list[FlightDetails]:
+    """Get details of all flights."""
+    # we pass the usage to the search agent so requests within this agent are counted
+    result = await extraction_agent.run(ctx.deps.web_page_text, usage=ctx.usage)
+    logfire.info('found {flight_count} flights', flight_count=len(result.output))
+    return result.output
+
+## examples/pydantic_ai_examples/question_graph.py
+
+async def run_as_continuous():
+    state = QuestionState()
+    node = Ask()
+    end = await question_graph.run(node, state=state)
+    print('END:', end.output)
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/agent.py
+
+async def analyze_profile(profile: Profile) -> Analysis | None:
+    result = await agent.run(profile.as_prompt())
+    return result.output  ### [/analyze_profile]
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+def get_captured_run_messages() -> _RunMessages:
+    return _messages_ctx_var.get()
+
+## pydantic_ai_slim/pydantic_ai/_function_schema.py
+
+    def _call_args(
+        self,
+        args_dict: dict[str, Any],
+        ctx: RunContext[Any],
+    ) -> tuple[list[Any], dict[str, Any]]:
+        if self.single_arg_name:
+            args_dict = {self.single_arg_name: args_dict}
+
+        args = [ctx] if self.takes_ctx else []
+        for positional_field in self.positional_fields:
+            args.append(args_dict.pop(positional_field))  # pragma: no cover
+        if self.var_positional_field:
+            args.extend(args_dict.pop(self.var_positional_field))
+
+        return args, args_dict
+
+def _is_call_ctx(annotation: Any) -> bool:
+    """Return whether the annotation is the `RunContext` class, parameterized or not."""
+    return annotation is RunContext or get_origin(annotation) is RunContext
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+async def group_by_temporal(
+    aiterable: AsyncIterable[T], soft_max_interval: float | None
+) -> AsyncIterator[AsyncIterable[list[T]]]:
+    """Group items from an async iterable into lists based on time interval between them.
+
+    Effectively, this debounces the iterator.
+
+    This returns a context manager usable as an iterator so any pending tasks can be cancelled if an error occurs
+    during iteration.
+
+    Usage:
+
+    ```python
+    async with group_by_temporal(yield_groups(), 0.1) as groups_iter:
+        async for groups in groups_iter:
+            print(groups)
+    ```
+
+    Args:
+        aiterable: The async iterable to group.
+        soft_max_interval: Maximum interval over which to group items, this should avoid a trickle of items causing
+            a group to never be yielded. It's a soft max in the sense that once we're over this time, we yield items
+            as soon as `anext(aiter)` returns. If `None`, no grouping/debouncing is performed
+
+    Returns:
+        A context manager usable as an async iterable of lists of items produced by the input async iterable.
+    """
+    if soft_max_interval is None:
+
+        async def async_iter_groups_noop() -> AsyncIterator[list[T]]:
+            async for item in aiterable:
+                yield [item]
+
+        yield async_iter_groups_noop()
+        return
+
+    # we might wait for the next item more than once, so we store the task to await next time
+    task: asyncio.Task[T] | None = None
+
+    async def async_iter_groups() -> AsyncIterator[list[T]]:
+        nonlocal task
+
+        assert soft_max_interval is not None and soft_max_interval >= 0, 'soft_max_interval must be a positive number'
+        buffer: list[T] = []
+        group_start_time = time.monotonic()
+
+        aiterator = aiter(aiterable)
+        while True:
+            if group_start_time is None:
+                # group hasn't started, we just wait for the maximum interval
+                wait_time = soft_max_interval
+            else:
+                # wait for the time remaining in the group
+                wait_time = soft_max_interval - (time.monotonic() - group_start_time)
+
+            # if there's no current task, we get the next one
+            if task is None:
+                # anext(aiter) returns an Awaitable[T], not a Coroutine which asyncio.create_task expects
+                # so far, this doesn't seem to be a problem
+                task = asyncio.create_task(anext(aiterator))  # pyright: ignore[reportArgumentType,reportUnknownVariableType]
+
+            # we use asyncio.wait to avoid cancelling the coroutine if it's not done
+            done, _ = await asyncio.wait((task,), timeout=wait_time)
+
+            if done:
+                # the one task we waited for completed
+                try:
+                    item = done.pop().result()
+                except StopAsyncIteration:
+                    # if the task raised StopAsyncIteration, we're done iterating
+                    if buffer:
+                        yield buffer
+                    task = None
+                    break
+                else:
+                    # we got an item, add it to the buffer and set task to None to get the next item
+                    buffer.append(item)
+                    task = None
+                    # if this is the first item in the group, set the group start time
+                    if group_start_time is None:
+                        group_start_time = time.monotonic()
+            elif buffer:
+                # otherwise if the task timeout expired and we have items in the buffer, yield the buffer
+                yield buffer
+                # clear the buffer and reset the group start time ready for the next group
+                buffer = []
+                group_start_time = None
+
+    try:
+        yield async_iter_groups()
+    finally:  # pragma: no cover
+        # after iteration if a tasks still exists, cancel it, this will only happen if an error occurred
+        if task:
+            task.cancel('Cancelling due to error in iterator')
+            with suppress(asyncio.CancelledError):
+                await task
+
+def dataclasses_no_defaults_repr(self: Any) -> str:
+    """Exclude fields with values equal to the field default."""
+    kv_pairs = (
+        f'{f.name}={getattr(self, f.name)!r}' for f in fields(self) if f.repr and getattr(self, f.name) != f.default
+    )
+    return f'{self.__class__.__qualname__}({", ".join(kv_pairs)})'
+
+def number_to_datetime(x: int | float) -> datetime:
+    return _datetime_ta.validate_python(x)
+
+## pydantic_ai_slim/pydantic_ai/builtin_tools.py
+
+def _tool_discriminator(tool_data: dict[str, Any] | AbstractBuiltinTool) -> str:
+    if isinstance(tool_data, dict):
+        return tool_data.get('kind', AbstractBuiltinTool.kind)
+    else:
+        return tool_data.kind
+
+## pydantic_ai_slim/pydantic_ai/mcp.py
+
+    async def read_resource(
+        self, uri: str | Resource
+    ) -> str | messages.BinaryContent | list[str | messages.BinaryContent]:
+        """Read the contents of a specific resource by URI.
+
+        Args:
+            uri: The URI of the resource to read, or a Resource object.
+
+        Returns:
+            The resource contents. If the resource has a single content item, returns that item directly.
+            If the resource has multiple content items, returns a list of items.
+
+        Raises:
+            MCPError: If the server returns an error.
+        """
+        resource_uri = uri if isinstance(uri, str) else uri.uri
+        async with self:  # Ensure server is running
+            try:
+                result = await self._client.read_resource(AnyUrl(resource_uri))
+            except mcp_exceptions.McpError as e:
+                raise MCPError.from_mcp_sdk(e) from e
+
+        return (
+            self._get_content(result.contents[0])
+            if len(result.contents) == 1
+            else [self._get_content(resource) for resource in result.contents]
+        )
+
+## pydantic_ai_slim/pydantic_ai/models/openai.py
+
+def _map_mcp_list_tools(
+    item: responses.response_output_item.McpListTools, provider_name: str
+) -> tuple[BuiltinToolCallPart, BuiltinToolReturnPart]:
+    tool_name = ':'.join([MCPServerTool.kind, item.server_label])
+    return (
+        BuiltinToolCallPart(
+            tool_name=tool_name,
+            tool_call_id=item.id,
+            provider_name=provider_name,
+            args={'action': 'list_tools'},
+        ),
+        BuiltinToolReturnPart(
+            tool_name=tool_name,
+            tool_call_id=item.id,
+            content=item.model_dump(mode='json', include={'tools', 'error'}),
+            provider_name=provider_name,
+        ),
+    )
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    wait: WaitBaseT
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_utils.py
+
+def load_provider_metadata(provider_metadata: ProviderMetadata | None) -> dict[str, Any]:
+    """Load the Pydantic AI metadata from the provider metadata."""
+    return provider_metadata.get(PROVIDER_METADATA_KEY, {}) if provider_metadata else {}
+
+## pydantic_graph/pydantic_graph/_utils.py
+
+def comma_and(items: list[str]) -> str:
+    """Join with a comma and 'and' for the last item."""
+    if len(items) == 1:
+        return items[0]
+    else:
+        # oxford comma ¯\_(ツ)_/¯
+        return ', '.join(items[:-1]) + ', and ' + items[-1]
+
+## pydantic_graph/pydantic_graph/beta/graph_builder.py
+
+def _validate_graph_structure(  # noqa: C901
+    nodes: dict[NodeID, AnyNode],
+    edges_by_source: dict[NodeID, list[Path]],
+) -> None:
+    """Validate the graph structure for common issues.
+
+    This function raises an error if any of the following criteria are not met:
+    1. There are edges from the start node
+    2. There are edges to the end node
+    3. No non-End node is a dead end (no outgoing edges)
+    4. The end node is reachable from the start node
+    5. All nodes are reachable from the start node
+
+    Note 1: Under some circumstances it may be reasonable to build a graph that violates one or more of
+    the above conditions. We may eventually add support for more granular control over validation,
+    but today, if you want to build a graph that violates any of these assumptions you need to pass
+    `validate_graph_structure=False` to the call to `GraphBuilder.build`.
+
+    Note 2: Some of the earlier items in the above list are redundant with the later items.
+    I've included the earlier items in the list as a reminder to ourselves if/when we add more granular validation
+    because you might want to check the earlier items but not the later items, as described in Note 1.
+
+    Args:
+        nodes: The nodes in the graph
+        edges_by_source: The edges by source node
+
+    Raises:
+        GraphBuildingError: If any of the aforementioned structural issues are found.
+    """
+    how_to_suppress = ' If this is intentional, you can suppress this error by passing `validate_graph_structure=False` to the call to `GraphBuilder.build`.'
+
+    # Extract all destination IDs from edges and decision branches
+    all_destinations: set[NodeID] = set()
+
+    def _collect_destinations_from_path(path: Path) -> None:
+        for item in path.items:
+            if isinstance(item, DestinationMarker):
+                all_destinations.add(item.destination_id)
+
+    for paths in edges_by_source.values():
+        for path in paths:
+            _collect_destinations_from_path(path)
+
+    # Also collect destinations from decision branches
+    for node in nodes.values():
+        if isinstance(node, Decision):
+            for branch in node.branches:
+                _collect_destinations_from_path(branch.path)
+
+    # Check 1: Check if there are edges from the start node
+    start_edges = edges_by_source.get(StartNode.id, [])
+    if not start_edges:
+        raise GraphValidationError('The graph has no edges from the start node.' + how_to_suppress)
+
+    # Check 2: Check if there are edges to the end node
+    if EndNode.id not in all_destinations:
+        raise GraphValidationError('The graph has no edges to the end node.' + how_to_suppress)
+
+    # Check 3: Find all nodes with no outgoing edges (dead ends)
+    dead_end_nodes: list[NodeID] = []
+    for node_id, node in nodes.items():
+        # Skip the end node itself
+        if isinstance(node, EndNode):
+            continue
+
+        # Check if this node has any outgoing edges
+        has_edges = node_id in edges_by_source and len(edges_by_source[node_id]) > 0
+
+        # Also check if it's a decision node with branches
+        if isinstance(node, Decision):
+            has_edges = has_edges or len(node.branches) > 0
+
+        if not has_edges:
+            dead_end_nodes.append(node_id)
+
+    if dead_end_nodes:
+        raise GraphValidationError(f'The following nodes have no outgoing edges: {dead_end_nodes}.' + how_to_suppress)
+
+    # Checks 4 and 5: Ensure all nodes (and in particular, the end node) are reachable from the start node
+    reachable: set[NodeID] = {StartNode.id}
+    to_visit = [StartNode.id]
+
+    while to_visit:
+        current_id = to_visit.pop()
+
+        # Add destinations from regular edges
+        for path in edges_by_source.get(current_id, []):
+            for item in path.items:
+                if isinstance(item, DestinationMarker):
+                    if item.destination_id not in reachable:
+                        reachable.add(item.destination_id)
+                        to_visit.append(item.destination_id)
+
+        # Add destinations from decision branches
+        current_node = nodes.get(current_id)
+        if isinstance(current_node, Decision):
+            for branch in current_node.branches:
+                for item in branch.path.items:
+                    if isinstance(item, DestinationMarker):
+                        if item.destination_id not in reachable:
+                            reachable.add(item.destination_id)
+                            to_visit.append(item.destination_id)
+
+    unreachable_nodes = [node_id for node_id in nodes if node_id not in reachable]
+    if unreachable_nodes:
+        raise GraphValidationError(
+            f'The following nodes are not reachable from the start node: {unreachable_nodes}.' + how_to_suppress
+        )
+
+def _flatten_paths(
+    nodes: dict[NodeID, AnyNode], edges: dict[NodeID, list[Path]]
+) -> tuple[dict[NodeID, AnyNode], dict[NodeID, list[Path]]]:
+    new_nodes = nodes.copy()
+    new_edges: dict[NodeID, list[Path]] = defaultdict(list)
+
+    paths_to_handle: list[tuple[NodeID, Path]] = []
+
+    def _split_at_first_fork(path: Path) -> tuple[Path, list[tuple[NodeID, Path]]]:
+        for i, item in enumerate(path.items):
+            if isinstance(item, MapMarker):
+                assert item.fork_id in nodes, 'This should have been added to the node during GraphBuilder.add'
+                upstream = Path(list(path.items[:i]) + [DestinationMarker(item.fork_id)])
+                downstream = Path(path.items[i + 1 :])
+                return upstream, [(item.fork_id, downstream)]
+
+            if isinstance(item, BroadcastMarker):
+                assert item.fork_id in nodes, 'This should have been added to the node during GraphBuilder.add'
+                upstream = Path(list(path.items[:i]) + [DestinationMarker(item.fork_id)])
+                return upstream, [(item.fork_id, p) for p in item.paths]
+        return path, []
+
+    for node in new_nodes.values():
+        if isinstance(node, Decision):
+            for branch in node.branches:
+                upstream, downstreams = _split_at_first_fork(branch.path)
+                branch.path = upstream
+                paths_to_handle.extend(downstreams)
+
+    for source_id, edges_from_source in edges.items():
+        for path in edges_from_source:
+            paths_to_handle.append((source_id, path))
+
+    while paths_to_handle:
+        source_id, path = paths_to_handle.pop()
+        upstream, downstreams = _split_at_first_fork(path)
+        new_edges[source_id].append(upstream)
+        paths_to_handle.extend(downstreams)
+
+    return new_nodes, dict(new_edges)
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+    def next_path(self) -> Path:
+        """Create a new path with the first item removed.
+
+        Returns:
+            A new Path with all items except the first one
+        """
+        return Path(self.items[1:])
+
+## pydantic_graph/pydantic_graph/persistence/_utils.py
+
+def set_nodes_type_context(nodes: Sequence[type[BaseNode[Any, Any, Any]]]) -> Iterator[None]:
+    token = nodes_type_context.set(nodes)
+    try:
+        yield
+    finally:
+        nodes_type_context.reset(token)
+
+## tests/graph/beta/test_broadcast_and_spread.py
+
+class CounterState:
+    values: list[int] = field(default_factory=list[int])
+
+async def test_map_over_list():
+    """Test mapping a list to process items in parallel."""
+    g = GraphBuilder(state_type=CounterState, output_type=list[int])
+
+    @g.step
+    async def generate_list(ctx: StepContext[CounterState, None, None]) -> list[int]:
+        return [1, 2, 3, 4, 5]
+
+    @g.step
+    async def square(ctx: StepContext[CounterState, None, int]) -> int:
+        return ctx.inputs * ctx.inputs
+
+    collect = g.join(reduce_list_append, initial_factory=list[int])
+
+    g.add_mapping_edge(generate_list, square)
+    g.add(
+        g.edge_from(g.start_node).to(generate_list),
+        g.edge_from(square).to(collect),
+        g.edge_from(collect).to(g.end_node),
+    )
+
+    graph = g.build()
+    result = await graph.run(state=CounterState())
+    assert sorted(result) == [1, 4, 9, 16, 25]
+
+## tests/graph/beta/test_decisions.py
+
+class DecisionState:
+    path_taken: str | None = None
+    value: int = 0
+
+## tests/graph/beta/test_edge_cases.py
+
+class EdgeCaseState:
+    value: int = 0
+    error_raised: bool = False
+
+## tests/graph/beta/test_edge_labels.py
+
+class LabelState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_builder.py
+
+class SimpleState:
+    counter: int = 0
+    result: str | None = None
+
+## tests/graph/beta/test_graph_edge_cases.py
+
+class MyState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_iteration.py
+
+class IterState:
+    counter: int = 0
+
+## tests/graph/beta/test_v1_v2_integration.py
+
+class IntegrationState:
+    log: list[str] = field(default_factory=list[str])
+
+## tests/models/test_anthropic.py
+
+def test_init_with_provider_string(env: TestEnv):
+    env.set('ANTHROPIC_API_KEY', 'env-api-key')
+    model = AnthropicModel('claude-3-opus-latest', provider='anthropic')
+    assert model.model_name == 'claude-3-opus-latest'
+    assert model.client is not None
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_model_max_tokens(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    model = BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'max_tokens': 5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is')
+
+## tests/models/test_cohere.py
+
+async def test_request_simple_success_with_vcr(allow_model_requests: None, co_api_key: str):
+    m = CohereModel('command-r7b-12-2024', provider=CohereProvider(api_key=co_api_key))
+    agent = Agent(m)
+    result = await agent.run('hello')
+    assert result.output == snapshot('Hello! How can I assist you today?')
+
+async def test_cohere_model_builtin_tools(allow_model_requests: None, co_api_key: str):
+    m = CohereModel('command-r7b-12-2024', provider=CohereProvider(api_key=co_api_key))
+    agent = Agent(m, builtin_tools=[WebSearchTool()])
+    with pytest.raises(UserError, match=r"Builtin tool\(s\) \['WebSearchTool'\] not supported by this model"):
+        await agent.run('Hello')
+
+## tests/models/test_fallback.py
+
+def add_missing_response_model(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for span in spans:
+        attrs = span.setdefault('attributes', {})
+        if 'gen_ai.request.model' in attrs:
+            attrs.setdefault('gen_ai.response.model', attrs['gen_ai.request.model'])
+    return spans
+
+## tests/models/test_google.py
+
+async def test_google_model_max_tokens(allow_model_requests: None, google_provider: GoogleProvider):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'max_tokens': 5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is')
+
+async def test_google_model_top_p(allow_model_requests: None, google_provider: GoogleProvider):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'top_p': 0.5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is Paris.\n')
+
+async def test_google_model_thinking_config(allow_model_requests: None, google_provider: GoogleProvider):
+    model = GoogleModel('gemini-2.5-pro-preview-03-25', provider=google_provider)
+    settings = GoogleModelSettings(google_thinking_config={'include_thoughts': False})
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings=settings)
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is **Paris**.')
+
+## tests/models/test_groq.py
+
+async def test_extra_headers(allow_model_requests: None, groq_api_key: str):
+    # This test doesn't do anything, it's just here to ensure that calls with `extra_headers` don't cause errors, including type.
+    m = GroqModel('llama-3.3-70b-versatile', provider=GroqProvider(api_key=groq_api_key))
+    agent = Agent(m, model_settings=GroqModelSettings(extra_headers={'Extra-Header-Key': 'Extra-Header-Value'}))
+    await agent.run('hello')
+
+## tests/models/test_huggingface.py
+
+async def test_max_completion_tokens(allow_model_requests: None, model_name: str, huggingface_api_key: str):
+    m = HuggingFaceModel(model_name, provider=HuggingFaceProvider(provider_name='nebius', api_key=huggingface_api_key))
+    agent = Agent(m, model_settings=ModelSettings(max_tokens=100))
+
+    result = await agent.run('hello')
+    assert result.output == IsStr()
+
+## tests/models/test_model_function.py
+
+async def return_last(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+    last = messages[-1].parts[-1]
+    response = asdict(last)
+    response.pop('timestamp', None)
+    response['message_count'] = len(messages)
+    return ModelResponse(parts=[TextPart(' '.join(f'{k}={v!r}' for k, v in response.items()))])
+
+## tests/models/test_openai.py
+
+async def test_system_prompt_role_o1_mini(allow_model_requests: None, openai_api_key: str):
+    model = OpenAIChatModel('o1-mini', provider=OpenAIProvider(api_key=openai_api_key))
+    agent = Agent(model=model, system_prompt='You are a helpful assistant.')
+
+    result = await agent.run("What's the capital of France?")
+    assert result.output == snapshot('The capital of France is **Paris**.')
+
+async def test_max_completion_tokens(allow_model_requests: None, model_name: str, openai_api_key: str):
+    m = OpenAIChatModel(model_name, provider=OpenAIProvider(api_key=openai_api_key))
+    agent = Agent(m, model_settings=ModelSettings(max_tokens=100))
+
+    result = await agent.run('hello')
+    assert result.output == IsStr()
+
+async def test_extra_headers(allow_model_requests: None, openai_api_key: str):
+    # This test doesn't do anything, it's just here to ensure that calls with `extra_headers` don't cause errors, including type.
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))
+    agent = Agent(m, model_settings=OpenAIChatModelSettings(extra_headers={'Extra-Header-Key': 'Extra-Header-Value'}))
+    await agent.run('hello')
+
+async def test_user_id(allow_model_requests: None, openai_api_key: str):
+    # This test doesn't do anything, it's just here to ensure that calls with `user` don't cause errors, including type.
+    # Since we use VCR, creating tests with an `httpx.Transport` is not possible.
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))
+    agent = Agent(m, model_settings=OpenAIChatModelSettings(openai_user='user_id'))
+    await agent.run('hello')
+
+async def test_openai_model_cerebras_provider(allow_model_requests: None, cerebras_api_key: str):
+    m = OpenAIChatModel('llama3.3-70b', provider=CerebrasProvider(api_key=cerebras_api_key))
+    agent = Agent(m)
+
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is Paris.')
+
+async def test_openai_model_cerebras_provider_harmony(allow_model_requests: None, cerebras_api_key: str):
+    m = OpenAIChatModel('gpt-oss-120b', provider=CerebrasProvider(api_key=cerebras_api_key))
+    agent = Agent(m)
+
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is **Paris**.')
+
+## tests/models/test_outlines.py
+
+async def test_multi_turn_async_model(mock_async_model: OutlinesModel) -> None:
+    """Test multi-turn conversation with message_history."""
+    agent = Agent(mock_async_model)
+    result1 = await agent.run('First message')
+    result2 = await agent.run('Second message', message_history=result1.all_messages())
+    assert result2.output == 'test'
+
+## tests/providers/test_alibaba_provider.py
+
+def test_alibaba_provider_env_key(env: TestEnv):
+    env.set('ALIBABA_API_KEY', 'env-key')
+    provider = AlibabaProvider()
+    assert provider.client.api_key == 'env-key'
+
+def test_alibaba_provider_dashscope_env_key(env: TestEnv):
+    env.remove('ALIBABA_API_KEY')
+    env.set('DASHSCOPE_API_KEY', 'dashscope-key')
+    provider = AlibabaProvider()
+    assert provider.client.api_key == 'dashscope-key'
+
+def test_infer_provider(env: TestEnv):
+    # infer_provider instantiates the class, so we need an env var or it raises UserError
+    env.set('ALIBABA_API_KEY', 'key')
+    provider = infer_provider('alibaba')
+    assert isinstance(provider, AlibabaProvider)
+
+## tests/providers/test_google_gla.py
+
+def test_api_key_arg(env: TestEnv):
+    env.set('GEMINI_API_KEY', 'via-env-var')
+    provider = GoogleGLAProvider(api_key='via-arg')
+    assert provider.client.headers['x-goog-api-key'] == 'via-arg'
+    assert provider.client.base_url == 'https://generativelanguage.googleapis.com/v1beta/models/'
+
+def test_api_key_env_var(env: TestEnv):
+    env.set('GEMINI_API_KEY', 'via-env-var')
+    provider = GoogleGLAProvider()
+    assert 'x-goog-api-key' in dict(provider.client.headers)
+
+## tests/providers/test_google_vertex.py
+
+async def test_vertexai_provider(allow_model_requests: None):  # pragma: lax no cover
+    m = GeminiModel('gemini-2.0-flash', provider='google-vertex')
+    agent = Agent(m)
+
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is **Paris**.\n')
+
+## tests/providers/test_sambanova_provider.py
+
+def test_sambanova_provider_env_key(env: TestEnv):
+    env.set('SAMBANOVA_API_KEY', 'env-key')
+    provider = SambaNovaProvider()
+    assert provider.client.api_key == 'env-key'
+
+def test_infer_provider(env: TestEnv):
+    # infer_provider instantiates the class, so we need an env var or it raises UserError
+    env.set('SAMBANOVA_API_KEY', 'key')
+    provider = infer_provider('sambanova')
+    assert isinstance(provider, SambaNovaProvider)
+
+def test_sambanova_provider_env_base_url(env: TestEnv):
+    env.set('SAMBANOVA_API_KEY', 'key')
+    env.set('SAMBANOVA_BASE_URL', 'https://env.endpoint.com/v1')
+    provider = SambaNovaProvider()
+    assert provider.base_url == 'https://env.endpoint.com/v1'
+
+## tests/test_agent.py
+
+async def test_agent_run_metadata_kwarg_dict() -> None:
+    agent = Agent(TestModel(custom_output_text='kwarg dict output'))
+
+    result = await agent.run('kwarg dict prompt', metadata={'env': 'run'})
+
+    assert result.metadata == {'env': 'run'}
+
+async def test_agent_run_metadata_kwarg_merges_agent_metadata() -> None:
+    agent = Agent(TestModel(custom_output_text='kwarg merge output'), metadata={'env': 'base', 'shared': 'agent'})
+
+    result = await agent.run('kwarg merge prompt', metadata={'run': 'value', 'shared': 'run'})
+
+    assert result.metadata == {'env': 'base', 'run': 'value', 'shared': 'run'}
+
+## tests/test_builtin_tools.py
+
+async def test_builtin_tools_not_supported_web_search(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[WebSearchTool()])
+
+    with pytest.raises(UserError):
+        await agent.run('What day is tomorrow?')
+
+async def test_builtin_tools_not_supported_code_execution(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[CodeExecutionTool()])
+
+    with pytest.raises(UserError):
+        await agent.run('What day is tomorrow?')
+
+async def test_builtin_tools_not_supported_file_search(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[FileSearchTool(file_store_ids=['test-id'])])
+
+    with pytest.raises(UserError):
+        await agent.run('Search my files')
+
+## tests/test_cli.py
+
+def test_code_theme_unset(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+    cli([])
+    mock_run_chat.assert_awaited_once_with(True, IsInstance(Agent), IsInstance(Console), 'monokai', 'clai')
+
+def test_code_theme_light(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+    cli(['--code-theme=light'])
+    mock_run_chat.assert_awaited_once_with(True, IsInstance(Agent), IsInstance(Console), 'default', 'clai')
+
+def test_code_theme_dark(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+    cli(['--code-theme=dark'])
+    mock_run_chat.assert_awaited_once_with(True, IsInstance(Agent), IsInstance(Console), 'monokai', 'clai')
+
+## tests/test_dbos.py
+
+async def test_dbos_agent_run(allow_model_requests: None, dbos: DBOS):
+    # Note: this runs as a DBOS workflow because we automatically wrap the run function.
+    result = await simple_dbos_agent.run('What is the capital of Mexico?')
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_dbos_agent_run_in_workflow_with_toolsets(allow_model_requests: None, dbos: DBOS):
+    # Since DBOS does not automatically wrap the tools in a workflow, and allows dynamic steps, we can pass in toolsets directly.
+    result = await simple_dbos_agent.run('What is the capital of Mexico?', toolsets=[FunctionToolset()])
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_custom_model_settings(allow_model_requests: None, dbos: DBOS):
+    result = await settings_dbos_agent.run('Give me those settings')
+    assert result.output == snapshot("{'max_tokens': 123, 'custom_setting': 'custom_value'}")
+
+## tests/test_examples.py
+
+def mock_group_by_temporal(aiter: Any, soft_max_interval: float | None) -> Any:
+    """Mock group_by_temporal to avoid debouncing, since the iterators above have no delay."""
+    return group_by_temporal(aiter, None)
+
+## tests/test_mcp.py
+
+async def test_agent_with_server_not_running(agent: Agent, allow_model_requests: None):
+    result = await agent.run('What is 0 degrees Celsius in Fahrenheit?')
+    assert result.output == snapshot('0 degrees Celsius is 32.0 degrees Fahrenheit.')
+
+async def test_read_resource_template(run_context: RunContext[int]):
+    """Test reading a resource template with parameters (converted to string)."""
+    server = MCPServerStdio('python', ['-m', 'tests.mcp_server'])
+    async with server:
+        content = await server.read_resource('resource://greeting/Alice')
+        assert isinstance(content, str)
+        assert content == snapshot('Hello, Alice!')
+
+## tests/test_parts_manager.py
+
+def test_handle_thinking_delta_no_content():
+    manager = ModelResponsePartsManager()
+
+    with pytest.raises(UnexpectedModelBehavior, match='Cannot create a ThinkingPart with no content'):
+        list(manager.handle_thinking_delta(vendor_part_id=None, content=None, signature=None))
+
+## tests/test_prefect.py
+
+async def test_prefect_agent_run(allow_model_requests: None) -> None:
+    """Test that agent.run() works (auto-wrapped as flow)."""
+    result = await simple_prefect_agent.run('What is the capital of Mexico?')
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_prefect_agent_with_model_retry(allow_model_requests: None) -> None:
+    """Test that ModelRetry works correctly."""
+    result = await model_retry_prefect_agent.run('What is the weather in CDMX?')
+    assert 'sunny' in result.output.lower() or 'mexico city' in result.output.lower()
+
+async def test_custom_model_settings(allow_model_requests: None):
+    """Test that custom model settings are passed through correctly."""
+    result = await settings_prefect_agent.run('Give me those settings')
+    assert result.output == snapshot("{'max_tokens': 123, 'custom_setting': 'custom_value'}")

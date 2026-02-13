@@ -1,0 +1,249 @@
+## httpx/_client.py
+
+    def headers(self, headers: HeaderTypes) -> None:
+        client_headers = Headers(
+            {
+                b"Accept": b"*/*",
+                b"Accept-Encoding": ACCEPT_ENCODING.encode("ascii"),
+                b"Connection": b"keep-alive",
+                b"User-Agent": USER_AGENT.encode("ascii"),
+            }
+        )
+        client_headers.update(headers)
+        self._headers = client_headers
+
+## httpx/_config.py
+
+class UnsetType:
+    pass  # pragma: no cover
+
+## httpx/_exceptions.py
+
+class HTTPStatusError(HTTPError):
+    """
+    The response had an error HTTP status of 4xx or 5xx.
+
+    May be raised when calling `response.raise_for_status()`
+    """
+
+    def __init__(self, message: str, *, request: Request, response: Response) -> None:
+        super().__init__(message)
+        self.request = request
+        self.response = response
+
+## httpx/_models.py
+
+def _parse_content_type_charset(content_type: str) -> str | None:
+    # We used to use `cgi.parse_header()` here, but `cgi` became a dead battery.
+    # See: https://peps.python.org/pep-0594/#cgi
+    msg = email.message.Message()
+    msg["content-type"] = content_type
+    return msg.get_content_charset(failobj=None)
+
+## httpx/_multipart.py
+
+def get_multipart_boundary_from_content_type(
+    content_type: bytes | None,
+) -> bytes | None:
+    if not content_type or not content_type.startswith(b"multipart/form-data"):
+        return None
+    # parse boundary according to
+    # https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1
+    if b";" in content_type:
+        for section in content_type.split(b";"):
+            if section.strip().lower().startswith(b"boundary="):
+                return section.strip()[len(b"boundary=") :].strip(b'"')
+    return None
+
+## tests/client/test_async_client.py
+
+async def test_raise_for_status(server):
+    async with httpx.AsyncClient() as client:
+        for status_code in (200, 400, 404, 500, 505):
+            response = await client.request(
+                "GET", server.url.copy_with(path=f"/status/{status_code}")
+            )
+
+            if 400 <= status_code < 600:
+                with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                    response.raise_for_status()
+                assert exc_info.value.response == response
+            else:
+                assert response.raise_for_status() is response
+
+## tests/client/test_auth.py
+
+async def test_auth_invalid_type() -> None:
+    app = App()
+
+    with pytest.raises(TypeError):
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(app),
+            auth="not a tuple, not a callable",  # type: ignore
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(TypeError):
+            await client.get(auth="not a tuple, not a callable")  # type: ignore
+
+        with pytest.raises(TypeError):
+            client.auth = "not a tuple, not a callable"  # type: ignore
+
+## tests/client/test_client.py
+
+def test_raise_for_status(server):
+    with httpx.Client() as client:
+        for status_code in (200, 400, 404, 500, 505):
+            response = client.request(
+                "GET", server.url.copy_with(path=f"/status/{status_code}")
+            )
+            if 400 <= status_code < 600:
+                with pytest.raises(httpx.HTTPStatusError) as exc_info:
+                    response.raise_for_status()
+                assert exc_info.value.response == response
+                assert exc_info.value.request.url.path == f"/status/{status_code}"
+            else:
+                assert response.raise_for_status() is response
+
+## tests/client/test_redirects.py
+
+def test_body_redirect():
+    """
+    A 308 redirect should preserve the request body.
+    """
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.org/redirect_body"
+    content = b"Example request body"
+    response = client.post(url, content=content, follow_redirects=True)
+    assert response.url == "https://example.org/redirect_body_target"
+    assert response.json()["body"] == "Example request body"
+    assert "content-length" in response.json()["headers"]
+
+class ConsumeBodyTransport(httpx.MockTransport):
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.SyncByteStream)
+        list(request.stream)
+        return self.handler(request)  # type: ignore[return-value]
+
+## tests/conftest.py
+
+Message = typing.Dict[str, typing.Any]
+
+async def status_code(scope: Scope, receive: Receive, send: Send) -> None:
+    status_code = int(scope["path"].replace("/status/", ""))
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [[b"content-type", b"text/plain"]],
+        }
+    )
+    await send({"type": "http.response.body", "body": b"Hello, world!"})
+
+## tests/models/test_queryparams.py
+
+def test_queryparam_types():
+    q = httpx.QueryParams(None)
+    assert str(q) == ""
+
+    q = httpx.QueryParams({"a": True})
+    assert str(q) == "a=true"
+
+    q = httpx.QueryParams({"a": False})
+    assert str(q) == "a=false"
+
+    q = httpx.QueryParams({"a": ""})
+    assert str(q) == "a="
+
+    q = httpx.QueryParams({"a": None})
+    assert str(q) == "a="
+
+    q = httpx.QueryParams({"a": 1.23})
+    assert str(q) == "a=1.23"
+
+    q = httpx.QueryParams({"a": 123})
+    assert str(q) == "a=123"
+
+    q = httpx.QueryParams({"a": [1, 2]})
+    assert str(q) == "a=1&a=2"
+
+## tests/models/test_responses.py
+
+def test_response_content_type_encoding():
+    """
+    Use the charset encoding in the Content-Type header if possible.
+    """
+    headers = {"Content-Type": "text-plain; charset=latin-1"}
+    content = "Latin 1: ÿ".encode("latin-1")
+    response = httpx.Response(
+        200,
+        content=content,
+        headers=headers,
+    )
+    assert response.text == "Latin 1: ÿ"
+    assert response.encoding == "latin-1"
+
+def test_unknown_status_code():
+    response = httpx.Response(
+        600,
+    )
+    assert response.status_code == 600
+    assert response.reason_phrase == ""
+    assert response.text == ""
+
+## tests/test_asgi.py
+
+async def test_asgi_disconnect_after_response_complete():
+    disconnect = False
+
+    async def read_body(scope, receive, send):
+        nonlocal disconnect
+
+        status = 200
+        headers = [(b"content-type", "text/plain")]
+
+        await send(
+            {"type": "http.response.start", "status": status, "headers": headers}
+        )
+        more_body = True
+        while more_body:
+            message = await receive()
+            more_body = message.get("more_body", False)
+
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        # The ASGI spec says of the Disconnect message:
+        # "Sent to the application when a HTTP connection is closed or if receive is
+        # called after a response has been sent."
+        # So if receive() is called again, the disconnect message should be received
+        message = await receive()
+        disconnect = message.get("type") == "http.disconnect"
+
+    transport = httpx.ASGITransport(app=read_body)
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("http://www.example.org/", content=b"example")
+
+    assert response.status_code == 200
+    assert disconnect
+
+## tests/test_status_codes.py
+
+def test_status_code_as_int():
+    # mypy doesn't (yet) recognize that IntEnum members are ints, so ignore it here
+    assert httpx.codes.NOT_FOUND == 404  # type: ignore[comparison-overlap]
+    assert str(httpx.codes.NOT_FOUND) == "404"
+
+def test_status_code_value_lookup():
+    assert httpx.codes(404) == 404
+
+def test_status_code_phrase_lookup():
+    assert httpx.codes["NOT_FOUND"] == 404
+
+def test_lowercase_status_code():
+    assert httpx.codes.not_found == 404  # type: ignore
+
+def test_reason_phrase_for_status_code():
+    assert httpx.codes.get_reason_phrase(404) == "Not Found"
+
+def test_reason_phrase_for_unknown_status_code():
+    assert httpx.codes.get_reason_phrase(499) == ""

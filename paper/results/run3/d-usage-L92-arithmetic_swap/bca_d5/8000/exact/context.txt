@@ -1,0 +1,893 @@
+## clai/clai/__init__.py
+
+def cli():
+    """Run the clai CLI and exit."""
+    _cli.cli_exit('clai')
+
+## examples/pydantic_ai_examples/chat_app.py
+
+async def index() -> FileResponse:
+    return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
+
+async def main_ts() -> FileResponse:
+    """Get the raw typescript code, it's compiled in the browser, forgive me."""
+    return FileResponse((THIS_DIR / 'chat_app.ts'), media_type='text/plain')
+
+async def get_chat(database: Database = Depends(get_db)) -> Response:
+    msgs = await database.get_messages()
+    return Response(
+        b'\n'.join(json.dumps(to_chat_message(m)).encode('utf-8') for m in msgs),
+        media_type='text/plain',
+    )
+
+    timestamp: str
+
+## examples/pydantic_ai_examples/data_analyst.py
+
+def display(ctx: RunContext[AnalystAgentDeps], name: str) -> str:
+    """Display at most 5 rows of the dataframe."""
+    dataset = ctx.deps.get(name)
+    return dataset.head().to_string()  # pyright: ignore[reportUnknownMemberType]
+
+## examples/pydantic_ai_examples/evals/agent.py
+
+    now: datetime = field(default_factory=lambda: datetime.now().astimezone())
+
+async def infer_time_range(inputs: TimeRangeInputs) -> TimeRangeResponse:
+    """Infer a time range from a user prompt."""
+    deps = TimeRangeDeps(now=inputs['now'])
+    return (await time_range_agent.run(inputs['prompt'], deps=deps)).output
+
+## examples/pydantic_ai_examples/flight_booking.py
+
+class Deps:
+    web_page_text: str
+    req_origin: str
+    req_destination: str
+    req_date: datetime.date
+
+## examples/pydantic_ai_examples/pydantic_model.py
+
+class MyModel(BaseModel):
+    city: str
+    country: str
+
+## examples/pydantic_ai_examples/question_graph.py
+
+async def run_as_continuous():
+    state = QuestionState()
+    node = Ask()
+    end = await question_graph.run(node, state=state)
+    print('END:', end.output)
+
+## examples/pydantic_ai_examples/rag.py
+
+    id: int
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/agent.py
+
+async def analyze_profile(profile: Profile) -> Analysis | None:
+    result = await agent.run(profile.as_prompt())
+    return result.output  ### [/analyze_profile]
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    usage: _usage.RunUsage = dataclasses.field(default_factory=_usage.RunUsage)
+
+    request: _messages.ModelRequest
+
+    model_response: _messages.ModelResponse
+
+async def _call_tools(  # noqa: C901
+    tool_manager: ToolManager[DepsT],
+    tool_calls: list[_messages.ToolCallPart],
+    tool_call_results: dict[str, DeferredToolResult],
+    tool_call_metadata: dict[str, dict[str, Any]] | None,
+    tracer: Tracer,
+    usage: _usage.RunUsage,
+    usage_limits: _usage.UsageLimits,
+    output_parts: list[_messages.ModelRequestPart],
+    output_deferred_calls: dict[Literal['external', 'unapproved'], list[_messages.ToolCallPart]],
+    output_deferred_metadata: dict[str, dict[str, Any]],
+) -> AsyncIterator[_messages.HandleResponseEvent]:
+    tool_parts_by_index: dict[int, _messages.ModelRequestPart] = {}
+    user_parts_by_index: dict[int, _messages.UserPromptPart] = {}
+    deferred_calls_by_index: dict[int, Literal['external', 'unapproved']] = {}
+    deferred_metadata_by_index: dict[int, dict[str, Any] | None] = {}
+
+    if usage_limits.tool_calls_limit is not None:
+        projected_usage = deepcopy(usage)
+        projected_usage.tool_calls += len(tool_calls)
+        usage_limits.check_before_tool_call(projected_usage)
+
+    for call in tool_calls:
+        yield _messages.FunctionToolCallEvent(call)
+
+    with tracer.start_as_current_span(
+        'running tools',
+        attributes={
+            'tools': [call.tool_name for call in tool_calls],
+            'logfire.msg': f'running {len(tool_calls)} tool{"" if len(tool_calls) == 1 else "s"}',
+        },
+    ):
+
+        async def handle_call_or_result(
+            coro_or_task: Awaitable[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ]
+            | Task[
+                tuple[
+                    _messages.ToolReturnPart | _messages.RetryPromptPart, str | Sequence[_messages.UserContent] | None
+                ]
+            ],
+            index: int,
+        ) -> _messages.HandleResponseEvent | None:
+            try:
+                tool_part, tool_user_content = (
+                    (await coro_or_task) if inspect.isawaitable(coro_or_task) else coro_or_task.result()
+                )
+            except exceptions.CallDeferred as e:
+                deferred_calls_by_index[index] = 'external'
+                deferred_metadata_by_index[index] = e.metadata
+            except exceptions.ApprovalRequired as e:
+                deferred_calls_by_index[index] = 'unapproved'
+                deferred_metadata_by_index[index] = e.metadata
+            else:
+                tool_parts_by_index[index] = tool_part
+                if tool_user_content:
+                    user_parts_by_index[index] = _messages.UserPromptPart(content=tool_user_content)
+
+                return _messages.FunctionToolResultEvent(tool_part, content=tool_user_content)
+
+        parallel_execution_mode = tool_manager.get_parallel_execution_mode(tool_calls)
+        if parallel_execution_mode == 'sequential':
+            for index, call in enumerate(tool_calls):
+                if event := await handle_call_or_result(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    index,
+                ):
+                    yield event
+
+        else:
+            tasks = [
+                asyncio.create_task(
+                    _call_tool(tool_manager, call, tool_call_results.get(call.tool_call_id), tool_call_metadata),
+                    name=call.tool_name,
+                )
+                for call in tool_calls
+            ]
+            try:
+                if parallel_execution_mode == 'parallel_ordered_events':
+                    # Wait for all tasks to complete before yielding any events
+                    await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+                    for index, task in enumerate(tasks):
+                        if event := await handle_call_or_result(coro_or_task=task, index=index):
+                            yield event
+                else:
+                    pending: set[
+                        asyncio.Task[
+                            tuple[_messages.ToolReturnPart | _messages.RetryPromptPart, _messages.UserPromptPart | None]
+                        ]
+                    ] = set(tasks)  # pyright: ignore[reportAssignmentType]
+                    while pending:
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            index = tasks.index(task)  # pyright: ignore[reportArgumentType]
+                            if event := await handle_call_or_result(coro_or_task=task, index=index):  # pyright: ignore[reportArgumentType]
+                                yield event
+
+            except asyncio.CancelledError as e:
+                for task in tasks:
+                    task.cancel(msg=e.args[0] if len(e.args) != 0 else None)
+
+                raise
+
+    # We append the results at the end, rather than as they are received, to retain a consistent ordering
+    # This is mostly just to simplify testing
+    output_parts.extend([tool_parts_by_index[k] for k in sorted(tool_parts_by_index)])
+    output_parts.extend([user_parts_by_index[k] for k in sorted(user_parts_by_index)])
+
+    _populate_deferred_calls(
+        tool_calls, deferred_calls_by_index, deferred_metadata_by_index, output_deferred_calls, output_deferred_metadata
+    )
+
+class _RunMessages:
+    messages: list[_messages.ModelMessage]
+    used: bool = False
+
+def get_captured_run_messages() -> _RunMessages:
+    return _messages_ctx_var.get()
+
+## pydantic_ai_slim/pydantic_ai/_function_schema.py
+
+def _is_call_ctx(annotation: Any) -> bool:
+    """Return whether the annotation is the `RunContext` class, parameterized or not."""
+    return annotation is RunContext or get_origin(annotation) is RunContext
+
+## pydantic_ai_slim/pydantic_ai/_otel_messages.py
+
+    type: Literal['text']
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def is_set(t_or_unset: T | Unset) -> TypeGuard[T]:
+    return t_or_unset is not UNSET
+
+def number_to_datetime(x: int | float) -> datetime:
+    return _datetime_ta.validate_python(x)
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far. This will not be the final usage until the stream is exhausted."""
+        return self._usage
+
+def get_user_agent() -> str:
+    """Get the user agent string for the HTTP client."""
+    from .. import __version__
+
+    return f'pydantic-ai/{__version__}'
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+class _GeminiContent(TypedDict):
+    role: Literal['user', 'model']
+    parts: list[_GeminiPartUnion]
+
+class _BasePart(TypedDict):
+    thought: NotRequired[bool]
+    """Indicates if the part is thought from the model."""
+
+def _function_call_part_from_call(tool: ToolCallPart) -> _GeminiFunctionCallPart:
+    return _GeminiFunctionCallPart(function_call=_GeminiFunctionCall(name=tool.tool_name, args=tool.args_as_dict()))
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._initial_run_ctx_usage + self._raw_stream_response.usage()
+
+## pydantic_ai_slim/pydantic_ai/retries.py
+
+    sleep: Callable[[int | float], None | Awaitable[None]]
+
+    wait: WaitBaseT
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def usage(self) -> _usage.RunUsage:
+        """Get usage statistics for the run so far, including token usage, model requests, and so on."""
+        return self._graph_run.state.usage
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/_utils.py
+
+def load_provider_metadata(provider_metadata: ProviderMetadata | None) -> dict[str, Any]:
+    """Load the Pydantic AI metadata from the provider metadata."""
+    return provider_metadata.get(PROVIDER_METADATA_KEY, {}) if provider_metadata else {}
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+def _incr_usage_tokens(slf: RunUsage | RequestUsage, incr_usage: RunUsage | RequestUsage) -> None:
+    """Increment the usage in place.
+
+    Args:
+        slf: The usage to increment.
+        incr_usage: The usage to increment by.
+    """
+    slf.input_tokens += incr_usage.input_tokens
+    slf.cache_write_tokens += incr_usage.cache_write_tokens
+    slf.cache_read_tokens += incr_usage.cache_read_tokens
+    slf.input_audio_tokens += incr_usage.input_audio_tokens
+    slf.cache_audio_read_tokens += incr_usage.cache_audio_read_tokens
+    slf.output_tokens += incr_usage.output_tokens
+
+    for key, value in incr_usage.details.items():
+        # Note: value can be None at runtime from model responses despite the type annotation
+        if isinstance(value, (int, float)):
+            slf.details[key] = slf.details.get(key, 0) + value
+
+class Usage(RunUsage):
+    """Deprecated alias for `RunUsage`."""
+
+## pydantic_graph/pydantic_graph/beta/graph.py
+
+    def value(self) -> OutputT:
+        return self._value
+
+class _GraphTaskAsyncIterable:
+    iterable: AsyncIterable[Sequence[GraphTask]]
+    fork_stack: ForkStack
+
+def _is_any_iterable(x: Any) -> TypeGuard[Iterable[Any]]:
+    return isinstance(x, Iterable)
+
+def _is_any_async_iterable(x: Any) -> TypeGuard[AsyncIterable[Any]]:
+    return isinstance(x, AsyncIterable)
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+    items: list[PathItem]
+
+## tests/conftest.py
+
+def raise_if_exception(e: Any) -> None:
+    if isinstance(e, Exception):
+        raise e
+
+## tests/evals/test_dataset.py
+
+class TaskInput(BaseModel):
+    query: str
+
+class TaskOutput(BaseModel):
+    answer: str
+    confidence: float = 1.0
+
+class TaskMetadata(BaseModel):
+    difficulty: str = 'easy'
+    category: str = 'general'
+
+## tests/evals/test_report_evaluators.py
+
+def _make_report(cases: list[ReportCase]) -> EvaluationReport:
+    return EvaluationReport(name='test', cases=cases)
+
+## tests/graph/beta/test_broadcast_and_spread.py
+
+class CounterState:
+    values: list[int] = field(default_factory=list[int])
+
+    values: list[int] = field(default_factory=list[int])
+
+## tests/graph/beta/test_decisions.py
+
+class DecisionState:
+    path_taken: str | None = None
+    value: int = 0
+
+## tests/graph/beta/test_edge_cases.py
+
+class EdgeCaseState:
+    value: int = 0
+    error_raised: bool = False
+
+## tests/graph/beta/test_edge_labels.py
+
+class LabelState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_builder.py
+
+class SimpleState:
+    counter: int = 0
+    result: str | None = None
+
+## tests/graph/beta/test_graph_edge_cases.py
+
+class MyState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_execution.py
+
+class ExecutionState:
+    log: list[str] = field(default_factory=list[str])
+    counter: int = 0
+
+## tests/graph/beta/test_graph_iteration.py
+
+class IterState:
+    counter: int = 0
+
+## tests/graph/beta/test_v1_v2_integration.py
+
+class IntegrationState:
+    log: list[str] = field(default_factory=list[str])
+
+## tests/models/test_anthropic.py
+
+def test_init_with_provider():
+    provider = AnthropicProvider(api_key='api-key')
+    model = AnthropicModel('claude-3-opus-latest', provider=provider)
+    assert model.model_name == 'claude-3-opus-latest'
+    assert model.client == provider.client
+
+def test_init_with_provider_string(env: TestEnv):
+    env.set('ANTHROPIC_API_KEY', 'env-api-key')
+    model = AnthropicModel('claude-3-opus-latest', provider='anthropic')
+    assert model.model_name == 'claude-3-opus-latest'
+    assert model.client is not None
+
+async def test_anthropic_model_usage_limit_exceeded(
+    allow_model_requests: None,
+    anthropic_api_key: str,
+):
+    model = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+    agent = Agent(model=model)
+
+    with pytest.raises(
+        UsageLimitExceeded,
+        match='The next request would exceed the input_tokens_limit of 18 \\(input_tokens=19\\)',
+    ):
+        await agent.run(
+            'The quick brown fox jumps over the lazydog.',
+            usage_limits=UsageLimits(input_tokens_limit=18, count_tokens_before_request=True),
+        )
+
+async def test_anthropic_model_usage_limit_not_exceeded(
+    allow_model_requests: None,
+    anthropic_api_key: str,
+):
+    model = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+    agent = Agent(model=model)
+
+    result = await agent.run(
+        'The quick brown fox jumps over the lazydog.',
+        usage_limits=UsageLimits(input_tokens_limit=25, count_tokens_before_request=True),
+    )
+    assert result.output == snapshot(
+        """\
+I noticed a small typo in that famous pangram! It should be:
+
+"The quick brown fox jumps over the **lazy dog**."
+
+(There should be a space between "lazy" and "dog")
+
+This sentence is often used for testing typewriters, fonts, and keyboards because it contains every letter of the English alphabet at least once.\
+"""
+    )
+
+## tests/models/test_bedrock.py
+
+async def test_bedrock_model_max_tokens(allow_model_requests: None, bedrock_provider: BedrockProvider):
+    model = BedrockConverseModel('us.amazon.nova-micro-v1:0', provider=bedrock_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'max_tokens': 5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is')
+
+## tests/models/test_cohere.py
+
+async def test_request_simple_success_with_vcr(allow_model_requests: None, co_api_key: str):
+    m = CohereModel('command-r7b-12-2024', provider=CohereProvider(api_key=co_api_key))
+    agent = Agent(m)
+    result = await agent.run('hello')
+    assert result.output == snapshot('Hello! How can I assist you today?')
+
+async def test_cohere_model_builtin_tools(allow_model_requests: None, co_api_key: str):
+    m = CohereModel('command-r7b-12-2024', provider=CohereProvider(api_key=co_api_key))
+    agent = Agent(m, builtin_tools=[WebSearchTool()])
+    with pytest.raises(UserError, match=r"Builtin tool\(s\) \['WebSearchTool'\] not supported by this model"):
+        await agent.run('Hello')
+
+## tests/models/test_gemini.py
+
+def gemini_response(content: _GeminiContent, finish_reason: Literal['STOP'] | None = 'STOP') -> _GeminiResponse:
+    candidate = _GeminiCandidates(content=content, index=0, safety_ratings=[])
+    if finish_reason:  # pragma: no branch
+        candidate['finish_reason'] = finish_reason
+    return _GeminiResponse(candidates=[candidate], usage_metadata=example_usage(), model_version='gemini-1.5-flash-123')
+
+## tests/models/test_google.py
+
+async def test_google_model_max_tokens(allow_model_requests: None, google_provider: GoogleProvider):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'max_tokens': 5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is')
+
+async def test_google_model_top_p(allow_model_requests: None, google_provider: GoogleProvider):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'top_p': 0.5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is Paris.\n')
+
+## tests/models/test_groq.py
+
+def text_chunk(text: str, finish_reason: FinishReason | None = None) -> chat.ChatCompletionChunk:
+    return chunk([ChoiceDelta(content=text, role='assistant')], finish_reason=finish_reason)
+
+async def test_extra_headers(allow_model_requests: None, groq_api_key: str):
+    # This test doesn't do anything, it's just here to ensure that calls with `extra_headers` don't cause errors, including type.
+    m = GroqModel('llama-3.3-70b-versatile', provider=GroqProvider(api_key=groq_api_key))
+    agent = Agent(m, model_settings=GroqModelSettings(extra_headers={'Extra-Header-Key': 'Extra-Header-Value'}))
+    await agent.run('hello')
+
+## tests/models/test_huggingface.py
+
+async def test_request_simple_usage(allow_model_requests: None, huggingface_api_key: str):
+    model = HuggingFaceModel(
+        'Qwen/Qwen2.5-72B-Instruct',
+        provider=HuggingFaceProvider(provider_name='nebius', api_key=huggingface_api_key),
+    )
+    agent = Agent(model)
+
+    result = await agent.run('Hello')
+    assert (
+        result.output
+        == "Hello! It's great to meet you. How can I assist you today? Whether you have any questions, need some advice, or just want to chat, feel free to let me know!"
+    )
+    assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=30, output_tokens=40))
+
+async def test_stream_completion(allow_model_requests: None):
+    stream = [text_chunk('hello '), text_chunk('world', finish_reason='stop')]
+    mock_client = MockHuggingFace.create_stream_mock(stream)
+    model = HuggingFaceModel('hf-model', provider=HuggingFaceProvider(hf_client=mock_client, api_key='x'))
+    agent = Agent(model)
+
+    async with agent.run_stream('') as result:
+        assert [c async for c in result.stream_text(debounce_by=None)] == snapshot(['hello ', 'hello world'])
+
+def test_model_status_error(allow_model_requests: None) -> None:
+    error = HfHubHTTPError(message='test_error', response=Mock(status_code=500, content={'error': 'test error'}))
+    mock_client = MockHuggingFace.create_mock(error)
+    m = HuggingFaceModel('not_a_model', provider=HuggingFaceProvider(hf_client=mock_client, api_key='x'))
+    agent = Agent(m)
+    with pytest.raises(ModelHTTPError) as exc_info:
+        agent.run_sync('hello')
+    assert str(exc_info.value) == snapshot("status_code: 500, model_name: not_a_model, body: {'error': 'test error'}")
+
+async def test_max_completion_tokens(allow_model_requests: None, model_name: str, huggingface_api_key: str):
+    m = HuggingFaceModel(model_name, provider=HuggingFaceProvider(provider_name='nebius', api_key=huggingface_api_key))
+    agent = Agent(m, model_settings=ModelSettings(max_tokens=100))
+
+    result = await agent.run('hello')
+    assert result.output == IsStr()
+
+def test_system_property():
+    model = HuggingFaceModel('some-model', provider=HuggingFaceProvider(hf_client=Mock(), api_key='x'))
+    assert model.system == 'huggingface'
+
+## tests/models/test_mcp_sampling.py
+
+def fake_session(create_message: Any) -> Any:
+    return FakeSession(create_message)
+
+## tests/models/test_mistral.py
+
+def func_chunk(
+    tool_calls: list[MistralToolCall], finish_reason: MistralCompletionResponseStreamChoiceFinishReason | None = None
+) -> MistralCompletionEvent:
+    return chunk([MistralDeltaMessage(tool_calls=tool_calls, role='assistant')], finish_reason=finish_reason)
+
+## tests/models/test_model_names.py
+
+    object: Literal['model']
+
+## tests/models/test_model_test.py
+
+def test_different_content_input(content: AudioUrl | VideoUrl | ImageUrl | BinaryContent):
+    agent = Agent()
+    result = agent.run_sync(['x', content], model=TestModel(custom_output_text='custom'))
+    assert result.output == snapshot('custom')
+    assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=1))
+
+## tests/models/test_openai.py
+
+async def test_extra_headers(allow_model_requests: None, openai_api_key: str):
+    # This test doesn't do anything, it's just here to ensure that calls with `extra_headers` don't cause errors, including type.
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))
+    agent = Agent(m, model_settings=OpenAIChatModelSettings(extra_headers={'Extra-Header-Key': 'Extra-Header-Value'}))
+    await agent.run('hello')
+
+def test_openai_model_profile():
+    m = OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key='foobar'))
+    assert isinstance(m.profile, OpenAIModelProfile)
+
+## tests/models/test_openrouter.py
+
+async def test_openrouter_usage(allow_model_requests: None, openrouter_api_key: str) -> None:
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('openai/gpt-5-mini', provider=provider)
+    agent = Agent(model, instructions='Be helpful.', retries=1)
+
+    result = await agent.run('Tell me about Venus')
+
+    assert result.usage() == snapshot(
+        RunUsage(input_tokens=17, output_tokens=1515, details={'reasoning_tokens': 704}, requests=1)
+    )
+
+    settings = OpenRouterModelSettings(openrouter_usage={'include': True})
+
+    result = await agent.run('Tell me about Mars', model_settings=settings)
+
+    assert result.usage() == snapshot(
+        RunUsage(
+            input_tokens=17,
+            output_tokens=2177,
+            details={'is_byok': 0, 'reasoning_tokens': 960, 'image_tokens': 0},
+            requests=1,
+        )
+    )
+
+    last_message = result.all_messages()[-1]
+
+    assert isinstance(last_message, ModelResponse)
+    assert last_message.provider_details is not None
+    for key in ['cost', 'upstream_inference_cost', 'is_byok']:
+        assert key in last_message.provider_details
+
+## tests/providers/test_alibaba_provider.py
+
+def test_alibaba_provider_env_key(env: TestEnv):
+    env.set('ALIBABA_API_KEY', 'env-key')
+    provider = AlibabaProvider()
+    assert provider.client.api_key == 'env-key'
+
+def test_alibaba_provider_dashscope_env_key(env: TestEnv):
+    env.remove('ALIBABA_API_KEY')
+    env.set('DASHSCOPE_API_KEY', 'dashscope-key')
+    provider = AlibabaProvider()
+    assert provider.client.api_key == 'dashscope-key'
+
+## tests/providers/test_deepseek.py
+
+def test_deep_seek_model_profile():
+    provider = DeepSeekProvider(api_key='api-key')
+    model = OpenAIChatModel('deepseek-r1', provider=provider)
+    assert model.profile.json_schema_transformer == OpenAIJsonSchemaTransformer
+
+## tests/providers/test_google_gla.py
+
+def test_api_key_env_var(env: TestEnv):
+    env.set('GEMINI_API_KEY', 'via-env-var')
+    provider = GoogleGLAProvider()
+    assert 'x-goog-api-key' in dict(provider.client.headers)
+
+## tests/providers/test_huggingface.py
+
+def test_huggingface_provider_pass_hf_client() -> None:
+    hf_client = AsyncInferenceClient(api_key='api-key')
+    provider = HuggingFaceProvider(hf_client=hf_client, api_key='api-key')
+    assert provider.client == hf_client
+
+def test_huggingface_provider_init_api_key_error(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv('HF_TOKEN', raising=False)
+    with pytest.raises(UserError, match='Set the `HF_TOKEN` environment variable'):
+        HuggingFaceProvider()
+
+def test_huggingface_provider_init_http_client_error():
+    with pytest.raises(ValueError, match='`http_client` is ignored'):
+        HuggingFaceProvider(api_key='key', http_client=Mock())  # type: ignore[call-overload]
+
+def test_huggingface_provider_init_base_url_and_provider_name_error():
+    with pytest.raises(ValueError, match='Cannot provide both `base_url` and `provider_name`'):
+        HuggingFaceProvider(api_key='key', base_url='url', provider_name='provider')  # type: ignore[call-overload]
+
+def test_huggingface_provider_init_with_hf_client():
+    mock_client = Mock(spec=AsyncInferenceClient)
+    provider = HuggingFaceProvider(hf_client=mock_client, api_key='key')
+    assert provider.client is mock_client
+
+def test_huggingface_provider_init_without_hf_client(MockAsyncInferenceClient: MagicMock):
+    provider = HuggingFaceProvider(api_key='key')
+    assert provider.client is MockAsyncInferenceClient.return_value
+    MockAsyncInferenceClient.assert_called_with(api_key='key', provider=None, base_url=None)
+
+def test_huggingface_provider_init_with_provider_name(MockAsyncInferenceClient: MagicMock):
+    HuggingFaceProvider(api_key='key', provider_name='test-provider')
+    MockAsyncInferenceClient.assert_called_once_with(api_key='key', provider='test-provider', base_url=None)
+
+def test_huggingface_provider_init_with_base_url(MockAsyncInferenceClient: MagicMock):
+    HuggingFaceProvider(api_key='key', base_url='test-url')
+    MockAsyncInferenceClient.assert_called_once_with(api_key='key', provider=None, base_url='test-url')
+
+def test_huggingface_provider_init_api_key_is_none(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv('HF_TOKEN', raising=False)
+    with pytest.raises(UserError):
+        HuggingFaceProvider(api_key=None)
+
+def test_huggingface_provider_base_url():
+    mock_client = Mock(spec=AsyncInferenceClient)
+    mock_client.model = 'test-model'
+    provider = HuggingFaceProvider(hf_client=mock_client, api_key='test-api-key')
+    assert provider.base_url == 'test-model'
+
+## tests/providers/test_sambanova_provider.py
+
+def test_sambanova_provider_env_key(env: TestEnv):
+    env.set('SAMBANOVA_API_KEY', 'env-key')
+    provider = SambaNovaProvider()
+    assert provider.client.api_key == 'env-key'
+
+## tests/test_ag_ui.py
+
+def uuid_str() -> str:
+    """Generate a random UUID string."""
+    return uuid.uuid4().hex
+
+## tests/test_agent.py
+
+class UserContext:
+    location: str | None
+
+## tests/test_builtin_tools.py
+
+async def test_builtin_tools_not_supported_web_search(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[WebSearchTool()])
+
+    with pytest.raises(UserError):
+        await agent.run('What day is tomorrow?')
+
+async def test_builtin_tools_not_supported_code_execution(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[CodeExecutionTool()])
+
+    with pytest.raises(UserError):
+        await agent.run('What day is tomorrow?')
+
+async def test_builtin_tools_not_supported_file_search(model: Model, allow_model_requests: None):
+    agent = Agent(model=model, builtin_tools=[FileSearchTool(file_store_ids=['test-id'])])
+
+    with pytest.raises(UserError):
+        await agent.run('Search my files')
+
+## tests/test_cli.py
+
+def test_code_theme_unset(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+    cli([])
+    mock_run_chat.assert_awaited_once_with(True, IsInstance(Agent), IsInstance(Console), 'monokai', 'clai')
+
+def test_code_theme_light(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+    cli(['--code-theme=light'])
+    mock_run_chat.assert_awaited_once_with(True, IsInstance(Agent), IsInstance(Console), 'default', 'clai')
+
+def test_code_theme_dark(mocker: MockerFixture, env: TestEnv):
+    env.set('OPENAI_API_KEY', 'test')
+    mock_run_chat = mocker.patch('pydantic_ai._cli.run_chat')
+    cli(['--code-theme=dark'])
+    mock_run_chat.assert_awaited_once_with(True, IsInstance(Agent), IsInstance(Console), 'monokai', 'clai')
+
+## tests/test_dbos.py
+
+def workflow_raises(exc_type: type[Exception], exc_message: str) -> Iterator[None]:
+    """Helper for asserting that a DBOS workflow fails with the expected error."""
+    with pytest.raises(Exception) as exc_info:
+        yield
+    assert isinstance(exc_info.value, Exception)
+    assert str(exc_info.value) == exc_message
+
+class BasicSpan:
+    content: str
+    children: list[BasicSpan] = field(default_factory=list['BasicSpan'])
+    parent_id: int | None = field(repr=False, compare=False, default=None)
+
+async def test_dbos_agent_run(allow_model_requests: None, dbos: DBOS):
+    # Note: this runs as a DBOS workflow because we automatically wrap the run function.
+    result = await simple_dbos_agent.run('What is the capital of Mexico?')
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_dbos_agent_run_in_workflow_with_toolsets(allow_model_requests: None, dbos: DBOS):
+    # Since DBOS does not automatically wrap the tools in a workflow, and allows dynamic steps, we can pass in toolsets directly.
+    result = await simple_dbos_agent.run('What is the capital of Mexico?', toolsets=[FunctionToolset()])
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_custom_model_settings(allow_model_requests: None, dbos: DBOS):
+    result = await settings_dbos_agent.run('Give me those settings')
+    assert result.output == snapshot("{'max_tokens': 123, 'custom_setting': 'custom_value'}")
+
+## tests/test_deps.py
+
+class MyDeps:
+    foo: int
+    bar: int
+
+## tests/test_logfire.py
+
+def get_logfire_summary(capfire: CaptureLogfire) -> Callable[[], LogfireSummary]:
+    def get_summary() -> LogfireSummary:
+        return LogfireSummary(capfire)
+
+    return get_summary
+
+class WeatherInfo(BaseModel):
+    temperature: float
+    description: str
+
+## tests/test_mcp.py
+
+def model(openai_api_key: str) -> Model:
+    return OpenAIChatModel('gpt-4o', provider=OpenAIProvider(api_key=openai_api_key))
+
+async def test_agent_with_server_not_running(agent: Agent, allow_model_requests: None):
+    result = await agent.run('What is 0 degrees Celsius in Fahrenheit?')
+    assert result.output == snapshot('0 degrees Celsius is 32.0 degrees Fahrenheit.')
+
+def test_load_mcp_servers_with_non_string_values(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Test that non-string primitive values (int, bool, null) in nested structures are passed through unchanged."""
+    config = tmp_path / 'mcp.json'
+
+    # Create a config with environment variables and extra fields containing primitives
+    # The extra fields will be ignored during validation but go through _expand_env_vars
+    monkeypatch.setenv('PYTHON_CMD', 'python')
+    config.write_text(
+        '{"mcpServers": {"my_server": {"command": "${PYTHON_CMD}", "args": ["-m", "tests.mcp_server"], '
+        '"metadata": {"count": 42, "enabled": true, "value": null}}}}',
+        encoding='utf-8',
+    )
+
+    # This should successfully expand env vars and ignore the metadata field
+    servers = load_mcp_servers(config)
+
+    assert len(servers) == 1
+    server = servers[0]
+    assert isinstance(server, MCPServerStdio)
+    assert server.command == 'python'
+
+## tests/test_prefect.py
+
+async def test_prefect_agent_run(allow_model_requests: None) -> None:
+    """Test that agent.run() works (auto-wrapped as flow)."""
+    result = await simple_prefect_agent.run('What is the capital of Mexico?')
+    assert result.output == snapshot('The capital of Mexico is Mexico City.')
+
+async def test_prefect_agent_with_model_retry(allow_model_requests: None) -> None:
+    """Test that ModelRetry works correctly."""
+    result = await model_retry_prefect_agent.run('What is the weather in CDMX?')
+    assert 'sunny' in result.output.lower() or 'mexico city' in result.output.lower()
+
+async def test_custom_model_settings(allow_model_requests: None):
+    """Test that custom model settings are passed through correctly."""
+    result = await settings_prefect_agent.run('Give me those settings')
+    assert result.output == snapshot("{'max_tokens': 123, 'custom_setting': 'custom_value'}")
+
+## tests/test_streaming.py
+
+def _make_run_result(*, metadata: dict[str, Any] | None) -> AgentRunResult[str]:
+    state = GraphAgentState(metadata=metadata)
+    response_message = ModelResponse(parts=[TextPart('final')], model_name='test')
+    state.message_history.append(response_message)
+    return AgentRunResult('final', _state=state)
+
+## tests/test_ui.py
+
+class DummyUIRunInput(BaseModel):
+    messages: list[ModelMessage] = field(default_factory=list[ModelMessage])
+    tool_defs: list[ToolDefinition] = field(default_factory=list[ToolDefinition])
+    state: dict[str, Any] = field(default_factory=dict[str, Any])
+
+## tests/test_usage_limits.py
+
+def test_add_usages_with_none_detail_value():
+    """Test that None values in details are skipped when incrementing usage."""
+    usage = RunUsage(
+        requests=1,
+        input_tokens=10,
+        output_tokens=20,
+        details={'reasoning_tokens': 5},
+    )
+
+    # Create a usage with None in details (simulating model response with missing detail)
+    incr_usage = RunUsage(
+        requests=1,
+        input_tokens=5,
+        output_tokens=10,
+    )
+    # Manually set a None value in details to simulate edge case from model responses
+    incr_usage.details = {'reasoning_tokens': None, 'other_tokens': 10}  # type: ignore[dict-item]
+
+    result = usage + incr_usage
+    assert result == snapshot(
+        RunUsage(
+            requests=2,
+            input_tokens=15,
+            output_tokens=30,
+            details={'reasoning_tokens': 5, 'other_tokens': 10},
+        )
+    )

@@ -1,0 +1,1053 @@
+# tests/test_agent.py:6793-6878
+async def test_run_with_deferred_tool_results_errors():
+    agent = Agent('test')
+
+    message_history: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=['Hello', 'world'])])]
+
+    with pytest.raises(
+        UserError,
+        match='Tool call results were provided, but the message history does not contain a `ModelResponse`.',
+    ):
+        await agent.run(
+            'Hello again',
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(parts=[TextPart(content='Hello to you too!')]),
+    ]
+
+    with pytest.raises(
+        UserError,
+        match='Tool call results were provided, but the message history does not contain any unprocessed tool calls.',
+    ):
+        await agent.run(
+            'Hello again',
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(parts=[ToolCallPart(tool_name='say_hello')]),
+    ]
+
+    with pytest.raises(
+        UserError, match='Cannot provide a new user prompt when the message history contains unprocessed tool calls.'
+    ):
+        await agent.run('Hello', message_history=message_history)
+
+    with pytest.raises(UserError, match='Tool call results need to be provided for all deferred tool calls.'):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(),
+        )
+
+    with pytest.raises(UserError, match='Tool call results were provided, but the message history is empty.'):
+        await agent.run(
+            'Hello again',
+            deferred_tool_results=DeferredToolResults(approvals={'create_file': True}),
+        )
+
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Hello')]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(tool_name='run_me', tool_call_id='run_me'),
+                ToolCallPart(tool_name='run_me_too', tool_call_id='run_me_too'),
+                ToolCallPart(tool_name='defer_me', tool_call_id='defer_me'),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name='run_me', tool_call_id='run_me', content='Success'),
+                RetryPromptPart(tool_name='run_me_too', tool_call_id='run_me_too', content='Failure'),
+            ]
+        ),
+    ]
+
+    with pytest.raises(UserError, match="Tool call 'run_me' was already executed and its result cannot be overridden."):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(
+                calls={'run_me': 'Failure', 'defer_me': 'Failure'},
+            ),
+        )
+
+    with pytest.raises(
+        UserError, match="Tool call 'run_me_too' was already executed and its result cannot be overridden."
+    ):
+        await agent.run(
+            message_history=message_history,
+            deferred_tool_results=DeferredToolResults(
+                calls={'run_me_too': 'Success', 'defer_me': 'Failure'},
+            ),
+        )
+
+# tests/test_exceptions.py:70-74
+def test_tool_retry_error_str_with_string_content():
+    """Test that ToolRetryError uses string content as message automatically."""
+    part = RetryPromptPart(content='error from tool', tool_name='my_tool')
+    error = ToolRetryError(part)
+    assert str(error) == 'error from tool'
+
+# tests/test_vercel_ai.py:2731-2816
+async def test_adapter_dump_messages_with_retry_no_tool_name():
+    """Test dumping messages with retry prompts without tool_name (e.g., output validation errors)."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Give me a number')]),
+        ModelResponse(parts=[TextPart(content='Not a valid number')]),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content='Output validation failed: expected integer',
+                    # No tool_name - this is an output validation error, not a tool error
+                )
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Give me a number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Not a valid number', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'text',
+                        'text': """\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                        'state': 'done',
+                        'provider_metadata': None,
+                    }
+                ],
+            },
+        ]
+    )
+
+    # Verify roundtrip
+    # Note: This is a lossy conversion - RetryPromptPart without tool_call_id becomes a user text message.
+    # When loaded back, it creates a UserPromptPart instead of RetryPromptPart.
+    # So we check it's value and then replace it with the original RetryPromptPart to assert equality
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    assert reloaded_messages[2] == snapshot(
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content="""\
+Validation feedback:
+Output validation failed: expected integer
+
+Fix the errors and try again.\
+""",
+                    timestamp=IsDatetime(),
+                )
+            ]
+        )
+    )
+    # Get original tool_call_id and replace with original RetryPromptPart
+    original_retry = messages[2].parts[0]
+    assert isinstance(original_retry, RetryPromptPart)
+    reloaded_messages[2] = ModelRequest(
+        parts=[
+            RetryPromptPart(
+                content='Output validation failed: expected integer', tool_call_id=original_retry.tool_call_id
+            )
+        ]
+    )
+    _sync_timestamps(messages, reloaded_messages)
+    assert reloaded_messages == messages
+
+# tests/test_temporal.py:1647-1651
+class SimpleAgentWorkflowWithRunToolsets:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await simple_temporal_agent.run(prompt, toolsets=[FunctionToolset()])
+        return result.output  # pragma: no cover
+
+# tests/test_temporal.py:1734-1738
+class SimpleAgentWorkflowWithOverrideTools:
+    @workflow.run
+    async def run(self, prompt: str) -> None:
+        with simple_temporal_agent.override(tools=[get_weather]):
+            pass
+
+# tests/test_temporal.py:1705-1709
+class SimpleAgentWorkflowWithOverrideToolsets:
+    @workflow.run
+    async def run(self, prompt: str) -> None:
+        with simple_temporal_agent.override(toolsets=[FunctionToolset()]):
+            pass
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# pydantic_ai_slim/pydantic_ai/_agent_graph.py:30-30
+from .exceptions import ToolRetryError
+
+# tests/evals/test_evaluators.py:581-620
+async def test_import_errors():
+    with pytest.raises(
+        ImportError,
+        match='The `Python` evaluator has been removed for security reasons. See https://github.com/pydantic/pydantic-ai/pull/2808 for more details and a workaround.',
+    ):
+        from pydantic_evals.evaluators import Python  # pyright: ignore[reportUnusedImport]
+
+    with pytest.raises(
+        ImportError,
+        match='The `Python` evaluator has been removed for security reasons. See https://github.com/pydantic/pydantic-ai/pull/2808 for more details and a workaround.',
+    ):
+        from pydantic_evals.evaluators.common import Python  # pyright: ignore[reportUnusedImport] # noqa: F401
+
+    with pytest.raises(
+        ImportError,
+        match="cannot import name 'Foo' from 'pydantic_evals.evaluators'",
+    ):
+        from pydantic_evals.evaluators import Foo  # pyright: ignore[reportUnusedImport]
+
+    with pytest.raises(
+        ImportError,
+        match="cannot import name 'Foo' from 'pydantic_evals.evaluators.common'",
+    ):
+        from pydantic_evals.evaluators.common import Foo  # pyright: ignore[reportUnusedImport] # noqa: F401
+
+    with pytest.raises(
+        AttributeError,
+        match="module 'pydantic_evals.evaluators' has no attribute 'Foo'",
+    ):
+        import pydantic_evals.evaluators as _evaluators
+
+        _evaluators.Foo
+
+    with pytest.raises(
+        AttributeError,
+        match="module 'pydantic_evals.evaluators.common' has no attribute 'Foo'",
+    ):
+        import pydantic_evals.evaluators.common as _common
+
+        _common.Foo
+
+# tests/test_exceptions.py:77-87
+def test_tool_retry_error_str_with_error_details():
+    """Test that ToolRetryError formats ErrorDetails automatically."""
+    validation_error = ValidationError.from_exception_data(
+        'Test', [{'type': 'string_type', 'loc': ('name',), 'input': 123}]
+    )
+    part = RetryPromptPart(content=validation_error.errors(include_url=False), tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nname\n  Input should be a valid string [type=string_type, input_value=123]"
+    )
+
+# tests/test_temporal.py:1649-1651
+    async def run(self, prompt: str) -> str:
+        result = await simple_temporal_agent.run(prompt, toolsets=[FunctionToolset()])
+        return result.output  # pragma: no cover
+
+# tests/test_fastmcp.py:491-504
+    async def test_call_tool_with_error_behavior_model_retry(
+        self,
+        fastmcp_client: Client[FastMCPTransport],
+        run_context: RunContext[None],
+    ):
+        """Test tool call with error behavior set to model retry."""
+        toolset = FastMCPToolset(fastmcp_client, tool_error_behavior='model_retry')
+
+        async with toolset:
+            tools = await toolset.get_tools(run_context)
+            error_tool = tools['error_tool']
+
+            with pytest.raises(ModelRetry, match='This is a test error'):
+                await toolset.call_tool('error_tool', {}, run_context, error_tool)
+
+# tests/models/test_instrumented.py:1000-1045
+def test_messages_to_otel_events_serialization_errors():
+    class Foo:
+        def __repr__(self):
+            return 'Foo()'
+
+    class Bar:
+        def __repr__(self):
+            raise ValueError('error!')
+
+    messages = [
+        ModelResponse(parts=[ToolCallPart('tool', {'arg': Foo()}, tool_call_id='tool_call_id')]),
+        ModelRequest(parts=[ToolReturnPart('tool', Bar(), tool_call_id='return_tool_call_id')], timestamp=IsDatetime()),
+    ]
+
+    settings = InstrumentationSettings()
+    assert [InstrumentedModel.event_to_dict(e) for e in settings.messages_to_otel_events(messages)] == [
+        {
+            'body': "{'role': 'assistant', 'tool_calls': [{'id': 'tool_call_id', 'type': 'function', 'function': {'name': 'tool', 'arguments': {'arg': Foo()}}}]}",
+            'gen_ai.message.index': 0,
+            'event.name': 'gen_ai.assistant.message',
+        },
+        {
+            'body': 'Unable to serialize: error!',
+            'gen_ai.message.index': 1,
+            'event.name': 'gen_ai.tool.message',
+        },
+    ]
+    assert settings.messages_to_otel_messages(messages) == snapshot(
+        [
+            {
+                'role': 'assistant',
+                'parts': [{'type': 'tool_call', 'id': 'tool_call_id', 'name': 'tool', 'arguments': {'arg': 'Foo()'}}],
+            },
+            {
+                'role': 'user',
+                'parts': [
+                    {
+                        'type': 'tool_call_response',
+                        'id': 'return_tool_call_id',
+                        'name': 'tool',
+                        'result': 'Unable to serialize: error!',
+                    }
+                ],
+            },
+        ]
+    )
+
+# tests/test_temporal.py:1736-1738
+    async def run(self, prompt: str) -> None:
+        with simple_temporal_agent.override(tools=[get_weather]):
+            pass
+
+# tests/evals/test_dataset.py:903-909
+def test_serialization_errors(tmp_path: Path):
+    with pytest.raises(ValueError) as exc_info:
+        Dataset[TaskInput, TaskOutput, TaskMetadata].from_file(tmp_path / 'test_cases.abc')
+
+    assert str(exc_info.value) == snapshot(
+        "Could not infer format for filename 'test_cases.abc'. Use the `fmt` argument to specify the format."
+    )
+
+# tests/test_temporal.py:1707-1709
+    async def run(self, prompt: str) -> None:
+        with simple_temporal_agent.override(toolsets=[FunctionToolset()]):
+            pass
+
+# tests/models/test_openrouter.py:272-280
+async def test_openrouter_errors_raised(allow_model_requests: None, openrouter_api_key: str) -> None:
+    provider = OpenRouterProvider(api_key=openrouter_api_key)
+    model = OpenRouterModel('google/gemini-2.0-flash-exp:free', provider=provider)
+    agent = Agent(model, instructions='Be helpful.', retries=1)
+    with pytest.raises(ModelHTTPError) as exc_info:
+        await agent.run('Tell me a joke.')
+    assert str(exc_info.value) == snapshot(
+        "status_code: 429, model_name: google/gemini-2.0-flash-exp:free, body: {'code': 429, 'message': 'Provider returned error', 'metadata': {'provider_name': 'Google', 'raw': 'google/gemini-2.0-flash-exp:free is temporarily rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits: https://openrouter.ai/settings/integrations'}}"
+    )
+
+# tests/models/test_model_test.py:327-335
+def test_output_tool_retry_error_handled_with_custom_args():
+    class ResultModel(BaseModel):
+        x: int
+        y: str
+
+    agent = Agent('test', output_type=ResultModel, retries=2)
+
+    with pytest.raises(UnexpectedModelBehavior, match=r'Exceeded maximum retries \(2\) for output validation'):
+        agent.run_sync('Hello', model=TestModel(custom_output_args={'foo': 'a', 'bar': 1}))
+
+# tests/models/test_model_test.py:276-294
+def test_output_tool_retry_error_handled():
+    class OutputModel(BaseModel):
+        x: int
+        y: str
+
+    agent = Agent('test', output_type=OutputModel, retries=2)
+
+    call_count = 0
+
+    @agent.output_validator
+    def validate_output(ctx: RunContext[None], output: OutputModel) -> OutputModel:
+        nonlocal call_count
+        call_count += 1
+        raise ModelRetry('Fail')
+
+    with pytest.raises(UnexpectedModelBehavior, match=re.escape('Exceeded maximum retries (2) for output validation')):
+        agent.run_sync('Hello', model=TestModel())
+
+    assert call_count == 3
+
+# pydantic_ai_slim/pydantic_ai/_output.py:77-158
+async def execute_traced_output_function(
+    function_schema: _function_schema.FunctionSchema,
+    run_context: RunContext[AgentDepsT],
+    args: dict[str, Any],
+    wrap_validation_errors: bool = True,
+) -> Any:
+    """Execute an output function within a traced span with error handling.
+
+    This function executes the output function within an OpenTelemetry span for observability,
+    automatically records the function response, and handles ModelRetry exceptions by converting
+    them to ToolRetryError when wrap_validation_errors is True.
+
+    Args:
+        function_schema: The function schema containing the function to execute
+        run_context: The current run context containing tracing and tool information
+        args: Arguments to pass to the function
+        wrap_validation_errors: If True, wrap ModelRetry exceptions in ToolRetryError
+
+    Returns:
+        The result of the function execution
+
+    Raises:
+        ToolRetryError: When wrap_validation_errors is True and a ModelRetry is caught
+        ModelRetry: When wrap_validation_errors is False and a ModelRetry occurs
+    """
+    instrumentation_names = InstrumentationNames.for_version(run_context.instrumentation_version)
+    # Set up span attributes
+    tool_name = run_context.tool_name or getattr(function_schema.function, '__name__', 'output_function')
+    attributes = {
+        'gen_ai.tool.name': tool_name,
+        'logfire.msg': f'running output function: {tool_name}',
+    }
+    if run_context.tool_call_id:
+        attributes['gen_ai.tool.call.id'] = run_context.tool_call_id
+    if run_context.trace_include_content:
+        attributes[instrumentation_names.tool_arguments_attr] = to_json(args).decode()
+
+    attributes['logfire.json_schema'] = json.dumps(
+        {
+            'type': 'object',
+            'properties': {
+                **(
+                    {
+                        instrumentation_names.tool_arguments_attr: {'type': 'object'},
+                        instrumentation_names.tool_result_attr: {'type': 'object'},
+                    }
+                    if run_context.trace_include_content
+                    else {}
+                ),
+                'gen_ai.tool.name': {},
+                **({'gen_ai.tool.call.id': {}} if run_context.tool_call_id else {}),
+            },
+        }
+    )
+
+    with run_context.tracer.start_as_current_span(
+        instrumentation_names.get_output_tool_span_name(tool_name), attributes=attributes
+    ) as span:
+        try:
+            output = await function_schema.call(args, run_context)
+        except ModelRetry as r:
+            if wrap_validation_errors:
+                m = _messages.RetryPromptPart(
+                    content=r.message,
+                    tool_name=run_context.tool_name,
+                )
+                if run_context.tool_call_id:
+                    m.tool_call_id = run_context.tool_call_id  # pragma: no cover
+                raise ToolRetryError(m) from r
+            else:
+                raise
+
+        # Record response if content inclusion is enabled
+        if run_context.trace_include_content and span.is_recording():
+            from .models.instrumented import InstrumentedModel
+
+            span.set_attribute(
+                instrumentation_names.tool_result_attr,
+                output if isinstance(output, str) else json.dumps(InstrumentedModel.serialize_any(output)),
+            )
+
+        return output
+
+# tests/models/test_google.py:5035-5053
+async def test_google_api_errors_are_handled(
+    allow_model_requests: None,
+    google_provider: GoogleProvider,
+    mocker: MockerFixture,
+    error_class: Any,
+    error_response: dict[str, Any],
+    expected_status: int,
+):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    mocked_error = error_class(expected_status, error_response)
+    mocker.patch.object(model.client.aio.models, 'generate_content', side_effect=mocked_error)
+
+    agent = Agent(model=model)
+
+    with pytest.raises(ModelHTTPError) as exc_info:
+        await agent.run('This prompt will trigger the mocked error.')
+
+    assert exc_info.value.status_code == expected_status
+    assert error_response['error']['message'] in str(exc_info.value.body)
+
+# tests/test_exceptions.py:90-110
+def test_tool_retry_error_str_with_value_error_type():
+    """Test that ToolRetryError handles value_error type without ctx.error.
+
+    When ErrorDetails are serialized, the exception object in ctx is stripped.
+    This test ensures we handle error types that normally require ctx.error.
+    """
+    # Simulate serialized ErrorDetails where ctx.error has been stripped
+    error_details: list[ErrorDetails] = [
+        {
+            'type': 'value_error',
+            'loc': ('field',),
+            'msg': 'Value error, must not be foo',
+            'input': 'foo',
+        }
+    ]
+    part = RetryPromptPart(content=error_details, tool_name='my_tool')
+    error = ToolRetryError(part)
+
+    assert str(error) == (
+        "1 validation error for 'my_tool'\nfield\n  Value error, must not be foo [type=value_error, input_value='foo']"
+    )
+
+# tests/test_temporal.py:1579-1583
+class SimpleAgentWorkflowWithEventStreamHandler:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await simple_temporal_agent.run(prompt, event_stream_handler=simple_event_stream_handler)
+        return result.output  # pragma: no cover
+
+# tests/test_temporal.py:1541-1547
+class SimpleAgentWorkflowWithIter:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        async with simple_temporal_agent.iter(prompt) as run:
+            async for _ in run:
+                pass
+        return 'done'  # pragma: no cover
+
+# tests/test_fastmcp.py:310-324
+    async def test_call_tool_with_structured_content(
+        self,
+        fastmcp_toolset: FastMCPToolset[None],
+        run_context: RunContext[None],
+    ):
+        """Test tool call with structured content."""
+        async with fastmcp_toolset:
+            tools = await fastmcp_toolset.get_tools(run_context)
+            another_tool = tools['another_tool']
+
+            result = await fastmcp_toolset.call_tool(
+                name='another_tool', tool_args={'value': 3.14}, ctx=run_context, tool=another_tool
+            )
+
+            assert result == {'result': 'success', 'value': 3.14, 'doubled': 6.28}
+
+# pydantic_ai_slim/pydantic_ai/exceptions.py:201-208
+    def __init__(self, tool_retry: RetryPromptPart):
+        self.tool_retry = tool_retry
+        message = (
+            tool_retry.content
+            if not isinstance(tool_retry.content, str)
+            else self._format_error_details(tool_retry.content, tool_retry.tool_name)
+        )
+        super().__init__(message)
+
+# tests/test_temporal.py:1371-1375
+class SimpleAgentWorkflowWithRunSync:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = simple_temporal_agent.run_sync(prompt)
+        return result.output  # pragma: no cover
+
+# tests/test_vercel_ai.py:2365-2429
+async def test_adapter_dump_messages_with_tools():
+    """Test dumping messages with tool calls and returns."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Search for something')]),
+        ModelResponse(
+            parts=[
+                TextPart(content='Let me search for that.'),
+                ToolCallPart(
+                    tool_name='web_search',
+                    args={'query': 'test query'},
+                    tool_call_id='tool_123',
+                ),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name='web_search',
+                    content={'results': ['result1', 'result2']},
+                    tool_call_id='tool_123',
+                )
+            ]
+        ),
+        ModelResponse(parts=[TextPart(content='Here are the results.')]),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Search for something', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'Let me search for that.', 'state': 'done', 'provider_metadata': None},
+                    {
+                        'type': 'dynamic-tool',
+                        'tool_name': 'web_search',
+                        'tool_call_id': 'tool_123',
+                        'state': 'output-available',
+                        'input': '{"query":"test query"}',
+                        'output': '{"results":["result1","result2"]}',
+                        'call_provider_metadata': None,
+                        'preliminary': None,
+                    },
+                ],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {'type': 'text', 'text': 'Here are the results.', 'state': 'done', 'provider_metadata': None}
+                ],
+            },
+        ]
+    )
+
+# tests/models/test_mistral.py:1721-1879
+async def test_stream_tool_call_with_retry(allow_model_requests: None):
+    completion = [
+        [
+            chunk(
+                delta=[MistralDeltaMessage(role=MistralUnset(), content='', tool_calls=MistralUnset())],
+                finish_reason='tool_calls',
+            ),
+            func_chunk(
+                tool_calls=[
+                    MistralToolCall(
+                        id='1',
+                        function=MistralFunctionCall(arguments='{"loc_name": "San Fransisco"}', name='get_location'),
+                        type='function',
+                    )
+                ],
+                finish_reason='tool_calls',
+            ),
+        ],
+        [
+            func_chunk(
+                tool_calls=[
+                    MistralToolCall(
+                        id='2',
+                        function=MistralFunctionCall(arguments='{"loc_name": "London"}', name='get_location'),
+                        type='function',
+                    )
+                ],
+                finish_reason='tool_calls',
+            ),
+        ],
+        [
+            chunk(delta=[MistralDeltaMessage(role='assistant', content='', tool_calls=MistralUnset())]),
+            chunk(delta=[MistralDeltaMessage(role=MistralUnset(), content='final ', tool_calls=MistralUnset())]),
+            chunk(delta=[MistralDeltaMessage(role=MistralUnset(), content='response', tool_calls=MistralUnset())]),
+            chunk(
+                delta=[MistralDeltaMessage(role=MistralUnset(), content='', tool_calls=MistralUnset())],
+                finish_reason='stop',
+            ),
+        ],
+    ]
+
+    mock_client = MockMistralAI.create_stream_mock(completion)
+    model = MistralModel('mistral-large-latest', provider=MistralProvider(mistral_client=mock_client))
+    agent = Agent(model, instructions='this is the system prompt')
+
+    @agent.tool_plain
+    async def get_location(loc_name: str) -> str:
+        if loc_name == 'London':
+            return json.dumps({'lat': 51, 'lng': 0})
+        else:
+            raise ModelRetry('Wrong location, please try again')
+
+    async with agent.run_stream('User prompt value') as result:
+        assert not result.is_complete
+        v = [c async for c in result.stream_text(debounce_by=None)]
+        assert v == snapshot(['final ', 'final response'])
+        assert result.is_complete
+        assert result.timestamp() == IsNow(tz=timezone.utc)
+        assert result.usage().input_tokens == 7
+        assert result.usage().output_tokens == 7
+
+        # double check usage matches stream count
+        assert result.usage().output_tokens == 7
+
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(content='User prompt value', timestamp=IsNow(tz=timezone.utc)),
+                ],
+                instructions='this is the system prompt',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='get_location',
+                        args='{"loc_name": "San Fransisco"}',
+                        tool_call_id='1',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=2, output_tokens=2),
+                model_name='gpt-4',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='mistral',
+                provider_url='https://api.mistral.ai',
+                provider_details={
+                    'finish_reason': 'tool_calls',
+                    'timestamp': datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc),
+                },
+                provider_response_id='x',
+                finish_reason='tool_call',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Wrong location, please try again',
+                        tool_name='get_location',
+                        tool_call_id='1',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                instructions='this is the system prompt',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='get_location',
+                        args='{"loc_name": "London"}',
+                        tool_call_id='2',
+                    )
+                ],
+                usage=RequestUsage(input_tokens=1, output_tokens=1),
+                model_name='gpt-4',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='mistral',
+                provider_url='https://api.mistral.ai',
+                provider_details={
+                    'finish_reason': 'tool_calls',
+                    'timestamp': datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc),
+                },
+                provider_response_id='x',
+                finish_reason='tool_call',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='get_location',
+                        content='{"lat": 51, "lng": 0}',
+                        tool_call_id='2',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                instructions='this is the system prompt',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='final response')],
+                usage=RequestUsage(input_tokens=4, output_tokens=4),
+                model_name='gpt-4',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='mistral',
+                provider_url='https://api.mistral.ai',
+                provider_details={
+                    'finish_reason': 'stop',
+                    'timestamp': datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc),
+                },
+                provider_response_id='x',
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+# tests/test_temporal.py:1618-1622
+class SimpleAgentWorkflowWithRunModel:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await simple_temporal_agent.run(prompt, model=unregistered_model)
+        return result.output  # pragma: no cover
+
+# tests/test_vercel_ai.py:3903-3978
+async def test_adapter_dump_messages_tool_error_with_provider_metadata():
+    """Test dumping ToolCallPart with RetryPromptPart includes provider metadata with provider_name."""
+    messages = [
+        ModelRequest(parts=[UserPromptPart(content='Do task')]),
+        ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name='failing_tool',
+                    args={'x': 1},
+                    tool_call_id='tc_fail',
+                    id='call_fail_id',
+                    provider_name='google',
+                    provider_details={'attempt': 1},
+                ),
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content='Tool execution failed',
+                    tool_name='failing_tool',
+                    tool_call_id='tc_fail',
+                )
+            ]
+        ),
+    ]
+
+    ui_messages = VercelAIAdapter.dump_messages(messages)
+    ui_message_dicts = [msg.model_dump() for msg in ui_messages]
+
+    assert ui_message_dicts == snapshot(
+        [
+            {
+                'id': IsStr(),
+                'role': 'user',
+                'metadata': None,
+                'parts': [{'type': 'text', 'text': 'Do task', 'state': 'done', 'provider_metadata': None}],
+            },
+            {
+                'id': IsStr(),
+                'role': 'assistant',
+                'metadata': None,
+                'parts': [
+                    {
+                        'type': 'dynamic-tool',
+                        'tool_name': 'failing_tool',
+                        'tool_call_id': 'tc_fail',
+                        'state': 'output-error',
+                        'input': '{"x":1}',
+                        'error_text': """\
+Tool execution failed
+
+Fix the errors and try again.\
+""",
+                        'call_provider_metadata': {
+                            'pydantic_ai': {
+                                'id': 'call_fail_id',
+                                'provider_name': 'google',
+                                'provider_details': {'attempt': 1},
+                            }
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+
+    # Verify roundtrip
+    reloaded_messages = VercelAIAdapter.load_messages(ui_messages)
+    # Content will have changed for retry prompt part, so we set it back to the original value
+    retry_prompt_part = reloaded_messages[2].parts[0]
+    assert isinstance(retry_prompt_part, RetryPromptPart)
+    assert retry_prompt_part.content == 'Tool execution failed\n\nFix the errors and try again.'
+    retry_prompt_part.content = 'Tool execution failed'
+    _sync_timestamps(messages, reloaded_messages)
+    assert reloaded_messages == messages
+
+# tests/test_temporal.py:1483-1488
+class SimpleAgentWorkflowWithRunStream:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        async with simple_temporal_agent.run_stream(prompt) as result:
+            pass
+        return await result.get_output()  # pragma: no cover
+
+# tests/models/test_huggingface.py:823-904
+async def test_retry_prompt_without_tool_name(allow_model_requests: None):
+    responses = [
+        completion_message(
+            ChatCompletionOutputMessage.parse_obj_as_instance({'content': 'invalid-response', 'role': 'assistant'})  # type: ignore
+        ),
+        completion_message(
+            ChatCompletionOutputMessage.parse_obj_as_instance({'content': 'final-response', 'role': 'assistant'})  # type: ignore
+        ),
+    ]
+
+    mock_client = MockHuggingFace.create_mock(responses)
+    model = HuggingFaceModel(
+        'test-model',
+        provider=HuggingFaceProvider(hf_client=mock_client, api_key='x'),
+    )
+    agent = Agent(model)
+
+    @agent.output_validator
+    def response_validator(value: str) -> str:
+        if value == 'invalid-response':
+            raise ModelRetry('Response is invalid')
+        return value
+
+    result = await agent.run('Hello')
+    assert result.output == 'final-response'
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Hello', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='invalid-response')],
+                model_name='hf-model',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='huggingface',
+                provider_url='https://api-inference.huggingface.co',
+                provider_details={
+                    'finish_reason': 'stop',
+                    'timestamp': datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc),
+                },
+                provider_response_id='123',
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Response is invalid',
+                        tool_name=None,
+                        tool_call_id=IsStr(),
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='final-response')],
+                model_name='hf-model',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_name='huggingface',
+                provider_url='https://api-inference.huggingface.co',
+                provider_details={
+                    'finish_reason': 'stop',
+                    'timestamp': datetime(2024, 1, 1, 0, 0, tzinfo=timezone.utc),
+                },
+                provider_response_id='123',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    kwargs = get_mock_chat_completion_kwargs(mock_client)[1]
+    messages = kwargs['messages']
+    assert {k: v for k, v in asdict(messages[-2]).items() if v is not None} == {
+        'role': 'assistant',
+        'content': 'invalid-response',
+    }
+    assert {k: v for k, v in asdict(messages[-1]).items() if v is not None} == {
+        'role': 'user',
+        'content': 'Validation feedback:\nResponse is invalid\n\nFix the errors and try again.',
+    }
+
+# tests/test_ag_ui.py:238-241
+async def simple_stream(messages: list[ModelMessage], agent_info: AgentInfo) -> AsyncIterator[str]:
+    """A simple function that returns a text response without tool calls."""
+    yield 'success '
+    yield '(no tool calls)'
+
+# tests/test_temporal.py:1763-1768
+class SimpleAgentWorkflowWithOverrideDeps:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        with simple_temporal_agent.override(deps=None):
+            result = await simple_temporal_agent.run(prompt)
+            return result.output
+
+# pydantic_ai_slim/pydantic_ai/toolsets/abstract.py:86-91
+    def label(self) -> str:
+        """The name of the toolset for use in error messages."""
+        label = self.__class__.__name__
+        if self.id:  # pragma: no branch
+            label += f' {self.id!r}'
+        return label
+
+# tests/test_temporal.py:1676-1680
+class SimpleAgentWorkflowWithOverrideModel:
+    @workflow.run
+    async def run(self, prompt: str) -> None:
+        with simple_temporal_agent.override(model=model):
+            pass
+
+# tests/test_temporal.py:1802-1806
+class AgentWorkflowWithSyncToolActivityDisabled:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await temporal_agent_with_sync_tool_activity_disabled.run(prompt)
+        return result.output  # pragma: no cover
+
+# pydantic_ai_slim/pydantic_ai/models/groq.py:664-664
+    message: str
+
+# tests/test_temporal.py:1513-1516
+class SimpleAgentWorkflowWithRunStreamEvents:
+    @workflow.run
+    async def run(self, prompt: str) -> list[AgentStreamEvent | AgentRunResultEvent]:
+        return [event async for event in simple_temporal_agent.run_stream_events(prompt)]
+
+# tests/test_agent.py:4611-4620
+def test_capture_run_messages_with_user_exception_does_not_contain_internal_errors() -> None:
+    """Test that user exceptions within capture_run_messages context have clean stack traces."""
+    agent = Agent('test')
+
+    try:
+        with capture_run_messages():
+            agent.run_sync('Hello')
+            raise ZeroDivisionError('division by zero')
+    except Exception as e:
+        assert e.__context__ is None
+
+# pydantic_ai_slim/pydantic_ai/toolsets/fastmcp.py:52-52
+ToolErrorBehavior = Literal['model_retry', 'error']
+
+# pydantic_ai_slim/pydantic_ai/toolsets/fastmcp.py:71-71
+    tool_error_behavior: Literal['model_retry', 'error']

@@ -1,0 +1,399 @@
+## pydantic_ai_slim/pydantic_ai/profiles/google.py
+
+class GoogleJsonSchemaTransformer(JsonSchemaTransformer):
+    """Transforms the JSON Schema from Pydantic to be suitable for Gemini.
+
+    Gemini supports [a subset of OpenAPI v3.0.3](https://ai.google.dev/gemini-api/docs/function-calling#function_declarations).
+    """
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        # Remove properties not supported by Gemini
+        schema.pop('$schema', None)
+        if (const := schema.pop('const', None)) is not None:
+            # Gemini doesn't support const, but it does support enum with a single value
+            schema['enum'] = [const]
+            # If type is not present, infer it from the const value for Gemini API compatibility
+            if 'type' not in schema:
+                if isinstance(const, str):
+                    schema['type'] = 'string'
+                elif isinstance(const, bool):
+                    # bool must be checked before int since bool is a subclass of int in Python
+                    schema['type'] = 'boolean'
+                elif isinstance(const, int):
+                    schema['type'] = 'integer'
+                elif isinstance(const, float):
+                    schema['type'] = 'number'
+        schema.pop('discriminator', None)
+        schema.pop('examples', None)
+
+        # Remove 'title' due to https://github.com/googleapis/python-genai/issues/1732
+        schema.pop('title', None)
+
+        type_ = schema.get('type')
+        if type_ == 'string' and (fmt := schema.pop('format', None)):
+            description = schema.get('description')
+            if description:
+                schema['description'] = f'{description} (format: {fmt})'
+            else:
+                schema['description'] = f'Format: {fmt}'
+
+        # Note: exclusiveMinimum/exclusiveMaximum are NOT yet supported
+        schema.pop('exclusiveMinimum', None)
+        schema.pop('exclusiveMaximum', None)
+
+        return schema
+
+## tests/evals/test_report_evaluators.py
+
+def _make_report_case(
+    name: str,
+    output: Any = None,
+    expected_output: Any = None,
+    labels: dict[str, Any] | None = None,
+    scores: dict[str, Any] | None = None,
+    assertions: dict[str, Any] | None = None,
+    metrics: dict[str, float | int] | None = None,
+    metadata: Any = None,
+) -> ReportCase[Any, Any, Any]:
+    from pydantic_evals.evaluators.evaluator import EvaluationResult
+    from pydantic_evals.evaluators.spec import EvaluatorSpec
+
+    _source = EvaluatorSpec(name='test', arguments=None)
+
+    def _make_eval_result(key: str, val: Any) -> Any:
+        return EvaluationResult(name=key, value=val, reason=None, source=_source)
+
+    return ReportCase(
+        name=name,
+        inputs={},
+        metadata=metadata,
+        expected_output=expected_output,
+        output=output,
+        metrics=metrics or {},
+        attributes={},
+        scores={k: _make_eval_result(k, v) for k, v in (scores or {}).items()},
+        labels={k: _make_eval_result(k, v) for k, v in (labels or {}).items()},
+        assertions={k: _make_eval_result(k, v) for k, v in (assertions or {}).items()},
+        task_duration=0.1,
+        total_duration=0.2,
+    )
+
+## tests/models/test_mcp_sampling.py
+
+def test_assistant_text_history():
+    result = CreateMessageResult(
+        role='assistant', content=TextContent(type='text', text='text content'), model='test-model'
+    )
+    create_message = AsyncMock(return_value=result)
+    agent = Agent(model=MCPSamplingModel(fake_session(create_message)), instructions='testing')
+
+    result = agent.run_sync('1')
+    result = agent.run_sync('2', message_history=result.all_messages())
+
+    assert result.output == snapshot('text content')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='1', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                instructions='testing',
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='text content')],
+                model_name='test-model',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[UserPromptPart(content='2', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                instructions='testing',
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='text content')],
+                model_name='test-model',
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+def test_assistant_text_history_complex():
+    history = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(content='1'),
+                UserPromptPart(content=['a string', BinaryContent(data=b'data', media_type='image/jpeg')]),
+                SystemPromptPart(content='system content'),
+            ],
+            timestamp=IsDatetime(),
+        ),
+        ModelResponse(
+            parts=[TextPart(content='text content')],
+            model_name='test-model',
+        ),
+    ]
+
+    result = CreateMessageResult(
+        role='assistant', content=TextContent(type='text', text='text content'), model='test-model'
+    )
+    create_message = AsyncMock(return_value=result)
+    agent = Agent(model=MCPSamplingModel(fake_session(create_message)))
+    result = agent.run_sync('1', message_history=history)
+    assert result.output == snapshot('text content')
+
+## tests/models/test_xai.py
+
+async def test_xai_reorders_tool_return_parts_by_tool_call_id(allow_model_requests: None):
+    response = create_response(
+        content='done',
+        usage=create_usage(prompt_tokens=20, completion_tokens=5),
+    )
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+
+    messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='Run tools')]),
+        ModelResponse(
+            parts=[
+                # Deliberately non-alphabetical order to ensure we don't sort tool results by name/content.
+                ToolCallPart(tool_name='tool_a', args='{}', tool_call_id='tool_a'),
+                ToolCallPart(tool_name='tool_c', args='{}', tool_call_id='tool_c'),
+                ToolCallPart(tool_name='tool_b', args='{}', tool_call_id='tool_b'),
+            ],
+            finish_reason='tool_call',
+        ),
+        # Intentionally shuffled: xAI expects tool results in the order the calls were requested.
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name='tool_b', content='tool_b', tool_call_id='tool_b'),
+                ToolReturnPart(tool_name='tool_a', content='tool_a', tool_call_id='tool_a'),
+                ToolReturnPart(tool_name='tool_c', content='tool_c', tool_call_id='tool_c'),
+            ]
+        ),
+    ]
+
+    await m.request(messages, model_settings=None, model_request_parameters=ModelRequestParameters())
+
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'Run tools'}], 'role': 'ROLE_USER'},
+                    {
+                        'content': [{'text': ''}],
+                        'role': 'ROLE_ASSISTANT',
+                        'tool_calls': [
+                            {
+                                'id': 'tool_a',
+                                'type': 'TOOL_CALL_TYPE_CLIENT_SIDE_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'tool_a', 'arguments': '{}'},
+                            },
+                            {
+                                'id': 'tool_c',
+                                'type': 'TOOL_CALL_TYPE_CLIENT_SIDE_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'tool_c', 'arguments': '{}'},
+                            },
+                            {
+                                'id': 'tool_b',
+                                'type': 'TOOL_CALL_TYPE_CLIENT_SIDE_TOOL',
+                                'status': 'TOOL_CALL_STATUS_COMPLETED',
+                                'function': {'name': 'tool_b', 'arguments': '{}'},
+                            },
+                        ],
+                    },
+                    {'content': [{'text': 'tool_a'}], 'role': 'ROLE_TOOL'},
+                    {'content': [{'text': 'tool_c'}], 'role': 'ROLE_TOOL'},
+                    {'content': [{'text': 'tool_b'}], 'role': 'ROLE_TOOL'},
+                ],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+async def test_xai_thinking_part_content_only_with_provider_in_history(allow_model_requests: None):
+    """Test ThinkingPart with content and provider_name but NO signature in history."""
+    # Create a response for the continuation
+    response = create_response(content='Got it', usage=create_usage(prompt_tokens=10, completion_tokens=5))
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    # Manually construct history with ThinkingPart that has content and provider_name='xai' but NO signature
+    # This triggers the branch where item.signature is falsy
+    message_history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content='First question')]),
+        ModelResponse(
+            parts=[
+                ThinkingPart(
+                    content='I am reasoning about this',
+                    signature=None,  # No signature - this is the key for branch coverage
+                    provider_name='xai',  # Must be 'xai' to enter the if block
+                ),
+                TextPart(content='First answer'),
+            ],
+            model_name=XAI_REASONING_MODEL,
+        ),
+    ]
+
+    await agent.run('Follow up', message_history=message_history)
+
+    # Verify kwargs - ThinkingPart with content only should map to reasoning_content without encrypted_content
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_REASONING_MODEL,
+                'messages': [
+                    {'content': [{'text': 'First question'}], 'role': 'ROLE_USER'},
+                    # ThinkingPart with content only → reasoning_content set, no encrypted_content
+                    {
+                        'content': [{'text': ''}],
+                        'reasoning_content': 'I am reasoning about this',
+                        'role': 'ROLE_ASSISTANT',
+                    },
+                    {'content': [{'text': 'First answer'}], 'role': 'ROLE_ASSISTANT'},
+                    {'content': [{'text': 'Follow up'}], 'role': 'ROLE_USER'},
+                ],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+## tests/test_agent.py
+
+def test_run_with_history_ending_on_model_request_and_no_user_prompt():
+    m = TestModel()
+    agent = Agent(m)
+
+    @agent.system_prompt(dynamic=True)
+    async def system_prompt(ctx: RunContext) -> str:
+        return f'System prompt: user prompt length = {len(ctx.prompt or [])}'
+
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                SystemPromptPart(content='System prompt', dynamic_ref=system_prompt.__qualname__),
+                UserPromptPart(content=['Hello', ImageUrl('https://example.com/image.jpg')]),
+                UserPromptPart(content='How goes it?'),
+            ],
+            instructions='Original instructions',
+        ),
+    ]
+
+    @agent.instructions
+    async def instructions(ctx: RunContext) -> str:
+        assert ctx.prompt == ['Hello', ImageUrl('https://example.com/image.jpg'), 'How goes it?']
+        return 'New instructions'
+
+    result = agent.run_sync(message_history=messages)
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    SystemPromptPart(
+                        content='System prompt: user prompt length = 3',
+                        timestamp=IsDatetime(),
+                        dynamic_ref=IsStr(),
+                    ),
+                    UserPromptPart(
+                        content=['Hello', ImageUrl(url='https://example.com/image.jpg', identifier='39cfc4')],
+                        timestamp=IsDatetime(),
+                    ),
+                    UserPromptPart(
+                        content='How goes it?',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                instructions='New instructions',
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='success (no tool calls)')],
+                usage=RequestUsage(input_tokens=61, output_tokens=4),
+                model_name='test',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+    assert result.new_messages() == result.all_messages()[-1:]
+
+## tests/test_history_processor.py
+
+async def test_history_processor_streaming_replaces_message_history(
+    function_model: FunctionModel, received_messages: list[ModelMessage]
+):
+    """Test that the history processor replaces the message history in the state."""
+
+    def process_previous_answers(messages: list[ModelMessage]) -> list[ModelMessage]:
+        # Keep the last message (last question) and add a new system prompt
+        return messages[-1:] + [ModelRequest(parts=[SystemPromptPart(content='Processed answer')])]
+
+    agent = Agent(function_model, history_processors=[process_previous_answers])
+
+    message_history = [
+        ModelRequest(parts=[UserPromptPart(content='Question 1')]),
+        ModelResponse(parts=[TextPart(content='Answer 1')]),
+        ModelRequest(parts=[UserPromptPart(content='Question 2')]),
+        ModelResponse(parts=[TextPart(content='Answer 2')]),
+    ]
+
+    with capture_run_messages() as captured_messages:
+        async with agent.run_stream('Question 3', message_history=message_history) as result:
+            async for _ in result.stream_text():
+                pass
+
+    assert received_messages == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Question 3',
+                        timestamp=IsDatetime(),
+                    ),
+                    SystemPromptPart(
+                        content='Processed answer',
+                        timestamp=IsDatetime(),
+                    ),
+                ],
+                timestamp=IsDatetime(),
+            )
+        ]
+    )
+    assert captured_messages == result.all_messages()
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Question 3', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[SystemPromptPart(content='Processed answer', timestamp=IsDatetime())],
+                timestamp=IsDatetime(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='hello')],
+                usage=RequestUsage(input_tokens=50, output_tokens=1),
+                model_name='function:capture_model_function:capture_model_stream_function',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.new_messages() == result.all_messages()[-2:]

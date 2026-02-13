@@ -1,0 +1,206 @@
+## examples/pydantic_ai_examples/evals/agent.py
+
+    now: datetime = field(default_factory=lambda: datetime.now().astimezone())
+
+## tests/test_messages.py
+
+def test_binary_image_requires_image_media_type():
+    # Valid image media type should work
+    img = BinaryImage(data=b'test', media_type='image/png')
+    assert img.is_image
+
+    # Non-image media type should raise
+    with pytest.raises(ValueError, match='`BinaryImage` must have a media type that starts with "image/"'):
+        BinaryImage(data=b'test', media_type='text/plain')
+
+def test_audio_url_invalid():
+    with pytest.raises(ValueError, match='Could not infer media type from audio URL: foobar.potato'):
+        AudioUrl('foobar.potato').media_type
+
+def test_image_url_invalid():
+    with pytest.raises(ValueError, match='Could not infer media type from image URL: foobar.potato'):
+        ImageUrl('foobar.potato').media_type
+
+    with pytest.raises(ValueError, match='Could not infer media type from image URL: foobar.potato'):
+        ImageUrl('foobar.potato').format
+
+def test_pre_usage_refactor_messages_deserializable():
+    # https://github.com/pydantic/pydantic-ai/pull/2378 changed the `ModelResponse` fields,
+    # but we as tell people to store those in the DB we want to be very careful not to break deserialization.
+    data = [
+        {
+            'parts': [
+                {
+                    'content': 'What is the capital of Mexico?',
+                    'timestamp': datetime.now(tz=timezone.utc),
+                    'part_kind': 'user-prompt',
+                }
+            ],
+            'instructions': None,
+            'kind': 'request',
+        },
+        {
+            'parts': [{'content': 'Mexico City.', 'part_kind': 'text'}],
+            'usage': {
+                'requests': 1,
+                'request_tokens': 13,
+                'response_tokens': 76,
+                'total_tokens': 89,
+                'details': None,
+            },
+            'model_name': 'gpt-5-2025-08-07',
+            'timestamp': datetime.now(tz=timezone.utc),
+            'kind': 'response',
+            'vendor_details': {
+                'finish_reason': 'STOP',
+            },
+            'vendor_id': 'chatcmpl-CBpEXeCfDAW4HRcKQwbqsRDn7u7C5',
+        },
+    ]
+    messages = ModelMessagesTypeAdapter.validate_python(data)
+    assert messages == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='What is the capital of Mexico?',
+                        timestamp=IsNow(tz=timezone.utc),
+                    )
+                ],
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Mexico City.')],
+                usage=RequestUsage(
+                    input_tokens=13,
+                    output_tokens=76,
+                    details={},
+                ),
+                model_name='gpt-5-2025-08-07',
+                timestamp=IsNow(tz=timezone.utc),
+                provider_details={'finish_reason': 'STOP'},
+                provider_response_id='chatcmpl-CBpEXeCfDAW4HRcKQwbqsRDn7u7C5',
+            ),
+        ]
+    )
+
+def test_file_part_has_content():
+    filepart = FilePart(content=BinaryContent(data=b'', media_type='application/pdf'))
+    assert not filepart.has_content()
+
+    filepart.content.data = b'not empty'
+    assert filepart.has_content()
+
+def test_file_part_serialization_roundtrip():
+    # Verify that a serialized BinaryImage doesn't come back as a BinaryContent.
+    messages: list[ModelMessage] = [
+        ModelResponse(parts=[FilePart(content=BinaryImage(data=b'fake', media_type='image/jpeg'))])
+    ]
+    serialized = ModelMessagesTypeAdapter.dump_python(messages, mode='json')
+    assert serialized == snapshot(
+        [
+            {
+                'parts': [
+                    {
+                        'content': {
+                            'data': 'ZmFrZQ==',
+                            'media_type': 'image/jpeg',
+                            'identifier': 'c053ec',
+                            'vendor_metadata': None,
+                            'kind': 'binary',
+                        },
+                        'id': None,
+                        'provider_name': None,
+                        'part_kind': 'file',
+                        'provider_details': None,
+                    }
+                ],
+                'usage': {
+                    'input_tokens': 0,
+                    'cache_write_tokens': 0,
+                    'cache_read_tokens': 0,
+                    'output_tokens': 0,
+                    'input_audio_tokens': 0,
+                    'cache_audio_read_tokens': 0,
+                    'output_audio_tokens': 0,
+                    'details': {},
+                },
+                'model_name': None,
+                'timestamp': IsStr(),
+                'kind': 'response',
+                'provider_name': None,
+                'provider_url': None,
+                'provider_details': None,
+                'provider_response_id': None,
+                'finish_reason': None,
+                'run_id': None,
+                'metadata': None,
+            }
+        ]
+    )
+    deserialized = ModelMessagesTypeAdapter.validate_python(serialized)
+    assert deserialized == messages
+
+def test_model_messages_type_adapter_preserves_run_id():
+    messages: list[ModelMessage] = [
+        ModelRequest(
+            parts=[UserPromptPart(content='Hi there', timestamp=datetime.now(tz=timezone.utc))],
+            run_id='run-123',
+            metadata={'key': 'value'},
+        ),
+        ModelResponse(parts=[TextPart(content='Hello!')], run_id='run-123', metadata={'key': 'value'}),
+    ]
+
+    serialized = ModelMessagesTypeAdapter.dump_python(messages, mode='python')
+    deserialized = ModelMessagesTypeAdapter.validate_python(serialized)
+
+    assert [message.run_id for message in deserialized] == snapshot(['run-123', 'run-123'])
+
+def test_model_response_convenience_methods():
+    response = ModelResponse(parts=[])
+    assert response.text == snapshot(None)
+    assert response.thinking == snapshot(None)
+    assert response.files == snapshot([])
+    assert response.images == snapshot([])
+    assert response.tool_calls == snapshot([])
+    assert response.builtin_tool_calls == snapshot([])
+
+    response = ModelResponse(
+        parts=[
+            ThinkingPart(content="Let's generate an image"),
+            ThinkingPart(content="And then, call the 'hello_world' tool"),
+            TextPart(content="I'm going to"),
+            TextPart(content=' generate an image'),
+            BuiltinToolCallPart(tool_name='image_generation', args={}, tool_call_id='123'),
+            FilePart(content=BinaryImage(data=b'fake', media_type='image/jpeg')),
+            BuiltinToolReturnPart(tool_name='image_generation', content={}, tool_call_id='123'),
+            TextPart(content="I'm going to call"),
+            TextPart(content=" the 'hello_world' tool"),
+            ToolCallPart(tool_name='hello_world', args={}, tool_call_id='123'),
+        ]
+    )
+    assert response.text == snapshot("""\
+I'm going to generate an image
+
+I'm going to call the 'hello_world' tool\
+""")
+    assert response.thinking == snapshot("""\
+Let's generate an image
+
+And then, call the 'hello_world' tool\
+""")
+    assert response.files == snapshot([BinaryImage(data=b'fake', media_type='image/jpeg', identifier='c053ec')])
+    assert response.images == snapshot([BinaryImage(data=b'fake', media_type='image/jpeg', identifier='c053ec')])
+    assert response.tool_calls == snapshot([ToolCallPart(tool_name='hello_world', args={}, tool_call_id='123')])
+    assert response.builtin_tool_calls == snapshot(
+        [
+            (
+                BuiltinToolCallPart(tool_name='image_generation', args={}, tool_call_id='123'),
+                BuiltinToolReturnPart(
+                    tool_name='image_generation',
+                    content={},
+                    tool_call_id='123',
+                    timestamp=IsDatetime(),
+                ),
+            )
+        ]
+    )

@@ -1,0 +1,756 @@
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    model_settings: ModelSettings | None
+
+    instrumentation_settings: InstrumentationSettings | None
+
+    async def _prepare_request(
+        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+    ) -> tuple[ModelSettings | None, models.ModelRequestParameters, list[_messages.ModelMessage], RunContext[DepsT]]:
+        self.request.timestamp = now_utc()
+        self.request.run_id = self.request.run_id or ctx.state.run_id
+        ctx.state.message_history.append(self.request)
+
+        ctx.state.run_step += 1
+
+        run_context = build_run_context(ctx)
+
+        # This will raise errors for any tool name conflicts
+        ctx.deps.tool_manager = await ctx.deps.tool_manager.for_run_step(run_context)
+
+        original_history = ctx.state.message_history[:]
+        message_history = await _process_message_history(original_history, ctx.deps.history_processors, run_context)
+        # `ctx.state.message_history` is the same list used by `capture_run_messages`, so we should replace its contents, not the reference
+        ctx.state.message_history[:] = message_history
+        # Update the new message index to ensure `result.new_messages()` returns the correct messages
+        ctx.deps.new_message_index -= len(original_history) - len(message_history)
+
+        # Merge possible consecutive trailing `ModelRequest`s into one, with tool call parts before user parts,
+        # but don't store it in the message history on state. This is just for the benefit of model classes that want clear user/assistant boundaries.
+        # See `tests/test_tools.py::test_parallel_tool_return_with_deferred` for an example where this is necessary
+        message_history = _clean_message_history(message_history)
+
+        model_request_parameters = await _prepare_request_parameters(ctx)
+
+        model_settings = ctx.deps.model_settings
+        usage = ctx.state.usage
+        if ctx.deps.usage_limits.count_tokens_before_request:
+            # Copy to avoid modifying the original usage object with the counted usage
+            usage = deepcopy(usage)
+
+            counted_usage = await ctx.deps.model.count_tokens(message_history, model_settings, model_request_parameters)
+            usage.incr(counted_usage)
+
+        ctx.deps.usage_limits.check_before_request(usage)
+
+        return model_settings, model_request_parameters, message_history, run_context
+
+## pydantic_ai_slim/pydantic_ai/_cli/__init__.py
+
+async def ask_agent(
+    agent: AbstractAgent[AgentDepsT, OutputDataT],
+    prompt: str,
+    stream: bool,
+    console: Console,
+    code_theme: str,
+    deps: AgentDepsT = None,
+    messages: Sequence[ModelMessage] | None = None,
+    model_settings: ModelSettings | None = None,
+    usage_limits: _usage.UsageLimits | None = None,
+) -> list[ModelMessage]:
+    status = Status('[dim]Working on it…[/dim]', console=console)
+
+    if not stream:
+        with status:
+            result = await agent.run(prompt, message_history=messages, deps=deps)
+        content = str(result.output)
+        console.print(Markdown(content, code_theme=code_theme))
+        return result.all_messages()
+
+    with status, ExitStack() as stack:
+        async with agent.iter(
+            prompt, message_history=messages, deps=deps, model_settings=model_settings, usage_limits=usage_limits
+        ) as agent_run:
+            live = Live('', refresh_per_second=15, console=console, vertical_overflow='ellipsis')
+            async for node in agent_run:
+                if Agent.is_model_request_node(node):
+                    async with node.stream(agent_run.ctx) as handle_stream:
+                        status.stop()  # stopping multiple times is idempotent
+                        stack.enter_context(live)  # entering multiple times is idempotent
+
+                        async for content in handle_stream.stream_output(debounce_by=None):
+                            live.update(Markdown(str(content), code_theme=code_theme))
+
+        assert agent_run.result is not None
+        return agent_run.result.all_messages()
+
+## pydantic_ai_slim/pydantic_ai/_cli/web.py
+
+def run_web_command(
+    agent_path: str | None = None,
+    host: str = '127.0.0.1',
+    port: int = 7932,
+    models: list[str] = [],
+    tools: list[str] = [],
+    instructions: str | None = None,
+    default_model: str = 'openai:gpt-5',
+    html_source: str | None = None,
+) -> int:
+    """Run the web command to serve an agent via web UI.
+
+    If an agent is provided, its model and builtin tools are used as defaults.
+    CLI-specified models and tools are added on top. Duplicates are removed.
+
+    Args:
+        agent_path: Agent path in 'module:variable' format. If None, creates generic agent.
+        host: Host to bind the server to.
+        port: Port to bind the server to.
+        models: List of model strings (e.g., ['openai:gpt-5', 'anthropic:claude-sonnet-4-5']).
+        tools: List of builtin tool IDs (e.g., ['web_search', 'code_execution']).
+        instructions: System instructions passed as extra instructions to each agent run.
+        default_model: Default model to use when no agent or models are specified.
+        html_source: URL or file path for the chat UI HTML.
+    """
+    console = Console()
+
+    if agent_path:
+        agent = load_agent(agent_path)
+        if agent is None:
+            console.print(f'[red]Error: Could not load agent from {agent_path}[/red]')
+            return 1
+    else:
+        agent = Agent()
+
+    # Use default model if neither agent nor CLI specifies one
+    if agent.model is None and not models:
+        models = [default_model]
+
+    tool_instances: list[AbstractBuiltinTool] = []
+    for tool_id in tools:
+        tool_cls = BUILTIN_TOOL_TYPES.get(tool_id)
+        if tool_cls is None:
+            console.print(f'[yellow]Warning: Unknown tool "{tool_id}", skipping[/yellow]')
+            continue
+        if tool_id not in SUPPORTED_CLI_TOOL_IDS:
+            console.print(
+                f'[yellow]Warning: "{tool_id}" requires configuration and cannot be enabled via CLI, skipping[/yellow]'
+            )
+            continue
+        tool_instances.append(tool_cls())
+
+    app = create_web_app(
+        agent,
+        models=models or None,
+        builtin_tools=tool_instances,
+        instructions=instructions,
+        html_source=html_source,
+    )
+
+    agent_desc = agent_path or 'generic agent'
+    console.print(f'\n[green]Starting chat UI for {agent_desc}...[/green]')
+    console.print(f'Open your browser at: [link=http://{host}:{port}]http://{host}:{port}[/link]')
+    console.print('[dim]Press Ctrl+C to stop the server[/dim]\n')
+
+    try:
+        import uvicorn
+
+        uvicorn.run(app, host=host, port=port)
+        return 0
+    except KeyboardInterrupt:  # pragma: no cover
+        console.print('\n[dim]Server stopped.[/dim]')
+        return 0
+    except ImportError:  # pragma: no cover
+        console.print('[red]Error: uvicorn is required to run the chat UI[/red]')
+        console.print('[dim]Install it with: pip install uvicorn[/dim]')
+        return 1
+    except Exception as e:  # pragma: no cover
+        console.print(f'[red]Error starting server: {e}[/red]')
+        return 1
+
+## pydantic_ai_slim/pydantic_ai/ag_ui.py
+
+from .models import KnownModelName, Model
+
+## pydantic_ai_slim/pydantic_ai/agent/__init__.py
+
+    model_settings: ModelSettings | None
+
+    def to_web(
+        self,
+        *,
+        models: ModelsParam = None,
+        builtin_tools: list[AbstractBuiltinTool] | None = None,
+        deps: AgentDepsT = None,
+        model_settings: ModelSettings | None = None,
+        instructions: str | None = None,
+        html_source: str | Path | None = None,
+    ) -> Starlette:
+        """Create a Starlette app that serves a web chat UI for this agent.
+
+        This method returns a pre-configured Starlette application that provides a web-based
+        chat interface for interacting with the agent. By default, the UI is fetched from a
+        CDN and cached on first use.
+
+        The returned Starlette application can be mounted into a FastAPI app or run directly
+        with any ASGI server (uvicorn, hypercorn, etc.).
+
+        Note that the `deps` and `model_settings` will be the same for each request.
+        To provide different `deps` for each request use the lower-level adapters directly.
+
+        Args:
+            models: Additional models to make available in the UI. Can be:
+                - A sequence of model names/instances (e.g., `['openai:gpt-5', 'anthropic:claude-sonnet-4-5']`)
+                - A dict mapping display labels to model names/instances
+                  (e.g., `{'GPT 5': 'openai:gpt-5', 'Claude': 'anthropic:claude-sonnet-4-5'}`)
+                The agent's model is always included. Builtin tool support is automatically
+                determined from each model's profile.
+            builtin_tools: Additional builtin tools to make available in the UI.
+                The agent's configured builtin tools are always included. Tool labels
+                in the UI are derived from the tool's `label` property.
+            deps: Optional dependencies to use for all requests.
+            model_settings: Optional settings to use for all model requests.
+            instructions: Optional extra instructions to pass to each agent run.
+            html_source: Path or URL for the chat UI HTML. Can be:
+                - None (default): Fetches from CDN and caches locally
+                - A Path instance: Reads from the local file
+                - A URL string (http:// or https://): Fetches from the URL
+                - A file path string: Reads from the local file
+
+        Returns:
+            A configured Starlette application ready to be served (e.g., with uvicorn)
+
+        Example:
+            ```python
+            from pydantic_ai import Agent
+            from pydantic_ai.builtin_tools import WebSearchTool
+
+            agent = Agent('openai:gpt-5', builtin_tools=[WebSearchTool()])
+
+            # Simple usage - uses agent's model and builtin tools
+            app = agent.to_web()
+
+            # Or provide additional models for UI selection
+            app = agent.to_web(models=['openai:gpt-5', 'anthropic:claude-sonnet-4-5'])
+
+            # Then run with: uvicorn app:app --reload
+            ```
+        """
+        from ..ui._web import create_web_app
+
+        return create_web_app(
+            self,
+            models=models,
+            builtin_tools=builtin_tools,
+            deps=deps,
+            model_settings=model_settings,
+            instructions=instructions,
+            html_source=html_source,
+        )
+
+## pydantic_ai_slim/pydantic_ai/embeddings/wrapper.py
+
+    def settings(self) -> EmbeddingSettings | None:
+        """Get the settings from the wrapped embedding model."""
+        return self.wrapped.settings
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def settings(self) -> ModelSettings | None:
+        """Get the model settings."""
+        return self._settings
+
+## pydantic_ai_slim/pydantic_ai/models/function.py
+
+    model_settings: ModelSettings | None
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class TestModel(Model):
+    """A model specifically for testing purposes.
+
+    This will (by default) call all tools in the agent, then return a tool response if possible,
+    otherwise a plain response.
+
+    How useful this model is will vary significantly.
+
+    Apart from `__init__` derived by the `dataclass` decorator, all methods are private or match those
+    of the base class.
+    """
+
+    # NOTE: Avoid test discovery by pytest.
+    __test__ = False
+
+    call_tools: list[str] | Literal['all'] = 'all'
+    """List of tools to call. If `'all'`, all tools will be called."""
+    custom_output_text: str | None = None
+    """If set, this text is returned as the final output."""
+    custom_output_args: Any | None = None
+    """If set, these args will be passed to the output tool."""
+    seed: int = 0
+    """Seed for generating random data."""
+    last_model_request_parameters: ModelRequestParameters | None = field(default=None, init=False)
+    """The last ModelRequestParameters passed to the model in a request.
+
+    The ModelRequestParameters contains information about the function and output tools available during request handling.
+
+    This is set when a request is made, so will reflect the function tools from the last step of the last run.
+    """
+    _model_name: str = field(default='test', repr=False)
+    _system: str = field(default='test', repr=False)
+
+    def __init__(
+        self,
+        *,
+        call_tools: list[str] | Literal['all'] = 'all',
+        custom_output_text: str | None = None,
+        custom_output_args: Any | None = None,
+        seed: int = 0,
+        model_name: str = 'test',
+        profile: ModelProfileSpec | None = None,
+        settings: ModelSettings | None = None,
+    ):
+        """Initialize TestModel with optional settings and profile."""
+        self.call_tools = call_tools
+        self.custom_output_text = custom_output_text
+        self.custom_output_args = custom_output_args
+        self.seed = seed
+        self.last_model_request_parameters = None
+        self._model_name = model_name
+        self._system = 'test'
+        super().__init__(settings=settings, profile=profile)
+
+    async def request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        model_response.usage = _estimate_usage([*messages, model_response])
+        return model_response
+
+    @asynccontextmanager
+    async def request_stream(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+        run_context: RunContext[Any] | None = None,
+    ) -> AsyncIterator[StreamedResponse]:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        self.last_model_request_parameters = model_request_parameters
+
+        model_response = self._request(messages, model_settings, model_request_parameters)
+        yield TestStreamedResponse(
+            model_request_parameters=model_request_parameters,
+            _model_name=self._model_name,
+            _structured_response=model_response,
+            _messages=messages,
+            _provider_name=self._system,
+        )
+
+    @property
+    def model_name(self) -> str:
+        """The model name."""
+        return self._model_name
+
+    @property
+    def system(self) -> str:
+        """The model provider."""
+        return self._system
+
+    @classmethod
+    def supported_builtin_tools(cls) -> frozenset[type[AbstractBuiltinTool]]:
+        """TestModel supports all builtin tools for testing flexibility."""
+        return SUPPORTED_BUILTIN_TOOLS
+
+    def gen_tool_args(self, tool_def: ToolDefinition) -> Any:
+        return _JsonSchemaTestData(tool_def.parameters_json_schema, self.seed).generate()
+
+    def _get_tool_calls(self, model_request_parameters: ModelRequestParameters) -> list[tuple[str, ToolDefinition]]:
+        if self.call_tools == 'all':
+            return [(r.name, r) for r in model_request_parameters.function_tools]
+        else:
+            function_tools_lookup = {t.name: t for t in model_request_parameters.function_tools}
+            tools_to_call = (function_tools_lookup[name] for name in self.call_tools)
+            return [(r.name, r) for r in tools_to_call]
+
+    def _get_output(self, model_request_parameters: ModelRequestParameters) -> _WrappedTextOutput | _WrappedToolOutput:
+        if self.custom_output_text is not None:
+            assert model_request_parameters.output_mode != 'tool', (
+                'Plain response not allowed, but `custom_output_text` is set.'
+            )
+            assert self.custom_output_args is None, 'Cannot set both `custom_output_text` and `custom_output_args`.'
+            return _WrappedTextOutput(self.custom_output_text)
+        elif self.custom_output_args is not None:
+            assert model_request_parameters.output_tools is not None, (
+                'No output tools provided, but `custom_output_args` is set.'
+            )
+            output_tool = model_request_parameters.output_tools[0]
+
+            if k := output_tool.outer_typed_dict_key:
+                return _WrappedToolOutput({k: self.custom_output_args})
+            else:
+                return _WrappedToolOutput(self.custom_output_args)
+        elif model_request_parameters.allow_text_output:
+            return _WrappedTextOutput(None)
+        elif model_request_parameters.output_tools:
+            return _WrappedToolOutput(None)
+        else:
+            return _WrappedTextOutput(None)
+
+    def _request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        if model_request_parameters.builtin_tools:
+            raise UserError('TestModel does not support built-in tools')
+
+        tool_calls = self._get_tool_calls(model_request_parameters)
+        output_wrapper = self._get_output(model_request_parameters)
+        output_tools = model_request_parameters.output_tools
+
+        # if there are tools, the first thing we want to do is call all of them
+        if tool_calls and not any(isinstance(m, ModelResponse) for m in messages):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(name, self.gen_tool_args(args), tool_call_id=f'pyd_ai_tool_call_id__{name}')
+                    for name, args in tool_calls
+                ],
+                model_name=self._model_name,
+            )
+
+        if messages:  # pragma: no branch
+            last_message = messages[-1]
+            assert isinstance(last_message, ModelRequest), 'Expected last message to be a `ModelRequest`.'
+
+            # check if there are any retry prompts, if so retry them
+            new_retry_names = {p.tool_name for p in last_message.parts if isinstance(p, RetryPromptPart)}
+            if new_retry_names:
+                # Handle retries for both function tools and output tools
+                # Check function tools first
+                retry_parts: list[ModelResponsePart] = [
+                    ToolCallPart(name, self.gen_tool_args(args)) for name, args in tool_calls if name in new_retry_names
+                ]
+                # Check output tools
+                if output_tools:
+                    retry_parts.extend(
+                        [
+                            ToolCallPart(
+                                tool.name,
+                                output_wrapper.value
+                                if isinstance(output_wrapper, _WrappedToolOutput) and output_wrapper.value is not None
+                                else self.gen_tool_args(tool),
+                                tool_call_id=f'pyd_ai_tool_call_id__{tool.name}',
+                            )
+                            for tool in output_tools
+                            if tool.name in new_retry_names
+                        ]
+                    )
+                return ModelResponse(parts=retry_parts, model_name=self._model_name)
+
+        if isinstance(output_wrapper, _WrappedTextOutput):
+            if (response_text := output_wrapper.value) is None:
+                # build up details of tool responses
+                output: dict[str, Any] = {}
+                for message in messages:
+                    if isinstance(message, ModelRequest):
+                        for part in message.parts:
+                            if isinstance(part, ToolReturnPart):
+                                output[part.tool_name] = part.content
+                if output:
+                    return ModelResponse(
+                        parts=[TextPart(pydantic_core.to_json(output).decode())], model_name=self._model_name
+                    )
+                else:
+                    return ModelResponse(parts=[TextPart('success (no tool calls)')], model_name=self._model_name)
+            else:
+                return ModelResponse(parts=[TextPart(response_text)], model_name=self._model_name)
+        else:
+            assert output_tools, 'No output tools provided'
+            custom_output_args = output_wrapper.value
+            output_tool = output_tools[self.seed % len(output_tools)]
+            if custom_output_args is not None:
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            custom_output_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+            else:
+                response_args = self.gen_tool_args(output_tool)
+                return ModelResponse(
+                    parts=[
+                        ToolCallPart(
+                            output_tool.name,
+                            response_args,
+                            tool_call_id=f'pyd_ai_tool_call_id__{output_tool.name}',
+                        )
+                    ],
+                    model_name=self._model_name,
+                )
+
+## pydantic_ai_slim/pydantic_ai/settings.py
+
+def merge_model_settings(base: ModelSettings | None, overrides: ModelSettings | None) -> ModelSettings | None:
+    """Merge two sets of model settings, preferring the overrides.
+
+    A common use case is: merge_model_settings(<agent settings>, <run settings>)
+    """
+    # Note: we may want merge recursively if/when we add non-primitive values
+    if base and overrides:
+        return overrides | base
+    else:
+        return base or overrides
+
+## pydantic_ai_slim/pydantic_ai/ui/_web/api.py
+
+    id: str
+
+## tests/models/test_anthropic.py
+
+async def test_model_settings_reusable_with_beta_headers(allow_model_requests: None):
+    """Verify that model_settings with extra_headers can be reused across multiple runs.
+
+    This test ensures that the beta header extraction doesn't mutate the original model_settings,
+    allowing the same settings to be used for multiple agent runs.
+    """
+    c = completion_message(
+        [BetaTextBlock(text='Hello!', type='text')],
+        BetaUsage(input_tokens=5, output_tokens=10),
+    )
+    mock_client = MockAnthropic.create_mock(c)
+
+    model_settings = AnthropicModelSettings(extra_headers={'anthropic-beta': 'custom-feature-1, custom-feature-2'})
+
+    model = AnthropicModel(
+        'claude-sonnet-4-5',
+        provider=AnthropicProvider(anthropic_client=mock_client),
+        settings=model_settings,
+    )
+
+    agent = Agent(model)
+
+    # First run
+    await agent.run('Hello')
+
+    # Verify the original model_settings is not mutated
+    assert model_settings.get('extra_headers') == {'anthropic-beta': 'custom-feature-1, custom-feature-2'}
+
+    # Second run should work with the same beta headers
+    await agent.run('Hello again')
+
+    # Verify again after second run
+    assert model_settings.get('extra_headers') == {'anthropic-beta': 'custom-feature-1, custom-feature-2'}
+
+    # Verify both runs had the correct betas
+    all_kwargs = get_mock_chat_completion_kwargs(mock_client)
+    assert len(all_kwargs) == 2
+    for completion_kwargs in all_kwargs:
+        betas = completion_kwargs['betas']
+        assert 'custom-feature-1' in betas
+        assert 'custom-feature-2' in betas
+
+## tests/models/test_model_settings.py
+
+def test_settings_merge_hierarchy():
+    """Test the complete settings merge hierarchy: model -> agent -> run."""
+    # Create a function that captures the merged settings
+    captured_settings = None
+
+    def capture_settings(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+        nonlocal captured_settings
+        captured_settings = agent_info.model_settings
+        return ModelResponse(parts=[TextPart('captured')])
+
+    # Model settings (lowest priority)
+    model_settings = ModelSettings(max_tokens=100, temperature=0.5, top_p=0.8, seed=123)
+    model = FunctionModel(capture_settings, settings=model_settings)
+
+    # Agent settings (medium priority)
+    agent_settings = ModelSettings(
+        max_tokens=200,  # overrides model
+        temperature=0.6,  # overrides model
+        frequency_penalty=0.1,  # new setting
+    )
+    agent = Agent(model=model, model_settings=agent_settings)
+
+    # Run settings (highest priority)
+    run_settings = ModelSettings(
+        temperature=0.7,  # overrides agent and model
+        presence_penalty=0.2,  # new setting
+        seed=456,  # overrides model
+    )
+
+    # Run the agent
+    result = agent.run_sync('test', model_settings=run_settings)
+    assert result.output == 'captured'
+
+    # Verify the merged settings follow the correct precedence
+    assert captured_settings is not None
+    assert captured_settings['temperature'] == 0.7  # from run_settings
+    assert captured_settings['max_tokens'] == 200  # from agent_settings
+    assert captured_settings['top_p'] == 0.8  # from model_settings
+    assert captured_settings['seed'] == 456  # from run_settings
+    assert captured_settings['frequency_penalty'] == 0.1  # from agent_settings
+    assert captured_settings['presence_penalty'] == 0.2  # from run_settings
+
+## tests/models/test_openai.py
+
+async def test_openai_model_settings_temperature_ignored_on_gpt_5(allow_model_requests: None, openai_api_key: str):
+    m = OpenAIChatModel('gpt-5', provider=OpenAIProvider(api_key=openai_api_key))
+    agent = Agent(m)
+
+    with pytest.warns(UserWarning, match='Sampling parameters.*temperature.*not supported when reasoning is enabled'):
+        result = await agent.run('What is the capital of France?', model_settings=ModelSettings(temperature=0.0))
+    assert result.output == snapshot('Paris.')
+
+## tests/test_agent.py
+
+async def test_agent_run_metadata_kwarg_ignored_with_override() -> None:
+    agent = Agent(TestModel(custom_output_text='kwarg override output'), metadata={'env': 'base'})
+
+    with agent.override(metadata={'env': 'override', 'override_only': True}):
+        result = await agent.run('kwarg override prompt', metadata={'run_only': True})
+
+    assert result.metadata == {'env': 'override', 'override_only': True}
+
+## tests/test_cli.py
+
+def create_test_module():
+    def _create_test_module(**namespace: Any) -> None:
+        assert 'test_module' not in sys.modules
+
+        test_module = types.ModuleType('test_module')
+        for key, value in namespace.items():
+            setattr(test_module, key, value)
+
+        sys.modules['test_module'] = test_module
+
+    try:
+        yield _create_test_module
+    finally:
+        if 'test_module' in sys.modules:  # pragma: no branch
+            del sys.modules['test_module']
+
+def test_run_web_command_agent_with_model(
+    mocker: MockerFixture, create_test_module: Callable[..., None], capfd: CaptureFixture[str]
+):
+    """Test run_web_command uses agent's model when no -m flag provided."""
+
+    mock_uvicorn_run = mocker.patch('uvicorn.run')
+    mocker.patch('pydantic_ai._cli.web.create_web_app')
+
+    test_agent = Agent(TestModel(custom_output_text='test'))
+    create_test_module(custom_agent=test_agent)
+
+    result = run_web_command(agent_path='test_module:custom_agent')
+
+    assert result == 0
+    mock_uvicorn_run.assert_called_once()
+
+def test_run_web_command_generic_agent_no_model(mocker: MockerFixture, capfd: CaptureFixture[str]):
+    """Test run_web_command uses default model when no agent and no model provided."""
+    mock_uvicorn_run = mocker.patch('uvicorn.run')
+    mock_create_app = mocker.patch('pydantic_ai._cli.web.create_web_app')
+
+    result = run_web_command()
+
+    assert result == 0
+    mock_uvicorn_run.assert_called_once()
+    # Verify default model was passed
+    call_kwargs = mock_create_app.call_args.kwargs
+    assert call_kwargs['models'] == ['openai:gpt-5']
+
+## tests/test_dbos.py
+
+def return_settings(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+    return ModelResponse(parts=[TextPart(str(agent_info.model_settings))])
+
+settings_agent = Agent(return_settings_model, name='settings_agent')
+
+settings_dbos_agent = DBOSAgent(settings_agent)
+
+## tests/test_mcp.py
+
+def agent(model: Model, mcp_server: MCPServerStdio) -> Agent:
+    return Agent(model, toolsets=[mcp_server])
+
+## tests/test_prefect.py
+
+def return_settings(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+    return ModelResponse(parts=[TextPart(str(agent_info.model_settings))])
+
+settings_agent = Agent(function_model, name='settings_agent')
+
+settings_prefect_agent = PrefectAgent(settings_agent)
+
+async def test_custom_model_settings(allow_model_requests: None):
+    """Test that custom model settings are passed through correctly."""
+    result = await settings_prefect_agent.run('Give me those settings')
+    assert result.output == snapshot("{'max_tokens': 123, 'custom_setting': 'custom_value'}")
+
+## tests/test_settings.py
+
+def settings(request: pytest.FixtureRequest) -> tuple[type[ModelSettings], str]:
+    prefix_cls_name = request.param.replace('_', '')
+    try:
+        module = importlib.import_module(f'pydantic_ai.models.{prefix_cls_name}')
+    except ImportError:  # pragma: lax no cover
+        pytest.skip(f'{prefix_cls_name} is not installed')
+    capitalized_prefix = prefix_cls_name.capitalize().replace('Openai', 'OpenAI')
+    cls = getattr(module, capitalized_prefix + 'ModelSettings')
+    return cls, request.param
+
+## tests/test_temporal.py
+
+class SimpleAgentWorkflowWithRunModel:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await simple_temporal_agent.run(prompt, model=unregistered_model)
+        return result.output  # pragma: no cover
+
+    async def run(self, prompt: str) -> str:
+        result = await simple_temporal_agent.run(prompt, model=unregistered_model)
+        return result.output  # pragma: no cover
+
+def return_settings(messages: list[ModelMessage], agent_info: AgentInfo) -> ModelResponse:
+    return ModelResponse(parts=[TextPart(str(agent_info.model_settings))])
+
+settings_agent = Agent(return_settings_model, name='settings_agent')
+
+settings_temporal_agent = TemporalAgent(settings_agent, activity_config=BASE_ACTIVITY_CONFIG)
+
+class SettingsAgentWorkflow:
+    @workflow.run
+    async def run(self, prompt: str) -> str:
+        result = await settings_temporal_agent.run(prompt)
+        return result.output
+
+    async def run(self, prompt: str) -> str:
+        result = await settings_temporal_agent.run(prompt)
+        return result.output
+
+## tests/test_ui_web.py
+
+def test_agent_to_web_with_model_settings():
+    """Test to_web() accepts model_settings parameter."""
+    agent = Agent(TestModel())
+    settings = ModelSettings(temperature=0.5, max_tokens=100)
+
+    app = agent.to_web(model_settings=settings)
+    assert isinstance(app, Starlette)

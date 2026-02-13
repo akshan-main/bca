@@ -1,0 +1,1105 @@
+# httpx/_main.py:147-153
+def print_request_headers(request: httpcore.Request, http2: bool = False) -> None:
+    console = rich.console.Console()
+    http_text = format_request_headers(request, http2=http2)
+    syntax = rich.syntax.Syntax(http_text, "http", theme="ansi_dark", word_wrap=True)
+    console.print(syntax)
+    syntax = rich.syntax.Syntax("", "http", theme="ansi_dark", word_wrap=True)
+    console.print(syntax)
+
+# httpx/_models.py:607-608
+    def request(self, value: Request) -> None:
+        self._request = value
+
+# httpx/_auth.py:12-12
+from ._models import Cookies, Request, Response
+
+# httpx/_client.py:29-29
+from ._models import Cookies, Headers, Request, Response
+
+# httpx/_transports/asgi.py:5-5
+from .._models import Request, Response
+
+# httpx/_transports/base.py:6-6
+from .._models import Request, Response
+
+# httpx/_transports/default.py:55-55
+from .._models import Request, Response
+
+# httpx/_transports/mock.py:5-5
+from .._models import Request, Response
+
+# httpx/_transports/wsgi.py:8-8
+from .._models import Request, Response
+
+# httpx/_models.py:382-512
+class Request:
+    def __init__(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        stream: SyncByteStream | AsyncByteStream | None = None,
+        extensions: RequestExtensions | None = None,
+    ) -> None:
+        self.method = method.upper()
+        self.url = URL(url) if params is None else URL(url, params=params)
+        self.headers = Headers(headers)
+        self.extensions = {} if extensions is None else dict(extensions)
+
+        if cookies:
+            Cookies(cookies).set_cookie_header(self)
+
+        if stream is None:
+            content_type: str | None = self.headers.get("content-type")
+            headers, stream = encode_request(
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                boundary=get_multipart_boundary_from_content_type(
+                    content_type=content_type.encode(self.headers.encoding)
+                    if content_type
+                    else None
+                ),
+            )
+            self._prepare(headers)
+            self.stream = stream
+            # Load the request body, except for streaming content.
+            if isinstance(stream, ByteStream):
+                self.read()
+        else:
+            # There's an important distinction between `Request(content=...)`,
+            # and `Request(stream=...)`.
+            #
+            # Using `content=...` implies automatically populated `Host` and content
+            # headers, of either `Content-Length: ...` or `Transfer-Encoding: chunked`.
+            #
+            # Using `stream=...` will not automatically include *any*
+            # auto-populated headers.
+            #
+            # As an end-user you don't really need `stream=...`. It's only
+            # useful when:
+            #
+            # * Preserving the request stream when copying requests, eg for redirects.
+            # * Creating request instances on the *server-side* of the transport API.
+            self.stream = stream
+
+    def _prepare(self, default_headers: dict[str, str]) -> None:
+        for key, value in default_headers.items():
+            # Ignore Transfer-Encoding if the Content-Length has been set explicitly.
+            if key.lower() == "transfer-encoding" and "Content-Length" in self.headers:
+                continue
+            self.headers.setdefault(key, value)
+
+        auto_headers: list[tuple[bytes, bytes]] = []
+
+        has_host = "Host" in self.headers
+        has_content_length = (
+            "Content-Length" in self.headers or "Transfer-Encoding" in self.headers
+        )
+
+        if not has_host and self.url.host:
+            auto_headers.append((b"Host", self.url.netloc))
+        if not has_content_length and self.method in ("POST", "PUT", "PATCH"):
+            auto_headers.append((b"Content-Length", b"0"))
+
+        self.headers = Headers(auto_headers + self.headers.raw)
+
+    @property
+    def content(self) -> bytes:
+        if not hasattr(self, "_content"):
+            raise RequestNotRead()
+        return self._content
+
+    def read(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.Iterable)
+            self._content = b"".join(self.stream)
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    async def aread(self) -> bytes:
+        """
+        Read and return the request content.
+        """
+        if not hasattr(self, "_content"):
+            assert isinstance(self.stream, typing.AsyncIterable)
+            self._content = b"".join([part async for part in self.stream])
+            if not isinstance(self.stream, ByteStream):
+                # If a streaming request has been read entirely into memory, then
+                # we can replace the stream with a raw bytes implementation,
+                # to ensure that any non-replayable streams can still be used.
+                self.stream = ByteStream(self._content)
+        return self._content
+
+    def __repr__(self) -> str:
+        class_name = self.__class__.__name__
+        url = str(self.url)
+        return f"<{class_name}({self.method!r}, {url!r})>"
+
+    def __getstate__(self) -> dict[str, typing.Any]:
+        return {
+            name: value
+            for name, value in self.__dict__.items()
+            if name not in ["extensions", "stream"]
+        }
+
+    def __setstate__(self, state: dict[str, typing.Any]) -> None:
+        for name, value in state.items():
+            setattr(self, name, value)
+        self.extensions = {}
+        self.stream = UnattachedStream()
+
+# httpx/_exceptions.py:103-104
+    def request(self, request: Request) -> None:
+        self._request = request
+
+# httpx/_main.py:116-126
+def format_request_headers(request: httpcore.Request, http2: bool = False) -> str:
+    version = "HTTP/2" if http2 else "HTTP/1.1"
+    headers = [
+        (name.lower() if http2 else name, value) for name, value in request.headers
+    ]
+    method = request.method.decode("ascii")
+    target = request.url.target.decode("ascii")
+    lines = [f"{method} {target} {version}"] + [
+        f"{name.decode('ascii')}: {value.decode('ascii')}" for name, value in headers
+    ]
+    return "\n".join(lines)
+
+# httpx/_transports/default.py:136-215
+    def __init__(
+        self,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+        proxy: ProxyTypes | None = None,
+        uds: str | None = None,
+        local_address: str | None = None,
+        retries: int = 0,
+        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+    ) -> None:
+        import httpcore
+
+        proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
+        ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
+
+        if proxy is None:
+            self._pool = httpcore.ConnectionPool(
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                uds=uds,
+                local_address=local_address,
+                retries=retries,
+                socket_options=socket_options,
+            )
+        elif proxy.url.scheme in ("http", "https"):
+            self._pool = httpcore.HTTPProxy(
+                proxy_url=httpcore.URL(
+                    scheme=proxy.url.raw_scheme,
+                    host=proxy.url.raw_host,
+                    port=proxy.url.port,
+                    target=proxy.url.raw_path,
+                ),
+                proxy_auth=proxy.raw_auth,
+                proxy_headers=proxy.headers.raw,
+                ssl_context=ssl_context,
+                proxy_ssl_context=proxy.ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                socket_options=socket_options,
+            )
+        elif proxy.url.scheme in ("socks5", "socks5h"):
+            try:
+                import socksio  # noqa
+            except ImportError:  # pragma: no cover
+                raise ImportError(
+                    "Using SOCKS proxy, but the 'socksio' package is not installed. "
+                    "Make sure to install httpx using `pip install httpx[socks]`."
+                ) from None
+
+            self._pool = httpcore.SOCKSProxy(
+                proxy_url=httpcore.URL(
+                    scheme=proxy.url.raw_scheme,
+                    host=proxy.url.raw_host,
+                    port=proxy.url.port,
+                    target=proxy.url.raw_path,
+                ),
+                proxy_auth=proxy.raw_auth,
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+            )
+        else:  # pragma: no cover
+            raise ValueError(
+                "Proxy protocol must be either 'http', 'https', 'socks5', or 'socks5h',"
+                f" but got {proxy.url.scheme!r}."
+            )
+
+# httpx/_transports/default.py:280-359
+    def __init__(
+        self,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+        proxy: ProxyTypes | None = None,
+        uds: str | None = None,
+        local_address: str | None = None,
+        retries: int = 0,
+        socket_options: typing.Iterable[SOCKET_OPTION] | None = None,
+    ) -> None:
+        import httpcore
+
+        proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
+        ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
+
+        if proxy is None:
+            self._pool = httpcore.AsyncConnectionPool(
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                uds=uds,
+                local_address=local_address,
+                retries=retries,
+                socket_options=socket_options,
+            )
+        elif proxy.url.scheme in ("http", "https"):
+            self._pool = httpcore.AsyncHTTPProxy(
+                proxy_url=httpcore.URL(
+                    scheme=proxy.url.raw_scheme,
+                    host=proxy.url.raw_host,
+                    port=proxy.url.port,
+                    target=proxy.url.raw_path,
+                ),
+                proxy_auth=proxy.raw_auth,
+                proxy_headers=proxy.headers.raw,
+                proxy_ssl_context=proxy.ssl_context,
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+                socket_options=socket_options,
+            )
+        elif proxy.url.scheme in ("socks5", "socks5h"):
+            try:
+                import socksio  # noqa
+            except ImportError:  # pragma: no cover
+                raise ImportError(
+                    "Using SOCKS proxy, but the 'socksio' package is not installed. "
+                    "Make sure to install httpx using `pip install httpx[socks]`."
+                ) from None
+
+            self._pool = httpcore.AsyncSOCKSProxy(
+                proxy_url=httpcore.URL(
+                    scheme=proxy.url.raw_scheme,
+                    host=proxy.url.raw_host,
+                    port=proxy.url.port,
+                    target=proxy.url.raw_path,
+                ),
+                proxy_auth=proxy.raw_auth,
+                ssl_context=ssl_context,
+                max_connections=limits.max_connections,
+                max_keepalive_connections=limits.max_keepalive_connections,
+                keepalive_expiry=limits.keepalive_expiry,
+                http1=http1,
+                http2=http2,
+            )
+        else:  # pragma: no cover
+            raise ValueError(
+                "Proxy protocol must be either 'http', 'https', 'socks5', or 'socks5h',"
+                f" but got {proxy.url.scheme!r}."
+            )
+
+# httpx/_client.py:740-758
+    def _init_proxy_transport(
+        self,
+        proxy: Proxy,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+    ) -> BaseTransport:
+        return HTTPTransport(
+            verify=verify,
+            cert=cert,
+            trust_env=trust_env,
+            http1=http1,
+            http2=http2,
+            limits=limits,
+            proxy=proxy,
+        )
+
+# httpx/_client.py:1454-1472
+    def _init_proxy_transport(
+        self,
+        proxy: Proxy,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+    ) -> AsyncBaseTransport:
+        return AsyncHTTPTransport(
+            verify=verify,
+            cert=cert,
+            trust_env=trust_env,
+            http1=http1,
+            http2=http2,
+            limits=limits,
+            proxy=proxy,
+        )
+
+# httpx/_client.py:475-492
+    def _build_redirect_request(self, request: Request, response: Response) -> Request:
+        """
+        Given a request and a redirect response, return a new request that
+        should be used to effect the redirect.
+        """
+        method = self._redirect_method(request, response)
+        url = self._redirect_url(request, response)
+        headers = self._redirect_headers(request, url, method)
+        stream = self._redirect_stream(request, method)
+        cookies = Cookies(self.cookies)
+        return Request(
+            method=method,
+            url=url,
+            headers=headers,
+            cookies=cookies,
+            stream=stream,
+            extensions=request.extensions,
+        )
+
+# httpx/_client.py:718-738
+    def _init_transport(
+        self,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+        transport: BaseTransport | None = None,
+    ) -> BaseTransport:
+        if transport is not None:
+            return transport
+
+        return HTTPTransport(
+            verify=verify,
+            cert=cert,
+            trust_env=trust_env,
+            http1=http1,
+            http2=http2,
+            limits=limits,
+        )
+
+# httpx/_client.py:1432-1452
+    def _init_transport(
+        self,
+        verify: ssl.SSLContext | str | bool = True,
+        cert: CertTypes | None = None,
+        trust_env: bool = True,
+        http1: bool = True,
+        http2: bool = False,
+        limits: Limits = DEFAULT_LIMITS,
+        transport: AsyncBaseTransport | None = None,
+    ) -> AsyncBaseTransport:
+        if transport is not None:
+            return transport
+
+        return AsyncHTTPTransport(
+            verify=verify,
+            cert=cert,
+            trust_env=trust_env,
+            http1=http1,
+            http2=http2,
+            limits=limits,
+        )
+
+# httpx/_client.py:1594-1643
+    async def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `AsyncClient.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = await self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                await response.aread()
+
+            return response
+
+        except BaseException as exc:
+            await response.aclose()
+            raise exc
+
+# httpx/_client.py:879-928
+    def send(
+        self,
+        request: Request,
+        *,
+        stream: bool = False,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+    ) -> Response:
+        """
+        Send a request.
+
+        The request is sent as-is, unmodified.
+
+        Typically you'll want to build one with `Client.build_request()`
+        so that any client-level configuration is merged into the request,
+        but passing an explicit `httpx.Request()` is supported as well.
+
+        See also: [Request instances][0]
+
+        [0]: /advanced/clients/#request-instances
+        """
+        if self._state == ClientState.CLOSED:
+            raise RuntimeError("Cannot send a request, as the client has been closed.")
+
+        self._state = ClientState.OPENED
+        follow_redirects = (
+            self.follow_redirects
+            if isinstance(follow_redirects, UseClientDefault)
+            else follow_redirects
+        )
+
+        self._set_timeout(request)
+
+        auth = self._build_request_auth(request, auth)
+
+        response = self._send_handling_auth(
+            request,
+            auth=auth,
+            follow_redirects=follow_redirects,
+            history=[],
+        )
+        try:
+            if not stream:
+                response.read()
+
+            return response
+
+        except BaseException as exc:
+            response.close()
+            raise exc
+
+# httpx/_api.py:39-120
+def request(
+    method: str,
+    url: URL | str,
+    *,
+    params: QueryParamTypes | None = None,
+    content: RequestContent | None = None,
+    data: RequestData | None = None,
+    files: RequestFiles | None = None,
+    json: typing.Any | None = None,
+    headers: HeaderTypes | None = None,
+    cookies: CookieTypes | None = None,
+    auth: AuthTypes | None = None,
+    proxy: ProxyTypes | None = None,
+    timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+    follow_redirects: bool = False,
+    verify: ssl.SSLContext | str | bool = True,
+    trust_env: bool = True,
+) -> Response:
+    """
+    Sends an HTTP request.
+
+    **Parameters:**
+
+    * **method** - HTTP method for the new `Request` object: `GET`, `OPTIONS`,
+    `HEAD`, `POST`, `PUT`, `PATCH`, or `DELETE`.
+    * **url** - URL for the new `Request` object.
+    * **params** - *(optional)* Query parameters to include in the URL, as a
+    string, dictionary, or sequence of two-tuples.
+    * **content** - *(optional)* Binary content to include in the body of the
+    request, as bytes or a byte iterator.
+    * **data** - *(optional)* Form data to include in the body of the request,
+    as a dictionary.
+    * **files** - *(optional)* A dictionary of upload files to include in the
+    body of the request.
+    * **json** - *(optional)* A JSON serializable object to include in the body
+    of the request.
+    * **headers** - *(optional)* Dictionary of HTTP headers to include in the
+    request.
+    * **cookies** - *(optional)* Dictionary of Cookie items to include in the
+    request.
+    * **auth** - *(optional)* An authentication class to use when sending the
+    request.
+    * **proxy** - *(optional)* A proxy URL where all the traffic should be routed.
+    * **timeout** - *(optional)* The timeout configuration to use when sending
+    the request.
+    * **follow_redirects** - *(optional)* Enables or disables HTTP redirects.
+    * **verify** - *(optional)* Either `True` to use an SSL context with the
+    default CA bundle, `False` to disable verification, or an instance of
+    `ssl.SSLContext` to use a custom context.
+    * **trust_env** - *(optional)* Enables or disables usage of environment
+    variables for configuration.
+
+    **Returns:** `Response`
+
+    Usage:
+
+    ```
+    >>> import httpx
+    >>> response = httpx.request('GET', 'https://httpbin.org/get')
+    >>> response
+    <Response [200 OK]>
+    ```
+    """
+    with Client(
+        cookies=cookies,
+        proxy=proxy,
+        verify=verify,
+        timeout=timeout,
+        trust_env=trust_env,
+    ) as client:
+        return client.request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            auth=auth,
+            follow_redirects=follow_redirects,
+        )
+
+# httpx/_transports/base.py:9-9
+A = typing.TypeVar("A", bound="AsyncBaseTransport")
+
+# httpx/_transports/default.py:61-61
+A = typing.TypeVar("A", bound="AsyncHTTPTransport")
+
+# httpx/_utils.py:15-27
+def primitive_value_to_str(value: PrimitiveData) -> str:
+    """
+    Coerce a primitive data type into a string value.
+
+    Note that we prefer JSON-style 'true'/'false' for boolean values here.
+    """
+    if value is True:
+        return "true"
+    elif value is False:
+        return "false"
+    elif value is None:
+        return ""
+    return str(value)
+
+# httpx/_auth.py:193-222
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        if self._last_challenge:
+            request.headers["Authorization"] = self._build_auth_header(
+                request, self._last_challenge
+            )
+
+        response = yield request
+
+        if response.status_code != 401 or "www-authenticate" not in response.headers:
+            # If the response is not a 401 then we don't
+            # need to build an authenticated request.
+            return
+
+        for auth_header in response.headers.get_list("www-authenticate"):
+            if auth_header.lower().startswith("digest "):
+                break
+        else:
+            # If the response does not include a 'WWW-Authenticate: Digest ...'
+            # header, then we don't need to build an authenticated request.
+            return
+
+        self._last_challenge = self._parse_challenge(request, response, auth_header)
+        self._nonce_count = 1
+
+        request.headers["Authorization"] = self._build_auth_header(
+            request, self._last_challenge
+        )
+        if response.cookies:
+            Cookies(response.cookies).set_cookie_header(request=request)
+        yield request
+
+# httpx/_auth.py:135-137
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        request.headers["Authorization"] = self._auth_header
+        yield request
+
+# httpx/_auth.py:122-123
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        yield self._func(request)
+
+# httpx/_auth.py:157-167
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        auth_info = self._netrc_info.authenticators(request.url.host)
+        if auth_info is None or not auth_info[2]:
+            # The netrc file did not have authentication credentials for this host.
+            yield request
+        else:
+            # Build a basic auth header with credentials from the netrc file.
+            request.headers["Authorization"] = self._build_auth_header(
+                username=auth_info[0], password=auth_info[2]
+            )
+            yield request
+
+# httpx/_models.py:9-9
+import urllib.request
+
+# httpx/_client.py:1001-1034
+    def _send_single_request(self, request: Request) -> Response:
+        """
+        Sends a single request, without handling any redirections.
+        """
+        transport = self._transport_for_url(request.url)
+        start = time.perf_counter()
+
+        if not isinstance(request.stream, SyncByteStream):
+            raise RuntimeError(
+                "Attempted to send an async request with a sync Client instance."
+            )
+
+        with request_context(request=request):
+            response = transport.handle_request(request)
+
+        assert isinstance(response.stream, SyncByteStream)
+
+        response.request = request
+        response.stream = BoundSyncStream(
+            response.stream, response=response, start=start
+        )
+        self.cookies.extract_cookies(response)
+        response.default_encoding = self._default_encoding
+
+        logger.info(
+            'HTTP Request: %s %s "%s %d %s"',
+            request.method,
+            request.url,
+            response.http_version,
+            response.status_code,
+            response.reason_phrase,
+        )
+
+        return response
+
+# httpx/_decoders.py:208-214
+    def __init__(self, children: typing.Sequence[ContentDecoder]) -> None:
+        """
+        'children' should be a sequence of decoders in the order in which
+        each was applied.
+        """
+        # Note that we reverse the order for decoding.
+        self.children = list(reversed(children))
+
+# httpx/_client.py:1717-1749
+    async def _send_single_request(self, request: Request) -> Response:
+        """
+        Sends a single request, without handling any redirections.
+        """
+        transport = self._transport_for_url(request.url)
+        start = time.perf_counter()
+
+        if not isinstance(request.stream, AsyncByteStream):
+            raise RuntimeError(
+                "Attempted to send a sync request with an AsyncClient instance."
+            )
+
+        with request_context(request=request):
+            response = await transport.handle_async_request(request)
+
+        assert isinstance(response.stream, AsyncByteStream)
+        response.request = request
+        response.stream = BoundAsyncStream(
+            response.stream, response=response, start=start
+        )
+        self.cookies.extract_cookies(response)
+        response.default_encoding = self._default_encoding
+
+        logger.info(
+            'HTTP Request: %s %s "%s %d %s"',
+            request.method,
+            request.url,
+            response.http_version,
+            response.status_code,
+            response.reason_phrase,
+        )
+
+        return response
+
+# tests/client/test_auth.py:100-112
+    def auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        nonces = []
+
+        for index in range(self.repeat):
+            request.headers["Authorization"] = f"Repeat {index}"
+            response = yield request
+            nonces.append(response.headers["www-authenticate"])
+
+        key = ".".join(nonces)
+        request.headers["Authorization"] = f"Repeat {key}"
+        yield request
+
+# tests/client/test_auth.py:127-134
+    def auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        request.headers["Authorization"] = self.token
+        response = yield request
+        data = response.text
+        request.headers["Authorization"] = data
+        yield request
+
+# httpx/_models.py:1249-1255
+        def __init__(self, request: Request) -> None:
+            super().__init__(
+                url=str(request.url),
+                headers=dict(request.headers),
+                method=request.method,
+            )
+            self.request = request
+
+# httpx/_models.py:629-633
+    def url(self) -> URL:
+        """
+        Returns the URL for which the request was made.
+        """
+        return self.request.url
+
+# httpx/_auth.py:38-60
+    def auth_flow(self, request: Request) -> typing.Generator[Request, Response, None]:
+        """
+        Execute the authentication flow.
+
+        To dispatch a request, `yield` it:
+
+        ```
+        yield request
+        ```
+
+        The client will `.send()` the response back into the flow generator. You can
+        access it like so:
+
+        ```
+        response = yield request
+        ```
+
+        A `return` (or reaching the end of the generator) will result in the
+        client returning the last response obtained from the server.
+
+        You can dispatch as many requests as is necessary.
+        """
+        yield request
+
+# httpx/_client.py:1485-1540
+    async def request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Build and send a request.
+
+        Equivalent to:
+
+        ```python
+        request = client.build_request(...)
+        response = await client.send(request, ...)
+        ```
+
+        See `AsyncClient.build_request()`, `AsyncClient.send()`
+        and [Merging of configuration][0] for how the various parameters
+        are merged with client-level configuration.
+
+        [0]: /advanced/clients/#merging-of-configuration
+        """
+
+        if cookies is not None:  # pragma: no cover
+            message = (
+                "Setting per-request cookies=<...> is being deprecated, because "
+                "the expected behaviour on cookie persistence is ambiguous. Set "
+                "cookies directly on the client instance instead."
+            )
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        return await self.send(request, auth=auth, follow_redirects=follow_redirects)
+
+# tests/client/test_auth.py:147-152
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        with self._lock:
+            request.headers["Authorization"] = "sync-auth"
+        yield request
+
+# tests/client/test_auth.py:154-159
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> typing.AsyncGenerator[httpx.Request, httpx.Response]:
+        async with self._async_lock:
+            request.headers["Authorization"] = "async-auth"
+        yield request
+
+# httpx/_client.py:771-825
+    def request(
+        self,
+        method: str,
+        url: URL | str,
+        *,
+        content: RequestContent | None = None,
+        data: RequestData | None = None,
+        files: RequestFiles | None = None,
+        json: typing.Any | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        auth: AuthTypes | UseClientDefault | None = USE_CLIENT_DEFAULT,
+        follow_redirects: bool | UseClientDefault = USE_CLIENT_DEFAULT,
+        timeout: TimeoutTypes | UseClientDefault = USE_CLIENT_DEFAULT,
+        extensions: RequestExtensions | None = None,
+    ) -> Response:
+        """
+        Build and send a request.
+
+        Equivalent to:
+
+        ```python
+        request = client.build_request(...)
+        response = client.send(request, ...)
+        ```
+
+        See `Client.build_request()`, `Client.send()` and
+        [Merging of configuration][0] for how the various parameters
+        are merged with client-level configuration.
+
+        [0]: /advanced/clients/#merging-of-configuration
+        """
+        if cookies is not None:
+            message = (
+                "Setting per-request cookies=<...> is being deprecated, because "
+                "the expected behaviour on cookie persistence is ambiguous. Set "
+                "cookies directly on the client instance instead."
+            )
+            warnings.warn(message, DeprecationWarning, stacklevel=2)
+
+        request = self.build_request(
+            method=method,
+            url=url,
+            content=content,
+            data=data,
+            files=files,
+            json=json,
+            params=params,
+            headers=headers,
+            cookies=cookies,
+            timeout=timeout,
+            extensions=extensions,
+        )
+        return self.send(request, auth=auth, follow_redirects=follow_redirects)
+
+# httpx/_exceptions.py:265-268
+    def __init__(self, message: str, *, request: Request, response: Response) -> None:
+        super().__init__(message)
+        self.request = request
+        self.response = response
+
+# httpx/_exceptions.py:112-120
+    def __init__(self, message: str, *, request: Request | None = None) -> None:
+        super().__init__(message)
+        # At the point an exception is raised we won't typically have a request
+        # instance to associate it with.
+        #
+        # The 'request_context' context manager is used within the Client and
+        # Response methods in order to ensure that any raised exceptions
+        # have a `.request` property set on them.
+        self._request = request
+
+# httpx/_auth.py:119-120
+    def __init__(self, func: typing.Callable[[Request], Request]) -> None:
+        self._func = func
+
+# tests/client/test_cookies.py:34-46
+def test_set_per_request_cookie_is_deprecated() -> None:
+    """
+    Sending a request including a per-request cookie is deprecated.
+    """
+    url = "http://example.org/echo_cookies"
+    cookies = {"example-name": "example-value"}
+
+    client = httpx.Client(transport=httpx.MockTransport(get_and_set_cookies))
+    with pytest.warns(DeprecationWarning):
+        response = client.get(url, cookies=cookies)
+
+    assert response.status_code == 200
+    assert response.json() == {"cookies": "example-name=example-value"}
+
+# httpx/_models.py:1110-1115
+    def set_cookie_header(self, request: Request) -> None:
+        """
+        Sets an appropriate 'Cookie:' HTTP header on the `Request`.
+        """
+        urllib_request = self._CookieCompatRequest(request)
+        self.jar.add_cookie_header(urllib_request)
+
+# tests/client/test_auth.py:87-112
+class RepeatAuth(httpx.Auth):
+    """
+    A mock authentication scheme that requires clients to send
+    the request a fixed number of times, and then send a last request containing
+    an aggregation of nonces that the server sent in 'WWW-Authenticate' headers
+    of intermediate responses.
+    """
+
+    requires_request_body = True
+
+    def __init__(self, repeat: int) -> None:
+        self.repeat = repeat
+
+    def auth_flow(
+        self, request: httpx.Request
+    ) -> typing.Generator[httpx.Request, httpx.Response, None]:
+        nonces = []
+
+        for index in range(self.repeat):
+            request.headers["Authorization"] = f"Repeat {index}"
+            response = yield request
+            nonces.append(response.headers["www-authenticate"])
+
+        key = ".".join(nonces)
+        request.headers["Authorization"] = f"Repeat {key}"
+        yield request
+
+# httpx/_status_codes.py:67-71
+    def is_client_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 4xx status codes, `False` otherwise.
+        """
+        return 400 <= value <= 499
+
+# httpx/_status_codes.py:74-78
+    def is_server_error(cls, value: int) -> bool:
+        """
+        Returns `True` for 5xx status codes, `False` otherwise.
+        """
+        return 500 <= value <= 599
+
+# httpx/_status_codes.py:60-64
+    def is_redirect(cls, value: int) -> bool:
+        """
+        Returns `True` for 3xx status codes, `False` otherwise.
+        """
+        return 300 <= value <= 399
+
+# httpx/_status_codes.py:46-50
+    def is_informational(cls, value: int) -> bool:
+        """
+        Returns `True` for 1xx status codes, `False` otherwise.
+        """
+        return 100 <= value <= 199
+
+# httpx/_status_codes.py:53-57
+    def is_success(cls, value: int) -> bool:
+        """
+        Returns `True` for 2xx status codes, `False` otherwise.
+        """
+        return 200 <= value <= 299

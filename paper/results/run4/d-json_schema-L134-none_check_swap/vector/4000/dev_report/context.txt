@@ -1,0 +1,467 @@
+# tests/test_json_schema.py:55-89
+def test_schema_defs_not_modified():
+    """Test that the original schema $defs are not modified during transformation."""
+
+    # Create a concrete subclass for testing
+    class TestTransformer(JsonSchemaTransformer):
+        def transform(self, schema: dict[str, Any]) -> dict[str, Any]:
+            return schema
+
+    # Create a schema with $defs that should not be modified
+    original_schema = {
+        'type': 'object',
+        'properties': {'value': {'$ref': '#/$defs/TestUnion'}},
+        '$defs': {
+            'TestUnion': {
+                'anyOf': [
+                    {'type': 'string'},
+                    {'type': 'number'},
+                ],
+                'title': 'TestUnion',
+            }
+        },
+    }
+
+    # Keep a deepcopy to compare against later
+    original_schema_copy = deepcopy(original_schema)
+
+    # Transform the schema
+    transformer = TestTransformer(original_schema)
+    result = transformer.walk()
+
+    # Verify the original schema was not modified
+    assert original_schema == original_schema_copy
+
+    # Verify the result is correct
+    assert result == original_schema_copy
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:449-489
+def merge_json_schema_defs(schemas: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Merges the `$defs` from different JSON schemas into a single deduplicated `$defs`, handling name collisions of `$defs` that are not the same, and rewrites `$ref`s to point to the new `$defs`.
+
+    Returns a tuple of the rewritten schemas and a dictionary of the new `$defs`.
+    """
+    all_defs: dict[str, dict[str, Any]] = {}
+    rewritten_schemas: list[dict[str, Any]] = []
+
+    for schema in schemas:
+        if '$defs' not in schema:
+            rewritten_schemas.append(schema)
+            continue
+
+        schema = schema.copy()
+        defs = schema.pop('$defs', None)
+        schema_name_mapping: dict[str, str] = {}
+
+        # Process definitions and build mapping
+        for name, def_schema in defs.items():
+            if name not in all_defs:
+                all_defs[name] = def_schema
+                schema_name_mapping[name] = name
+            elif def_schema != all_defs[name]:
+                new_name = name
+                if title := schema.get('title'):
+                    new_name = f'{title}_{name}'
+
+                i = 1
+                original_new_name = new_name
+                new_name = f'{new_name}_{i}'
+                while new_name in all_defs:
+                    i += 1
+                    new_name = f'{original_new_name}_{i}'
+
+                all_defs[new_name] = def_schema
+                schema_name_mapping[name] = new_name
+
+        _update_mapped_json_schema_refs(schema, schema_name_mapping)
+        rewritten_schemas.append(schema)
+
+    return rewritten_schemas, all_defs
+
+# pydantic_ai_slim/pydantic_ai/output.py:296-360
+def StructuredDict(
+    json_schema: JsonSchemaValue, name: str | None = None, description: str | None = None
+) -> type[JsonSchemaValue]:
+    """Returns a `dict[str, Any]` subclass with a JSON schema attached that will be used for structured output.
+
+    Args:
+        json_schema: A JSON schema of type `object` defining the structure of the dictionary content.
+        name: Optional name of the structured output. If not provided, the `title` field of the JSON schema will be used if it's present.
+        description: Optional description of the structured output. If not provided, the `description` field of the JSON schema will be used if it's present.
+
+    Example:
+    ```python {title="structured_dict.py"}
+    from pydantic_ai import Agent, StructuredDict
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'name': {'type': 'string'},
+            'age': {'type': 'integer'}
+        },
+        'required': ['name', 'age']
+    }
+
+    agent = Agent('openai:gpt-5.2', output_type=StructuredDict(schema))
+    result = agent.run_sync('Create a person')
+    print(result.output)
+    #> {'name': 'John Doe', 'age': 30}
+    ```
+    """
+    json_schema = _utils.check_object_json_schema(json_schema)
+
+    # Pydantic `TypeAdapter` fails when `object.__get_pydantic_json_schema__` has `$defs`, so we inline them
+    # See https://github.com/pydantic/pydantic/issues/12145
+    if '$defs' in json_schema:
+        json_schema = InlineDefsJsonSchemaTransformer(json_schema).walk()
+        if '$defs' in json_schema:
+            raise exceptions.UserError(
+                '`StructuredDict` does not currently support recursive `$ref`s and `$defs`. See https://github.com/pydantic/pydantic/issues/12145 for more information.'
+            )
+
+    if name:
+        json_schema['title'] = name
+
+    if description:
+        json_schema['description'] = description
+
+    class _StructuredDict(JsonSchemaValue):
+        __is_model_like__ = True
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls, source_type: Any, handler: GetCoreSchemaHandler
+        ) -> core_schema.CoreSchema:
+            return core_schema.dict_schema(
+                keys_schema=core_schema.str_schema(),
+                values_schema=core_schema.any_schema(),
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, core_schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler
+        ) -> JsonSchemaValue:
+            return json_schema
+
+    return _StructuredDict
+
+# pydantic_ai_slim/pydantic_ai/_json_schema.py:53-55
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        """Make changes to the schema."""
+        return schema
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:421-440
+    def _object_gen(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """Generate data for a JSON Schema object."""
+        required = set(schema.get('required', []))
+
+        data: dict[str, Any] = {}
+        if properties := schema.get('properties'):
+            for key, value in properties.items():
+                if key in required:
+                    data[key] = self._gen_any(value)
+
+        if addition_props := schema.get('additionalProperties'):
+            add_prop_key = 'additionalProperty'
+            while add_prop_key in data:
+                add_prop_key += '_'
+            if addition_props is True:
+                data[add_prop_key] = self._char()
+            else:
+                data[add_prop_key] = self._gen_any(addition_props)
+
+        return data
+
+# pydantic_evals/pydantic_evals/dataset.py:778-825
+    def model_json_schema_with_evaluators(
+        cls,
+        custom_evaluator_types: Sequence[type[Evaluator[InputsT, OutputT, MetadataT]]] = (),
+        custom_report_evaluator_types: Sequence[type[ReportEvaluator[InputsT, OutputT, MetadataT]]] = (),
+    ) -> dict[str, Any]:
+        """Generate a JSON schema for this dataset type, including evaluator details.
+
+        This is useful for generating a schema that can be used to validate YAML-format dataset files.
+
+        Args:
+            custom_evaluator_types: Custom evaluator classes to include in the schema.
+            custom_report_evaluator_types: Custom report evaluator classes to include in the schema.
+
+        Returns:
+            A dictionary representing the JSON schema.
+        """
+        evaluator_schema_types = _build_evaluator_schema_types(
+            _get_evaluator_registry(custom_evaluator_types, Evaluator, DEFAULT_EVALUATORS, 'evaluator')
+        )
+        report_evaluator_schema_types = _build_evaluator_schema_types(
+            _get_evaluator_registry(
+                custom_report_evaluator_types, ReportEvaluator, DEFAULT_REPORT_EVALUATORS, 'report evaluator'
+            )
+        )
+
+        in_type, out_type, meta_type = cls._params()
+
+        # Note: we shadow the `Case` and `Dataset` class names here to generate a clean JSON schema
+        class Case(BaseModel, extra='forbid'):  # pyright: ignore[reportUnusedClass]  # this _is_ used below, but pyright doesn't seem to notice..
+            name: str | None = None
+            inputs: in_type  # pyright: ignore[reportInvalidTypeForm]
+            metadata: meta_type | None = None  # pyright: ignore[reportInvalidTypeForm]
+            expected_output: out_type | None = None  # pyright: ignore[reportInvalidTypeForm]
+            if evaluator_schema_types:  # pragma: no branch
+                evaluators: list[Union[tuple(evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
+
+        class Dataset(BaseModel, extra='forbid'):
+            name: str | None = None
+            cases: list[Case]
+            if evaluator_schema_types:  # pragma: no branch
+                evaluators: list[Union[tuple(evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
+            if report_evaluator_schema_types:  # pragma: no branch
+                report_evaluators: list[Union[tuple(report_evaluator_schema_types)]] = []  # pyright: ignore  # noqa: UP007
+
+        json_schema = Dataset.model_json_schema()
+        # See `_add_json_schema` below, since `$schema` is added to the JSON, it has to be supported in the JSON
+        json_schema['properties']['$schema'] = {'type': 'string'}
+        return json_schema
+
+# pydantic_ai_slim/pydantic_ai/_json_schema.py:192-199
+class InlineDefsJsonSchemaTransformer(JsonSchemaTransformer):
+    """Transforms the JSON Schema to inline $defs."""
+
+    def __init__(self, schema: JsonSchema, *, strict: bool | None = None):
+        super().__init__(schema, strict=strict, prefer_inlined_defs=True)
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        return schema
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:442-455
+    def _str_gen(self, schema: dict[str, Any]) -> str:
+        """Generate a string from a JSON Schema string."""
+        min_len = schema.get('minLength')
+        if min_len is not None:
+            return self._char() * min_len
+
+        if schema.get('maxLength') == 0:
+            return ''
+
+        if fmt := schema.get('format'):
+            if fmt == 'date':
+                return (date(2024, 1, 1) + timedelta(days=self.seed)).isoformat()
+
+        return self._char()
+
+# pydantic_ai_slim/pydantic_ai/models/mistral.py:438-488
+    def _get_python_type(cls, value: dict[str, Any]) -> str:
+        """Return a string representation of the Python type for a single JSON schema property.
+
+        This function handles recursion for nested arrays/objects and `anyOf`.
+        """
+        # 1) Handle anyOf first, because it's a different schema structure
+        if any_of := value.get('anyOf'):
+            # Simplistic approach: pick the first option in anyOf
+            # (In reality, you'd possibly want to merge or union types)
+            return f'Optional[{cls._get_python_type(any_of[0])}]'
+
+        # 2) If we have a top-level "type" field
+        value_type = value.get('type')
+        if not value_type:
+            # No explicit type; fallback
+            return 'Any'
+
+        # 3) Direct simple type mapping (string, integer, float, bool, None)
+        if value_type in SIMPLE_JSON_TYPE_MAPPING and value_type != 'array' and value_type != 'object':
+            return SIMPLE_JSON_TYPE_MAPPING[value_type]
+
+        # 4) Array: Recursively get the item type
+        if value_type == 'array':
+            items = value.get('items', {})
+            return f'list[{cls._get_python_type(items)}]'
+
+        # 5) Object: Check for additionalProperties
+        if value_type == 'object':
+            additional_properties = value.get('additionalProperties', {})
+            if isinstance(additional_properties, bool):
+                return 'bool'  # pragma: lax no cover
+            additional_properties_type = additional_properties.get('type')
+            if (
+                additional_properties_type in SIMPLE_JSON_TYPE_MAPPING
+                and additional_properties_type != 'array'
+                and additional_properties_type != 'object'
+            ):
+                # dict[str, bool/int/float/etc...]
+                return f'dict[str, {SIMPLE_JSON_TYPE_MAPPING[additional_properties_type]}]'
+            elif additional_properties_type == 'array':
+                array_items = additional_properties.get('items', {})
+                return f'dict[str, list[{cls._get_python_type(array_items)}]]'
+            elif additional_properties_type == 'object':
+                # nested dictionary of unknown shape
+                return 'dict[str, dict[str, Any]]'
+            else:
+                # If no additionalProperties type or something else, default to a generic dict
+                return 'dict[str, Any]'
+
+        # 6) Fallback
+        return 'Any'
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:385-419
+    def _gen_any(self, schema: dict[str, Any]) -> Any:
+        """Generate data for any JSON Schema."""
+        if const := schema.get('const'):
+            return const
+        elif enum := schema.get('enum'):
+            return enum[self.seed % len(enum)]
+        elif examples := schema.get('examples'):
+            return examples[self.seed % len(examples)]
+        elif ref := schema.get('$ref'):
+            key = re.sub(r'^#/\$defs/', '', ref)
+            js_def = self.defs[key]
+            return self._gen_any(js_def)
+        elif any_of := schema.get('anyOf'):
+            return self._gen_any(any_of[self.seed % len(any_of)])
+
+        type_ = schema.get('type')
+        if type_ is None:
+            # if there's no type or ref, we can't generate anything
+            return self._char()
+        elif type_ == 'object':
+            return self._object_gen(schema)
+        elif type_ == 'string':
+            return self._str_gen(schema)
+        elif type_ == 'integer':
+            return self._int_gen(schema)
+        elif type_ == 'number':
+            return float(self._int_gen(schema))
+        elif type_ == 'boolean':
+            return self._bool_gen()
+        elif type_ == 'array':
+            return self._array_gen(schema)
+        elif type_ == 'null':
+            return None
+        else:
+            raise NotImplementedError(f'Unknown type: {type_}, please submit a PR to extend JsonSchemaTestData!')
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:20-20
+    type: Literal['tool_call']
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:15-15
+    type: Literal['text']
+
+# pydantic_evals/pydantic_evals/dataset.py:828-845
+    def _save_schema(
+        cls,
+        path: Path | str,
+        custom_evaluator_types: Sequence[type[Evaluator[InputsT, OutputT, MetadataT]]] = (),
+        custom_report_evaluator_types: Sequence[type[ReportEvaluator[InputsT, OutputT, MetadataT]]] = (),
+    ):
+        """Save the JSON schema for this dataset type to a file.
+
+        Args:
+            path: Path to save the schema to.
+            custom_evaluator_types: Custom evaluator classes to include in the schema.
+            custom_report_evaluator_types: Custom report evaluator classes to include in the schema.
+        """
+        path = Path(path)
+        json_schema = cls.model_json_schema_with_evaluators(custom_evaluator_types, custom_report_evaluator_types)
+        schema_content = to_json(json_schema, indent=2).decode() + '\n'
+        if not path.exists() or path.read_text(encoding='utf-8') != schema_content:  # pragma: no branch
+            path.write_text(schema_content, encoding='utf-8')
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:47-47
+    type: Literal['thinking']
+
+# pydantic_evals/pydantic_evals/dataset.py:884-894
+    def _add_json_schema(self, nxt: SerializerFunctionWrapHandler, info: SerializationInfo) -> dict[str, Any]:
+        """Add the JSON schema path to the serialized output.
+
+        See <https://github.com/json-schema-org/json-schema-spec/issues/828> for context, that seems to be the nearest
+        there is to a spec for this.
+        """
+        context = cast(dict[str, Any] | None, info.context)
+        if isinstance(context, dict) and (schema := context.get('$schema')):
+            return {'$schema': schema} | nxt(self)
+        else:
+            return nxt(self)
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:484-509
+    def _array_gen(self, schema: dict[str, Any]) -> list[Any]:
+        """Generate an array from a JSON Schema array."""
+        data: list[Any] = []
+        unique_items = schema.get('uniqueItems')
+        if prefix_items := schema.get('prefixItems'):
+            for item in prefix_items:
+                data.append(self._gen_any(item))
+                if unique_items:
+                    self.seed += 1
+
+        items_schema = schema.get('items', {})
+        min_items = schema.get('minItems', 0)
+        if min_items > len(data):
+            for _ in range(min_items - len(data)):
+                data.append(self._gen_any(items_schema))
+                if unique_items:
+                    self.seed += 1
+        elif items_schema:
+            # if there is an `items` schema, add an item unless it would break `maxItems` rule
+            max_items = schema.get('maxItems')
+            if max_items is None or max_items > len(data):
+                data.append(self._gen_any(items_schema))
+                if unique_items:
+                    self.seed += 1
+
+        return data
+
+# pydantic_ai_slim/pydantic_ai/_json_schema.py:198-199
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        return schema
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:152-152
+    type: Annotated[str, Field(pattern=r'^tool-')]
+
+# pydantic_ai_slim/pydantic_ai/providers/anthropic.py:142-145
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        schema.pop('title', None)
+        schema.pop('$schema', None)
+        return schema
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:139-139
+    type: Annotated[str, Field(pattern=r'^tool-')]
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:192-192
+    type: Literal['dynamic-tool'] = 'dynamic-tool'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:90-90
+    type: Literal['tool-input-start'] = 'tool-input-start'
+
+# pydantic_evals/pydantic_evals/reporting/analyses.py:21-21
+    type: Literal['confusion_matrix'] = 'confusion_matrix'
+
+# pydantic_evals/pydantic_evals/reporting/analyses.py:52-52
+    type: Literal['precision_recall'] = 'precision_recall'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:78-78
+    type: Literal['file'] = 'file'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:128-128
+    type: Annotated[str, Field(pattern=r'^tool-')]
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:205-205
+    type: Literal['dynamic-tool'] = 'dynamic-tool'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:124-124
+    type: Literal['tool-input-available'] = 'tool-input-available'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py:136-136
+    type: Literal['tool-input-error'] = 'tool-input-error'
+
+# pydantic_evals/pydantic_evals/reporting/analyses.py:62-62
+    type: Literal['scalar'] = 'scalar'
+
+# pydantic_evals/pydantic_evals/reporting/analyses.py:73-73
+    type: Literal['table'] = 'table'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:27-27
+    type: Literal['text'] = 'text'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:67-67
+    type: Literal['source-document'] = 'source-document'
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:117-117
+    type: Annotated[str, Field(pattern=r'^tool-')]

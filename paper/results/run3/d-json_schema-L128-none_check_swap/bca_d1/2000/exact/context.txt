@@ -1,0 +1,226 @@
+## examples/pydantic_ai_examples/question_graph.py
+
+class Ask(BaseNode[QuestionState]):
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+    async def run(self, ctx: GraphRunContext[QuestionState]) -> Answer:
+        result = await ask_agent.run(
+            'Ask a simple question with a single correct answer.',
+            message_history=ctx.state.ask_agent_messages,
+        )
+        ctx.state.ask_agent_messages += result.all_messages()
+        ctx.state.question = result.output
+        return Answer(result.output)
+
+## pydantic_ai_slim/pydantic_ai/direct.py
+
+    def get(self) -> messages.ModelResponse:
+        """Build a ModelResponse from the data received from the stream so far."""
+        return self._ensure_stream_ready().get()
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def get(self) -> ModelResponse:
+        return self.response
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/temporal/_model.py
+
+    def get(self) -> ModelResponse:
+        return self.response
+
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+def tool_from_langchain(langchain_tool: LangChainTool) -> Tool:
+    """Creates a Pydantic AI tool proxy from a LangChain tool.
+
+    Args:
+        langchain_tool: The LangChain tool to wrap.
+
+    Returns:
+        A Pydantic AI tool that corresponds to the LangChain tool.
+    """
+    function_name = langchain_tool.name
+    function_description = langchain_tool.description
+    inputs = langchain_tool.args.copy()
+    required = sorted({name for name, detail in inputs.items() if 'default' not in detail})
+    schema: JsonSchemaValue = langchain_tool.get_input_jsonschema()
+    if 'additionalProperties' not in schema:
+        schema['additionalProperties'] = False
+    if required:
+        schema['required'] = required
+
+    defaults = {name: detail['default'] for name, detail in inputs.items() if 'default' in detail}
+
+    # restructures the arguments to match langchain tool run
+    def proxy(*args: Any, **kwargs: Any) -> str:
+        assert not args, 'This should always be called with kwargs'
+        kwargs = defaults | kwargs
+        return langchain_tool.run(kwargs)
+
+    return Tool.from_schema(
+        function=proxy,
+        name=function_name,
+        description=function_description,
+        json_schema=schema,
+    )
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def get(self) -> ModelResponse:
+        """Build a [`ModelResponse`][pydantic_ai.messages.ModelResponse] from the data received from the stream so far."""
+        return ModelResponse(
+            parts=self._parts_manager.get_parts(),
+            model_name=self.model_name,
+            timestamp=self.timestamp,
+            usage=self.usage(),
+            provider_name=self.provider_name,
+            provider_url=self.provider_url,
+            provider_response_id=self.provider_response_id,
+            provider_details=self.provider_details,
+            finish_reason=self.finish_reason,
+        )
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def get(self) -> _messages.ModelResponse:
+        """Get the current state of the response."""
+        return self._raw_stream_response.get()
+
+## tests/ext/test_langchain.py
+
+class SimulatedLangChainTool:
+    name: str
+    description: str
+    args: dict[str, dict[str, str]]
+    additional_properties_missing: bool = False
+
+    def run(
+        self,
+        tool_input: str | dict[str, Any],
+        verbose: bool | None = None,
+        start_color: str | None = 'green',
+        color: str | None = 'green',
+        callbacks: Any = None,
+        *,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        run_name: str | None = None,
+        run_id: Any | None = None,
+        config: Any | None = None,
+        tool_call_id: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        if isinstance(tool_input, dict):
+            tool_input = dict(sorted(tool_input.items()))
+        return f'I was called with {tool_input}'
+
+    def get_input_jsonschema(self) -> JsonSchemaValue:
+        if self.additional_properties_missing:
+            return {
+                'type': 'object',
+                'properties': self.args,
+            }
+        return {
+            'type': 'object',
+            'properties': self.args,
+            'additionalProperties': False,
+        }
+
+def test_langchain_tool_no_additional_properties():
+    langchain_tool = SimulatedLangChainTool(
+        name='file_search',
+        description='Recursively search for files in a subdirectory that match the regex pattern',
+        args={
+            'dir_path': {
+                'default': '.',
+                'description': 'Subdirectory to search in.',
+                'title': 'Dir Path',
+                'type': 'string',
+            },
+            'pattern': {
+                'description': 'Unix shell regex, where * matches everything.',
+                'title': 'Pattern',
+                'type': 'string',
+            },
+        },
+        additional_properties_missing=True,
+    )
+    pydantic_tool = tool_from_langchain(langchain_tool)
+
+    agent = Agent('test', tools=[pydantic_tool], retries=7)
+    result = agent.run_sync('foobar')
+    assert result.output == snapshot("{\"file_search\":\"I was called with {'dir_path': '.', 'pattern': 'a'}\"}")
+
+## tests/models/test_gemini.py
+
+async def test_gemini_additional_properties_is_false(allow_model_requests: None, gemini_api_key: str):
+    m = GeminiModel('gemini-2.0-flash', provider=GoogleGLAProvider(api_key=gemini_api_key))
+    agent = Agent(m)
+
+    @agent.tool_plain
+    async def get_temperature(location: CurrentLocation) -> float:  # pragma: no cover
+        return 20.0
+
+    result = await agent.run('What is the temperature in Tokyo?')
+    assert result.output == snapshot(
+        'I need the country to find the temperature in Tokyo. Could you please tell me which country Tokyo is in?\n'
+    )
+
+async def test_gemini_additional_properties_is_true(allow_model_requests: None, gemini_api_key: str):
+    """Test that additionalProperties with schemas now work natively (no warning since Nov 2025 announcement)."""
+    m = GeminiModel('gemini-2.5-flash', provider=GoogleGLAProvider(api_key=gemini_api_key))
+    agent = Agent(m)
+
+    @agent.tool_plain
+    async def get_temperature(location: dict[str, CurrentLocation]) -> float:  # pragma: no cover
+        return 20.0
+
+    result = await agent.run('What is the temperature in Tokyo?')
+    assert result.output == snapshot(
+        "I'm sorry, I'm having trouble getting the temperature for Tokyo. Can you please try again?"
+    )
+
+## tests/models/test_google.py
+
+async def test_google_dict_with_additional_properties_native_output(
+    allow_model_requests: None, google_provider: GoogleProvider
+):
+    """Test dicts with additionalProperties using gemini-2.5-flash."""
+    m = GoogleModel('gemini-2.5-flash', provider=google_provider)
+
+    class ConfigResponse(BaseModel):
+        """A response with configuration metadata."""
+
+        name: str
+        metadata: dict[str, str]
+
+    agent = Agent(m, output_type=NativeOutput(ConfigResponse))
+
+    result = await agent.run('Create a config named "api-config" with metadata author="Alice" and version="1.0"')
+    assert result.output.name == snapshot('api-config')
+    assert result.output.metadata == snapshot({'author': 'Alice', 'version': '1.0'})
+
+async def test_google_dict_with_additional_properties_native_output_gemini_2_0(
+    allow_model_requests: None, google_provider: GoogleProvider
+):
+    """Test dicts with additionalProperties using gemini-2.0-flash."""
+    m = GoogleModel('gemini-2.0-flash', provider=google_provider)
+
+    class ConfigResponse(BaseModel):
+        """A response with configuration metadata."""
+
+        name: str
+        metadata: dict[str, str]
+
+    agent = Agent(m, output_type=NativeOutput(ConfigResponse))
+
+    result = await agent.run('Create a config named "api-config" with metadata author="Alice" and version="1.0"')
+    assert result.output.name == snapshot('api-config')
+    assert result.output.metadata == snapshot({'author': 'Alice', 'version': '1.0'})

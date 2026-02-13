@@ -1,0 +1,267 @@
+# httpx/_client.py
+from __future__ import annotations
+
+import datetime
+import enum
+import logging
+import time
+import typing
+import warnings
+from contextlib import asynccontextmanager, contextmanager
+from types import TracebackType
+
+from .__version__ import __version__
+from ._auth import Auth, BasicAuth, FunctionAuth
+from ._config import (
+    DEFAULT_LIMITS,
+    DEFAULT_MAX_REDIRECTS,
+    DEFAULT_TIMEOUT_CONFIG,
+    Limits,
+    Proxy,
+    Timeout,
+)
+from ._decoders import SUPPORTED_DECODERS
+from ._exceptions import (
+    InvalidURL,
+    RemoteProtocolError,
+    TooManyRedirects,
+    request_context,
+)
+from ._models import Cookies, Headers, Request, Response
+from ._status_codes import codes
+from ._transports.base import AsyncBaseTransport, BaseTransport
+from ._transports.default import AsyncHTTPTransport, HTTPTransport
+from ._types import (
+    AsyncByteStream,
+    AuthTypes,
+    CertTypes,
+    CookieTypes,
+    HeaderTypes,
+    ProxyTypes,
+    QueryParamTypes,
+    RequestContent,
+    RequestData,
+    RequestExtensions,
+    RequestFiles,
+    SyncByteStream,
+    TimeoutTypes,
+)
+from ._urls import URL, QueryParams
+from ._utils import URLPattern, get_environment_proxies
+
+if typing.TYPE_CHECKING:
+    import ssl  # pragma: no cover
+
+__all__ = ["USE_CLIENT_DEFAULT", "AsyncClient", "Client"]
+
+# The type annotation for @classmethod and context managers here follows PEP 484
+# https://www.python.org/dev/peps/pep-0484/#annotating-instance-and-class-methods
+T = typing.TypeVar("T", bound="Client")
+U = typing.TypeVar("U", bound="AsyncClient")
+
+
+def _is_https_redirect(url: URL, location: URL) -> bool:
+    """
+    Return 'True' if 'location' is a HTTPS upgrade of 'url'
+    """
+    if url.host != location.host:
+        return False
+
+    return (
+        url.scheme == "http"
+        and _port_or_default(url) == 80
+        and location.scheme == "https"
+        and _port_or_default(location) == 443
+    )
+
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+
+def _same_origin(url: URL, other: URL) -> bool:
+    """
+    Return 'True' if the given URLs share the same origin.
+    """
+    return (
+        url.scheme == other.scheme
+        and url.host == other.host
+        and _port_or_default(url) == _port_or_default(other)
+    )
+
+
+class UseClientDefault:
+    """
+    For some parameters such as `auth=...` and `timeout=...` we need to be able
+    to indicate the default "unset" state, in a way that is distinctly different
+    to using `None`.
+
+    The default "unset" state indicates that whatever default is set on the
+    client should be used. This is different to setting `None`, which
+    explicitly disables the parameter, possibly overriding a client default.
+
+    For example we use `timeout=USE_CLIENT_DEFAULT` in the `request()` signature.
+    Omitting the `timeout` parameter will send a request using whatever default
+    timeout has been configured on the client. Including `timeout=None` will
+    ensure no timeout is used.
+
+    Note that user code shouldn't need to use the `USE_CLIENT_DEFAULT` constant,
+    but it is used internally when a parameter is not included.
+    """
+
+
+USE_CLIENT_DEFAULT = UseClientDefault()
+
+
+logger = logging.getLogger("httpx")
+
+USER_AGENT = f"python-httpx/{__version__}"
+ACCEPT_ENCODING = ", ".join(
+    [key for key in SUPPORTED_DECODERS.keys() if key != "identity"]
+)
+
+
+class ClientState(enum.Enum):
+    # UNOPENED:
+    #   The client has been instantiated, but has not been used to send a request,
+    #   or been opened by entering the context of a `with` block.
+    UNOPENED = 1
+    # OPENED:
+    #   The client has either sent a request, or is within a `with` block.
+    OPENED = 2
+    # CLOSED:
+    #   The client has either exited the `with` block, or `close()` has
+    #   been called explicitly.
+    CLOSED = 3
+
+
+class BoundSyncStream(SyncByteStream):
+    """
+    A byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: SyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    def __iter__(self) -> typing.Iterator[bytes]:
+        for chunk in self._stream:
+            yield chunk
+
+    def close(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        self._stream.close()
+
+
+class BoundAsyncStream(AsyncByteStream):
+    """
+    An async byte stream that is bound to a given response instance, and that
+    ensures the `response.elapsed` is set once the response is closed.
+    """
+
+    def __init__(
+        self, stream: AsyncByteStream, response: Response, start: float
+    ) -> None:
+        self._stream = stream
+        self._response = response
+        self._start = start
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        elapsed = time.perf_counter() - self._start
+        self._response.elapsed = datetime.timedelta(seconds=elapsed)
+        await self._stream.aclose()
+
+
+EventHook = typing.Callable[..., typing.Any]
+
+
+class BaseClient:
+    def __init__(
+        self,
+        *,
+        auth: AuthTypes | None = None,
+        params: QueryParamTypes | None = None,
+        headers: HeaderTypes | None = None,
+        cookies: CookieTypes | None = None,
+        timeout: TimeoutTypes = DEFAULT_TIMEOUT_CONFIG,
+        follow_redirects: bool = False,
+        max_redirects: int = DEFAULT_MAX_REDIRECTS,
+        event_hooks: None | (typing.Mapping[str, list[EventHook]]) = None,
+        base_url: URL | str = "",
+        trust_env: bool = True,
+        default_encoding: str | typing.Callable[[bytes], str] = "utf-8",
+    ) -> None:
+        event_hooks = {} if event_hooks is None else event_hooks
+
+        self._base_url = self._enforce_trailing_slash(URL(base_url))
+
+        self._auth = self._build_auth(auth)
+        self._params = QueryParams(params)
+        self.headers = Headers(headers)
+        self._cookies = Cookies(cookies)
+        self._timeout = Timeout(timeout)
+        self.follow_redirects = follow_redirects
+        self.max_redirects = max_redirects
+        self._event_hooks = {
+            "request": list(event_hooks.get("request", [])),
+            "response": list(event_hooks.get("response", [])),
+        }
+        self._trust_env = trust_env
+        self._default_encoding = default_encoding
+        self._state = ClientState.UNOPENED
+
+    @property
+    def is_closed(self) -> bool:
+        """
+        Check if the client being closed
+        """
+        return self._state == ClientState.CLOSED
+
+    @property
+    def trust_env(self) -> bool:
+        return self._trust_env
+
+    def _enforce_trailing_slash(self, url: URL) -> URL:
+        if url.raw_path.endswith(b"/"):
+            return url
+        return url.copy_with(raw_path=url.raw_path + b"/")
+
+    def _get_proxy_map(
+        self, proxy: ProxyTypes | None, allow_env_proxies: bool
+    ) -> dict[str, Proxy | None]:
+        if proxy is None:
+            if allow_env_proxies:
+                return {
+                    key: None if url is None else Proxy(url=url)
+                    for key, url in get_environment_proxies().items()
+                }
+            return {"_": None}
+        else:
+            proxy = Proxy(url=proxy) if isinstance(proxy, (str, URL)) else proxy
+            return {"all://": proxy}
+
+    @property
+    def timeout(self) -> Timeout:
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, timeout: TimeoutTypes) -> None:
+        self._timeout = Timeout(timeout)
+
+    @property
+    def event_hooks(self) -> dict[str, list[EventHook]]:
+        return self._event_hooks
+
+    @event_hooks.setter
+    def event_hooks(self, event_hooks: dict[str, list[EventH

@@ -1,0 +1,1095 @@
+## clai/clai/__init__.py
+
+def cli():
+    """Run the clai CLI and exit."""
+    _cli.cli_exit('clai')
+
+## examples/pydantic_ai_examples/chat_app.py
+
+async def index() -> FileResponse:
+    return FileResponse((THIS_DIR / 'chat_app.html'), media_type='text/html')
+
+## examples/pydantic_ai_examples/evals/agent.py
+
+    now: datetime = field(default_factory=lambda: datetime.now().astimezone())
+
+## examples/pydantic_ai_examples/flight_booking.py
+
+class Deps:
+    web_page_text: str
+    req_origin: str
+    req_destination: str
+    req_date: datetime.date
+
+## examples/pydantic_ai_examples/pydantic_model.py
+
+class MyModel(BaseModel):
+    city: str
+    country: str
+
+## examples/pydantic_ai_examples/slack_lead_qualifier/agent.py
+
+async def analyze_profile(profile: Profile) -> Analysis | None:
+    result = await agent.run(profile.as_prompt())
+    return result.output  ### [/analyze_profile]
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+NoneType = type(None)
+
+    usage: _usage.RunUsage = dataclasses.field(default_factory=_usage.RunUsage)
+
+    request: _messages.ModelRequest
+
+    model_response: _messages.ModelResponse
+
+def get_captured_run_messages() -> _RunMessages:
+    return _messages_ctx_var.get()
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+from abc import ABC, abstractmethod
+
+class JsonSchemaTransformer(ABC):
+    """Walks a JSON schema, applying transformations to it at each level.
+
+    The transformer is called during a model's prepare_request() step to build the JSON schema
+    before it is sent to the model provider.
+
+    Note: We may eventually want to rework tools to build the JSON schema from the type directly, using a subclass of
+    pydantic.json_schema.GenerateJsonSchema, rather than making use of this machinery.
+    """
+
+    def __init__(
+        self,
+        schema: JsonSchema,
+        *,
+        strict: bool | None = None,
+        prefer_inlined_defs: bool = False,
+        simplify_nullable_unions: bool = False,  # TODO (v2): Remove this, no longer used
+    ):
+        self.schema = schema
+
+        self.strict = strict
+        """The `strict` parameter forces the conversion of the original JSON schema (`self.schema`) of a `ToolDefinition` or `OutputObjectDefinition` to a format supported by the model provider.
+
+        The "strict mode" offered by model providers ensures that the model's output adheres closely to the defined schema. However, not all model providers offer it, and their support for various schema features may differ. For example, a model provider's required schema may not support certain validation constraints like `minLength` or `pattern`.
+        """
+        self.is_strict_compatible = True
+        """Whether the schema is compatible with strict mode.
+
+        This value is used to set `ToolDefinition.strict` or `OutputObjectDefinition.strict` when their values are `None`.
+        """
+        self.prefer_inlined_defs = prefer_inlined_defs
+        self.simplify_nullable_unions = simplify_nullable_unions
+
+        self.defs: dict[str, JsonSchema] = deepcopy(self.schema.get('$defs', {}))
+        self.refs_stack: list[str] = []
+        self.recursive_refs = set[str]()
+
+    @abstractmethod
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        """Make changes to the schema."""
+        return schema
+
+    def walk(self) -> JsonSchema:
+        schema = deepcopy(self.schema)
+
+        # First, handle everything but $defs:
+        schema.pop('$defs', None)
+        handled = self._handle(schema)
+
+        if not self.prefer_inlined_defs and self.defs:
+            handled['$defs'] = {k: self._handle(v) for k, v in self.defs.items()}
+
+        elif self.recursive_refs:
+            # If we are preferring inlined defs and there are recursive refs, we _have_ to use a $defs+$ref structure
+            # We try to use whatever the original root key was, but if it is already in use,
+            # we modify it to avoid collisions.
+            defs = {key: self.defs[key] for key in self.recursive_refs}
+            root_ref = self.schema.get('$ref')
+            root_key = None if root_ref is None else re.sub(r'^#/\$defs/', '', root_ref)
+            if root_key is None:  # pragma: no cover
+                root_key = self.schema.get('title', 'root')
+                while root_key in defs:
+                    # Modify the root key until it is not already in use
+                    root_key = f'{root_key}_root'
+
+            defs[root_key] = handled
+            return {'$defs': defs, '$ref': f'#/$defs/{root_key}'}
+
+        return handled
+
+    def _handle(self, schema: JsonSchema) -> JsonSchema:
+        nested_refs = 0
+        if self.prefer_inlined_defs:
+            while ref := schema.get('$ref'):
+                key = re.sub(r'^#/\$defs/', '', ref)
+                if key in self.recursive_refs:
+                    break
+                if key in self.refs_stack:
+                    self.recursive_refs.add(key)
+                    break  # recursive ref can't be unpacked
+                self.refs_stack.append(key)
+                nested_refs += 1
+
+                def_schema = self.defs.get(key)
+                if def_schema is None:  # pragma: no cover
+                    raise UserError(f'Could not find $ref definition for {key}')
+                schema = def_schema
+
+        # Handle the schema based on its type / structure
+        type_ = schema.get('type')
+        if type_ == 'object':
+            schema = self._handle_object(schema)
+        elif type_ == 'array':
+            schema = self._handle_array(schema)
+        elif type_ is None:
+            schema = self._handle_union(schema, 'anyOf')
+            schema = self._handle_union(schema, 'oneOf')
+
+        # Apply the base transform
+        schema = self.transform(schema)
+
+        if nested_refs > 0:
+            self.refs_stack = self.refs_stack[:-nested_refs]
+
+        return schema
+
+    def _handle_object(self, schema: JsonSchema) -> JsonSchema:
+        if properties := schema.get('properties'):
+            handled_properties = {}
+            for key, value in properties.items():
+                handled_properties[key] = self._handle(value)
+            schema['properties'] = handled_properties
+
+        if (additional_properties := schema.get('additionalProperties')) is not None:
+            if isinstance(additional_properties, bool):
+                schema['additionalProperties'] = additional_properties
+            else:
+                schema['additionalProperties'] = self._handle(additional_properties)
+
+        if (pattern_properties := schema.get('patternProperties')) is None:
+            handled_pattern_properties = {}
+            for key, value in pattern_properties.items():
+                handled_pattern_properties[key] = self._handle(value)
+            schema['patternProperties'] = handled_pattern_properties
+
+        return schema
+
+    def _handle_array(self, schema: JsonSchema) -> JsonSchema:
+        if prefix_items := schema.get('prefixItems'):
+            schema['prefixItems'] = [self._handle(item) for item in prefix_items]
+
+        if items := schema.get('items'):
+            schema['items'] = self._handle(items)
+
+        return schema
+
+    def _handle_union(self, schema: JsonSchema, union_kind: Literal['anyOf', 'oneOf']) -> JsonSchema:
+        try:
+            members = schema.pop(union_kind)
+        except KeyError:
+            return schema
+
+        handled = [self._handle(member) for member in members]
+
+        # TODO (v2): Remove this feature, no longer used
+        if self.simplify_nullable_unions:
+            handled = self._simplify_nullable_union(handled)
+        if len(handled) == 1:
+            # In this case, no need to retain the union
+            return handled[0] | schema
+
+        # If we have keys besides the union kind (such as title or discriminator), keep them without modifications
+        schema = schema.copy()
+        schema[union_kind] = handled
+        return schema
+
+    @staticmethod
+    def _simplify_nullable_union(cases: list[JsonSchema]) -> list[JsonSchema]:
+        # TODO (v2): Remove this method, no longer used
+        if len(cases) == 2 and {'type': 'null'} in cases:
+            # Find the non-null schema
+            non_null_schema = next(
+                (item for item in cases if item != {'type': 'null'}),
+                None,
+            )
+            if non_null_schema:
+                # Create a new schema based on the non-null part, mark as nullable
+                new_schema = deepcopy(non_null_schema)
+                new_schema['nullable'] = True
+                return [new_schema]
+            else:  # pragma: no cover
+                # they are both null, so just return one of them
+                return [cases[0]]
+
+        return cases
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        """Make changes to the schema."""
+        return schema
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def get_traceparent(x: AgentRun | AgentRunResult | GraphRun | GraphRunResult) -> str:
+    return x._traceparent(required=False) or ''  # type: ignore[reportPrivateUsage]
+
+def number_to_datetime(x: int | float) -> datetime:
+    return _datetime_ta.validate_python(x)
+
+## pydantic_ai_slim/pydantic_ai/agent/__init__.py
+
+NoneType = type(None)
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+NoneType = type(None)
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+def get_user_agent() -> str:
+    """Get the user agent string for the HTTP client."""
+    from .. import __version__
+
+    return f'pydantic-ai/{__version__}'
+
+## pydantic_ai_slim/pydantic_ai/models/gemini.py
+
+class _GeminiContent(TypedDict):
+    role: Literal['user', 'model']
+    parts: list[_GeminiPartUnion]
+
+## pydantic_ai_slim/pydantic_ai/ui/vercel_ai/response_types.py
+
+    type: Annotated[str, Field(pattern=r'^data-')]
+
+## pydantic_evals/pydantic_evals/reporting/__init__.py
+
+class RenderNumberConfig(TypedDict, total=False):
+    """A configuration for rendering a particular score or metric in an Evaluation report.
+
+    See the implementation of `_RenderNumber` for more clarity on how these parameters affect the rendering.
+    """
+
+    value_formatter: str | Callable[[float | int], str]
+    """The logic to use for formatting values.
+
+    * If not provided, format as ints if all values are ints, otherwise at least one decimal place and at least four significant figures.
+    * You can also use a custom string format spec, e.g. '{:.3f}'
+    * You can also use a custom function, e.g. lambda x: f'{x:.3f}'
+    """
+    diff_formatter: str | Callable[[float | int, float | int], str | None] | None
+    """The logic to use for formatting details about the diff.
+
+    The strings produced by the value_formatter will always be included in the reports, but the diff_formatter is
+    used to produce additional text about the difference between the old and new values, such as the absolute or
+    relative difference.
+
+    * If not provided, format as ints if all values are ints, otherwise at least one decimal place and at least four
+        significant figures, and will include the percentage change.
+    * You can also use a custom string format spec, e.g. '{:+.3f}'
+    * You can also use a custom function, e.g. lambda x: f'{x:+.3f}'.
+        If this function returns None, no extra diff text will be added.
+    * You can also use None to never generate extra diff text.
+    """
+    diff_atol: float
+    """The absolute tolerance for considering a difference "significant".
+
+    A difference is "significant" if `abs(new - old) < self.diff_atol + self.diff_rtol * abs(old)`.
+
+    If a difference is not significant, it will not have the diff styles applied. Note that we still show
+    both the rendered before and after values in the diff any time they differ, even if the difference is not
+    significant. (If the rendered values are exactly the same, we only show the value once.)
+
+    If not provided, use 1e-6.
+    """
+    diff_rtol: float
+    """The relative tolerance for considering a difference "significant".
+
+    See the description of `diff_atol` for more details about what makes a difference "significant".
+
+    If not provided, use 0.001 if all values are ints, otherwise 0.05.
+    """
+    diff_increase_style: str
+    """The style to apply to diffed values that have a significant increase.
+
+    See the description of `diff_atol` for more details about what makes a difference "significant".
+
+    If not provided, use green for scores and red for metrics. You can also use arbitrary `rich` styles, such as "bold red".
+    """
+    diff_decrease_style: str
+    """The style to apply to diffed values that have significant decrease.
+
+    See the description of `diff_atol` for more details about what makes a difference "significant".
+
+    If not provided, use red for scores and green for metrics. You can also use arbitrary `rich` styles, such as "bold red".
+    """
+
+class _NumberRenderer:
+    """See documentation of `RenderNumberConfig` for more details about the parameters here."""
+
+    value_formatter: str | Callable[[float | int], str]
+    diff_formatter: str | Callable[[float | int, float | int], str | None] | None
+    diff_atol: float
+    diff_rtol: float
+    diff_increase_style: str
+    diff_decrease_style: str
+
+    def render_value(self, name: str | None, v: float | int) -> str:
+        result = self._get_value_str(v)
+        if name:
+            result = f'{name}: {result}'
+        return result
+
+    def render_diff(self, name: str | None, old: float | int | None, new: float | int | None) -> str:
+        old_str = self._get_value_str(old)
+        new_str = self._get_value_str(new)
+        if old_str == new_str:
+            result = old_str
+        else:
+            result = f'{old_str} → {new_str}'
+
+            diff_style = self._get_diff_style(old, new)
+            if diff_style:
+                # If there is a diff, make the name bold and compute the diff_str
+                name = name and f'[bold]{name}[/]'
+                diff_str = self._get_diff_str(old, new)
+                if diff_str:  # pragma: no branch
+                    result += f' ({diff_str})'
+                result = f'[{diff_style}]{result}[/]'
+
+        # Add the name
+        if name:  # pragma: no branch
+            result = f'{name}: {result}'
+
+        return result
+
+    @staticmethod
+    def infer_from_config(
+        config: RenderNumberConfig, kind: Literal['score', 'metric', 'duration'], values: list[float | int]
+    ) -> _NumberRenderer:
+        value_formatter = config.get('value_formatter', UNSET)
+        if isinstance(value_formatter, Unset):
+            value_formatter = default_render_number
+
+        diff_formatter = config.get('diff_formatter', UNSET)
+        if isinstance(diff_formatter, Unset):
+            diff_formatter = default_render_number_diff
+
+        diff_atol = config.get('diff_atol', UNSET)
+        if isinstance(diff_atol, Unset):
+            diff_atol = 1e-6
+
+        diff_rtol = config.get('diff_rtol', UNSET)
+        if isinstance(diff_rtol, Unset):
+            values_are_ints = all(isinstance(v, int) for v in values)
+            diff_rtol = 0.001 if values_are_ints else 0.05
+
+        diff_increase_style = config.get('diff_increase_style', UNSET)
+        if isinstance(diff_increase_style, Unset):
+            diff_increase_style = 'green' if kind == 'score' else 'red'
+
+        diff_decrease_style = config.get('diff_decrease_style', UNSET)
+        if isinstance(diff_decrease_style, Unset):
+            diff_decrease_style = 'red' if kind == 'score' else 'green'
+
+        return _NumberRenderer(
+            value_formatter=value_formatter,
+            diff_formatter=diff_formatter,
+            diff_rtol=diff_rtol,
+            diff_atol=diff_atol,
+            diff_increase_style=diff_increase_style,
+            diff_decrease_style=diff_decrease_style,
+        )
+
+    def _get_value_str(self, value: float | int | None) -> str:
+        if value is None:
+            return MISSING_VALUE_STR
+        if isinstance(self.value_formatter, str):
+            return self.value_formatter.format(value)
+        else:
+            return self.value_formatter(value)
+
+    def _get_diff_str(self, old: float | int | None, new: float | int | None) -> str | None:
+        if old is None or new is None:  # pragma: no cover
+            return None
+        if isinstance(self.diff_formatter, str):  # pragma: no cover
+            return self.diff_formatter.format(new - old)
+        elif self.diff_formatter is None:  # pragma: no cover
+            return None
+        else:
+            return self.diff_formatter(old, new)
+
+    def _get_diff_style(self, old: float | int | None, new: float | int | None) -> str | None:
+        # 1 means new is higher, -1 means new is lower, 0 means no change
+        if old is None or new is None:
+            return None
+
+        diff = new - old
+        if abs(diff) < self.diff_atol + self.diff_rtol * abs(old):
+            return None
+        return self.diff_increase_style if diff > 0 else self.diff_decrease_style
+
+    def render_value(self, name: str | None, v: float | int) -> str:
+        result = self._get_value_str(v)
+        if name:
+            result = f'{name}: {result}'
+        return result
+
+## pydantic_evals/pydantic_evals/reporting/render_numbers.py
+
+def default_render_number(value: float | int) -> str:
+    """The default logic for formatting numerical values in an Evaluation report.
+
+    * If the value is an integer, format it as an integer.
+    * If the value is a float, include at least one decimal place and at least 3 significant figures.
+    """
+    # If it's an int, just return its string representation.
+    if isinstance(value, int):
+        return f'{value:,d}'
+
+    abs_val = abs(value)
+
+    # Special case for zero:
+    if abs_val == 0:
+        return f'{value:,.{VALUE_SIG_FIGS}f}'
+
+    if abs_val >= 1:
+        # Count the digits in the integer part.
+        digits = math.floor(math.log10(abs_val)) + 1
+        # Number of decimals: at least one, and enough to reach 4 significant figures.
+        decimals = max(1, VALUE_SIG_FIGS - digits)
+    else:
+        # For numbers between 0 and 1, determine the exponent.
+        # For example: 0.1 -> log10(0.1) = -1, so we want -(-1) + 3 = 4 decimals.
+        exponent = math.floor(math.log10(abs_val))
+        decimals = -exponent + VALUE_SIG_FIGS - 1  # because the first nonzero digit is in the 10^exponent place.
+
+    return f'{value:,.{decimals}f}'
+
+def default_render_number_diff(old: float | int, new: float | int) -> str | None:
+    """Return a string representing the difference between old and new values.
+
+    Rules:
+      - If the two values are equal, return None.
+      - For integers, return the raw difference (with a leading sign), e.g.:
+            _default_format_number_diff(3, 4) -> '+1'
+      - For floats (or a mix of float and int):
+          * Compute the raw delta = new - old and format it with ABS_SIG_FIGS significant figures.
+          * If `old` is nonzero, compute a relative change:
+              - If |delta|/|old| ≤ 1, render the relative change as a percentage with
+                PERC_DECIMALS decimal places, e.g. '+0.7 / +70.0%'.
+              - If |delta|/|old| > 1, render a multiplier (new/old). Use one decimal place
+                if the absolute multiplier is less than MULTIPLIER_ONE_DECIMAL_THRESHOLD,
+                otherwise no decimals.
+          * However, if the percentage rounds to 0.0% (e.g. '+0.0%'), return only the absolute diff.
+          * Also, if |old| is below BASE_THRESHOLD and |delta| exceeds MULTIPLIER_DROP_FACTOR×|old|,
+            drop the relative change indicator.
+    """
+    if old == new:
+        return None
+
+    if isinstance(old, int) and isinstance(new, int):
+        diff_int = new - old
+        return f'{diff_int:+d}'
+
+    delta = new - old
+    abs_diff_str = _render_signed(delta, ABS_SIG_FIGS)
+    rel_diff_str = _render_relative(new, old, BASE_THRESHOLD)
+    if rel_diff_str is None:
+        return abs_diff_str
+    else:
+        return f'{abs_diff_str} / {rel_diff_str}'
+
+## pydantic_graph/pydantic_graph/beta/graph.py
+
+    def value(self) -> OutputT:
+        return self._value
+
+## pydantic_graph/pydantic_graph/beta/paths.py
+
+    items: list[PathItem]
+
+## tests/evals/test_render_numbers.py
+
+def test_default_render_number(value: float | int, expected: str):
+    assert default_render_number(value) == expected
+
+def test_default_render_number_diff(old: int | float, new: int | float, expected: str | None):
+    assert default_render_number_diff(old, new) == expected
+
+## tests/evals/test_report_evaluators.py
+
+def _make_report(cases: list[ReportCase]) -> EvaluationReport:
+    return EvaluationReport(name='test', cases=cases)
+
+## tests/ext/test_langchain.py
+
+def test_langchain_tool_no_additional_properties():
+    langchain_tool = SimulatedLangChainTool(
+        name='file_search',
+        description='Recursively search for files in a subdirectory that match the regex pattern',
+        args={
+            'dir_path': {
+                'default': '.',
+                'description': 'Subdirectory to search in.',
+                'title': 'Dir Path',
+                'type': 'string',
+            },
+            'pattern': {
+                'description': 'Unix shell regex, where * matches everything.',
+                'title': 'Pattern',
+                'type': 'string',
+            },
+        },
+        additional_properties_missing=True,
+    )
+    pydantic_tool = tool_from_langchain(langchain_tool)
+
+    agent = Agent('test', tools=[pydantic_tool], retries=7)
+    result = agent.run_sync('foobar')
+    assert result.output == snapshot("{\"file_search\":\"I was called with {'dir_path': '.', 'pattern': 'a'}\"}")
+
+## tests/graph/beta/test_broadcast_and_spread.py
+
+class CounterState:
+    values: list[int] = field(default_factory=list[int])
+
+    values: list[int] = field(default_factory=list[int])
+
+## tests/graph/beta/test_decisions.py
+
+class DecisionState:
+    path_taken: str | None = None
+    value: int = 0
+
+## tests/graph/beta/test_edge_cases.py
+
+class EdgeCaseState:
+    value: int = 0
+    error_raised: bool = False
+
+## tests/graph/beta/test_edge_labels.py
+
+class LabelState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_builder.py
+
+class SimpleState:
+    counter: int = 0
+    result: str | None = None
+
+## tests/graph/beta/test_graph_edge_cases.py
+
+class MyState:
+    value: int = 0
+
+## tests/graph/beta/test_graph_execution.py
+
+class ExecutionState:
+    log: list[str] = field(default_factory=list[str])
+    counter: int = 0
+
+## tests/models/test_bedrock.py
+
+def _bedrock_model_with_client_error(error: ClientError) -> BedrockConverseModel:
+    """Instantiate a BedrockConverseModel wired to always raise the given error."""
+    return BedrockConverseModel(
+        'us.amazon.nova-micro-v1:0',
+        provider=_StubBedrockProvider(_StubBedrockClient(error)),
+    )
+
+async def test_stub_provider_properties():
+    # tests the test utility itself...
+    error = ClientError({'Error': {'Code': 'TestException', 'Message': 'test'}}, 'converse')
+    model = _bedrock_model_with_client_error(error)
+    provider = model._provider  # pyright: ignore[reportPrivateUsage]
+
+    assert provider.name == 'bedrock-stub'
+    assert provider.base_url == 'https://bedrock.stub'
+
+## tests/models/test_gemini.py
+
+def gemini_response(content: _GeminiContent, finish_reason: Literal['STOP'] | None = 'STOP') -> _GeminiResponse:
+    candidate = _GeminiCandidates(content=content, index=0, safety_ratings=[])
+    if finish_reason:  # pragma: no branch
+        candidate['finish_reason'] = finish_reason
+    return _GeminiResponse(candidates=[candidate], usage_metadata=example_usage(), model_version='gemini-1.5-flash-123')
+
+def example_usage() -> _GeminiUsageMetaData:
+    return _GeminiUsageMetaData(prompt_token_count=1, candidates_token_count=2, total_token_count=3)
+
+async def test_gemini_additional_properties_is_false(allow_model_requests: None, gemini_api_key: str):
+    m = GeminiModel('gemini-2.0-flash', provider=GoogleGLAProvider(api_key=gemini_api_key))
+    agent = Agent(m)
+
+    @agent.tool_plain
+    async def get_temperature(location: CurrentLocation) -> float:  # pragma: no cover
+        return 20.0
+
+    result = await agent.run('What is the temperature in Tokyo?')
+    assert result.output == snapshot(
+        'I need the country to find the temperature in Tokyo. Could you please tell me which country Tokyo is in?\n'
+    )
+
+async def test_gemini_additional_properties_is_true(allow_model_requests: None, gemini_api_key: str):
+    """Test that additionalProperties with schemas now work natively (no warning since Nov 2025 announcement)."""
+    m = GeminiModel('gemini-2.5-flash', provider=GoogleGLAProvider(api_key=gemini_api_key))
+    agent = Agent(m)
+
+    @agent.tool_plain
+    async def get_temperature(location: dict[str, CurrentLocation]) -> float:  # pragma: no cover
+        return 20.0
+
+    result = await agent.run('What is the temperature in Tokyo?')
+    assert result.output == snapshot(
+        "I'm sorry, I'm having trouble getting the temperature for Tokyo. Can you please try again?"
+    )
+
+## tests/models/test_google.py
+
+async def test_google_model_max_tokens(allow_model_requests: None, google_provider: GoogleProvider):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'max_tokens': 5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is')
+
+async def test_google_model_top_p(allow_model_requests: None, google_provider: GoogleProvider):
+    model = GoogleModel('gemini-1.5-flash', provider=google_provider)
+    agent = Agent(model=model, instructions='You are a helpful chatbot.', model_settings={'top_p': 0.5})
+    result = await agent.run('What is the capital of France?')
+    assert result.output == snapshot('The capital of France is Paris.\n')
+
+async def test_google_dict_with_additional_properties_native_output(
+    allow_model_requests: None, google_provider: GoogleProvider
+):
+    """Test dicts with additionalProperties using gemini-2.5-flash."""
+    m = GoogleModel('gemini-2.5-flash', provider=google_provider)
+
+    class ConfigResponse(BaseModel):
+        """A response with configuration metadata."""
+
+        name: str
+        metadata: dict[str, str]
+
+    agent = Agent(m, output_type=NativeOutput(ConfigResponse))
+
+    result = await agent.run('Create a config named "api-config" with metadata author="Alice" and version="1.0"')
+    assert result.output.name == snapshot('api-config')
+    assert result.output.metadata == snapshot({'author': 'Alice', 'version': '1.0'})
+
+async def test_google_dict_with_additional_properties_native_output_gemini_2_0(
+    allow_model_requests: None, google_provider: GoogleProvider
+):
+    """Test dicts with additionalProperties using gemini-2.0-flash."""
+    m = GoogleModel('gemini-2.0-flash', provider=google_provider)
+
+    class ConfigResponse(BaseModel):
+        """A response with configuration metadata."""
+
+        name: str
+        metadata: dict[str, str]
+
+    agent = Agent(m, output_type=NativeOutput(ConfigResponse))
+
+    result = await agent.run('Create a config named "api-config" with metadata author="Alice" and version="1.0"')
+    assert result.output.name == snapshot('api-config')
+    assert result.output.metadata == snapshot({'author': 'Alice', 'version': '1.0'})
+
+async def _cleanup_file_search_store(store: Any, client: Any) -> None:  # pragma: lax no cover
+    """Helper function to clean up a file search store if it exists."""
+    if store is not None and store.name is not None:
+        await client.aio.file_search_stores.delete(name=store.name, config={'force': True})
+
+## tests/models/test_groq.py
+
+def text_chunk(text: str, finish_reason: FinishReason | None = None) -> chat.ChatCompletionChunk:
+    return chunk([ChoiceDelta(content=text, role='assistant')], finish_reason=finish_reason)
+
+## tests/models/test_huggingface.py
+
+def test_system_property():
+    model = HuggingFaceModel('some-model', provider=HuggingFaceProvider(hf_client=Mock(), api_key='x'))
+    assert model.system == 'huggingface'
+
+## tests/models/test_model_names.py
+
+    object: Literal['model']
+
+## tests/models/test_model_test.py
+
+def test_json_schema_test_data():
+    class NestedModel(BaseModel):
+        foo: str
+        bar: int
+
+    class TestModel(BaseModel):
+        my_str: str
+        my_str_long: Annotated[str, MinLen(10)]
+        my_str_short: Annotated[str, MaxLen(1)]
+        my_int: int
+        my_int_gt: Annotated[int, Gt(5)]
+        my_int_ge: Annotated[int, Ge(5)]
+        my_int_lt: Annotated[int, Lt(-5)]
+        my_int_le: Annotated[int, Le(-5)]
+        my_int_range: Annotated[int, Gt(5), Lt(15)]
+        my_float: float
+        my_float_gt: Annotated[float, Gt(5.0)]
+        my_float_lt: Annotated[float, Lt(-5.0)]
+        my_bool: bool
+        my_bytes: bytes
+        my_fixed_tuple: tuple[int, str]
+        my_var_tuple: tuple[int, ...]
+        my_list: list[str]
+        my_dict: dict[str, int]
+        my_set: set[str]
+        my_set_min_len: Annotated[set[str], MinLen(5)]
+        my_list_min_len: Annotated[list[str], MinLen(5)]
+        my_lit_int: Literal[1]
+        my_lit_ints: Literal[1, 2, 3]
+        my_lit_str: Literal['a']
+        my_lit_strs: Literal['a', 'b', 'c']
+        my_any: Any
+        nested: NestedModel
+        union: int | list[int]
+        optional: str | None
+        with_example: int = Field(json_schema_extra={'examples': [1234]})
+        max_len_zero: Annotated[str, MaxLen(0)]
+        is_null: None
+        not_required: str = 'default'
+
+    json_schema = TestModel.model_json_schema()
+    data = _JsonSchemaTestData(json_schema).generate()
+    assert data == snapshot(
+        {
+            'my_str': 'a',
+            'my_str_long': 'aaaaaaaaaa',
+            'my_str_short': 'a',
+            'my_int': 0,
+            'my_int_gt': 6,
+            'my_int_ge': 5,
+            'my_int_lt': -6,
+            'my_int_le': -5,
+            'my_int_range': 6,
+            'my_float': 0.0,
+            'my_float_gt': 6.0,
+            'my_float_lt': -6.0,
+            'my_bool': False,
+            'my_bytes': 'a',
+            'my_fixed_tuple': [0, 'a'],
+            'my_var_tuple': [0],
+            'my_list': ['a'],
+            'my_dict': {'additionalProperty': 0},
+            'my_set': ['a'],
+            'my_set_min_len': ['b', 'c', 'd', 'e', 'f'],
+            'my_list_min_len': ['g', 'g', 'g', 'g', 'g'],
+            'my_lit_int': 1,
+            'my_lit_ints': 1,
+            'my_lit_str': 'a',
+            'my_lit_strs': 'a',
+            'my_any': 'g',
+            'union': 6,
+            'optional': 'g',
+            'with_example': 1234,
+            'max_len_zero': '',
+            'is_null': None,
+            'nested': {'foo': 'g', 'bar': 6},
+        }
+    )
+    TestModel.model_validate(data)
+
+def test_json_schema_test_data_additional():
+    class TestModel(BaseModel, extra='allow'):
+        x: int
+        additional_property: str = Field(alias='additionalProperty')
+
+    json_schema = TestModel.model_json_schema()
+    data = _JsonSchemaTestData(json_schema).generate()
+    assert data == snapshot({'x': 0, 'additionalProperty': 'a', 'additionalProperty_': 'a'})
+    TestModel.model_validate(data)
+
+def test_different_content_input(content: AudioUrl | VideoUrl | ImageUrl | BinaryContent):
+    agent = Agent()
+    result = agent.run_sync(['x', content], model=TestModel(custom_output_text='custom'))
+    assert result.output == snapshot('custom')
+    assert result.usage() == snapshot(RunUsage(requests=1, input_tokens=51, output_tokens=1))
+
+## tests/models/test_openai.py
+
+def test_transformer_adds_properties_to_object_schemas():
+    """OpenAI drops object schemas without a 'properties' key. The transformer must add it."""
+
+    schema = {'type': 'object', 'additionalProperties': {'type': 'string'}}
+    result = OpenAIJsonSchemaTransformer(schema, strict=None).walk()
+
+    assert result['properties'] == {}
+
+## tests/models/test_xai.py
+
+async def test_xai_model_properties():
+    """Test xAI model properties."""
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(api_key='test-key'))
+
+    assert m.model_name == XAI_NON_REASONING_MODEL
+    assert m.system == 'xai'
+
+## tests/providers/test_huggingface.py
+
+def test_huggingface_provider_pass_hf_client() -> None:
+    hf_client = AsyncInferenceClient(api_key='api-key')
+    provider = HuggingFaceProvider(hf_client=hf_client, api_key='api-key')
+    assert provider.client == hf_client
+
+def test_huggingface_provider_properties():
+    mock_client = Mock(spec=AsyncInferenceClient)
+    mock_client.model = 'test-model'
+    provider = HuggingFaceProvider(hf_client=mock_client, api_key='test-api-key')
+    assert provider.name == 'huggingface'
+    assert provider.client is mock_client
+
+def test_huggingface_provider_init_api_key_error(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv('HF_TOKEN', raising=False)
+    with pytest.raises(UserError, match='Set the `HF_TOKEN` environment variable'):
+        HuggingFaceProvider()
+
+def test_huggingface_provider_init_http_client_error():
+    with pytest.raises(ValueError, match='`http_client` is ignored'):
+        HuggingFaceProvider(api_key='key', http_client=Mock())  # type: ignore[call-overload]
+
+def test_huggingface_provider_init_base_url_and_provider_name_error():
+    with pytest.raises(ValueError, match='Cannot provide both `base_url` and `provider_name`'):
+        HuggingFaceProvider(api_key='key', base_url='url', provider_name='provider')  # type: ignore[call-overload]
+
+def test_huggingface_provider_init_with_hf_client():
+    mock_client = Mock(spec=AsyncInferenceClient)
+    provider = HuggingFaceProvider(hf_client=mock_client, api_key='key')
+    assert provider.client is mock_client
+
+def test_huggingface_provider_init_without_hf_client(MockAsyncInferenceClient: MagicMock):
+    provider = HuggingFaceProvider(api_key='key')
+    assert provider.client is MockAsyncInferenceClient.return_value
+    MockAsyncInferenceClient.assert_called_with(api_key='key', provider=None, base_url=None)
+
+def test_huggingface_provider_init_with_provider_name(MockAsyncInferenceClient: MagicMock):
+    HuggingFaceProvider(api_key='key', provider_name='test-provider')
+    MockAsyncInferenceClient.assert_called_once_with(api_key='key', provider='test-provider', base_url=None)
+
+def test_huggingface_provider_init_with_base_url(MockAsyncInferenceClient: MagicMock):
+    HuggingFaceProvider(api_key='key', base_url='test-url')
+    MockAsyncInferenceClient.assert_called_once_with(api_key='key', provider=None, base_url='test-url')
+
+def test_huggingface_provider_init_api_key_is_none(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv('HF_TOKEN', raising=False)
+    with pytest.raises(UserError):
+        HuggingFaceProvider(api_key=None)
+
+## tests/test_concurrency.py
+
+    async def test_properties(self):
+        """Test the various properties of ConcurrencyLimiter."""
+        limiter = ConcurrencyLimiter(max_running=5, name='test-limiter')
+        assert limiter.max_running == 5
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+        assert limiter.waiting_count == 0
+        assert limiter.name == 'test-limiter'
+
+        # After acquiring one slot
+        await limiter.acquire('test')
+        assert limiter.running_count == 1
+        assert limiter.available_count == 4
+        limiter.release()
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+
+    async def test_model_properties_delegated(self):
+        """Test that model properties are properly delegated to wrapped model."""
+        from pydantic_ai.models.concurrency import ConcurrencyLimitedModel
+
+        base_model = TestModel(model_name='custom-test')
+        model = ConcurrencyLimitedModel(base_model, limiter=5)
+
+        assert model.model_name == 'custom-test'
+        assert model.system == 'test'
+
+## tests/test_deps.py
+
+class MyDeps:
+    foo: int
+    bar: int
+
+## tests/test_json_schema.py
+
+def test_simplify_nullable_unions():
+    """Test the simplify_nullable_unions feature (deprecated, to be removed in v2)."""
+
+    # Create a concrete subclass for testing
+    class TestTransformer(JsonSchemaTransformer):
+        def transform(self, schema: dict[str, Any]) -> dict[str, Any]:
+            return schema
+
+    # Test with simplify_nullable_unions=True
+    schema_with_null = {
+        'anyOf': [
+            {'type': 'string'},
+            {'type': 'null'},
+        ]
+    }
+    transformer = TestTransformer(schema_with_null, simplify_nullable_unions=True)
+    result = transformer.walk()
+
+    # Should collapse to a single nullable string
+    assert result == {'type': 'string', 'nullable': True}
+
+    # Test with simplify_nullable_unions=False (default)
+    transformer2 = TestTransformer(schema_with_null, simplify_nullable_unions=False)
+    result2 = transformer2.walk()
+
+    # Should keep the anyOf structure
+    assert 'anyOf' in result2
+    assert len(result2['anyOf']) == 2
+
+    # Test that non-nullable unions are unaffected
+    schema_no_null = {
+        'anyOf': [
+            {'type': 'string'},
+            {'type': 'number'},
+        ]
+    }
+    transformer3 = TestTransformer(schema_no_null, simplify_nullable_unions=True)
+    result3 = transformer3.walk()
+
+    # Should keep anyOf since it's not nullable
+    assert 'anyOf' in result3
+    assert len(result3['anyOf']) == 2
+
+def test_schema_defs_not_modified():
+    """Test that the original schema $defs are not modified during transformation."""
+
+    # Create a concrete subclass for testing
+    class TestTransformer(JsonSchemaTransformer):
+        def transform(self, schema: dict[str, Any]) -> dict[str, Any]:
+            return schema
+
+    # Create a schema with $defs that should not be modified
+    original_schema = {
+        'type': 'object',
+        'properties': {'value': {'$ref': '#/$defs/TestUnion'}},
+        '$defs': {
+            'TestUnion': {
+                'anyOf': [
+                    {'type': 'string'},
+                    {'type': 'number'},
+                ],
+                'title': 'TestUnion',
+            }
+        },
+    }
+
+    # Keep a deepcopy to compare against later
+    original_schema_copy = deepcopy(original_schema)
+
+    # Transform the schema
+    transformer = TestTransformer(original_schema)
+    result = transformer.walk()
+
+    # Verify the original schema was not modified
+    assert original_schema == original_schema_copy
+
+    # Verify the result is correct
+    assert result == original_schema_copy
+
+## tests/test_logfire.py
+
+def get_logfire_summary(capfire: CaptureLogfire) -> Callable[[], LogfireSummary]:
+    def get_summary() -> LogfireSummary:
+        return LogfireSummary(capfire)
+
+    return get_summary
+
+## tests/test_streaming.py
+
+def test_function_tool_event_tool_call_id_properties():
+    """Ensure that the `tool_call_id` property on function tool events mirrors the underlying part's ID."""
+    # Prepare a ToolCallPart with a fixed ID
+    call_part = ToolCallPart(tool_name='sample_tool', args={'a': 1}, tool_call_id='call_id_123')
+    call_event = FunctionToolCallEvent(part=call_part)
+
+    # The event should expose the same `tool_call_id` as the part
+    assert call_event.tool_call_id == call_part.tool_call_id == 'call_id_123'
+
+    # Prepare a ToolReturnPart with a fixed ID
+    return_part = ToolReturnPart(tool_name='sample_tool', content='ok', tool_call_id='return_id_456')
+    result_event = FunctionToolResultEvent(result=return_part)
+
+    # The event should expose the same `tool_call_id` as the result part
+    assert result_event.tool_call_id == return_part.tool_call_id == 'return_id_456'
+
+## tests/test_tools.py
+
+def test_json_schema_required_parameters():
+    agent = Agent(FunctionModel(get_json_schema))
+
+    @agent.tool
+    def my_tool(ctx: RunContext[None], a: int, b: int = 1) -> int:
+        raise NotImplementedError
+
+    @agent.tool_plain
+    def my_tool_plain(*, a: int = 1, b: int) -> int:
+        raise NotImplementedError
+
+    result = agent.run_sync('Hello')
+    json_schema = json.loads(result.output)
+    assert json_schema == snapshot(
+        [
+            {
+                'description': None,
+                'name': 'my_tool',
+                'outer_typed_dict_key': None,
+                'parameters_json_schema': {
+                    'additionalProperties': False,
+                    'properties': {'a': {'type': 'integer'}, 'b': {'default': 1, 'type': 'integer'}},
+                    'required': ['a'],
+                    'type': 'object',
+                },
+                'strict': None,
+                'kind': 'function',
+                'sequential': False,
+                'metadata': None,
+                'timeout': None,
+            },
+            {
+                'description': None,
+                'name': 'my_tool_plain',
+                'outer_typed_dict_key': None,
+                'parameters_json_schema': {
+                    'additionalProperties': False,
+                    'properties': {'a': {'default': 1, 'type': 'integer'}, 'b': {'type': 'integer'}},
+                    'required': ['b'],
+                    'type': 'object',
+                },
+                'strict': None,
+                'kind': 'function',
+                'sequential': False,
+                'metadata': None,
+                'timeout': None,
+            },
+        ]
+    )
+
+def test_output_type_deferred_tool_requests_by_itself():
+    with pytest.raises(UserError, match='At least one output type must be provided other than `DeferredToolRequests`.'):
+        Agent(TestModel(), output_type=DeferredToolRequests)
+
+def test_output_type_empty():
+    with pytest.raises(UserError, match='At least one output type must be provided.'):
+        Agent(TestModel(), output_type=[])
+
+## tests/test_ui.py
+
+class DummyUIRunInput(BaseModel):
+    messages: list[ModelMessage] = field(default_factory=list[ModelMessage])
+    tool_defs: list[ToolDefinition] = field(default_factory=list[ToolDefinition])
+    state: dict[str, Any] = field(default_factory=dict[str, Any])

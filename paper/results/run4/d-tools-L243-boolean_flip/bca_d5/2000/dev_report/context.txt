@@ -1,0 +1,221 @@
+## pydantic_ai_slim/pydantic_ai/ext/langchain.py
+
+    def name(self) -> str: ...
+
+## tests/test_tools.py
+
+async def google_style_docstring(foo: int, bar: str) -> str:  # pragma: no cover
+    """Do foobar stuff, a lot.
+
+    Args:
+        foo: The foo thing.
+        bar: The bar thing.
+    """
+    return f'{foo} {bar}'
+
+async def missing_parameter_descriptions_docstring(foo: int, bar: str) -> str:  # pragma: no cover
+    """Describes function ops, but missing parameter descriptions."""
+    return f'{foo} {bar}'
+
+def test_tool_raises_approval_required():
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if len(messages) == 1:
+            return ModelResponse(
+                parts=[
+                    ToolCallPart('my_tool', {'x': 1}, tool_call_id='my_tool'),
+                ]
+            )
+        else:
+            return ModelResponse(
+                parts=[
+                    TextPart('Done!'),
+                ]
+            )
+
+    agent = Agent(FunctionModel(llm), output_type=[str, DeferredToolRequests])
+
+    @agent.tool
+    def my_tool(ctx: RunContext[None], x: int) -> int:
+        if not ctx.tool_call_approved:
+            raise ApprovalRequired
+        return x * 42
+
+    result = agent.run_sync('Hello')
+    messages = result.all_messages()
+    assert result.output == snapshot(
+        DeferredToolRequests(approvals=[ToolCallPart(tool_name='my_tool', args={'x': 1}, tool_call_id='my_tool')])
+    )
+
+    result = agent.run_sync(
+        message_history=messages,
+        deferred_tool_results=DeferredToolResults(approvals={'my_tool': ToolApproved(override_args={'x': 2})}),
+    )
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Hello',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='my_tool', args={'x': 1}, tool_call_id='my_tool')],
+                usage=RequestUsage(input_tokens=51, output_tokens=4),
+                model_name='function:llm:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='my_tool',
+                        content=84,
+                        tool_call_id='my_tool',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Done!')],
+                usage=RequestUsage(input_tokens=52, output_tokens=5),
+                model_name='function:llm:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+    assert result.output == snapshot('Done!')
+
+def test_output_type_deferred_tool_requests_by_itself():
+    with pytest.raises(UserError, match='At least one output type must be provided other than `DeferredToolRequests`.'):
+        Agent(TestModel(), output_type=DeferredToolRequests)
+
+def test_deferred_tool_call_approved_fails():
+    def llm(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(
+            parts=[
+                ToolCallPart('foo', {'x': 0}, tool_call_id='foo'),
+            ]
+        )
+
+    agent = Agent(FunctionModel(llm), output_type=[str, DeferredToolRequests])
+
+    async def defer(ctx: RunContext[None], tool_def: ToolDefinition) -> ToolDefinition | None:
+        return replace(tool_def, kind='external')
+
+    @agent.tool_plain(prepare=defer)
+    def foo(x: int) -> int:
+        return x + 1  # pragma: no cover
+
+    result = agent.run_sync('foo')
+    assert result.output == snapshot(
+        DeferredToolRequests(calls=[ToolCallPart(tool_name='foo', args={'x': 0}, tool_call_id='foo')])
+    )
+
+    with pytest.raises(RuntimeError, match='External tools cannot be called'):
+        agent.run_sync(
+            message_history=result.all_messages(),
+            deferred_tool_results=DeferredToolResults(
+                approvals={
+                    'foo': True,
+                },
+            ),
+        )
+
+def test_retry_tool_until_last_attempt():
+    model = TestModel()
+    agent = Agent(model, retries=2)
+
+    @agent.tool
+    def always_fail(ctx: RunContext[None]) -> str:
+        if ctx.last_attempt:
+            return 'I guess you never learn'
+        else:
+            raise ModelRetry('Please try again.')
+
+    result = agent.run_sync('Always fail!')
+    assert result.output == snapshot('{"always_fail":"I guess you never learn"}')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='Always fail!',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='always_fail', args={}, tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=52, output_tokens=2),
+                model_name='test',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Please try again.',
+                        tool_name='always_fail',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='always_fail', args={}, tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=62, output_tokens=4),
+                model_name='test',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='Please try again.',
+                        tool_name='always_fail',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[ToolCallPart(tool_name='always_fail', args={}, tool_call_id=IsStr())],
+                usage=RequestUsage(input_tokens=72, output_tokens=6),
+                model_name='test',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='always_fail',
+                        content='I guess you never learn',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='{"always_fail":"I guess you never learn"}')],
+                usage=RequestUsage(input_tokens=77, output_tokens=14),
+                model_name='test',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )

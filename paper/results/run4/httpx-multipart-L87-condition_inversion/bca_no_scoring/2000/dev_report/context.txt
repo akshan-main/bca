@@ -1,0 +1,223 @@
+## httpx/_content.py
+
+def encode_multipart_data(
+    data: RequestData, files: RequestFiles, boundary: bytes | None
+) -> tuple[dict[str, str], MultipartStream]:
+    multipart = MultipartStream(data=data, files=files, boundary=boundary)
+    headers = multipart.get_headers()
+    return headers, multipart
+
+## httpx/_models.py
+
+    def text(self) -> str:
+        if not hasattr(self, "_text"):
+            content = self.content
+            if not content:
+                self._text = ""
+            else:
+                decoder = TextDecoder(encoding=self.encoding or "utf-8")
+                self._text = "".join([decoder.decode(self.content), decoder.flush()])
+        return self._text
+
+## httpx/_multipart.py
+
+class DataField:
+    """
+    A single form field item, within a multipart form field.
+    """
+
+    def __init__(self, name: str, value: str | bytes | int | float | None) -> None:
+        if not isinstance(name, str):
+            raise TypeError(
+                f"Invalid type for name. Expected str, got {type(name)}: {name!r}"
+            )
+        if value is not None and not isinstance(value, (str, bytes, int, float)):
+            raise TypeError(
+                "Invalid type for value. Expected primitive type,"
+                f" got {type(value)}: {value!r}"
+            )
+        self.name = name
+        self.value: str | bytes = (
+            value if not isinstance(value, bytes) else primitive_value_to_str(value)
+        )
+
+    def render_headers(self) -> bytes:
+        if not hasattr(self, "_headers"):
+            name = _format_form_param("name", self.name)
+            self._headers = b"".join(
+                [b"Content-Disposition: form-data; ", name, b"\r\n\r\n"]
+            )
+
+        return self._headers
+
+    def render_data(self) -> bytes:
+        if not hasattr(self, "_data"):
+            self._data = to_bytes(self.value)
+
+        return self._data
+
+    def get_length(self) -> int:
+        headers = self.render_headers()
+        data = self.render_data()
+        return len(headers) + len(data)
+
+    def render(self) -> typing.Iterator[bytes]:
+        yield self.render_headers()
+        yield self.render_data()
+
+## httpx/_transports/mock.py
+
+class MockTransport(AsyncBaseTransport, BaseTransport):
+    def __init__(self, handler: SyncHandler | AsyncHandler) -> None:
+        self.handler = handler
+
+    def handle_request(
+        self,
+        request: Request,
+    ) -> Response:
+        request.read()
+        response = self.handler(request)
+        if not isinstance(response, Response):  # pragma: no cover
+            raise TypeError("Cannot use an async handler in a sync Client")
+        return response
+
+    async def handle_async_request(
+        self,
+        request: Request,
+    ) -> Response:
+        await request.aread()
+        response = self.handler(request)
+
+        # Allow handler to *optionally* be an `async` function.
+        # If it is, then the `response` variable need to be awaited to actually
+        # return the result.
+
+        if not isinstance(response, Response):
+            response = await response
+
+        return response
+
+## tests/conftest.py
+
+async def status_code(scope: Scope, receive: Receive, send: Send) -> None:
+    status_code = int(scope["path"].replace("/status/", ""))
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [[b"content-type", b"text/plain"]],
+        }
+    )
+    await send({"type": "http.response.body", "body": b"Hello, world!"})
+
+## tests/models/test_requests.py
+
+def test_json_encoded_data():
+    request = httpx.Request("POST", "http://example.org", json={"test": 123})
+    request.read()
+
+    assert request.headers["Content-Type"] == "application/json"
+    assert request.content == b'{"test":123}'
+
+def test_read_and_stream_data():
+    # Ensure a request may still be streamed if it has been read.
+    # Needed for cases such as authentication classes that read the request body.
+    request = httpx.Request("POST", "http://example.org", json={"test": 123})
+    request.read()
+    assert request.stream is not None
+    assert isinstance(request.stream, typing.Iterable)
+    content = b"".join(list(request.stream))
+    assert content == request.content
+
+## tests/test_multipart.py
+
+def echo_request_content(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, content=request.content)
+
+def test_multipart(value, output):
+    client = httpx.Client(transport=httpx.MockTransport(echo_request_content))
+
+    # Test with a single-value 'data' argument, and a plain file 'files' argument.
+    data = {"text": value}
+    files = {"file": io.BytesIO(b"<file content>")}
+    response = client.post("http://127.0.0.1:8000/", data=data, files=files)
+    boundary = response.request.headers["Content-Type"].split("boundary=")[-1]
+    boundary_bytes = boundary.encode("ascii")
+
+    assert response.status_code == 200
+    assert response.content == b"".join(
+        [
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="text"\r\n',
+            b"\r\n",
+            b"abc\r\n",
+            b"--" + boundary_bytes + b"\r\n",
+            b'Content-Disposition: form-data; name="file"; filename="upload"\r\n',
+            b"Content-Type: application/octet-stream\r\n",
+            b"\r\n",
+            b"<file content>\r\n",
+            b"--" + boundary_bytes + b"--\r\n",
+        ]
+    )
+
+def test_multipart_encode_files_guesses_correct_content_type(
+    file_name: str, expected_content_type: str
+) -> None:
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": (file_name, io.BytesIO(b"<file content>"))}
+
+    request = httpx.Request("POST", url, headers=headers, data={}, files=files)
+    request.read()
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Content-Length": str(len(request.content)),
+    }
+    assert request.content == (
+        f'--BOUNDARY\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{file_name}"\r\nContent-Type: '
+        f"{expected_content_type}\r\n\r\n<file content>\r\n--BOUNDARY--\r\n"
+        "".encode("ascii")
+    )
+
+def test_multipart_encode_non_seekable_filelike() -> None:
+    """
+    Test that special readable but non-seekable filelike objects are supported.
+    In this case uploads with use 'Transfer-Encoding: chunked', instead of
+    a 'Content-Length' header.
+    """
+
+    class IteratorIO(io.IOBase):
+        def __init__(self, iterator: typing.Iterator[bytes]) -> None:
+            self._iterator = iterator
+
+        def read(self, *args: typing.Any) -> bytes:
+            return b"".join(self._iterator)
+
+    def data() -> typing.Iterator[bytes]:
+        yield b"Hello"
+        yield b"World"
+
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    fileobj: typing.Any = IteratorIO(data())
+    files = {"file": fileobj}
+
+    request = httpx.Request("POST", url, headers=headers, files=files)
+    request.read()
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Transfer-Encoding": "chunked",
+    }
+    assert request.content == (
+        b"--BOUNDARY\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="upload"\r\n'
+        b"Content-Type: application/octet-stream\r\n"
+        b"\r\n"
+        b"HelloWorld\r\n"
+        b"--BOUNDARY--\r\n"
+    )

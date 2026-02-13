@@ -1,0 +1,457 @@
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+## httpx/_content.py
+
+class AsyncIteratorByteStream(AsyncByteStream):
+    CHUNK_SIZE = 65_536
+
+    def __init__(self, stream: AsyncIterable[bytes]) -> None:
+        self._stream = stream
+        self._is_stream_consumed = False
+        self._is_generator = inspect.isasyncgen(stream)
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        if self._is_stream_consumed and self._is_generator:
+            raise StreamConsumed()
+
+        self._is_stream_consumed = True
+        if hasattr(self._stream, "aread"):
+            # File-like interfaces should use 'aread' directly.
+            chunk = await self._stream.aread(self.CHUNK_SIZE)
+            while chunk:
+                yield chunk
+                chunk = await self._stream.aread(self.CHUNK_SIZE)
+        else:
+            # Otherwise iterate.
+            async for part in self._stream:
+                yield part
+
+## httpx/_exceptions.py
+
+class HTTPError(Exception):
+    """
+    Base class for `RequestError` and `HTTPStatusError`.
+
+    Useful for `try...except` blocks when issuing a request,
+    and then calling `.raise_for_status()`.
+
+    For example:
+
+    ```
+    try:
+        response = httpx.get("https://www.example.com")
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        print(f"HTTP Exception for {exc.request.url} - {exc}")
+    ```
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self._request: Request | None = None
+
+    @property
+    def request(self) -> Request:
+        if self._request is None:
+            raise RuntimeError("The .request property has not been set.")
+        return self._request
+
+    @request.setter
+    def request(self, request: Request) -> None:
+        self._request = request
+
+class ReadError(NetworkError):
+    """
+    Failed to receive data from the network.
+    """
+
+## httpx/_transports/default.py
+
+def _load_httpcore_exceptions() -> dict[type[Exception], type[httpx.HTTPError]]:
+    import httpcore
+
+    return {
+        httpcore.TimeoutException: TimeoutException,
+        httpcore.ConnectTimeout: ConnectTimeout,
+        httpcore.ReadTimeout: ReadTimeout,
+        httpcore.WriteTimeout: WriteTimeout,
+        httpcore.PoolTimeout: PoolTimeout,
+        httpcore.NetworkError: NetworkError,
+        httpcore.ConnectError: ConnectError,
+        httpcore.ReadError: ReadError,
+        httpcore.WriteError: WriteError,
+        httpcore.ProxyError: ProxyError,
+        httpcore.UnsupportedProtocol: UnsupportedProtocol,
+        httpcore.ProtocolError: ProtocolError,
+        httpcore.LocalProtocolError: LocalProtocolError,
+        httpcore.RemoteProtocolError: RemoteProtocolError,
+    }
+
+## tests/client/test_auth.py
+
+async def test_digest_auth_qop_must_be_auth_or_auth_int() -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = DigestApp(qop="not-auth")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+async def test_async_digest_auth_raises_protocol_error_on_malformed_header(
+    auth_header: str,
+) -> None:
+    url = "https://example.org/"
+    auth = httpx.DigestAuth(username="user", password="password123")
+    app = App(auth_header=auth_header, status_code=401)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(app)) as client:
+        with pytest.raises(httpx.ProtocolError):
+            await client.get(url, auth=auth)
+
+def test_sync_auth_history() -> None:
+    """
+    Test that intermediate requests sent as part of an authentication flow
+    are recorded in the response history.
+    """
+    url = "https://example.org/"
+    auth = RepeatAuth(repeat=2)
+    app = App(auth_header="abc")
+
+    with httpx.Client(transport=httpx.MockTransport(app)) as client:
+        response = client.get(url, auth=auth)
+
+    assert response.status_code == 200
+    assert response.json() == {"auth": "Repeat abc.abc"}
+
+    assert len(response.history) == 2
+    resp1, resp2 = response.history
+    assert resp1.json() == {"auth": "Repeat 0"}
+    assert resp2.json() == {"auth": "Repeat 1"}
+
+    assert len(resp2.history) == 1
+    assert resp2.history == [resp1]
+
+    assert len(resp1.history) == 0
+
+class ConsumeBodyTransport(httpx.MockTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        assert isinstance(request.stream, httpx.AsyncByteStream)
+        [_ async for _ in request.stream]
+        return self.handler(request)  # type: ignore[return-value]
+
+## tests/client/test_client.py
+
+def test_context_managed_transport():
+    class Transport(httpx.BaseTransport):
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def close(self):
+            # The base implementation of httpx.BaseTransport just
+            # calls into `.close`, so simple transport cases can just override
+            # this method for any cleanup, where more complex cases
+            # might want to additionally override `__enter__`/`__exit__`.
+            self.events.append("transport.close")
+
+        def __enter__(self):
+            super().__enter__()
+            self.events.append("transport.__enter__")
+
+        def __exit__(self, *args):
+            super().__exit__(*args)
+            self.events.append("transport.__exit__")
+
+    transport = Transport()
+    with httpx.Client(transport=transport):
+        pass
+
+    assert transport.events == [
+        "transport.__enter__",
+        "transport.close",
+        "transport.__exit__",
+    ]
+
+def test_all_mounted_transport():
+    mounts = {"all://": httpx.MockTransport(mounted)}
+
+    client = httpx.Client(mounts=mounts)
+
+    response = client.get("https://www.example.com")
+    assert response.status_code == 200
+    assert response.json() == {"app": "mounted"}
+
+## tests/client/test_proxies.py
+
+def test_transport_for_request(url, proxies, expected):
+    mounts = {key: httpx.HTTPTransport(proxy=value) for key, value in proxies.items()}
+    client = httpx.Client(mounts=mounts)
+
+    transport = client._transport_for_url(httpx.URL(url))
+
+    if expected is None:
+        assert transport is client._transport
+    else:
+        assert isinstance(transport, httpx.HTTPTransport)
+        assert isinstance(transport._pool, httpcore.HTTPProxy)
+        assert transport._pool._proxy_url == url_to_origin(expected)
+
+def test_unsupported_proxy_scheme():
+    with pytest.raises(ValueError):
+        httpx.Client(proxy="ftp://127.0.0.1")
+
+## tests/client/test_redirects.py
+
+def test_malformed_redirect():
+    # https://github.com/encode/httpx/issues/771
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.get(
+        "http://example.org/malformed_redirect", follow_redirects=True
+    )
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org:443/"
+    assert len(response.history) == 1
+
+## tests/conftest.py
+
+def cert_authority():
+    return trustme.CA()
+
+## tests/models/test_responses.py
+
+def test_raise_for_status():
+    request = httpx.Request("GET", "https://example.org")
+
+    # 2xx status codes are not an error.
+    response = httpx.Response(200, request=request)
+    response.raise_for_status()
+
+    # 1xx status codes are informational responses.
+    response = httpx.Response(101, request=request)
+    assert response.is_informational
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        response.raise_for_status()
+    assert str(exc_info.value) == (
+        "Informational response '101 Switching Protocols' for url 'https://example.org'\n"
+        "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/101"
+    )
+
+    # 3xx status codes are redirections.
+    headers = {"location": "https://other.org"}
+    response = httpx.Response(303, headers=headers, request=request)
+    assert response.is_redirect
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        response.raise_for_status()
+    assert str(exc_info.value) == (
+        "Redirect response '303 See Other' for url 'https://example.org'\n"
+        "Redirect location: 'https://other.org'\n"
+        "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/303"
+    )
+
+    # 4xx status codes are a client error.
+    response = httpx.Response(403, request=request)
+    assert response.is_client_error
+    assert response.is_error
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        response.raise_for_status()
+    assert str(exc_info.value) == (
+        "Client error '403 Forbidden' for url 'https://example.org'\n"
+        "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/403"
+    )
+
+    # 5xx status codes are a server error.
+    response = httpx.Response(500, request=request)
+    assert response.is_server_error
+    assert response.is_error
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        response.raise_for_status()
+    assert str(exc_info.value) == (
+        "Server error '500 Internal Server Error' for url 'https://example.org'\n"
+        "For more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500"
+    )
+
+    # Calling .raise_for_status without setting a request instance is
+    # not valid. Should raise a runtime error.
+    response = httpx.Response(200)
+    with pytest.raises(RuntimeError):
+        response.raise_for_status()
+
+def test_response_force_encoding():
+    response = httpx.Response(
+        200,
+        content="Snowman: ☃".encode("utf-8"),
+    )
+    response.encoding = "iso-8859-1"
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+    assert response.text == "Snowman: â\x98\x83"
+    assert response.encoding == "iso-8859-1"
+
+def test_response_force_encoding_after_text_accessed():
+    response = httpx.Response(
+        200,
+        content=b"Hello, world!",
+    )
+    assert response.status_code == 200
+    assert response.reason_phrase == "OK"
+    assert response.text == "Hello, world!"
+    assert response.encoding == "utf-8"
+
+    with pytest.raises(ValueError):
+        response.encoding = "UTF8"
+
+    with pytest.raises(ValueError):
+        response.encoding = "iso-8859-1"
+
+## tests/models/test_url.py
+
+def test_resolution_error_1833():
+    """
+    See https://github.com/encode/httpx/issues/1833
+    """
+    url = httpx.URL("https://example.com/?[]")
+    assert url.join("/") == "https://example.com/"
+
+## tests/test_config.py
+
+def test_load_ssl_config_cert_and_key_invalid_password(
+    cert_pem_file, cert_encrypted_private_key_file
+):
+    with pytest.raises(ssl.SSLError):
+        context = httpx.create_ssl_context()
+        context.load_cert_chain(
+            cert_pem_file, cert_encrypted_private_key_file, "password1"
+        )
+
+## tests/test_content.py
+
+async def test_iterator_content():
+    def hello_world() -> typing.Iterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    request = httpx.Request(method, url, content=hello_world())
+    assert isinstance(request.stream, typing.Iterable)
+    assert not isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        list(request.stream)
+
+    # Support 'data' for compat with requests.
+    with pytest.warns(DeprecationWarning):
+        request = httpx.Request(method, url, data=hello_world())  # type: ignore
+    assert isinstance(request.stream, typing.Iterable)
+    assert not isinstance(request.stream, typing.AsyncIterable)
+
+    content = b"".join(list(request.stream))
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Transfer-Encoding": "chunked",
+    }
+    assert content == b"Hello, world!"
+
+async def test_response_aiterator_content():
+    async def hello_world() -> typing.AsyncIterator[bytes]:
+        yield b"Hello, "
+        yield b"world!"
+
+    response = httpx.Response(200, content=hello_world())
+    assert not isinstance(response.stream, typing.Iterable)
+    assert isinstance(response.stream, typing.AsyncIterable)
+
+    content = b"".join([part async for part in response.stream])
+
+    assert response.headers == {"Transfer-Encoding": "chunked"}
+    assert content == b"Hello, world!"
+
+    with pytest.raises(httpx.StreamConsumed):
+        [part async for part in response.stream]
+
+## tests/test_exceptions.py
+
+def test_httpcore_all_exceptions_mapped() -> None:
+    """
+    All exception classes exposed by HTTPCore are properly mapped to an HTTPX-specific
+    exception class.
+    """
+    expected_mapped_httpcore_exceptions = {
+        value.__name__
+        for _, value in vars(httpcore).items()
+        if isinstance(value, type)
+        and issubclass(value, Exception)
+        and value is not httpcore.ConnectionNotAvailable
+    }
+
+    httpx_exceptions = {
+        value.__name__
+        for _, value in vars(httpx).items()
+        if isinstance(value, type) and issubclass(value, Exception)
+    }
+
+    unmapped_exceptions = expected_mapped_httpcore_exceptions - httpx_exceptions
+
+    if unmapped_exceptions:  # pragma: no cover
+        pytest.fail(f"Unmapped httpcore exceptions: {unmapped_exceptions}")
+
+## tests/test_multipart.py
+
+def test_multipart_encode_files_guesses_correct_content_type(
+    file_name: str, expected_content_type: str
+) -> None:
+    url = "https://www.example.com/"
+    headers = {"Content-Type": "multipart/form-data; boundary=BOUNDARY"}
+    files = {"file": (file_name, io.BytesIO(b"<file content>"))}
+
+    request = httpx.Request("POST", url, headers=headers, data={}, files=files)
+    request.read()
+
+    assert request.headers == {
+        "Host": "www.example.com",
+        "Content-Type": "multipart/form-data; boundary=BOUNDARY",
+        "Content-Length": str(len(request.content)),
+    }
+    assert request.content == (
+        f'--BOUNDARY\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{file_name}"\r\nContent-Type: '
+        f"{expected_content_type}\r\n\r\n<file content>\r\n--BOUNDARY--\r\n"
+        "".encode("ascii")
+    )
+
+## tests/test_wsgi.py
+
+def application_factory(output: typing.Iterable[bytes]) -> WSGIApplication:
+    def application(environ, start_response):
+        status = "200 OK"
+
+        response_headers = [
+            ("Content-type", "text/plain"),
+        ]
+
+        start_response(status, response_headers)
+
+        for item in output:
+            yield item
+
+    return wsgiref.validate.validator(application)
+
+def test_wsgi_generator_empty():
+    output = [b"", b"", b"", b""]
+    transport = httpx.WSGITransport(app=application_factory(output))
+    client = httpx.Client(transport=transport)
+    response = client.get("http://www.example.org/")
+    assert response.status_code == 200
+    assert response.text == ""

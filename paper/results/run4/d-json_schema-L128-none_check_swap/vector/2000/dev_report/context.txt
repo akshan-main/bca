@@ -1,0 +1,221 @@
+# tests/test_json_schema.py:55-89
+def test_schema_defs_not_modified():
+    """Test that the original schema $defs are not modified during transformation."""
+
+    # Create a concrete subclass for testing
+    class TestTransformer(JsonSchemaTransformer):
+        def transform(self, schema: dict[str, Any]) -> dict[str, Any]:
+            return schema
+
+    # Create a schema with $defs that should not be modified
+    original_schema = {
+        'type': 'object',
+        'properties': {'value': {'$ref': '#/$defs/TestUnion'}},
+        '$defs': {
+            'TestUnion': {
+                'anyOf': [
+                    {'type': 'string'},
+                    {'type': 'number'},
+                ],
+                'title': 'TestUnion',
+            }
+        },
+    }
+
+    # Keep a deepcopy to compare against later
+    original_schema_copy = deepcopy(original_schema)
+
+    # Transform the schema
+    transformer = TestTransformer(original_schema)
+    result = transformer.walk()
+
+    # Verify the original schema was not modified
+    assert original_schema == original_schema_copy
+
+    # Verify the result is correct
+    assert result == original_schema_copy
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:449-489
+def merge_json_schema_defs(schemas: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Merges the `$defs` from different JSON schemas into a single deduplicated `$defs`, handling name collisions of `$defs` that are not the same, and rewrites `$ref`s to point to the new `$defs`.
+
+    Returns a tuple of the rewritten schemas and a dictionary of the new `$defs`.
+    """
+    all_defs: dict[str, dict[str, Any]] = {}
+    rewritten_schemas: list[dict[str, Any]] = []
+
+    for schema in schemas:
+        if '$defs' not in schema:
+            rewritten_schemas.append(schema)
+            continue
+
+        schema = schema.copy()
+        defs = schema.pop('$defs', None)
+        schema_name_mapping: dict[str, str] = {}
+
+        # Process definitions and build mapping
+        for name, def_schema in defs.items():
+            if name not in all_defs:
+                all_defs[name] = def_schema
+                schema_name_mapping[name] = name
+            elif def_schema != all_defs[name]:
+                new_name = name
+                if title := schema.get('title'):
+                    new_name = f'{title}_{name}'
+
+                i = 1
+                original_new_name = new_name
+                new_name = f'{new_name}_{i}'
+                while new_name in all_defs:
+                    i += 1
+                    new_name = f'{original_new_name}_{i}'
+
+                all_defs[new_name] = def_schema
+                schema_name_mapping[name] = new_name
+
+        _update_mapped_json_schema_refs(schema, schema_name_mapping)
+        rewritten_schemas.append(schema)
+
+    return rewritten_schemas, all_defs
+
+# pydantic_ai_slim/pydantic_ai/output.py:296-360
+def StructuredDict(
+    json_schema: JsonSchemaValue, name: str | None = None, description: str | None = None
+) -> type[JsonSchemaValue]:
+    """Returns a `dict[str, Any]` subclass with a JSON schema attached that will be used for structured output.
+
+    Args:
+        json_schema: A JSON schema of type `object` defining the structure of the dictionary content.
+        name: Optional name of the structured output. If not provided, the `title` field of the JSON schema will be used if it's present.
+        description: Optional description of the structured output. If not provided, the `description` field of the JSON schema will be used if it's present.
+
+    Example:
+    ```python {title="structured_dict.py"}
+    from pydantic_ai import Agent, StructuredDict
+
+    schema = {
+        'type': 'object',
+        'properties': {
+            'name': {'type': 'string'},
+            'age': {'type': 'integer'}
+        },
+        'required': ['name', 'age']
+    }
+
+    agent = Agent('openai:gpt-5.2', output_type=StructuredDict(schema))
+    result = agent.run_sync('Create a person')
+    print(result.output)
+    #> {'name': 'John Doe', 'age': 30}
+    ```
+    """
+    json_schema = _utils.check_object_json_schema(json_schema)
+
+    # Pydantic `TypeAdapter` fails when `object.__get_pydantic_json_schema__` has `$defs`, so we inline them
+    # See https://github.com/pydantic/pydantic/issues/12145
+    if '$defs' in json_schema:
+        json_schema = InlineDefsJsonSchemaTransformer(json_schema).walk()
+        if '$defs' in json_schema:
+            raise exceptions.UserError(
+                '`StructuredDict` does not currently support recursive `$ref`s and `$defs`. See https://github.com/pydantic/pydantic/issues/12145 for more information.'
+            )
+
+    if name:
+        json_schema['title'] = name
+
+    if description:
+        json_schema['description'] = description
+
+    class _StructuredDict(JsonSchemaValue):
+        __is_model_like__ = True
+
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls, source_type: Any, handler: GetCoreSchemaHandler
+        ) -> core_schema.CoreSchema:
+            return core_schema.dict_schema(
+                keys_schema=core_schema.str_schema(),
+                values_schema=core_schema.any_schema(),
+            )
+
+        @classmethod
+        def __get_pydantic_json_schema__(
+            cls, core_schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler
+        ) -> JsonSchemaValue:
+            return json_schema
+
+    return _StructuredDict
+
+# pydantic_ai_slim/pydantic_ai/_json_schema.py:53-55
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        """Make changes to the schema."""
+        return schema
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:421-440
+    def _object_gen(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """Generate data for a JSON Schema object."""
+        required = set(schema.get('required', []))
+
+        data: dict[str, Any] = {}
+        if properties := schema.get('properties'):
+            for key, value in properties.items():
+                if key in required:
+                    data[key] = self._gen_any(value)
+
+        if addition_props := schema.get('additionalProperties'):
+            add_prop_key = 'additionalProperty'
+            while add_prop_key in data:
+                add_prop_key += '_'
+            if addition_props is True:
+                data[add_prop_key] = self._char()
+            else:
+                data[add_prop_key] = self._gen_any(addition_props)
+
+        return data
+
+# pydantic_ai_slim/pydantic_ai/_json_schema.py:192-199
+class InlineDefsJsonSchemaTransformer(JsonSchemaTransformer):
+    """Transforms the JSON Schema to inline $defs."""
+
+    def __init__(self, schema: JsonSchema, *, strict: bool | None = None):
+        super().__init__(schema, strict=strict, prefer_inlined_defs=True)
+
+    def transform(self, schema: JsonSchema) -> JsonSchema:
+        return schema
+
+# pydantic_ai_slim/pydantic_ai/models/test.py:442-455
+    def _str_gen(self, schema: dict[str, Any]) -> str:
+        """Generate a string from a JSON Schema string."""
+        min_len = schema.get('minLength')
+        if min_len is not None:
+            return self._char() * min_len
+
+        if schema.get('maxLength') == 0:
+            return ''
+
+        if fmt := schema.get('format'):
+            if fmt == 'date':
+                return (date(2024, 1, 1) + timedelta(days=self.seed)).isoformat()
+
+        return self._char()
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:20-20
+    type: Literal['tool_call']
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:15-15
+    type: Literal['text']
+
+# pydantic_ai_slim/pydantic_ai/_otel_messages.py:47-47
+    type: Literal['thinking']
+
+# pydantic_evals/pydantic_evals/dataset.py:884-894
+    def _add_json_schema(self, nxt: SerializerFunctionWrapHandler, info: SerializationInfo) -> dict[str, Any]:
+        """Add the JSON schema path to the serialized output.
+
+        See <https://github.com/json-schema-org/json-schema-spec/issues/828> for context, that seems to be the nearest
+        there is to a spec for this.
+        """
+        context = cast(dict[str, Any] | None, info.context)
+        if isinstance(context, dict) and (schema := context.get('$schema')):
+            return {'$schema': schema} | nxt(self)
+        else:
+            return nxt(self)

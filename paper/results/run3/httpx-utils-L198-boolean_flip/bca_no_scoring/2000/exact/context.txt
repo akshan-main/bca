@@ -1,0 +1,256 @@
+## httpx/_client.py
+
+def _port_or_default(url: URL) -> int | None:
+    if url.port is not None:
+        return url.port
+    return {"http": 80, "https": 443}.get(url.scheme)
+
+## httpx/_decoders.py
+
+class ContentDecoder:
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def flush(self) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+    def decode(self, data: bytes) -> bytes:
+        raise NotImplementedError()  # pragma: no cover
+
+## httpx/_urlparse.py
+
+IPv4_STYLE_HOSTNAME = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$")
+
+def encode_host(host: str) -> str:
+    if not host:
+        return ""
+
+    elif IPv4_STYLE_HOSTNAME.match(host):
+        # Validate IPv4 hostnames like #.#.#.#
+        #
+        # From https://datatracker.ietf.org/doc/html/rfc3986/#section-3.2.2
+        #
+        # IPv4address = dec-octet "." dec-octet "." dec-octet "." dec-octet
+        try:
+            ipaddress.IPv4Address(host)
+        except ipaddress.AddressValueError:
+            raise InvalidURL(f"Invalid IPv4 address: {host!r}")
+        return host
+
+    elif IPv6_STYLE_HOSTNAME.match(host):
+        # Validate IPv6 hostnames like [...]
+        #
+        # From https://datatracker.ietf.org/doc/html/rfc3986/#section-3.2.2
+        #
+        # "A host identified by an Internet Protocol literal address, version 6
+        # [RFC3513] or later, is distinguished by enclosing the IP literal
+        # within square brackets ("[" and "]").  This is the only place where
+        # square bracket characters are allowed in the URI syntax."
+        try:
+            ipaddress.IPv6Address(host[1:-1])
+        except ipaddress.AddressValueError:
+            raise InvalidURL(f"Invalid IPv6 address: {host!r}")
+        return host[1:-1]
+
+    elif host.isascii():
+        # Regular ASCII hostnames
+        #
+        # From https://datatracker.ietf.org/doc/html/rfc3986/#section-3.2.2
+        #
+        # reg-name    = *( unreserved / pct-encoded / sub-delims )
+        WHATWG_SAFE = '"`{}%|\\'
+        return quote(host.lower(), safe=SUB_DELIMS + WHATWG_SAFE)
+
+    # IDNA hostnames
+    try:
+        return idna.encode(host.lower()).decode("ascii")
+    except idna.IDNAError:
+        raise InvalidURL(f"Invalid IDNA hostname: {host!r}")
+
+def PERCENT(string: str) -> str:
+    return "".join([f"%{byte:02X}" for byte in string.encode("utf-8")])
+
+## httpx/_utils.py
+
+def to_str(value: str | bytes, encoding: str = "utf-8") -> str:
+    return value if isinstance(value, str) else value.decode(encoding)
+
+def is_ipv4_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv4Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+def is_ipv6_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.IPv6Address(hostname.split("/")[0])
+    except Exception:
+        return False
+    return True
+
+## tests/client/test_async_client.py
+
+async def test_get_invalid_url(server, url):
+    async with httpx.AsyncClient() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            await client.get(url)
+
+## tests/client/test_client.py
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+def test_get_invalid_url(server, url):
+    with httpx.Client() as client:
+        with pytest.raises((httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            client.get(url)
+
+## tests/client/test_headers.py
+
+def test_header_does_not_exist():
+    headers = httpx.Headers({"foo": "bar"})
+    with pytest.raises(KeyError):
+        del headers["baz"]
+
+def test_host_with_auth_and_port_in_url():
+    """
+    The Host header should only include the hostname, or hostname:port
+    (for non-default ports only). Any userinfo or default port should not
+    be present.
+    """
+    url = "http://username:password@example.org:80/echo_headers"
+
+    client = httpx.Client(transport=httpx.MockTransport(echo_headers))
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "headers": {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "connection": "keep-alive",
+            "host": "example.org",
+            "user-agent": f"python-httpx/{httpx.__version__}",
+            "authorization": "Basic dXNlcm5hbWU6cGFzc3dvcmQ=",
+        }
+    }
+
+## tests/client/test_redirects.py
+
+def test_redirect_301():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    response = client.post("https://example.org/redirect_301", follow_redirects=True)
+    assert response.status_code == httpx.codes.OK
+    assert response.url == "https://example.org/"
+    assert len(response.history) == 1
+
+def test_invalid_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.RemoteProtocolError):
+        client.get("http://example.org/invalid_redirect", follow_redirects=True)
+
+def test_redirect_loop():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.TooManyRedirects):
+        client.get("https://example.org/redirect_loop", follow_redirects=True)
+
+def test_cross_subdomain_redirect():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    url = "https://example.com/cross_subdomain"
+    response = client.get(url, follow_redirects=True)
+    assert response.url == "https://www.example.org/cross_subdomain"
+
+def test_redirect_custom_scheme():
+    client = httpx.Client(transport=httpx.MockTransport(redirects))
+    with pytest.raises(httpx.UnsupportedProtocol) as e:
+        client.post("https://example.org/redirect_custom_scheme", follow_redirects=True)
+    assert str(e.value) == "Scheme 'market' not supported."
+
+## tests/conftest.py
+
+def localhost_cert(cert_authority):
+    return cert_authority.issue_cert("localhost")
+
+## tests/models/test_responses.py
+
+async def async_streaming_body() -> typing.AsyncIterator[bytes]:
+    yield b"Hello, "
+    yield b"world!"
+
+def autodetect(content):
+    return chardet.detect(content).get("encoding")
+
+## tests/models/test_url.py
+
+def test_url_valid_host():
+    url = httpx.URL("https://example.com/")
+    assert url.host == "example.com"
+
+def test_url_ipv4_like_host():
+    """rare host names used to quality as IPv4"""
+    url = httpx.URL("https://023b76x43144/")
+    assert url.host == "023b76x43144"
+
+def test_ipv6_url_copy_with_host(url_str, new_host):
+    url = httpx.URL(url_str).copy_with(host=new_host)
+
+    assert url.host == "::ffff:192.168.0.1"
+    assert url.netloc == b"[::ffff:192.168.0.1]:1234"
+    assert str(url) == "http://[::ffff:192.168.0.1]:1234"
+
+## tests/test_api.py
+
+def test_get_invalid_url():
+    with pytest.raises(httpx.UnsupportedProtocol):
+        httpx.get("invalid://example.org")
+
+## tests/test_asgi.py
+
+async def test_asgi_exc():
+    transport = httpx.ASGITransport(app=raise_exc)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError):
+            await client.get("http://www.example.org/")
+
+async def test_asgi_exc_after_response():
+    transport = httpx.ASGITransport(app=raise_exc_after_response)
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError):
+            await client.get("http://www.example.org/")
+
+## tests/test_config.py
+
+def test_SSLContext_with_get_request(server, cert_pem_file):
+    context = httpx.create_ssl_context()
+    context.load_verify_locations(cert_pem_file)
+    response = httpx.get(server.url, verify=context)
+    assert response.status_code == 200
+
+## tests/test_main.py
+
+def splitlines(output: str) -> typing.Iterable[str]:
+    return [line.strip() for line in output.splitlines()]
+
+def remove_date_header(lines: typing.Iterable[str]) -> typing.Iterable[str]:
+    return [line for line in lines if not line.startswith("date:")]
+
+## tests/test_utils.py
+
+def test_url_matches(pattern, url, expected):
+    pattern = URLPattern(pattern)
+    assert pattern.matches(httpx.URL(url)) == expected
+
+## tests/test_wsgi.py
+
+def test_wsgi_exc():
+    transport = httpx.WSGITransport(app=raise_exc)
+    client = httpx.Client(transport=transport)
+    with pytest.raises(ValueError):
+        client.get("http://www.example.org/")
+
+def test_wsgi_http_error():
+    transport = httpx.WSGITransport(app=partial(raise_exc, exc=RuntimeError))
+    client = httpx.Client(transport=transport)
+    with pytest.raises(RuntimeError):
+        client.get("http://www.example.org/")

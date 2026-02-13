@@ -1,0 +1,431 @@
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def check_object_json_schema(schema: JsonSchemaValue) -> ObjectJsonSchema:
+    from .exceptions import UserError
+
+    if schema.get('type') == 'object':
+        return schema
+    elif ref := schema.get('$ref'):
+        prefix = '#/$defs/'
+        # Return the referenced schema unless it contains additional nested references.
+        if (
+            ref.startswith(prefix)
+            or (resolved := schema.get('$defs', {}).get(ref[len(prefix) :]))
+            and resolved.get('type') == 'object'
+            and not _contains_ref(resolved)
+        ):
+            return resolved
+        return schema
+    else:
+        raise UserError('Schema must be an object')
+
+## pydantic_graph/pydantic_graph/persistence/__init__.py
+
+    def set_graph_types(self, graph: Graph[StateT, Any, RunEndT]) -> None:
+        """Set the types of the state and run end from a graph.
+
+        You generally won't need to customise this method, instead implement
+        [`set_types`][pydantic_graph.persistence.BaseStatePersistence.set_types] and
+        [`should_set_types`][pydantic_graph.persistence.BaseStatePersistence.should_set_types].
+        """
+        if self.should_set_types():
+            with _utils.set_nodes_type_context(graph.get_nodes()):
+                self.set_types(*graph.inferred_types)
+
+## tests/models/test_xai.py
+
+async def test_xai_unknown_tool_type_in_response(allow_model_requests: None):
+    """Test handling of unknown tool types like x_search or collections_search."""
+    # Create a server-side tool call with an unknown/other type
+    unknown_tool_call = chat_pb2.ToolCall(
+        id='unknown_001',
+        type=chat_pb2.ToolCallType.TOOL_CALL_TYPE_X_SEARCH_TOOL,  # x_search is not directly mapped
+        status=chat_pb2.ToolCallStatus.TOOL_CALL_STATUS_COMPLETED,
+        function=chat_pb2.FunctionCall(
+            name='x_search',
+            arguments='{"query": "test"}',
+        ),
+    )
+
+    # Create response with unknown tool
+    response = create_mixed_tools_response([unknown_tool_call], text_content='Search results here')
+    mock_client = MockXai.create_mock([response])
+    m = XaiModel(XAI_NON_REASONING_MODEL, provider=XaiProvider(xai_client=mock_client))
+    agent = Agent(m)
+
+    result = await agent.run('Search for something')
+
+    # Verify kwargs sent to xAI
+    assert get_mock_chat_create_kwargs(mock_client) == snapshot(
+        [
+            {
+                'model': XAI_NON_REASONING_MODEL,
+                'messages': [{'content': [{'text': 'Search for something'}], 'role': 'ROLE_USER'}],
+                'tools': None,
+                'tool_choice': None,
+                'response_format': None,
+                'use_encrypted_content': False,
+                'include': [],
+            }
+        ]
+    )
+
+    # Verify the unknown tool type is handled gracefully using the function name
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[UserPromptPart(content='Search for something', timestamp=IsNow(tz=timezone.utc))],
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    BuiltinToolCallPart(
+                        tool_name='x_search', args={'query': 'test'}, tool_call_id=IsStr(), provider_name='xai'
+                    ),
+                    TextPart(content='Search results here'),
+                ],
+                model_name=XAI_NON_REASONING_MODEL,
+                timestamp=IsDatetime(),
+                provider_name='xai',
+                provider_url='https://api.x.ai/v1',
+                provider_response_id=IsStr(),
+                finish_reason='stop',
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+## tests/test_agent.py
+
+def test_output_type_function_with_retry():
+    class Weather(BaseModel):
+        temperature: float
+        description: str
+
+    def get_weather(city: str) -> Weather:
+        if city != 'Mexico City':
+            raise ModelRetry('City not found, I only know Mexico City')
+        return Weather(temperature=28.7, description='sunny')
+
+    def call_tool(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+
+        if len(messages) == 1:
+            args_json = '{"city": "New York City"}'
+        else:
+            args_json = '{"city": "Mexico City"}'
+
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, args_json)])
+
+    agent = Agent(FunctionModel(call_tool), output_type=get_weather)
+    result = agent.run_sync('New York City')
+    assert result.output == snapshot(Weather(temperature=28.7, description='sunny'))
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='New York City',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args='{"city": "New York City"}',
+                        tool_call_id=IsStr(),
+                    )
+                ],
+                usage=RequestUsage(input_tokens=53, output_tokens=7),
+                model_name='function:call_tool:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='City not found, I only know Mexico City',
+                        tool_name='final_result',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name='final_result',
+                        args='{"city": "Mexico City"}',
+                        tool_call_id=IsStr(),
+                    )
+                ],
+                usage=RequestUsage(input_tokens=68, output_tokens=13),
+                model_name='function:call_tool:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name='final_result',
+                        content='Final result processed.',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+def test_output_type_text_output_function_with_retry():
+    class Weather(BaseModel):
+        temperature: float
+        description: str
+
+    def get_weather(ctx: RunContext[None], city: str) -> Weather:
+        assert ctx is not None
+        if city != 'Mexico City':
+            raise ModelRetry('City not found, I only know Mexico City')
+        return Weather(temperature=28.7, description='sunny')
+
+    def call_tool(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        assert info.output_tools is not None
+
+        if len(messages) == 1:
+            city = 'New York City'
+        else:
+            city = 'Mexico City'
+
+        return ModelResponse(parts=[TextPart(content=city)])
+
+    agent = Agent(FunctionModel(call_tool), output_type=TextOutput(get_weather))
+    result = agent.run_sync('New York City')
+    assert result.output == snapshot(Weather(temperature=28.7, description='sunny'))
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='New York City',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='New York City')],
+                usage=RequestUsage(input_tokens=53, output_tokens=3),
+                model_name='function:call_tool:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+            ModelRequest(
+                parts=[
+                    RetryPromptPart(
+                        content='City not found, I only know Mexico City',
+                        tool_call_id=IsStr(),
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='Mexico City')],
+                usage=RequestUsage(input_tokens=70, output_tokens=5),
+                model_name='function:call_tool:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+def test_output_type_text_output_function():
+    def say_world(_: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(content='world')])
+
+    agent = Agent(FunctionModel(say_world), output_type=TextOutput(upcase))
+    result = agent.run_sync('hello')
+    assert result.output == snapshot('WORLD')
+    assert result.all_messages() == snapshot(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content='hello',
+                        timestamp=IsDatetime(),
+                    )
+                ],
+                timestamp=IsNow(tz=timezone.utc),
+                run_id=IsStr(),
+            ),
+            ModelResponse(
+                parts=[TextPart(content='world')],
+                usage=RequestUsage(input_tokens=51, output_tokens=1),
+                model_name='function:say_world:',
+                timestamp=IsDatetime(),
+                run_id=IsStr(),
+            ),
+        ]
+    )
+
+class OutputType(BaseModel):
+    """Result type used by multiple tests."""
+
+    value: str
+
+## tests/test_format_as_xml.py
+
+def test_custom_null():
+    assert format_as_xml(None, none_str='nil') == snapshot('<item>nil</item>')
+
+## tests/test_utils.py
+
+async def test_group_by_temporal(interval: float | None, expected: list[list[int]]):
+    async def yield_groups() -> AsyncIterator[int]:
+        yield 1
+        await asyncio.sleep(0.02)
+        yield 2
+        await asyncio.sleep(0.02)
+        yield 3
+        await asyncio.sleep(0.02)
+
+    async with group_by_temporal(yield_groups(), soft_max_interval=interval) as groups_iter:
+        groups: list[list[int]] = [g async for g in groups_iter]
+        assert groups == expected
+
+async def test_peekable_async_stream(peek_first: bool):
+    async_stream = MockAsyncStream(iter([1, 2, 3]))
+    peekable_async_stream = PeekableAsyncStream(async_stream)
+
+    items: list[int] = []
+
+    # We need to both peek before starting the stream, and not, to achieve full coverage
+    if peek_first:
+        assert not await peekable_async_stream.is_exhausted()
+        assert await peekable_async_stream.peek() == 1
+
+    async for item in peekable_async_stream:
+        items.append(item)
+
+        # The next line is included mostly for the sake of achieving coverage
+        assert await peekable_async_stream.peek() == (item + 1 if item < 3 else UNSET)
+
+    assert await peekable_async_stream.is_exhausted()
+    assert await peekable_async_stream.peek() is UNSET
+    assert items == [1, 2, 3]
+
+def test_package_versions(capsys: pytest.CaptureFixture[str]):
+    if os.getenv('CI'):
+        with capsys.disabled():  # pragma: lax no cover
+            print('\npackage versions:')
+            packages = sorted((package.metadata['Name'], package.version) for package in distributions())
+            for name, version in packages:
+                print(f'{name:30} {version}')
+
+async def test_run_in_executor_with_contextvars() -> None:
+    ctx_var = contextvars.ContextVar('test_var', default='default')
+    ctx_var.set('original_value')
+
+    result = await run_in_executor(ctx_var.get)
+    assert result == ctx_var.get()
+
+    ctx_var.set('new_value')
+    result = await run_in_executor(ctx_var.get)
+    assert result == ctx_var.get()
+
+    # show that the old version did not work
+    old_result = asyncio.get_running_loop().run_in_executor(None, ctx_var.get)
+    assert old_result != ctx_var.get()
+
+async def test_run_in_executor_with_disable_threads() -> None:
+    from pydantic_ai._utils import disable_threads
+
+    calls: list[str] = []
+
+    def sync_func() -> str:
+        calls.append('called')
+        return 'result'
+
+    # Without disable_threads, should use threading
+    result = await run_in_executor(sync_func)
+    assert result == 'result'
+    assert calls == ['called']
+
+    # With disable_threads enabled, should execute directly
+    calls.clear()
+    with disable_threads():
+        result = await run_in_executor(sync_func)
+        assert result == 'result'
+        assert calls == ['called']
+
+def test_is_async_callable():
+    def sync_func(): ...  # pragma: no branch
+
+    assert is_async_callable(sync_func) is False
+
+    async def async_func(): ...  # pragma: no branch
+
+    assert is_async_callable(async_func) is True
+
+    class AsyncCallable:
+        async def __call__(self): ...  # pragma: no branch
+
+    partial_async_callable = functools.partial(AsyncCallable())
+    assert is_async_callable(partial_async_callable) is True
+
+def test_strip_markdown_fences():
+    assert strip_markdown_fences('{"foo": "bar"}') == '{"foo": "bar"}'
+    assert strip_markdown_fences('```json\n{"foo": "bar"}\n```') == '{"foo": "bar"}'
+    assert strip_markdown_fences('```json\n{\n  "foo": "bar"\n}') == '{\n  "foo": "bar"\n}'
+    assert (
+        strip_markdown_fences('{"foo": "```json\\n{"foo": "bar"}\\n```"}')
+        == '{"foo": "```json\\n{"foo": "bar"}\\n```"}'
+    )
+    assert (
+        strip_markdown_fences('Here is some beautiful JSON:\n\n```\n{"foo": "bar"}\n``` Nice right?')
+        == '{"foo": "bar"}'
+    )
+    assert strip_markdown_fences('No JSON to be found') == 'No JSON to be found'
+
+def test_validate_empty_kwargs_empty():
+    """Test that empty dict passes validation."""
+    validate_empty_kwargs({})
+
+def test_validate_empty_kwargs_with_unknown():
+    """Test that unknown kwargs raise UserError."""
+    with pytest.raises(UserError, match='Unknown keyword arguments: `unknown_arg`'):
+        validate_empty_kwargs({'unknown_arg': 'value'})
+
+def test_validate_empty_kwargs_multiple_unknown():
+    """Test that multiple unknown kwargs are properly formatted."""
+    with pytest.raises(UserError, match='Unknown keyword arguments: `arg1`, `arg2`'):
+        validate_empty_kwargs({'arg1': 'value1', 'arg2': 'value2'})
+
+def test_validate_empty_kwargs_message_format():
+    """Test that the error message format matches expected pattern."""
+    with pytest.raises(UserError) as exc_info:
+        validate_empty_kwargs({'test_arg': 'test_value'})
+
+    assert 'Unknown keyword arguments: `test_arg`' in str(exc_info.value)
+
+def test_validate_empty_kwargs_preserves_order():
+    """Test that multiple kwargs preserve order in error message."""
+    kwargs = {'first': '1', 'second': '2', 'third': '3'}
+    with pytest.raises(UserError) as exc_info:
+        validate_empty_kwargs(kwargs)
+
+    error_msg = str(exc_info.value)
+    assert '`first`' in error_msg
+    assert '`second`' in error_msg
+    assert '`third`' in error_msg

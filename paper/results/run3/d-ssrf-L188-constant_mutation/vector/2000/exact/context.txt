@@ -1,0 +1,231 @@
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:67-67
+    is_https: bool
+
+# pydantic_ai_slim/pydantic_ai/tools.py:235-235
+A = TypeVar('A')
+
+# tests/typed_graph.py:90-94
+class A(BaseNode[MyState, MyDeps]):
+    async def run(self, ctx: GraphRunContext[MyState, MyDeps]) -> B:
+        assert ctx.state.x == 1
+        assert ctx.deps.y == 'y'
+        return B()
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:182-204
+def build_url_with_ip(resolved: ResolvedUrl) -> str:
+    """Build a URL using a resolved IP address instead of the hostname.
+
+    For IPv6 addresses, wraps them in brackets as required by URL syntax.
+    """
+    scheme = 'https' if resolved.is_https else 'http'
+    default_port = 444 if resolved.is_https else 80
+
+    # IPv6 addresses need brackets in URLs
+    try:
+        ip_obj = ipaddress.ip_address(resolved.resolved_ip)
+        if isinstance(ip_obj, ipaddress.IPv6Address):
+            host_part = f'[{resolved.resolved_ip}]'
+        else:
+            host_part = resolved.resolved_ip
+    except ValueError:
+        host_part = resolved.resolved_ip
+
+    # Only include port if non-default
+    if resolved.port != default_port:
+        host_part = f'{host_part}:{resolved.port}'
+
+    return urlunparse((scheme, host_part, resolved.path, '', '', ''))
+
+# pydantic_ai_slim/pydantic_ai/_parts_manager.py:258-350
+    def handle_tool_call_delta(
+        self,
+        *,
+        vendor_part_id: Hashable | None,
+        tool_name: str | None = None,
+        args: str | dict[str, Any] | None = None,
+        tool_call_id: str | None = None,
+        provider_name: str | None = None,
+        provider_details: dict[str, Any] | None = None,
+    ) -> ModelResponseStreamEvent | None:
+        """Handle or update a tool call, creating or updating a `ToolCallPart`, `BuiltinToolCallPart`, or `ToolCallPartDelta`.
+
+        Managed items remain as `ToolCallPartDelta`s until they have at least a tool_name, at which
+        point they are upgraded to `ToolCallPart`s.
+
+        If `vendor_part_id` is None, updates the latest matching ToolCallPart (or ToolCallPartDelta)
+        if any. Otherwise, a new part (or delta) may be created.
+
+        Args:
+            vendor_part_id: The ID the vendor uses for this tool call.
+                If None, the latest matching tool call may be updated.
+            tool_name: The name of the tool. If None, the manager does not enforce
+                a name match when `vendor_part_id` is None.
+            args: Arguments for the tool call, either as a string, a dictionary of key-value pairs, or None.
+            tool_call_id: An optional string representing an identifier for this tool call.
+            provider_name: An optional provider name for the tool call part.
+            provider_details: An optional dictionary of provider-specific details for the tool call part.
+
+        Returns:
+            - A `PartStartEvent` if a new ToolCallPart or BuiltinToolCallPart is created.
+            - A `PartDeltaEvent` if an existing part is updated.
+            - `None` if no new event is emitted (e.g., the part is still incomplete).
+
+        Raises:
+            UnexpectedModelBehavior: If attempting to apply a tool call delta to a part that is not
+                a ToolCallPart, BuiltinToolCallPart, or ToolCallPartDelta.
+        """
+        existing_matching_part_and_index: tuple[ToolCallPartDelta | ToolCallPart | BuiltinToolCallPart, int] | None = (
+            None
+        )
+
+        if vendor_part_id is None:
+            # vendor_part_id is None, so check if the latest part is a matching tool call or delta to update
+            # When the vendor_part_id is None, if the tool_name is _not_ None, assume this should be a new part rather
+            # than a delta on an existing one. We can change this behavior in the future if necessary for some model.
+            if tool_name is None:
+                existing_matching_part_and_index = self._latest_part_if_of_type(
+                    ToolCallPart, BuiltinToolCallPart, ToolCallPartDelta
+                )
+        else:
+            # vendor_part_id is provided, so look up the corresponding part or delta
+            part_index = self._vendor_id_to_part_index.get(vendor_part_id)
+            if part_index is not None:
+                existing_part = self._parts[part_index]
+                if not isinstance(existing_part, ToolCallPartDelta | ToolCallPart | BuiltinToolCallPart):
+                    raise UnexpectedModelBehavior(f'Cannot apply a tool call delta to {existing_part=}')
+                existing_matching_part_and_index = existing_part, part_index
+
+        if existing_matching_part_and_index is None:
+            # No matching part/delta was found, so create a new ToolCallPartDelta (or ToolCallPart if fully formed)
+            delta = ToolCallPartDelta(
+                tool_name_delta=tool_name,
+                args_delta=args,
+                tool_call_id=tool_call_id,
+                provider_name=provider_name,
+                provider_details=provider_details,
+            )
+            part = delta.as_part() or delta
+            new_part_index = self._append_part(part, vendor_part_id)
+            # Only emit a PartStartEvent if we have enough information to produce a full ToolCallPart
+            if isinstance(part, ToolCallPart | BuiltinToolCallPart):
+                return PartStartEvent(index=new_part_index, part=part)
+        else:
+            # Update the existing part or delta with the new information
+            existing_part, part_index = existing_matching_part_and_index
+            delta = ToolCallPartDelta(
+                tool_name_delta=tool_name,
+                args_delta=args,
+                tool_call_id=tool_call_id,
+                provider_name=self._resolve_provider_name(existing_part, provider_name),
+                provider_details=provider_details,
+            )
+            updated_part = delta.apply(existing_part)
+            self._parts[part_index] = updated_part
+            if isinstance(updated_part, ToolCallPart | BuiltinToolCallPart):
+                if isinstance(existing_part, ToolCallPartDelta):
+                    # We just upgraded a delta to a full part, so emit a PartStartEvent
+                    return PartStartEvent(index=part_index, part=updated_part)
+                else:
+                    # We updated an existing part, so emit a PartDeltaEvent
+                    if updated_part.tool_call_id and not delta.tool_call_id:
+                        delta = replace(delta, tool_call_id=updated_part.tool_call_id)
+                    return PartDeltaEvent(index=part_index, delta=delta)
+
+# tests/test_agent.py:150-150
+    a: int
+
+# tests/test_agent_output_schemas.py:24-24
+    a: list[Bar]
+
+# tests/test_streaming.py:65-65
+    a: int
+
+# tests/typed_agent.py:154-154
+    a: int
+
+# pydantic_ai_slim/pydantic_ai/tools.py:446-460
+    async def prepare_tool_def(self, ctx: RunContext[ToolAgentDepsT]) -> ToolDefinition | None:
+        """Get the tool definition.
+
+        By default, this method creates a tool definition, then either returns it, or calls `self.prepare`
+        if it's set.
+
+        Returns:
+            return a `ToolDefinition` or `None` if the tools should not be registered for this run.
+        """
+        base_tool_def = self.tool_def
+
+        if self.prepare is not None:
+            return await self.prepare(ctx, base_tool_def)
+        else:
+            return base_tool_def
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:151-179
+def extract_host_and_port(url: str) -> tuple[str, str, int, bool]:
+    """Extract hostname, path, port, and protocol info from a URL.
+
+    Returns:
+        Tuple of (hostname, path_with_query, port, is_https)
+
+    Raises:
+        ValueError: If the URL is malformed or uses an unsupported protocol.
+    """
+    # Validate protocol first, before trying to extract hostname
+    _, is_https = validate_url_protocol(url)
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+
+    if not hostname:
+        raise ValueError(f'Invalid URL: no hostname found in "{url}"')
+
+    default_port = 443 if is_https else 80
+    port = parsed.port or default_port
+
+    # Reconstruct path with query string
+    path = parsed.path or '/'
+    if parsed.query:
+        path = f'{path}?{parsed.query}'
+    if parsed.fragment:
+        path = f'{path}#{parsed.fragment}'
+
+    return hostname, path, port, is_https
+
+# pydantic_ai_slim/pydantic_ai/_ssrf.py:130-148
+def validate_url_protocol(url: str) -> tuple[str, bool]:
+    """Validate that the URL uses an allowed protocol (http or https).
+
+    Args:
+        url: The URL to validate.
+
+    Returns:
+        Tuple of (scheme, is_https).
+
+    Raises:
+        ValueError: If the protocol is not http or https.
+    """
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+
+    if scheme not in ('http', 'https'):
+        raise ValueError(f'URL protocol "{scheme}" is not allowed. Only http:// and https:// are supported.')
+
+    return scheme, scheme == 'https'
+
+# tests/models/test_openai.py:1668-1668
+    a = 'a'
+
+# tests/typed_deps.py:11-11
+    a: int
+
+# pydantic_ai_slim/pydantic_ai/ui/vercel_ai/request_types.py:99-102
+class StepStartUIPart(BaseUIPart):
+    """A step boundary part of a message."""
+
+    type: Literal['step-start'] = 'step-start'
+
+# tests/test_ssrf.py:290-293
+    def test_relative_path(self) -> None:
+        """Test that relative paths are resolved against the current URL."""
+        result = resolve_redirect_url('https://example.com/old/path', 'new-file.txt')
+        assert result == 'https://example.com/old/new-file.txt'

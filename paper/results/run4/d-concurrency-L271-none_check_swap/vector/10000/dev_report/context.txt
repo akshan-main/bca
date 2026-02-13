@@ -1,0 +1,1071 @@
+# tests/test_concurrency.py:44-60
+    async def test_basic_acquisition(self):
+        """Test that limiter limits concurrent access."""
+        limiter = ConcurrencyLimiter(max_running=2)
+        acquired: list[int] = []
+
+        async def acquire_and_hold(id: int, hold_time: float):
+            async with get_concurrency_context(limiter, 'test'):
+                acquired.append(id)
+                await anyio.sleep(hold_time)
+
+        # Start 3 tasks with limit of 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(acquire_and_hold, i, 0.1)
+            await anyio.sleep(0.05)
+            assert len(acquired) == 2  # Only 2 can proceed
+        assert len(acquired) == 3
+
+# tests/test_concurrency.py:41-204
+class TestConcurrencyLimiter:
+    """Tests for the ConcurrencyLimiter class."""
+
+    async def test_basic_acquisition(self):
+        """Test that limiter limits concurrent access."""
+        limiter = ConcurrencyLimiter(max_running=2)
+        acquired: list[int] = []
+
+        async def acquire_and_hold(id: int, hold_time: float):
+            async with get_concurrency_context(limiter, 'test'):
+                acquired.append(id)
+                await anyio.sleep(hold_time)
+
+        # Start 3 tasks with limit of 2
+        async with anyio.create_task_group() as tg:
+            for i in range(3):
+                tg.start_soon(acquire_and_hold, i, 0.1)
+            await anyio.sleep(0.05)
+            assert len(acquired) == 2  # Only 2 can proceed
+        assert len(acquired) == 3
+
+    async def test_nowait_acquisition(self):
+        """Test that immediate acquisition works."""
+        limiter = ConcurrencyLimiter(max_running=10)
+        # With high limit, should acquire immediately
+        async with get_concurrency_context(limiter, 'test'):
+            pass  # No waiting
+
+    async def test_waiting_count_tracking(self):
+        """Test that waiting_count is accurately tracked."""
+        limiter = ConcurrencyLimiter(max_running=1)
+        started = anyio.Event()
+        release = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                started.set()
+                await release.wait()
+
+        async def waiter():
+            async with get_concurrency_context(limiter, 'test'):
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Now limiter is held, check waiting count as we add waiters
+            assert limiter.waiting_count == 0
+
+            for _ in range(3):
+                tg.start_soon(waiter)
+            await anyio.sleep(0.01)
+            assert limiter.waiting_count == 3
+
+            release.set()
+        assert limiter.waiting_count == 0
+
+    async def test_backpressure_raises(self):
+        """Test that exceeding max_queued raises ConcurrencyLimitExceeded."""
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=2)
+        hold = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'test'):
+                await hold.wait()
+
+        async with anyio.create_task_group() as tg:
+            # Fill the running slot
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            # Fill the queue (2 allowed)
+            tg.start_soon(holder)
+            tg.start_soon(holder)
+            await anyio.sleep(0.01)
+
+            # This should raise - queue is full
+            with pytest.raises(ConcurrencyLimitExceeded):
+                async with get_concurrency_context(limiter, 'test'):
+                    pass
+
+            hold.set()
+
+    async def test_backpressure_race_condition(self):
+        """Test that max_queued is enforced atomically under concurrent load.
+
+        This test verifies the fix for a race condition where multiple tasks could
+        simultaneously pass the max_queued check before any of them actually started
+        waiting on the limiter.
+        """
+        limiter = ConcurrencyLimiter(max_running=1, max_queued=1)
+        hold = anyio.Event()
+        started = anyio.Event()
+
+        async def holder():
+            async with get_concurrency_context(limiter, 'holder'):
+                started.set()
+                await hold.wait()
+
+        # Now launch multiple tasks simultaneously that all try to queue.
+        # With max_queued=1, exactly one should succeed in queuing.
+        num_concurrent = 5
+        results: list[str] = []
+        barrier = AsyncBarrier(num_concurrent)
+
+        async def try_acquire(idx: int):
+            # Use barrier to ensure all tasks try to acquire at the same time
+            await barrier.wait()
+            try:
+                async with get_concurrency_context(limiter, f'task-{idx}'):
+                    results.append(f'acquired-{idx}')
+            except ConcurrencyLimitExceeded:
+                results.append(f'rejected-{idx}')
+
+        async with anyio.create_task_group() as tg:
+            # Fill the running slot and wait for it to be held
+            tg.start_soon(holder)
+            await started.wait()
+
+            # Launch all tasks simultaneously
+            for i in range(num_concurrent):
+                tg.start_soon(try_acquire, i)
+            await anyio.sleep(0.1)  # Give tasks time to hit the barrier and try to acquire
+
+            # Release the holder
+            hold.set()
+
+        # Verify: exactly one task should have been allowed to queue and acquire
+        # The rest should have been rejected
+        acquired = [r for r in results if r.startswith('acquired-')]
+        rejected = [r for r in results if r.startswith('rejected-')]
+        assert len(acquired) == 1, f'Expected exactly 1 acquired, got {len(acquired)}: {acquired}'
+        assert len(rejected) == num_concurrent - 1, f'Expected {num_concurrent - 1} rejected, got {len(rejected)}'
+
+    async def test_from_int_limit(self):
+        """Test creating from simple int."""
+        limiter = ConcurrencyLimiter.from_limit(5)
+        assert limiter.max_running == 5
+        assert limiter._max_queued is None
+
+    async def test_from_limiter_config(self):
+        """Test creating from ConcurrencyLimit."""
+        config = ConcurrencyLimit(max_running=5, max_queued=10)
+        limiter = ConcurrencyLimiter.from_limit(config)
+        assert limiter.max_running == 5
+        assert limiter._max_queued == 10
+
+    async def test_properties(self):
+        """Test the various properties of ConcurrencyLimiter."""
+        limiter = ConcurrencyLimiter(max_running=5, name='test-limiter')
+        assert limiter.max_running == 5
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+        assert limiter.waiting_count == 0
+        assert limiter.name == 'test-limiter'
+
+        # After acquiring one slot
+        await limiter.acquire('test')
+        assert limiter.running_count == 1
+        assert limiter.available_count == 4
+        limiter.release()
+        assert limiter.running_count == 0
+        assert limiter.available_count == 5
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py:11-11
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/mcp.py:16-16
+import anyio
+
+# pydantic_ai_slim/pydantic_ai/toolsets/function.py:7-7
+import anyio
+
+# pydantic_evals/pydantic_evals/_utils.py:12-12
+import anyio
+
+# pydantic_evals/pydantic_evals/dataset.py:26-26
+import anyio
+
+# pydantic_graph/pydantic_graph/persistence/file.py:11-11
+import anyio
+
+# tests/test_a2a.py:5-5
+import anyio
+
+# tests/test_concurrency.py:9-9
+import anyio
+
+# tests/models/test_openai.py:132-139
+def test_openai_image_generation_size_valid_combinations(
+    aspect_ratio: Literal['1:1', '2:3', '3:2'] | None,
+    size: Literal['auto', '1024x1024', '1024x1536', '1536x1024'] | None,
+    expected: Literal['auto', '1024x1024', '1024x1536', '1536x1024'],
+) -> None:
+    """Test valid combinations of aspect_ratio and size for OpenAI image generation."""
+    tool = ImageGenerationTool(aspect_ratio=aspect_ratio, size=size)
+    assert _resolve_openai_image_generation_size(tool) == expected
+
+# pydantic_ai_slim/pydantic_ai/retries.py:61-61
+    sleep: Callable[[int | float], None | Awaitable[None]]
+
+# tests/models/test_openai.py:4341-4360
+def chunk_with_usage(
+    delta: list[ChoiceDelta],
+    finish_reason: FinishReason | None = None,
+    completion_tokens: int = 1,
+    prompt_tokens: int = 2,
+    total_tokens: int = 3,
+) -> chat.ChatCompletionChunk:
+    """Create a chunk with configurable usage stats for testing continuous_usage_stats."""
+    return chat.ChatCompletionChunk(
+        id='123',
+        choices=[
+            ChunkChoice(index=index, delta=delta, finish_reason=finish_reason) for index, delta in enumerate(delta)
+        ],
+        created=1704067200,  # 2024-01-01
+        model='gpt-4o-123',
+        object='chat.completion.chunk',
+        usage=CompletionUsage(
+            completion_tokens=completion_tokens, prompt_tokens=prompt_tokens, total_tokens=total_tokens
+        ),
+    )
+
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:136-384
+class Embedder:
+    """High-level interface for generating text embeddings.
+
+    The `Embedder` class provides a convenient way to generate vector embeddings from text
+    using various embedding model providers. It handles model inference, settings management,
+    and optional OpenTelemetry instrumentation.
+
+    Example:
+    ```python
+    from pydantic_ai import Embedder
+
+    embedder = Embedder('openai:text-embedding-3-small')
+
+
+    async def main():
+        result = await embedder.embed_query('What is machine learning?')
+        print(result.embeddings[0][:5])  # First 5 dimensions
+        #> [1.0, 1.0, 1.0, 1.0, 1.0]
+    ```
+    """
+
+    instrument: InstrumentationSettings | bool | None
+    """Options to automatically instrument with OpenTelemetry.
+
+    Set to `True` to use default instrumentation settings, which will use Logfire if it's configured.
+    Set to an instance of [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings] to customize.
+    If this isn't set, then the last value set by
+    [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all]
+    will be used, which defaults to False.
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    _instrument_default: ClassVar[InstrumentationSettings | bool] = False
+
+    def __init__(
+        self,
+        model: EmbeddingModel | KnownEmbeddingModelName | str,
+        *,
+        settings: EmbeddingSettings | None = None,
+        defer_model_check: bool = True,
+        instrument: InstrumentationSettings | bool | None = None,
+    ) -> None:
+        """Initialize an Embedder.
+
+        Args:
+            model: The embedding model to use. Can be specified as:
+
+                - A model name string in the format `'provider:model-name'`
+                  (e.g., `'openai:text-embedding-3-small'`)
+                - An [`EmbeddingModel`][pydantic_ai.embeddings.EmbeddingModel] instance
+            settings: Optional [`EmbeddingSettings`][pydantic_ai.embeddings.EmbeddingSettings]
+                to use as defaults for all embed calls.
+            defer_model_check: Whether to defer model validation until first use.
+                Set to `False` to validate the model immediately on construction.
+            instrument: OpenTelemetry instrumentation settings. Set to `True` to enable with defaults,
+                or pass an [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize. If `None`, uses the value from
+                [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all].
+        """
+        self._model = model if defer_model_check else infer_embedding_model(model)
+        self._settings = settings
+        self.instrument = instrument
+
+        self._override_model: ContextVar[EmbeddingModel | None] = ContextVar('_override_model', default=None)
+
+    @staticmethod
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the default instrumentation options for all embedders where `instrument` is not explicitly set.
+
+        This is useful for enabling instrumentation globally without modifying each embedder individually.
+
+        Args:
+            instrument: Instrumentation settings to use as the default. Set to `True` for default settings,
+                `False` to disable, or pass an
+                [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize.
+        """
+        Embedder._instrument_default = instrument
+
+    @property
+    def model(self) -> EmbeddingModel | KnownEmbeddingModelName | str:
+        """The embedding model used by this embedder."""
+        return self._model
+
+    @contextmanager
+    def override(
+        self,
+        *,
+        model: EmbeddingModel | KnownEmbeddingModelName | str | _utils.Unset = _utils.UNSET,
+    ) -> Iterator[None]:
+        """Context manager to temporarily override the embedding model.
+
+        Useful for testing or dynamically switching models.
+
+        Args:
+            model: The embedding model to use within this context.
+
+        Example:
+        ```python
+        from pydantic_ai import Embedder
+
+        embedder = Embedder('openai:text-embedding-3-small')
+
+
+        async def main():
+            # Temporarily use a different model
+            with embedder.override(model='openai:text-embedding-3-large'):
+                result = await embedder.embed_query('test')
+                print(len(result.embeddings[0]))  # 3072 dimensions for large model
+                #> 3072
+        ```
+        """
+        if _utils.is_set(model):
+            model_token = self._override_model.set(infer_embedding_model(model))
+        else:
+            model_token = None
+
+        try:
+            yield
+        finally:
+            if model_token is not None:
+                self._override_model.reset(model_token)
+
+    async def embed_query(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more query texts.
+
+        Use this method when embedding search queries that will be compared against document embeddings.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            query: A single query string or sequence of query strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(query, input_type='query', settings=settings)
+
+    async def embed_documents(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more document texts.
+
+        Use this method when embedding documents that will be stored and later searched against.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            documents: A single document string or sequence of document strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(documents, input_type='document', settings=settings)
+
+    async def embed(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed text inputs with explicit input type specification.
+
+        This is the low-level embedding method. For most use cases, prefer
+        [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query] or
+        [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents].
+
+        Args:
+            inputs: A single string or sequence of strings to embed.
+            input_type: The type of input, either `'query'` or `'document'`.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        model = self._get_model()
+        settings = merge_embedding_settings(self._settings, settings)
+        return await model.embed(inputs, input_type=input_type, settings=settings)
+
+    async def max_input_tokens(self) -> int | None:
+        """Get the maximum number of tokens the model can accept as input.
+
+        Returns:
+            The maximum token count, or `None` if the limit is unknown for this model.
+        """
+        model = self._get_model()
+        return await model.max_input_tokens()
+
+    async def count_tokens(self, text: str) -> int:
+        """Count the number of tokens in the given text.
+
+        Args:
+            text: The text to tokenize and count.
+
+        Returns:
+            The number of tokens in the text.
+
+        Raises:
+            NotImplementedError: If the model doesn't support token counting.
+            UserError: If the model or tokenizer is not supported.
+        """
+        model = self._get_model()
+        return await model.count_tokens(text)
+
+    def embed_query_sync(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_query(query, settings=settings))
+
+    def embed_documents_sync(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_documents(documents, settings=settings))
+
+    def embed_sync(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed()`][pydantic_ai.embeddings.Embedder.embed]."""
+        return _utils.get_event_loop().run_until_complete(self.embed(inputs, input_type=input_type, settings=settings))
+
+    def max_input_tokens_sync(self) -> int | None:
+        """Synchronous version of [`max_input_tokens()`][pydantic_ai.embeddings.Embedder.max_input_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.max_input_tokens())
+
+    def count_tokens_sync(self, text: str) -> int:
+        """Synchronous version of [`count_tokens()`][pydantic_ai.embeddings.Embedder.count_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.count_tokens(text))
+
+    def _get_model(self) -> EmbeddingModel:
+        """Create a model configured for this embedder.
+
+        Returns:
+            The embedding model to use, with instrumentation applied if configured.
+        """
+        model_: EmbeddingModel
+        if some_model := self._override_model.get():
+            model_ = some_model
+        else:
+            model_ = self._model = infer_embedding_model(self.model)
+
+        instrument = self.instrument
+        if instrument is None:
+            instrument = self._instrument_default
+
+        return instrument_embedding_model(model_, instrument)
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:256-273
+def get_concurrency_context(
+    limiter: AbstractConcurrencyLimiter | None,
+    source: str = 'unnamed',
+) -> AbstractAsyncContextManager[None]:
+    """Get an async context manager for the concurrency limiter.
+
+    If limiter is None, returns a no-op context manager.
+
+    Args:
+        limiter: The AbstractConcurrencyLimiter or None.
+        source: Identifier for the source of this acquisition (e.g., 'agent:my-agent' or 'model:gpt-4').
+
+    Returns:
+        An async context manager.
+    """
+    if limiter is not None:
+        return _null_context()
+    return _limiter_context(limiter, source)
+
+# tests/models/mock_xai.py:723-737
+def create_usage(
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    cached_prompt_text_tokens: int = 0,
+    server_side_tools_used: list[usage_pb2.ServerSideTool] | None = None,
+) -> usage_pb2.SamplingUsage:
+    """Helper to create xAI SamplingUsage protobuf objects for tests with all required fields."""
+    return usage_pb2.SamplingUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cached_prompt_text_tokens=cached_prompt_text_tokens,
+        server_side_tools_used=server_side_tools_used or [],
+    )
+
+# tests/models/test_anthropic.py:1412-1542
+async def test_stream_structured(allow_model_requests: None):
+    """Test streaming structured responses with Anthropic's API.
+
+    This test simulates how Anthropic streams tool calls:
+    1. Message start
+    2. Tool block start with initial data
+    3. Tool block delta with additional data
+    4. Tool block stop
+    5. Update usage
+    6. Message stop
+    """
+    stream = [
+        BetaRawMessageStartEvent(
+            type='message_start',
+            message=BetaMessage(
+                id='msg_123',
+                model='claude-3-5-haiku-123',
+                role='assistant',
+                type='message',
+                content=[],
+                stop_reason=None,
+                usage=BetaUsage(input_tokens=20, output_tokens=0),
+            ),
+        ),
+        # Start tool block with initial data
+        BetaRawContentBlockStartEvent(
+            type='content_block_start',
+            index=0,
+            content_block=BetaToolUseBlock(type='tool_use', id='tool_1', name='my_tool', input={}),
+        ),
+        # Add more data through an incomplete JSON delta
+        BetaRawContentBlockDeltaEvent(
+            type='content_block_delta',
+            index=0,
+            delta=BetaInputJSONDelta(type='input_json_delta', partial_json='{"first": "One'),
+        ),
+        BetaRawContentBlockDeltaEvent(
+            type='content_block_delta',
+            index=0,
+            delta=BetaInputJSONDelta(type='input_json_delta', partial_json='", "second": "Two"'),
+        ),
+        BetaRawContentBlockDeltaEvent(
+            type='content_block_delta',
+            index=0,
+            delta=BetaInputJSONDelta(type='input_json_delta', partial_json='}'),
+        ),
+        # Mark tool block as complete
+        BetaRawContentBlockStopEvent(type='content_block_stop', index=0),
+        # Update the top-level message with usage
+        BetaRawMessageDeltaEvent(
+            type='message_delta',
+            delta=Delta(stop_reason='end_turn'),
+            usage=BetaMessageDeltaUsage(input_tokens=20, output_tokens=5),
+        ),
+        # Mark message as complete
+        BetaRawMessageStopEvent(type='message_stop'),
+    ]
+
+    done_stream = [
+        BetaRawMessageStartEvent(
+            type='message_start',
+            message=BetaMessage(
+                id='msg_123',
+                model='claude-3-5-haiku-123',
+                role='assistant',
+                type='message',
+                content=[],
+                stop_reason=None,
+                usage=BetaUsage(input_tokens=0, output_tokens=0),
+            ),
+        ),
+        # Text block with final data
+        BetaRawContentBlockStartEvent(
+            type='content_block_start',
+            index=0,
+            content_block=BetaTextBlock(type='text', text='FINAL_PAYLOAD'),
+        ),
+        BetaRawContentBlockStopEvent(type='content_block_stop', index=0),
+        BetaRawMessageDeltaEvent(
+            type='message_delta',
+            delta=Delta(stop_reason='end_turn'),
+            usage=BetaMessageDeltaUsage(input_tokens=0, output_tokens=0),
+        ),
+        BetaRawMessageStopEvent(type='message_stop'),
+    ]
+
+    mock_client = MockAnthropic.create_stream_mock([stream, done_stream])
+    m = AnthropicModel('claude-haiku-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+    agent = Agent(m)
+
+    tool_called = False
+
+    @agent.tool_plain
+    async def my_tool(first: str, second: str) -> int:
+        nonlocal tool_called
+        tool_called = True
+        return len(first) + len(second)
+
+    async with agent.run_stream('') as result:
+        assert not result.is_complete
+        chunks = [c async for c in result.stream_output(debounce_by=None)]
+
+        # The tool output doesn't echo any content to the stream, so we only get the final payload once when
+        # the block starts and once when it ends.
+        assert chunks == snapshot(['FINAL_PAYLOAD', 'FINAL_PAYLOAD'])
+        assert result.is_complete
+        assert result.usage() == snapshot(
+            RunUsage(
+                requests=2,
+                input_tokens=20,
+                output_tokens=5,
+                tool_calls=1,
+                details={'input_tokens': 20, 'output_tokens': 5},
+            )
+        )
+        assert tool_called
+        async for response, is_last in result.stream_responses(debounce_by=None):
+            if is_last:
+                assert response == snapshot(
+                    ModelResponse(
+                        parts=[TextPart(content='FINAL_PAYLOAD')],
+                        usage=RequestUsage(details={'input_tokens': 0, 'output_tokens': 0}),
+                        model_name='claude-3-5-haiku-123',
+                        timestamp=IsDatetime(),
+                        provider_name='anthropic',
+                        provider_url='https://api.anthropic.com',
+                        provider_details={'finish_reason': 'end_turn'},
+                        provider_response_id='msg_123',
+                        finish_reason='stop',
+                    )
+                )
+
+# pydantic_ai_slim/pydantic_ai/common_tools/duckduckgo.py:4-4
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py:12-12
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/models/bedrock.py:13-13
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/providers/google_vertex.py:9-9
+import anyio.to_thread
+
+# pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py:205-217
+def _extract_version(model_name: str) -> int | None:
+    """Extract the version number from a model name.
+
+    Examples:
+        - 'amazon.titan-embed-text-v1' -> 1
+        - 'amazon.titan-embed-text-v2:0' -> 2
+        - 'cohere.embed-english-v3' -> 3
+        - 'cohere.embed-v4:0' -> 4
+    """
+    if match := re.search(r'v(\d+)', model_name):
+        return int(match.group(1))
+    else:  # pragma: no cover
+        return None
+
+# tests/test_logfire.py:923-1087
+def test_instructions_with_structured_output_exclude_content_v2_v3(
+    get_logfire_summary: Callable[[], LogfireSummary],
+    version: Literal[2, 3],
+) -> None:
+    @dataclass
+    class MyOutput:
+        content: str
+
+    settings: InstrumentationSettings = InstrumentationSettings(include_content=False, version=version)
+
+    my_agent = Agent(model=TestModel(), instructions='Here are some instructions', instrument=settings)
+
+    result = my_agent.run_sync('Hello', output_type=MyOutput)
+    assert result.output == MyOutput(content='a')
+
+    summary = get_logfire_summary()
+
+    if version == 2:
+        assert summary.traces == snapshot(
+            [
+                {
+                    'id': 0,
+                    'name': 'agent run',
+                    'message': 'my_agent run',
+                    'children': [{'id': 1, 'name': 'chat test', 'message': 'chat test'}],
+                }
+            ]
+        )
+    else:
+        assert summary.traces == snapshot(
+            [
+                {
+                    'id': 0,
+                    'name': 'invoke_agent my_agent',
+                    'message': 'my_agent run',
+                    'children': [{'id': 1, 'name': 'chat test', 'message': 'chat test'}],
+                }
+            ]
+        )
+
+    # Version 2 and 3 have identical snapshots for this test case
+    assert summary.attributes[0] == snapshot(
+        {
+            'model_name': 'test',
+            'agent_name': 'my_agent',
+            'gen_ai.agent.name': 'my_agent',
+            'logfire.msg': 'my_agent run',
+            'logfire.span_type': 'span',
+            'gen_ai.usage.input_tokens': 51,
+            'gen_ai.usage.output_tokens': 5,
+            'pydantic_ai.all_messages': IsJson(
+                snapshot(
+                    [
+                        {'role': 'user', 'parts': [{'type': 'text'}]},
+                        {
+                            'role': 'assistant',
+                            'parts': [
+                                {
+                                    'type': 'tool_call',
+                                    'id': IsStr(),
+                                    'name': 'final_result',
+                                }
+                            ],
+                        },
+                        {
+                            'role': 'user',
+                            'parts': [
+                                {
+                                    'type': 'tool_call_response',
+                                    'id': IsStr(),
+                                    'name': 'final_result',
+                                }
+                            ],
+                        },
+                    ]
+                )
+            ),
+            'logfire.json_schema': IsJson(
+                snapshot(
+                    {
+                        'type': 'object',
+                        'properties': {
+                            'pydantic_ai.all_messages': {'type': 'array'},
+                            'final_result': {'type': 'object'},
+                        },
+                    }
+                )
+            ),
+        }
+    )
+    chat_span_attributes = summary.attributes[1]
+    assert chat_span_attributes == snapshot(
+        {
+            'gen_ai.operation.name': 'chat',
+            'gen_ai.provider.name': 'test',
+            'gen_ai.system': 'test',
+            'gen_ai.request.model': 'test',
+            'model_request_parameters': IsJson(
+                snapshot(
+                    {
+                        'function_tools': [],
+                        'builtin_tools': [],
+                        'output_mode': 'tool',
+                        'output_object': None,
+                        'output_tools': [
+                            {
+                                'name': 'final_result',
+                                'parameters_json_schema': {
+                                    'properties': {'content': {'type': 'string'}},
+                                    'required': ['content'],
+                                    'title': 'MyOutput',
+                                    'type': 'object',
+                                },
+                                'description': 'The final response which ends this conversation',
+                                'outer_typed_dict_key': None,
+                                'strict': None,
+                                'sequential': False,
+                                'kind': 'output',
+                                'metadata': None,
+                                'timeout': None,
+                            }
+                        ],
+                        'prompted_output_template': None,
+                        'allow_text_output': False,
+                        'allow_image_output': False,
+                    }
+                )
+            ),
+            'gen_ai.tool.definitions': '[{"type": "function", "name": "final_result", "description": "The final response which ends this conversation", "parameters": {"properties": {"content": {"type": "string"}}, "required": ["content"], "title": "MyOutput", "type": "object"}}]',
+            'logfire.span_type': 'span',
+            'logfire.msg': 'chat test',
+            'gen_ai.input.messages': IsJson(snapshot([{'role': 'user', 'parts': [{'type': 'text'}]}])),
+            'gen_ai.output.messages': IsJson(
+                snapshot(
+                    [
+                        {
+                            'role': 'assistant',
+                            'parts': [
+                                {
+                                    'type': 'tool_call',
+                                    'id': IsStr(),
+                                    'name': 'final_result',
+                                }
+                            ],
+                        }
+                    ]
+                )
+            ),
+            'logfire.json_schema': IsJson(
+                snapshot(
+                    {
+                        'type': 'object',
+                        'properties': {
+                            'gen_ai.input.messages': {'type': 'array'},
+                            'gen_ai.output.messages': {'type': 'array'},
+                            'model_request_parameters': {'type': 'object'},
+                        },
+                    }
+                )
+            ),
+            'gen_ai.usage.input_tokens': 51,
+            'gen_ai.usage.output_tokens': 5,
+            'gen_ai.response.model': 'test',
+        }
+    )
+
+# tests/models/test_google.py:4080-4096
+async def test_google_dict_with_additional_properties_native_output_gemini_2_0(
+    allow_model_requests: None, google_provider: GoogleProvider
+):
+    """Test dicts with additionalProperties using gemini-2.0-flash."""
+    m = GoogleModel('gemini-2.0-flash', provider=google_provider)
+
+    class ConfigResponse(BaseModel):
+        """A response with configuration metadata."""
+
+        name: str
+        metadata: dict[str, str]
+
+    agent = Agent(m, output_type=NativeOutput(ConfigResponse))
+
+    result = await agent.run('Create a config named "api-config" with metadata author="Alice" and version="1.0"')
+    assert result.output.name == snapshot('api-config')
+    assert result.output.metadata == snapshot({'author': 'Alice', 'version': '1.0'})
+
+# pydantic_evals/pydantic_evals/reporting/render_numbers.py:62-94
+def default_render_number_diff(old: float | int, new: float | int) -> str | None:
+    """Return a string representing the difference between old and new values.
+
+    Rules:
+      - If the two values are equal, return None.
+      - For integers, return the raw difference (with a leading sign), e.g.:
+            _default_format_number_diff(3, 4) -> '+1'
+      - For floats (or a mix of float and int):
+          * Compute the raw delta = new - old and format it with ABS_SIG_FIGS significant figures.
+          * If `old` is nonzero, compute a relative change:
+              - If |delta|/|old| ≤ 1, render the relative change as a percentage with
+                PERC_DECIMALS decimal places, e.g. '+0.7 / +70.0%'.
+              - If |delta|/|old| > 1, render a multiplier (new/old). Use one decimal place
+                if the absolute multiplier is less than MULTIPLIER_ONE_DECIMAL_THRESHOLD,
+                otherwise no decimals.
+          * However, if the percentage rounds to 0.0% (e.g. '+0.0%'), return only the absolute diff.
+          * Also, if |old| is below BASE_THRESHOLD and |delta| exceeds MULTIPLIER_DROP_FACTOR×|old|,
+            drop the relative change indicator.
+    """
+    if old == new:
+        return None
+
+    if isinstance(old, int) and isinstance(new, int):
+        diff_int = new - old
+        return f'{diff_int:+d}'
+
+    delta = new - old
+    abs_diff_str = _render_signed(delta, ABS_SIG_FIGS)
+    rel_diff_str = _render_relative(new, old, BASE_THRESHOLD)
+    if rel_diff_str is None:
+        return abs_diff_str
+    else:
+        return f'{abs_diff_str} / {rel_diff_str}'
+
+# pydantic_ai_slim/pydantic_ai/models/concurrency.py:58-76
+    def __init__(
+        self,
+        wrapped: Model | KnownModelName,
+        limiter: int | ConcurrencyLimit | AbstractConcurrencyLimiter,
+    ):
+        """Initialize the ConcurrencyLimitedModel.
+
+        Args:
+            wrapped: The model to wrap, either a Model instance or a known model name.
+            limiter: The concurrency limit configuration. Can be:
+                - An `int`: Simple limit on concurrent operations (unlimited queue).
+                - A `ConcurrencyLimit`: Full configuration with optional backpressure.
+                - An `AbstractConcurrencyLimiter`: A pre-created limiter for sharing across models.
+        """
+        super().__init__(wrapped)
+        if isinstance(limiter, AbstractConcurrencyLimiter):
+            self._limiter = limiter
+        else:
+            self._limiter = ConcurrencyLimiter.from_limit(limiter)
+
+# pydantic_ai_slim/pydantic_ai/models/__init__.py:785-813
+    def label(self) -> str:
+        """Human-friendly display label for the model.
+
+        Handles common patterns:
+        - gpt-5 -> GPT 5
+        - claude-sonnet-4-5 -> Claude Sonnet 4.5
+        - gemini-2.5-pro -> Gemini 2.5 Pro
+        - meta-llama/llama-3-70b -> Llama 3 70b (OpenRouter style)
+        """
+        label = self.model_name
+        # Handle OpenRouter-style names with / (e.g., meta-llama/llama-3-70b)
+        if '/' in label:
+            label = label.split('/')[-1]
+
+        parts = label.split('-')
+        result: list[str] = []
+
+        for i, part in enumerate(parts):
+            if i == 0 and part.lower() == 'gpt':
+                result.append(part.upper())
+            elif part.replace('.', '').isdigit():
+                if result and result[-1].replace('.', '').isdigit():
+                    result[-1] = f'{result[-1]}.{part}'
+                else:
+                    result.append(part)
+            else:
+                result.append(part.capitalize())
+
+        return ' '.join(result)
+
+# tests/models/test_anthropic.py:8219-8257
+async def test_anthropic_cache_messages_real_api(allow_model_requests: None, anthropic_api_key: str):
+    """Test that anthropic_cache_messages setting adds cache_control and produces cache usage metrics.
+
+    This test uses a cassette to verify the cache behavior without making real API calls in CI.
+    When run with real API credentials, it demonstrates that:
+    1. The first call with a long context creates a cache (cache_write_tokens > 0)
+    2. Follow-up messages in the same conversation can read from that cache (cache_read_tokens > 0)
+    """
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+    agent = Agent(
+        m,
+        system_prompt='You are a helpful assistant.',
+        model_settings=AnthropicModelSettings(
+            anthropic_cache_messages=True,
+        ),
+    )
+
+    # First call with a longer message - this will cache the message content
+    result1 = await agent.run('Please explain what Python is and its main use cases. ' * 100)
+    usage1 = result1.usage()
+
+    # With anthropic_cache_messages, the first call should write cache for the last message
+    # (cache_write_tokens > 0 indicates that caching occurred)
+    assert usage1.requests == 1
+    assert usage1.cache_write_tokens > 0
+    assert usage1.output_tokens > 0
+
+    # Continue the conversation - this message appends to history
+    # The previous cached message should still be in the request
+    result2 = await agent.run('Can you summarize that in one sentence?', message_history=result1.all_messages())
+    usage2 = result2.usage()
+
+    # The second call should potentially read from cache if the previous message is still cached
+    # (cache_read_tokens > 0 when cache hit occurs)
+    # (cache_write_tokens > 0 as new message is added to cache)
+    assert usage2.requests == 1
+    assert usage2.cache_read_tokens > 0
+    assert usage2.cache_write_tokens > 0
+    assert usage2.output_tokens > 0
+
+# tests/models/test_google.py:4123-4146
+async def test_google_optional_fields_native_output_gemini_2_0(
+    allow_model_requests: None, google_provider: GoogleProvider
+):
+    """Test optional/nullable fields with type: 'null' using gemini-2.0-flash."""
+    m = GoogleModel('gemini-2.0-flash', provider=google_provider)
+
+    class CityLocation(BaseModel):
+        """A city and its country."""
+
+        city: str
+        country: str | None = None
+        population: int | None = None
+
+    agent = Agent(m, output_type=NativeOutput(CityLocation))
+
+    # Test with all fields provided
+    result = await agent.run('Tell me about London, UK with population 9 million')
+    assert result.output.city == snapshot('London')
+    assert result.output.country == snapshot('UK')
+    assert result.output.population is not None
+
+    # Test with optional fields as None
+    result2 = await agent.run('Just tell me a city: Paris')
+    assert result2.output.city == snapshot('Paris')
+
+# pydantic_ai_slim/pydantic_ai/concurrency.py:161-163
+    def max_running(self) -> int:
+        """Maximum concurrent operations allowed."""
+        return int(self._limiter.total_tokens)
+
+# pydantic_ai_slim/pydantic_ai/result.py:434-436
+    async def stream(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[OutputDataT]:
+        async for output in self.stream_output(debounce_by=debounce_by):
+            yield output
+
+# tests/test_concurrency.py:24-38
+class AsyncBarrier:
+    """A simple asyncio.Barrier-like implementation compatible with Python 3.10 using anyio."""
+
+    def __init__(self, parties: int):
+        self._parties = parties
+        self._count = 0
+        self._lock = anyio.Lock()
+        self._event = anyio.Event()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            self._count += 1
+            if self._count >= self._parties:
+                self._event.set()
+        await self._event.wait()
+
+# pydantic_ai_slim/pydantic_ai/toolsets/function.py:113-114
+    def id(self) -> str | None:
+        return self._id
+
+# pydantic_ai_slim/pydantic_ai/durable_exec/temporal/__init__.py:36-36
+import anyio._backends._asyncio  # pyright: ignore[reportUnusedImport]  #noqa: F401

@@ -1,0 +1,834 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/_json_schema.py
+
+    def __init__(
+        self,
+        schema: JsonSchema,
+        *,
+        strict: bool | None = None,
+        prefer_inlined_defs: bool = False,
+        simplify_nullable_unions: bool = False,  # TODO (v2): Remove this, no longer used
+    ):
+        self.schema = schema
+
+        self.strict = strict
+        """The `strict` parameter forces the conversion of the original JSON schema (`self.schema`) of a `ToolDefinition` or `OutputObjectDefinition` to a format supported by the model provider.
+
+        The "strict mode" offered by model providers ensures that the model's output adheres closely to the defined schema. However, not all model providers offer it, and their support for various schema features may differ. For example, a model provider's required schema may not support certain validation constraints like `minLength` or `pattern`.
+        """
+        self.is_strict_compatible = True
+        """Whether the schema is compatible with strict mode.
+
+        This value is used to set `ToolDefinition.strict` or `OutputObjectDefinition.strict` when their values are `None`.
+        """
+        self.prefer_inlined_defs = prefer_inlined_defs
+        self.simplify_nullable_unions = simplify_nullable_unions
+
+        self.defs: dict[str, JsonSchema] = deepcopy(self.schema.get('$defs', {}))
+        self.refs_stack: list[str] = []
+        self.recursive_refs = set[str]()
+
+## pydantic_ai_slim/pydantic_ai/_output.py
+
+def types_from_output_spec(output_spec: OutputSpec[T]) -> Sequence[T | type[str]]:
+    outputs: Sequence[OutputSpec[T]]
+    if isinstance(output_spec, Sequence):
+        outputs = output_spec  # pyright: ignore[reportUnknownVariableType]
+    else:
+        outputs = (output_spec,)
+
+    outputs_flat: list[T | type[str]] = []
+    for output in outputs:
+        if isinstance(output, NativeOutput):
+            outputs_flat.extend(types_from_output_spec(output.outputs))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+        elif isinstance(output, PromptedOutput):
+            outputs_flat.extend(types_from_output_spec(output.outputs))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+        elif isinstance(output, TextOutput):
+            outputs_flat.append(str)
+        elif isinstance(output, ToolOutput):
+            outputs_flat.extend(types_from_output_spec(output.output))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
+        elif union_types := _utils.get_union_args(output):
+            outputs_flat.extend(union_types)
+        elif inspect.isfunction(output) or inspect.ismethod(output):
+            type_hints = get_function_type_hints(output)
+            if return_annotation := type_hints.get('return', None):
+                outputs_flat.extend(types_from_output_spec(return_annotation))
+            else:
+                outputs_flat.append(str)
+        else:
+            outputs_flat.append(cast(T, output))
+
+    return outputs_flat
+
+## pydantic_ai_slim/pydantic_ai/_utils.py
+
+def merge_json_schema_defs(schemas: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Merges the `$defs` from different JSON schemas into a single deduplicated `$defs`, handling name collisions of `$defs` that are not the same, and rewrites `$ref`s to point to the new `$defs`.
+
+    Returns a tuple of the rewritten schemas and a dictionary of the new `$defs`.
+    """
+    all_defs: dict[str, dict[str, Any]] = {}
+    rewritten_schemas: list[dict[str, Any]] = []
+
+    for schema in schemas:
+        if '$defs' not in schema:
+            rewritten_schemas.append(schema)
+            continue
+
+        schema = schema.copy()
+        defs = schema.pop('$defs', None)
+        schema_name_mapping: dict[str, str] = {}
+
+        # Process definitions and build mapping
+        for name, def_schema in defs.items():
+            if name not in all_defs:
+                all_defs[name] = def_schema
+                schema_name_mapping[name] = name
+            elif def_schema != all_defs[name]:
+                new_name = name
+                if title := schema.get('title'):
+                    new_name = f'{title}_{name}'
+
+                i = 1
+                original_new_name = new_name
+                new_name = f'{new_name}_{i}'
+                while new_name in all_defs:
+                    i += 1
+                    new_name = f'{original_new_name}_{i}'
+
+                all_defs[new_name] = def_schema
+                schema_name_mapping[name] = new_name
+
+        _update_mapped_json_schema_refs(schema, schema_name_mapping)
+        rewritten_schemas.append(schema)
+
+    return rewritten_schemas, all_defs
+
+## pydantic_ai_slim/pydantic_ai/agent/abstract.py
+
+    def output_json_schema(self, output_type: OutputSpec[OutputDataT | RunOutputDataT] | None = None) -> JsonSchema:
+        """The output return JSON schema."""
+        if output_type is None:
+            output_type = self.output_type
+
+        return_types = types_from_output_spec(output_spec=output_type)
+
+        json_schemas: list[JsonSchema] = []
+        for return_type in return_types:
+            json_schema = TypeAdapter(return_type).json_schema(mode='serialization')
+            if json_schema not in json_schemas:
+                json_schemas.append(json_schema)
+
+        if len(json_schemas) == 1:
+            return json_schemas[0]
+        else:
+            json_schemas, all_defs = _utils.merge_json_schema_defs(json_schemas)
+            json_schema: JsonSchema = {'anyOf': json_schemas}
+            if all_defs:
+                json_schema['$defs'] = all_defs
+            return json_schema
+
+## pydantic_ai_slim/pydantic_ai/agent/wrapper.py
+
+    def output_json_schema(self, output_type: OutputSpec[OutputDataT | RunOutputDataT] | None = None) -> JsonSchema:
+        return self.wrapped.output_json_schema(output_type=output_type)
+
+## pydantic_ai_slim/pydantic_ai/models/groq.py
+
+    def _map_json_schema(self, o: OutputObjectDefinition) -> chat.completion_create_params.ResponseFormat:
+        response_format_param: chat.completion_create_params.ResponseFormatResponseFormatJsonSchema = {
+            'type': 'json_schema',
+            'json_schema': {
+                'name': o.name or DEFAULT_OUTPUT_TOOL_NAME,
+                'schema': o.json_schema,
+                'strict': o.strict,
+            },
+        }
+        if o.description:  # pragma: no branch
+            response_format_param['json_schema']['description'] = o.description
+        return response_format_param
+
+## pydantic_ai_slim/pydantic_ai/models/openai.py
+
+    def _map_json_schema(self, o: OutputObjectDefinition) -> chat.completion_create_params.ResponseFormat:
+        response_format_param: chat.completion_create_params.ResponseFormatJSONSchema = {  # pyright: ignore[reportPrivateImportUsage]
+            'type': 'json_schema',
+            'json_schema': {'name': o.name or DEFAULT_OUTPUT_TOOL_NAME, 'schema': o.json_schema},
+        }
+        if o.description:
+            response_format_param['json_schema']['description'] = o.description
+        if OpenAIModelProfile.from_profile(self.profile).openai_supports_strict_tool_definition:  # pragma: no branch
+            response_format_param['json_schema']['strict'] = o.strict
+        return response_format_param
+
+    def _map_json_schema(self, o: OutputObjectDefinition) -> responses.ResponseFormatTextJSONSchemaConfigParam:
+        response_format_param: responses.ResponseFormatTextJSONSchemaConfigParam = {
+            'type': 'json_schema',
+            'name': o.name or DEFAULT_OUTPUT_TOOL_NAME,
+            'schema': o.json_schema,
+        }
+        if o.description:
+            response_format_param['description'] = o.description
+        if OpenAIModelProfile.from_profile(self.profile).openai_supports_strict_tool_definition:  # pragma: no branch
+            response_format_param['strict'] = o.strict
+        return response_format_param
+
+## pydantic_ai_slim/pydantic_ai/models/test.py
+
+class _JsonSchemaTestData:
+    """Generate data that matches a JSON schema.
+
+    This tries to generate the minimal viable data for the schema.
+    """
+
+    def __init__(self, schema: _utils.ObjectJsonSchema, seed: int = 0):
+        self.schema = schema
+        self.defs = schema.get('$defs', {})
+        self.seed = seed
+
+    def generate(self) -> dict[str, Any]:
+        """Generate data for the JSON schema."""
+        return self._gen_any(self.schema)
+
+    def _gen_any(self, schema: dict[str, Any]) -> Any:
+        """Generate data for any JSON Schema."""
+        if const := schema.get('const'):
+            return const
+        elif enum := schema.get('enum'):
+            return enum[self.seed % len(enum)]
+        elif examples := schema.get('examples'):
+            return examples[self.seed % len(examples)]
+        elif ref := schema.get('$ref'):
+            key = re.sub(r'^#/\$defs/', '', ref)
+            js_def = self.defs[key]
+            return self._gen_any(js_def)
+        elif any_of := schema.get('anyOf'):
+            return self._gen_any(any_of[self.seed % len(any_of)])
+
+        type_ = schema.get('type')
+        if type_ is None:
+            # if there's no type or ref, we can't generate anything
+            return self._char()
+        elif type_ == 'object':
+            return self._object_gen(schema)
+        elif type_ == 'string':
+            return self._str_gen(schema)
+        elif type_ == 'integer':
+            return self._int_gen(schema)
+        elif type_ == 'number':
+            return float(self._int_gen(schema))
+        elif type_ == 'boolean':
+            return self._bool_gen()
+        elif type_ == 'array':
+            return self._array_gen(schema)
+        elif type_ == 'null':
+            return None
+        else:
+            raise NotImplementedError(f'Unknown type: {type_}, please submit a PR to extend JsonSchemaTestData!')
+
+    def _object_gen(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """Generate data for a JSON Schema object."""
+        required = set(schema.get('required', []))
+
+        data: dict[str, Any] = {}
+        if properties := schema.get('properties'):
+            for key, value in properties.items():
+                if key in required:
+                    data[key] = self._gen_any(value)
+
+        if addition_props := schema.get('additionalProperties'):
+            add_prop_key = 'additionalProperty'
+            while add_prop_key in data:
+                add_prop_key += '_'
+            if addition_props is True:
+                data[add_prop_key] = self._char()
+            else:
+                data[add_prop_key] = self._gen_any(addition_props)
+
+        return data
+
+    def _str_gen(self, schema: dict[str, Any]) -> str:
+        """Generate a string from a JSON Schema string."""
+        min_len = schema.get('minLength')
+        if min_len is not None:
+            return self._char() * min_len
+
+        if schema.get('maxLength') == 0:
+            return ''
+
+        if fmt := schema.get('format'):
+            if fmt == 'date':
+                return (date(2024, 1, 1) + timedelta(days=self.seed)).isoformat()
+
+        return self._char()
+
+    def _int_gen(self, schema: dict[str, Any]) -> int:
+        """Generate an integer from a JSON Schema integer."""
+        maximum = schema.get('maximum')
+        if maximum is None:
+            exc_max = schema.get('exclusiveMaximum')
+            if exc_max is not None:
+                maximum = exc_max - 1
+
+        minimum = schema.get('minimum')
+        if minimum is None:
+            exc_min = schema.get('exclusiveMinimum')
+            if exc_min is not None:
+                minimum = exc_min + 1
+
+        if minimum is not None and maximum is not None:
+            return minimum + self.seed % (maximum - minimum)
+        elif minimum is not None:
+            return minimum + self.seed
+        elif maximum is not None:
+            return maximum - self.seed
+        else:
+            return self.seed
+
+    def _bool_gen(self) -> bool:
+        """Generate a boolean from a JSON Schema boolean."""
+        return bool(self.seed % 2)
+
+    def _array_gen(self, schema: dict[str, Any]) -> list[Any]:
+        """Generate an array from a JSON Schema array."""
+        data: list[Any] = []
+        unique_items = schema.get('uniqueItems')
+        if prefix_items := schema.get('prefixItems'):
+            for item in prefix_items:
+                data.append(self._gen_any(item))
+                if unique_items:
+                    self.seed += 1
+
+        items_schema = schema.get('items', {})
+        min_items = schema.get('minItems', 0)
+        if min_items > len(data):
+            for _ in range(min_items - len(data)):
+                data.append(self._gen_any(items_schema))
+                if unique_items:
+                    self.seed += 1
+        elif items_schema:
+            # if there is an `items` schema, add an item unless it would break `maxItems` rule
+            max_items = schema.get('maxItems')
+            if max_items is None or max_items > len(data):
+                data.append(self._gen_any(items_schema))
+                if unique_items:
+                    self.seed += 1
+
+        return data
+
+    def _char(self) -> str:
+        """Generate a character on the same principle as Excel columns, e.g. a-z, aa-az..."""
+        chars = len(_chars)
+        s = ''
+        rem = self.seed // chars
+        while rem > 0:
+            s += _chars[(rem - 1) % chars]
+            rem //= chars
+        s += _chars[self.seed % chars]
+        return s
+
+    def generate(self) -> dict[str, Any]:
+        """Generate data for the JSON schema."""
+        return self._gen_any(self.schema)
+
+## pydantic_ai_slim/pydantic_ai/profiles/__init__.py
+
+class ModelProfile:
+    """Describes how requests to and responses from specific models or families of models need to be constructed and processed to get the best results, independent of the model and provider classes used."""
+
+    supports_tools: bool = True
+    """Whether the model supports tools."""
+    supports_json_schema_output: bool = False
+    """Whether the model supports JSON schema output.
+
+    This is also referred to as 'native' support for structured output.
+    Relates to the `NativeOutput` output type.
+    """
+    supports_json_object_output: bool = False
+    """Whether the model supports a dedicated mode to enforce JSON output, without necessarily sending a schema.
+
+    E.g. [OpenAI's JSON mode](https://platform.openai.com/docs/guides/structured-outputs#json-mode)
+    Relates to the `PromptedOutput` output type.
+    """
+    supports_image_output: bool = False
+    """Whether the model supports image output."""
+    default_structured_output_mode: StructuredOutputMode = 'tool'
+    """The default structured output mode to use for the model."""
+    prompted_output_template: str = dedent(
+        """
+        Always respond with a JSON object that's compatible with this schema:
+
+        {schema}
+
+        Don't include any text or Markdown fencing before or after.
+        """
+    )
+    """The instructions template to use for prompted structured output. The '{schema}' placeholder will be replaced with the JSON schema for the output."""
+    native_output_requires_schema_in_instructions: bool = False
+    """Whether to add prompted output template in native structured output mode"""
+    json_schema_transformer: type[JsonSchemaTransformer] | None = None
+    """The transformer to use to make JSON schemas for tools and structured output compatible with the model."""
+
+    thinking_tags: tuple[str, str] = ('<think>', '</think>')
+    """The tags used to indicate thinking parts in the model's output. Defaults to ('<think>', '</think>')."""
+
+    ignore_streamed_leading_whitespace: bool = False
+    """Whether to ignore leading whitespace when streaming a response.
+
+    This is a workaround for models that emit `<think>\n</think>\n\n` or an empty text part ahead of tool calls (e.g. Ollama + Qwen3),
+    which we don't want to end up treating as a final result when using `run_stream` with `str` a valid `output_type`.
+
+    This is currently only used by `OpenAIChatModel`, `HuggingFaceModel`, and `GroqModel`.
+    """
+
+    supported_builtin_tools: frozenset[type[AbstractBuiltinTool]] = field(
+        default_factory=lambda: SUPPORTED_BUILTIN_TOOLS
+    )
+    """The set of builtin tool types that this model/profile supports.
+
+    Defaults to ALL builtin tools. Profile functions should explicitly
+    restrict this based on model capabilities.
+    """
+
+    @classmethod
+    def from_profile(cls, profile: ModelProfile | None) -> Self:
+        """Build a ModelProfile subclass instance from a ModelProfile instance."""
+        if isinstance(profile, cls):
+            return profile
+        return cls().update(profile)
+
+    def update(self, profile: ModelProfile | None) -> Self:
+        """Update this ModelProfile (subclass) instance with the non-default values from another ModelProfile instance."""
+        if not profile:
+            return self
+        field_names = set(f.name for f in fields(self))
+        non_default_attrs = {
+            f.name: getattr(profile, f.name)
+            for f in fields(profile)
+            if f.name in field_names and getattr(profile, f.name) != f.default
+        }
+        return replace(self, **non_default_attrs)
+
+    def from_profile(cls, profile: ModelProfile | None) -> Self:
+        """Build a ModelProfile subclass instance from a ModelProfile instance."""
+        if isinstance(profile, cls):
+            return profile
+        return cls().update(profile)
+
+## pydantic_ai_slim/pydantic_ai/toolsets/external.py
+
+    def __init__(self, tool_defs: list[ToolDefinition], *, id: str | None = None):
+        self.tool_defs = tool_defs
+        self._id = id
+
+## pydantic_graph/pydantic_graph/beta/mermaid.py
+
+def _topological_sort(
+    nodes: list[MermaidNode], edges: list[MermaidEdge]
+) -> tuple[list[MermaidNode], list[MermaidEdge]]:
+    """Sort nodes and edges in a logical topological order.
+
+    Uses BFS from the start node to assign depths, then sorts:
+    - Nodes by their distance from start
+    - Edges by the distance of their source and target nodes
+    """
+    # Build adjacency list for BFS
+    adjacency: dict[str, list[str]] = defaultdict(list)
+    for edge in edges:
+        adjacency[edge.start_id].append(edge.end_id)
+
+    # BFS to assign depth to each node (distance from start)
+    depths: dict[str, int] = {}
+    queue: list[tuple[str, int]] = [(StartNode.id, 0)]
+    depths[StartNode.id] = 0
+
+    while queue:
+        node_id, depth = queue.pop(0)
+        for next_id in adjacency[node_id]:
+            if next_id not in depths:  # pragma: no branch
+                depths[next_id] = depth + 1
+                queue.append((next_id, depth + 1))
+
+    # Sort nodes by depth (distance from start), then by id for stability
+    # Nodes not reachable from start get infinity depth (sorted to end)
+    sorted_nodes = sorted(nodes, key=lambda n: (depths.get(n.id, float('inf')), n.id))
+
+    # Sort edges by source depth, then target depth
+    # This ensures edges closer to start come first, edges closer to end come last
+    sorted_edges = sorted(
+        edges,
+        key=lambda e: (
+            depths.get(e.start_id, float('inf')),
+            depths.get(e.end_id, float('inf')),
+            e.start_id,
+            e.end_id,
+        ),
+    )
+
+    return sorted_nodes, sorted_edges
+
+## tests/conftest.py
+
+class TestEnv:
+    __test__ = False
+
+    def __init__(self):
+        self.envars: dict[str, str | None] = {}
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+    def remove(self, name: str) -> None:
+        self.envars[name] = os.environ.pop(name, None)
+
+    def reset(self) -> None:
+        for name, value in self.envars.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value  # pragma: lax no cover
+
+    def set(self, name: str, value: str) -> None:
+        self.envars[name] = os.getenv(name)
+        os.environ[name] = value
+
+## tests/evals/test_otel.py
+
+async def test_span_query_logical_combinations():
+    """Test logical combinations (AND/OR) in SpanQuery."""
+
+    with context_subtree() as tree:
+        with logfire.span('root1', level='0'):
+            with logfire.span('child1', level='1', category='important'):
+                pass
+            with logfire.span('child2', level='1', category='normal'):
+                pass
+            with logfire.span('special', level='1', category='important', priority='high'):
+                pass
+    assert isinstance(tree, SpanTree)
+
+    # Test AND logic
+    and_query: SpanQuery = {'and_': [{'name_contains': '1'}, {'has_attributes': {'level': '1'}}]}
+    matched_nodes = list(tree.find(and_query))
+    assert len(matched_nodes) == 1, matched_nodes
+    assert all(node.name in ['child1'] for node in matched_nodes)
+
+    # Test OR logic
+    or_query: SpanQuery = {'or_': [{'name_contains': '2'}, {'has_attributes': {'level': '0'}}]}
+    matched_nodes = list(tree.find(or_query))
+    assert len(matched_nodes) == 2
+    assert any(node.name == 'child2' for node in matched_nodes)
+    assert any(node.attributes.get('level') == '0' for node in matched_nodes)
+
+    # Test complex combination (AND + OR)
+    complex_query: SpanQuery = {
+        'and_': [
+            {'has_attributes': {'level': '1'}},
+            {'or_': [{'has_attributes': {'category': 'important'}}, {'name_equals': 'child2'}]},
+        ]
+    }
+    matched_nodes = list(tree.find(complex_query))
+    assert len(matched_nodes) == 3  # child1, child2, special
+    matched_names = [node.name for node in matched_nodes]
+    assert set(matched_names) == {'child1', 'child2', 'special'}
+
+async def test_span_query_timing_conditions():
+    """Test timing-related conditions in SpanQuery."""
+    from datetime import timedelta
+
+    with context_subtree() as tree:
+        with logfire.span('fast_operation'):
+            pass
+
+        with logfire.span('medium_operation'):
+            logfire.info('add a wait')
+
+        with logfire.span('slow_operation'):
+            logfire.info('add a wait')
+            logfire.info('add a wait')
+    assert isinstance(tree, SpanTree)
+
+    durations = sorted([node.duration for node in tree if node.duration > timedelta(seconds=0)])
+    fast_threshold = (durations[0] + durations[1]) / 2
+    medium_threshold = (durations[1] + durations[2]) / 2
+
+    # Test min_duration
+    min_duration_query: SpanQuery = {'min_duration': fast_threshold}
+    matched_nodes = list(tree.find(min_duration_query))
+    assert len(matched_nodes) == 2
+    assert 'fast_operation' not in [node.name for node in matched_nodes]
+
+    # Test max_duration
+    max_duration_queries: list[SpanQuery] = [
+        {'min_duration': 0.001, 'max_duration': medium_threshold},
+        {'min_duration': 0.001, 'max_duration': medium_threshold.seconds},
+    ]
+    for max_duration_query in max_duration_queries:
+        matched_nodes = list(tree.find(max_duration_query))
+        assert len(matched_nodes) == 2
+        assert 'slow_operation' not in [node.name for node in matched_nodes]
+
+    # Test min and max duration together using timedelta
+    duration_range_query: SpanQuery = {
+        'min_duration': fast_threshold,
+        'max_duration': medium_threshold,
+    }
+    matched_node = tree.first(duration_range_query)
+    assert matched_node is not None
+    assert matched_node.name == 'medium_operation'
+
+## tests/graph/beta/test_v1_v2_integration.py
+
+async def test_v1_node_conditional_return():
+    """Test v1 nodes with conditional returns creating implicit decisions."""
+
+    @dataclass
+    class RouterNode(BaseNode[IntegrationState, None, str]):
+        value: int
+
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> PathA | PathB:
+            if self.value < 10:
+                return PathA()
+            else:
+                return PathB()
+
+    @dataclass
+    class PathA(BaseNode[IntegrationState, None, str]):
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> End[str]:
+            return End('Path A')
+
+    @dataclass
+    class PathB(BaseNode[IntegrationState, None, str]):
+        async def run(self, ctx: GraphRunContext[IntegrationState, None]) -> End[str]:
+            return End('Path B')
+
+    g = GraphBuilder(state_type=IntegrationState, input_type=int, output_type=str)
+
+    @g.step
+    async def create_router(ctx: StepContext[IntegrationState, None, int]) -> RouterNode:
+        return RouterNode(ctx.inputs)
+
+    g.add(
+        g.node(RouterNode),
+        g.node(PathA),
+        g.node(PathB),
+        g.edge_from(g.start_node).to(create_router),
+    )
+
+    graph = g.build()
+
+    assert str(graph) == snapshot("""\
+stateDiagram-v2
+  create_router
+  RouterNode
+  state decision <<choice>>
+  PathA
+  PathB
+
+  [*] --> create_router
+  create_router --> RouterNode
+  RouterNode --> decision
+  decision --> PathA
+  decision --> PathB
+  PathA --> [*]
+  PathB --> [*]\
+""")
+
+    # Test path A
+    result_a = await graph.run(state=IntegrationState(), inputs=5)
+    assert result_a == 'Path A'
+
+    # Test path B
+    result_b = await graph.run(state=IntegrationState(), inputs=15)
+    assert result_b == 'Path B'
+
+## tests/models/test_model_test.py
+
+def test_json_schema_test_data():
+    class NestedModel(BaseModel):
+        foo: str
+        bar: int
+
+    class TestModel(BaseModel):
+        my_str: str
+        my_str_long: Annotated[str, MinLen(10)]
+        my_str_short: Annotated[str, MaxLen(1)]
+        my_int: int
+        my_int_gt: Annotated[int, Gt(5)]
+        my_int_ge: Annotated[int, Ge(5)]
+        my_int_lt: Annotated[int, Lt(-5)]
+        my_int_le: Annotated[int, Le(-5)]
+        my_int_range: Annotated[int, Gt(5), Lt(15)]
+        my_float: float
+        my_float_gt: Annotated[float, Gt(5.0)]
+        my_float_lt: Annotated[float, Lt(-5.0)]
+        my_bool: bool
+        my_bytes: bytes
+        my_fixed_tuple: tuple[int, str]
+        my_var_tuple: tuple[int, ...]
+        my_list: list[str]
+        my_dict: dict[str, int]
+        my_set: set[str]
+        my_set_min_len: Annotated[set[str], MinLen(5)]
+        my_list_min_len: Annotated[list[str], MinLen(5)]
+        my_lit_int: Literal[1]
+        my_lit_ints: Literal[1, 2, 3]
+        my_lit_str: Literal['a']
+        my_lit_strs: Literal['a', 'b', 'c']
+        my_any: Any
+        nested: NestedModel
+        union: int | list[int]
+        optional: str | None
+        with_example: int = Field(json_schema_extra={'examples': [1234]})
+        max_len_zero: Annotated[str, MaxLen(0)]
+        is_null: None
+        not_required: str = 'default'
+
+    json_schema = TestModel.model_json_schema()
+    data = _JsonSchemaTestData(json_schema).generate()
+    assert data == snapshot(
+        {
+            'my_str': 'a',
+            'my_str_long': 'aaaaaaaaaa',
+            'my_str_short': 'a',
+            'my_int': 0,
+            'my_int_gt': 6,
+            'my_int_ge': 5,
+            'my_int_lt': -6,
+            'my_int_le': -5,
+            'my_int_range': 6,
+            'my_float': 0.0,
+            'my_float_gt': 6.0,
+            'my_float_lt': -6.0,
+            'my_bool': False,
+            'my_bytes': 'a',
+            'my_fixed_tuple': [0, 'a'],
+            'my_var_tuple': [0],
+            'my_list': ['a'],
+            'my_dict': {'additionalProperty': 0},
+            'my_set': ['a'],
+            'my_set_min_len': ['b', 'c', 'd', 'e', 'f'],
+            'my_list_min_len': ['g', 'g', 'g', 'g', 'g'],
+            'my_lit_int': 1,
+            'my_lit_ints': 1,
+            'my_lit_str': 'a',
+            'my_lit_strs': 'a',
+            'my_any': 'g',
+            'union': 6,
+            'optional': 'g',
+            'with_example': 1234,
+            'max_len_zero': '',
+            'is_null': None,
+            'nested': {'foo': 'g', 'bar': 6},
+        }
+    )
+    TestModel.model_validate(data)
+
+## tests/test_agent_output_schemas.py
+
+async def test_text_output_json_schema():
+    agent = Agent('test')
+    assert agent.output_json_schema() == snapshot({'type': 'string'})
+
+    def func(x: str) -> str:
+        return x  # pragma: no cover
+
+    agent = Agent('test', output_type=TextOutput(func))
+    assert agent.output_json_schema() == snapshot({'type': 'string'})
+
+## tests/test_prefect.py
+
+def conditions(city: str) -> str:
+    # Simplified version without RunContext
+    return "It's raining"
+
+## tests/test_utils.py
+
+def test_check_object_json_schema():
+    object_schema = {'type': 'object', 'properties': {'a': {'type': 'string'}}}
+    assert check_object_json_schema(object_schema) == object_schema
+
+    assert check_object_json_schema(
+        {
+            '$defs': {
+                'JsonModel': {
+                    'properties': {
+                        'type': {'title': 'Type', 'type': 'string'},
+                        'items': {'anyOf': [{'type': 'string'}, {'type': 'null'}]},
+                    },
+                    'required': ['type', 'items'],
+                    'title': 'JsonModel',
+                    'type': 'object',
+                }
+            },
+            '$ref': '#/$defs/JsonModel',
+        }
+    ) == {
+        'properties': {
+            'items': {'anyOf': [{'type': 'string'}, {'type': 'null'}]},
+            'type': {'title': 'Type', 'type': 'string'},
+        },
+        'required': ['type', 'items'],
+        'title': 'JsonModel',
+        'type': 'object',
+    }
+
+    # Can't remove the recursive ref here:
+    assert check_object_json_schema(
+        {
+            '$defs': {
+                'JsonModel': {
+                    'properties': {
+                        'type': {'title': 'Type', 'type': 'string'},
+                        'items': {'anyOf': [{'$ref': '#/$defs/JsonModel'}, {'type': 'null'}]},
+                    },
+                    'required': ['type', 'items'],
+                    'title': 'JsonModel',
+                    'type': 'object',
+                }
+            },
+            '$ref': '#/$defs/JsonModel',
+        }
+    ) == {
+        '$defs': {
+            'JsonModel': {
+                'properties': {
+                    'items': {'anyOf': [{'$ref': '#/$defs/JsonModel'}, {'type': 'null'}]},
+                    'type': {'title': 'Type', 'type': 'string'},
+                },
+                'required': ['type', 'items'],
+                'title': 'JsonModel',
+                'type': 'object',
+            }
+        },
+        '$ref': '#/$defs/JsonModel',
+    }
+
+    array_schema = {'type': 'array', 'items': {'type': 'string'}}
+    with pytest.raises(UserError, match='^Schema must be an object$'):
+        check_object_json_schema(array_schema)

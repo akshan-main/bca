@@ -1,0 +1,1207 @@
+# pydantic_ai_slim/pydantic_ai/embeddings/__init__.py:136-384
+class Embedder:
+    """High-level interface for generating text embeddings.
+
+    The `Embedder` class provides a convenient way to generate vector embeddings from text
+    using various embedding model providers. It handles model inference, settings management,
+    and optional OpenTelemetry instrumentation.
+
+    Example:
+    ```python
+    from pydantic_ai import Embedder
+
+    embedder = Embedder('openai:text-embedding-3-small')
+
+
+    async def main():
+        result = await embedder.embed_query('What is machine learning?')
+        print(result.embeddings[0][:5])  # First 5 dimensions
+        #> [1.0, 1.0, 1.0, 1.0, 1.0]
+    ```
+    """
+
+    instrument: InstrumentationSettings | bool | None
+    """Options to automatically instrument with OpenTelemetry.
+
+    Set to `True` to use default instrumentation settings, which will use Logfire if it's configured.
+    Set to an instance of [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings] to customize.
+    If this isn't set, then the last value set by
+    [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all]
+    will be used, which defaults to False.
+    See the [Debugging and Monitoring guide](https://ai.pydantic.dev/logfire/) for more info.
+    """
+
+    _instrument_default: ClassVar[InstrumentationSettings | bool] = False
+
+    def __init__(
+        self,
+        model: EmbeddingModel | KnownEmbeddingModelName | str,
+        *,
+        settings: EmbeddingSettings | None = None,
+        defer_model_check: bool = True,
+        instrument: InstrumentationSettings | bool | None = None,
+    ) -> None:
+        """Initialize an Embedder.
+
+        Args:
+            model: The embedding model to use. Can be specified as:
+
+                - A model name string in the format `'provider:model-name'`
+                  (e.g., `'openai:text-embedding-3-small'`)
+                - An [`EmbeddingModel`][pydantic_ai.embeddings.EmbeddingModel] instance
+            settings: Optional [`EmbeddingSettings`][pydantic_ai.embeddings.EmbeddingSettings]
+                to use as defaults for all embed calls.
+            defer_model_check: Whether to defer model validation until first use.
+                Set to `False` to validate the model immediately on construction.
+            instrument: OpenTelemetry instrumentation settings. Set to `True` to enable with defaults,
+                or pass an [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize. If `None`, uses the value from
+                [`Embedder.instrument_all()`][pydantic_ai.embeddings.Embedder.instrument_all].
+        """
+        self._model = model if defer_model_check else infer_embedding_model(model)
+        self._settings = settings
+        self.instrument = instrument
+
+        self._override_model: ContextVar[EmbeddingModel | None] = ContextVar('_override_model', default=None)
+
+    @staticmethod
+    def instrument_all(instrument: InstrumentationSettings | bool = True) -> None:
+        """Set the default instrumentation options for all embedders where `instrument` is not explicitly set.
+
+        This is useful for enabling instrumentation globally without modifying each embedder individually.
+
+        Args:
+            instrument: Instrumentation settings to use as the default. Set to `True` for default settings,
+                `False` to disable, or pass an
+                [`InstrumentationSettings`][pydantic_ai.models.instrumented.InstrumentationSettings]
+                instance to customize.
+        """
+        Embedder._instrument_default = instrument
+
+    @property
+    def model(self) -> EmbeddingModel | KnownEmbeddingModelName | str:
+        """The embedding model used by this embedder."""
+        return self._model
+
+    @contextmanager
+    def override(
+        self,
+        *,
+        model: EmbeddingModel | KnownEmbeddingModelName | str | _utils.Unset = _utils.UNSET,
+    ) -> Iterator[None]:
+        """Context manager to temporarily override the embedding model.
+
+        Useful for testing or dynamically switching models.
+
+        Args:
+            model: The embedding model to use within this context.
+
+        Example:
+        ```python
+        from pydantic_ai import Embedder
+
+        embedder = Embedder('openai:text-embedding-3-small')
+
+
+        async def main():
+            # Temporarily use a different model
+            with embedder.override(model='openai:text-embedding-3-large'):
+                result = await embedder.embed_query('test')
+                print(len(result.embeddings[0]))  # 3072 dimensions for large model
+                #> 3072
+        ```
+        """
+        if _utils.is_set(model):
+            model_token = self._override_model.set(infer_embedding_model(model))
+        else:
+            model_token = None
+
+        try:
+            yield
+        finally:
+            if model_token is not None:
+                self._override_model.reset(model_token)
+
+    async def embed_query(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more query texts.
+
+        Use this method when embedding search queries that will be compared against document embeddings.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            query: A single query string or sequence of query strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(query, input_type='query', settings=settings)
+
+    async def embed_documents(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed one or more document texts.
+
+        Use this method when embedding documents that will be stored and later searched against.
+        Some models optimize embeddings differently based on whether the input is a query or document.
+
+        Args:
+            documents: A single document string or sequence of document strings to embed.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        return await self.embed(documents, input_type='document', settings=settings)
+
+    async def embed(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Embed text inputs with explicit input type specification.
+
+        This is the low-level embedding method. For most use cases, prefer
+        [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query] or
+        [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents].
+
+        Args:
+            inputs: A single string or sequence of strings to embed.
+            input_type: The type of input, either `'query'` or `'document'`.
+            settings: Optional settings to override the embedder's default settings for this call.
+
+        Returns:
+            An [`EmbeddingResult`][pydantic_ai.embeddings.EmbeddingResult] containing the embeddings
+            and metadata about the operation.
+        """
+        model = self._get_model()
+        settings = merge_embedding_settings(self._settings, settings)
+        return await model.embed(inputs, input_type=input_type, settings=settings)
+
+    async def max_input_tokens(self) -> int | None:
+        """Get the maximum number of tokens the model can accept as input.
+
+        Returns:
+            The maximum token count, or `None` if the limit is unknown for this model.
+        """
+        model = self._get_model()
+        return await model.max_input_tokens()
+
+    async def count_tokens(self, text: str) -> int:
+        """Count the number of tokens in the given text.
+
+        Args:
+            text: The text to tokenize and count.
+
+        Returns:
+            The number of tokens in the text.
+
+        Raises:
+            NotImplementedError: If the model doesn't support token counting.
+            UserError: If the model or tokenizer is not supported.
+        """
+        model = self._get_model()
+        return await model.count_tokens(text)
+
+    def embed_query_sync(
+        self, query: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_query()`][pydantic_ai.embeddings.Embedder.embed_query]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_query(query, settings=settings))
+
+    def embed_documents_sync(
+        self, documents: str | Sequence[str], *, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed_documents()`][pydantic_ai.embeddings.Embedder.embed_documents]."""
+        return _utils.get_event_loop().run_until_complete(self.embed_documents(documents, settings=settings))
+
+    def embed_sync(
+        self, inputs: str | Sequence[str], *, input_type: EmbedInputType, settings: EmbeddingSettings | None = None
+    ) -> EmbeddingResult:
+        """Synchronous version of [`embed()`][pydantic_ai.embeddings.Embedder.embed]."""
+        return _utils.get_event_loop().run_until_complete(self.embed(inputs, input_type=input_type, settings=settings))
+
+    def max_input_tokens_sync(self) -> int | None:
+        """Synchronous version of [`max_input_tokens()`][pydantic_ai.embeddings.Embedder.max_input_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.max_input_tokens())
+
+    def count_tokens_sync(self, text: str) -> int:
+        """Synchronous version of [`count_tokens()`][pydantic_ai.embeddings.Embedder.count_tokens]."""
+        return _utils.get_event_loop().run_until_complete(self.count_tokens(text))
+
+    def _get_model(self) -> EmbeddingModel:
+        """Create a model configured for this embedder.
+
+        Returns:
+            The embedding model to use, with instrumentation applied if configured.
+        """
+        model_: EmbeddingModel
+        if some_model := self._override_model.get():
+            model_ = some_model
+        else:
+            model_ = self._model = infer_embedding_model(self.model)
+
+        instrument = self.instrument
+        if instrument is None:
+            instrument = self._instrument_default
+
+        return instrument_embedding_model(model_, instrument)
+
+# tests/test_utils.py:41-52
+async def test_group_by_temporal(interval: float | None, expected: list[list[int]]):
+    async def yield_groups() -> AsyncIterator[int]:
+        yield 1
+        await asyncio.sleep(0.02)
+        yield 2
+        await asyncio.sleep(0.02)
+        yield 3
+        await asyncio.sleep(0.02)
+
+    async with group_by_temporal(yield_groups(), soft_max_interval=interval) as groups_iter:
+        groups: list[list[int]] = [g async for g in groups_iter]
+        assert groups == expected
+
+# tests/models/test_openai.py:132-139
+def test_openai_image_generation_size_valid_combinations(
+    aspect_ratio: Literal['1:1', '2:3', '3:2'] | None,
+    size: Literal['auto', '1024x1024', '1024x1536', '1536x1024'] | None,
+    expected: Literal['auto', '1024x1024', '1024x1536', '1536x1024'],
+) -> None:
+    """Test valid combinations of aspect_ratio and size for OpenAI image generation."""
+    tool = ImageGenerationTool(aspect_ratio=aspect_ratio, size=size)
+    assert _resolve_openai_image_generation_size(tool) == expected
+
+# pydantic_ai_slim/pydantic_ai/result.py:434-436
+    async def stream(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[OutputDataT]:
+        async for output in self.stream_output(debounce_by=debounce_by):
+            yield output
+
+# tests/models/mock_xai.py:723-737
+def create_usage(
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    cached_prompt_text_tokens: int = 0,
+    server_side_tools_used: list[usage_pb2.ServerSideTool] | None = None,
+) -> usage_pb2.SamplingUsage:
+    """Helper to create xAI SamplingUsage protobuf objects for tests with all required fields."""
+    return usage_pb2.SamplingUsage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cached_prompt_text_tokens=cached_prompt_text_tokens,
+        server_side_tools_used=server_side_tools_used or [],
+    )
+
+# pydantic_ai_slim/pydantic_ai/agent/abstract.py:1354-1408
+    def to_a2a(
+        self,
+        *,
+        storage: Storage | None = None,
+        broker: Broker | None = None,
+        # Agent card
+        name: str | None = None,
+        url: str = 'http://localhost:8000',
+        version: str = '1.0.0',
+        description: str | None = None,
+        provider: AgentProvider | None = None,
+        skills: list[Skill] | None = None,
+        # Starlette
+        debug: bool = False,
+        routes: Sequence[Route] | None = None,
+        middleware: Sequence[Middleware] | None = None,
+        exception_handlers: dict[Any, ExceptionHandler] | None = None,
+        lifespan: Lifespan[FastA2A] | None = None,
+    ) -> FastA2A:
+        """Convert the agent to a FastA2A application.
+
+        Example:
+        ```python
+        from pydantic_ai import Agent
+
+        agent = Agent('openai:gpt-5.2')
+        app = agent.to_a2a()
+        ```
+
+        The `app` is an ASGI application that can be used with any ASGI server.
+
+        To run the application, you can use the following command:
+
+        ```bash
+        uvicorn app:app --host 0.0.0.0 --port 8000
+        ```
+        """
+        from .._a2a import agent_to_a2a
+
+        return agent_to_a2a(
+            self,
+            storage=storage,
+            broker=broker,
+            name=name,
+            url=url,
+            version=version,
+            description=description,
+            provider=provider,
+            skills=skills,
+            debug=debug,
+            routes=routes,
+            middleware=middleware,
+            exception_handlers=exception_handlers,
+            lifespan=lifespan,
+        )
+
+# pydantic_ai_slim/pydantic_ai/embeddings/bedrock.py:205-217
+def _extract_version(model_name: str) -> int | None:
+    """Extract the version number from a model name.
+
+    Examples:
+        - 'amazon.titan-embed-text-v1' -> 1
+        - 'amazon.titan-embed-text-v2:0' -> 2
+        - 'cohere.embed-english-v3' -> 3
+        - 'cohere.embed-v4:0' -> 4
+    """
+    if match := re.search(r'v(\d+)', model_name):
+        return int(match.group(1))
+    else:  # pragma: no cover
+        return None
+
+# pydantic_evals/pydantic_evals/reporting/render_numbers.py:62-94
+def default_render_number_diff(old: float | int, new: float | int) -> str | None:
+    """Return a string representing the difference between old and new values.
+
+    Rules:
+      - If the two values are equal, return None.
+      - For integers, return the raw difference (with a leading sign), e.g.:
+            _default_format_number_diff(3, 4) -> '+1'
+      - For floats (or a mix of float and int):
+          * Compute the raw delta = new - old and format it with ABS_SIG_FIGS significant figures.
+          * If `old` is nonzero, compute a relative change:
+              - If |delta|/|old| ≤ 1, render the relative change as a percentage with
+                PERC_DECIMALS decimal places, e.g. '+0.7 / +70.0%'.
+              - If |delta|/|old| > 1, render a multiplier (new/old). Use one decimal place
+                if the absolute multiplier is less than MULTIPLIER_ONE_DECIMAL_THRESHOLD,
+                otherwise no decimals.
+          * However, if the percentage rounds to 0.0% (e.g. '+0.0%'), return only the absolute diff.
+          * Also, if |old| is below BASE_THRESHOLD and |delta| exceeds MULTIPLIER_DROP_FACTOR×|old|,
+            drop the relative change indicator.
+    """
+    if old == new:
+        return None
+
+    if isinstance(old, int) and isinstance(new, int):
+        diff_int = new - old
+        return f'{diff_int:+d}'
+
+    delta = new - old
+    abs_diff_str = _render_signed(delta, ABS_SIG_FIGS)
+    rel_diff_str = _render_relative(new, old, BASE_THRESHOLD)
+    if rel_diff_str is None:
+        return abs_diff_str
+    else:
+        return f'{abs_diff_str} / {rel_diff_str}'
+
+# tests/models/test_openai.py:4341-4360
+def chunk_with_usage(
+    delta: list[ChoiceDelta],
+    finish_reason: FinishReason | None = None,
+    completion_tokens: int = 1,
+    prompt_tokens: int = 2,
+    total_tokens: int = 3,
+) -> chat.ChatCompletionChunk:
+    """Create a chunk with configurable usage stats for testing continuous_usage_stats."""
+    return chat.ChatCompletionChunk(
+        id='123',
+        choices=[
+            ChunkChoice(index=index, delta=delta, finish_reason=finish_reason) for index, delta in enumerate(delta)
+        ],
+        created=1704067200,  # 2024-01-01
+        model='gpt-4o-123',
+        object='chat.completion.chunk',
+        usage=CompletionUsage(
+            completion_tokens=completion_tokens, prompt_tokens=prompt_tokens, total_tokens=total_tokens
+        ),
+    )
+
+# docs/.hooks/test_snippets.py:9-9
+from inline_snapshot import snapshot
+
+# pydantic_graph/pydantic_graph/__init__.py:4-4
+from .persistence import EndSnapshot, NodeSnapshot, Snapshot
+
+# pydantic_graph/pydantic_graph/persistence/__init__.py:98-98
+Snapshot = NodeSnapshot[StateT, RunEndT] | EndSnapshot[StateT, RunEndT]
+
+# pydantic_graph/pydantic_graph/persistence/file.py:16-26
+from . import (
+    BaseStatePersistence,
+    EndSnapshot,
+    NodeSnapshot,
+    RunEndT,
+    Snapshot,
+    SnapshotStatus,
+    StateT,
+    _utils,
+    build_snapshot_list_type_adapter,
+)
+
+# pydantic_graph/pydantic_graph/persistence/in_mem.py:19-28
+from . import (
+    BaseStatePersistence,
+    EndSnapshot,
+    NodeSnapshot,
+    RunEndT,
+    Snapshot,
+    StateT,
+    _utils,
+    build_snapshot_list_type_adapter,
+)
+
+# tests/evals/test_dataset.py:12-12
+from inline_snapshot import snapshot
+
+# tests/evals/test_evaluator_base.py:9-9
+from inline_snapshot import snapshot
+
+# tests/evals/test_evaluator_common.py:7-7
+from inline_snapshot import snapshot
+
+# tests/evals/test_evaluators.py:7-7
+from inline_snapshot import snapshot
+
+# tests/evals/test_llm_as_a_judge.py:4-4
+from inline_snapshot import snapshot
+
+# tests/evals/test_multi_run.py:8-8
+from inline_snapshot import snapshot
+
+# tests/evals/test_otel.py:6-6
+from inline_snapshot import snapshot
+
+# tests/evals/test_render_numbers.py:4-4
+from inline_snapshot import snapshot
+
+# tests/evals/test_reporting.py:6-6
+from inline_snapshot import snapshot
+
+# tests/evals/test_reports.py:6-6
+from inline_snapshot import snapshot
+
+# tests/ext/test_langchain.py:5-5
+from inline_snapshot import snapshot
+
+# tests/graph/beta/test_graph_edge_cases.py:10-10
+from inline_snapshot import snapshot
+
+# tests/graph/beta/test_parent_forks.py:4-4
+from inline_snapshot import snapshot
+
+# tests/graph/beta/test_v1_v2_integration.py:9-9
+from inline_snapshot import snapshot
+
+# tests/graph/test_file_persistence.py:9-9
+from inline_snapshot import snapshot
+
+# tests/graph/test_graph.py:11-11
+from inline_snapshot import snapshot
+
+# tests/graph/test_mermaid.py:12-12
+from inline_snapshot import snapshot
+
+# tests/graph/test_persistence.py:11-11
+from inline_snapshot import snapshot
+
+# tests/graph/test_state.py:7-7
+from inline_snapshot import snapshot
+
+# tests/models/anthropic/test_output.py:19-19
+from inline_snapshot import snapshot
+
+# tests/models/test_anthropic.py:15-15
+from inline_snapshot import snapshot
+
+# tests/models/test_bedrock.py:8-8
+from inline_snapshot import snapshot
+
+# tests/models/test_cohere.py:10-10
+from inline_snapshot import snapshot
+
+# tests/models/test_deepseek.py:6-6
+from inline_snapshot import snapshot
+
+# tests/models/test_fallback.py:11-11
+from inline_snapshot import snapshot
+
+# tests/models/test_gemini.py:16-16
+from inline_snapshot import snapshot
+
+# tests/models/test_gemini_vertex.py:6-6
+from inline_snapshot import Is, snapshot
+
+# tests/models/test_google.py:16-16
+from inline_snapshot import Is, snapshot
+
+# tests/models/test_groq.py:14-14
+from inline_snapshot import snapshot
+
+# tests/models/test_huggingface.py:12-12
+from inline_snapshot import snapshot
+
+# tests/models/test_instrumented.py:9-9
+from inline_snapshot import snapshot
+
+# tests/models/test_mcp_sampling.py:7-7
+from inline_snapshot import snapshot
+
+# tests/models/test_mistral.py:12-12
+from inline_snapshot import snapshot
+
+# tests/models/test_model_function.py:9-9
+from inline_snapshot import snapshot
+
+# tests/models/test_model_request_parameters.py:1-1
+from inline_snapshot import snapshot
+
+# tests/models/test_model_test.py:14-14
+from inline_snapshot import snapshot
+
+# tests/models/test_openai.py:15-15
+from inline_snapshot import snapshot
+
+# tests/models/test_openrouter.py:7-7
+from inline_snapshot import snapshot
+
+# tests/models/test_outlines.py:15-15
+from inline_snapshot import snapshot
+
+# tests/models/test_xai.py:25-25
+from inline_snapshot import snapshot
+
+# tests/profiles/test_anthropic.py:22-22
+from inline_snapshot import snapshot
+
+# tests/profiles/test_google.py:13-13
+from inline_snapshot import snapshot
+
+# tests/providers/test_azure.py:4-4
+from inline_snapshot import snapshot
+
+# tests/providers/test_gateway.py:9-9
+from inline_snapshot import snapshot
+
+# tests/providers/test_google_vertex.py:12-12
+from inline_snapshot import snapshot
+
+# tests/providers/test_heroku.py:5-5
+from inline_snapshot import snapshot
+
+# tests/providers/test_openrouter.py:5-5
+from inline_snapshot import snapshot
+
+# tests/test_a2a.py:9-9
+from inline_snapshot import snapshot
+
+# tests/test_ag_ui.py:16-16
+from inline_snapshot import snapshot
+
+# tests/test_agent.py:13-13
+from inline_snapshot import snapshot
+
+# tests/test_agent_output_schemas.py:2-2
+from inline_snapshot import snapshot
+
+# tests/test_cli.py:9-9
+from inline_snapshot import snapshot
+
+# tests/test_dbos.py:72-72
+from inline_snapshot import snapshot
+
+# tests/test_direct.py:8-8
+from inline_snapshot import snapshot
+
+# tests/test_embeddings.py:11-11
+from inline_snapshot import snapshot
+
+# tests/test_fastmcp.py:11-11
+from inline_snapshot import snapshot
+
+# tests/test_format_as_xml.py:11-11
+from inline_snapshot import snapshot
+
+# tests/test_history_processor.py:5-5
+from inline_snapshot import snapshot
+
+# tests/test_logfire.py:9-9
+from inline_snapshot import snapshot
+
+# tests/test_mcp.py:13-13
+from inline_snapshot import snapshot
+
+# tests/test_messages.py:6-6
+from inline_snapshot import snapshot
+
+# tests/test_parts_manager.py:7-7
+from inline_snapshot import snapshot
+
+# tests/test_prefect.py:69-69
+from inline_snapshot import snapshot
+
+# tests/test_streaming.py:14-14
+from inline_snapshot import snapshot
+
+# tests/test_temporal.py:13-13
+from inline_snapshot import snapshot
+
+# tests/test_thinking_part.py:4-4
+from inline_snapshot import snapshot
+
+# tests/test_tools.py:9-9
+from inline_snapshot import snapshot
+
+# tests/test_toolsets.py:10-10
+from inline_snapshot import snapshot
+
+# tests/test_ui.py:9-9
+from inline_snapshot import snapshot
+
+# tests/test_ui_web.py:12-12
+from inline_snapshot import snapshot
+
+# tests/test_usage_limits.py:10-10
+from inline_snapshot import snapshot
+
+# tests/test_utils.py:11-11
+from inline_snapshot import snapshot
+
+# tests/test_validation_context.py:4-4
+from inline_snapshot import snapshot
+
+# tests/test_vercel_ai.py:8-8
+from inline_snapshot import snapshot
+
+# pydantic_ai_slim/pydantic_ai/_utils.py:164-259
+async def group_by_temporal(
+    aiterable: AsyncIterable[T], soft_max_interval: float | None
+) -> AsyncIterator[AsyncIterable[list[T]]]:
+    """Group items from an async iterable into lists based on time interval between them.
+
+    Effectively, this debounces the iterator.
+
+    This returns a context manager usable as an iterator so any pending tasks can be cancelled if an error occurs
+    during iteration.
+
+    Usage:
+
+    ```python
+    async with group_by_temporal(yield_groups(), 0.1) as groups_iter:
+        async for groups in groups_iter:
+            print(groups)
+    ```
+
+    Args:
+        aiterable: The async iterable to group.
+        soft_max_interval: Maximum interval over which to group items, this should avoid a trickle of items causing
+            a group to never be yielded. It's a soft max in the sense that once we're over this time, we yield items
+            as soon as `anext(aiter)` returns. If `None`, no grouping/debouncing is performed
+
+    Returns:
+        A context manager usable as an async iterable of lists of items produced by the input async iterable.
+    """
+    if soft_max_interval is None:
+
+        async def async_iter_groups_noop() -> AsyncIterator[list[T]]:
+            async for item in aiterable:
+                yield [item]
+
+        yield async_iter_groups_noop()
+        return
+
+    # we might wait for the next item more than once, so we store the task to await next time
+    task: asyncio.Task[T] | None = None
+
+    async def async_iter_groups() -> AsyncIterator[list[T]]:
+        nonlocal task
+
+        assert soft_max_interval is not None and soft_max_interval >= 0, 'soft_max_interval must be a positive number'
+        buffer: list[T] = []
+        group_start_time = time.monotonic()
+
+        aiterator = aiter(aiterable)
+        while True:
+            if group_start_time is None:
+                # group hasn't started, we just wait for the maximum interval
+                wait_time = soft_max_interval
+            else:
+                # wait for the time remaining in the group
+                wait_time = soft_max_interval - (time.monotonic() - group_start_time)
+
+            # if there's no current task, we get the next one
+            if task is None:
+                # anext(aiter) returns an Awaitable[T], not a Coroutine which asyncio.create_task expects
+                # so far, this doesn't seem to be a problem
+                task = asyncio.create_task(anext(aiterator))  # pyright: ignore[reportArgumentType,reportUnknownVariableType]
+
+            # we use asyncio.wait to avoid cancelling the coroutine if it's not done
+            done, _ = await asyncio.wait((task,), timeout=wait_time)
+
+            if done:
+                # the one task we waited for completed
+                try:
+                    item = done.pop().result()
+                except StopAsyncIteration:
+                    # if the task raised StopAsyncIteration, we're done iterating
+                    if buffer:
+                        yield buffer
+                    task = None
+                    break
+                else:
+                    # we got an item, add it to the buffer and set task to None to get the next item
+                    buffer.append(item)
+                    task = None
+                    # if this is the first item in the group, set the group start time
+                    if group_start_time is not None:
+                        group_start_time = time.monotonic()
+            elif buffer:
+                # otherwise if the task timeout expired and we have items in the buffer, yield the buffer
+                yield buffer
+                # clear the buffer and reset the group start time ready for the next group
+                buffer = []
+                group_start_time = None
+
+    try:
+        yield async_iter_groups()
+    finally:  # pragma: no cover
+        # after iteration if a tasks still exists, cancel it, this will only happen if an error occurred
+        if task:
+            task.cancel('Cancelling due to error in iterator')
+            with suppress(asyncio.CancelledError):
+                await task
+
+# pydantic_ai_slim/pydantic_ai/result.py:64-91
+    async def stream_output(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[OutputDataT]:
+        """Asynchronously stream the (validated) agent outputs."""
+        if self._cached_output is not None:
+            yield deepcopy(self._cached_output)
+            return
+
+        last_response: _messages.ModelResponse | None = None
+        async for response in self.stream_responses(debounce_by=debounce_by):
+            if self._raw_stream_response.final_result_event is None or (
+                last_response and response.parts == last_response.parts
+            ):
+                continue
+            last_response = response
+
+            try:
+                yield await self.validate_response_output(response, allow_partial=True)
+            except ValidationError:
+                pass
+
+        if self._raw_stream_response.final_result_event is not None:  # pragma: no branch
+            response = self.response
+            # Final validation with allow_partial=False (the default).
+            # We always yield the final result even if the content matches the last partial yield, because:
+            # 1. Output validators/functions receive partial_output=False only on this final call,
+            #    and may behave differently based on that flag
+            # 2. Users can rely on the last yielded item being the fully validated output
+            self._cached_output = await self.validate_response_output(response)
+            yield deepcopy(self._cached_output)
+
+# pydantic_ai_slim/pydantic_ai/result.py:492-496
+    async def stream_structured(
+        self, *, debounce_by: float | None = 0.1
+    ) -> AsyncIterator[tuple[_messages.ModelResponse, bool]]:
+        async for msg, last in self.stream_responses(debounce_by=debounce_by):
+            yield msg, last
+
+# pydantic_ai_slim/pydantic_ai/retries.py:61-61
+    sleep: Callable[[int | float], None | Awaitable[None]]
+
+# pydantic_ai_slim/pydantic_ai/result.py:244-301
+    async def _stream_response_text(
+        self, *, delta: bool = False, debounce_by: float | None = 0.1
+    ) -> AsyncIterator[str]:
+        """Stream the response as an async iterable of text."""
+
+        # Define a "merged" version of the iterator that will yield items that have already been retrieved
+        # and items that we receive while streaming. We define a dedicated async iterator for this so we can
+        # pass the combined stream to the group_by_temporal function within `_stream_text_deltas` below.
+        async def _stream_text_deltas_ungrouped() -> AsyncIterator[tuple[str, int]]:
+            # yields tuples of (text_content, part_index)
+            # we don't currently make use of the part_index, but in principle this may be useful
+            # so we retain it here for now to make possible future refactors simpler
+            msg = self.response
+            for i, part in enumerate(msg.parts):
+                if isinstance(part, _messages.TextPart) and part.content:
+                    yield part.content, i
+
+            last_text_index: int | None = None
+            async for event in self._raw_stream_response:
+                if (
+                    isinstance(event, _messages.PartStartEvent)
+                    and isinstance(event.part, _messages.TextPart)
+                    and event.part.content
+                ):
+                    last_text_index = event.index
+                    yield event.part.content, event.index
+                elif (
+                    isinstance(event, _messages.PartDeltaEvent)
+                    and isinstance(event.delta, _messages.TextPartDelta)
+                    and event.delta.content_delta
+                ):
+                    last_text_index = event.index
+                    yield event.delta.content_delta, event.index
+                elif (
+                    isinstance(event, _messages.PartStartEvent)
+                    and isinstance(event.part, _messages.BuiltinToolCallPart)
+                    and last_text_index is not None
+                ):
+                    # Text parts that are interrupted by a built-in tool call should not be joined together directly
+                    yield '\n\n', event.index
+                    last_text_index = None
+
+        async def _stream_text_deltas() -> AsyncIterator[str]:
+            async with _utils.group_by_temporal(_stream_text_deltas_ungrouped(), debounce_by) as group_iter:
+                async for items in group_iter:
+                    # Note: we are currently just dropping the part index on the group here
+                    yield ''.join([content for content, _ in items])
+
+        if delta:
+            async for text in _stream_text_deltas():
+                yield text
+        else:
+            # a quick benchmark shows it's faster to build up a string with concat when we're
+            # yielding at each step
+            deltas: list[str] = []
+            async for text in _stream_text_deltas():
+                deltas.append(text)
+                yield ''.join(deltas)
+
+# pydantic_ai_slim/pydantic_ai/result.py:93-104
+    async def stream_responses(self, *, debounce_by: float | None = 0.1) -> AsyncIterator[_messages.ModelResponse]:
+        """Asynchronously stream the (unvalidated) model responses for the agent."""
+        # if the message currently has any parts with content, yield before streaming
+        msg = self.response
+        for part in msg.parts:
+            if part.has_content():
+                yield msg
+                break
+
+        async with _utils.group_by_temporal(self, debounce_by) as group_iter:
+            async for _items in group_iter:
+                yield self.response  # current state of the response
+
+# tests/models/test_anthropic.py:8219-8257
+async def test_anthropic_cache_messages_real_api(allow_model_requests: None, anthropic_api_key: str):
+    """Test that anthropic_cache_messages setting adds cache_control and produces cache usage metrics.
+
+    This test uses a cassette to verify the cache behavior without making real API calls in CI.
+    When run with real API credentials, it demonstrates that:
+    1. The first call with a long context creates a cache (cache_write_tokens > 0)
+    2. Follow-up messages in the same conversation can read from that cache (cache_read_tokens > 0)
+    """
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(api_key=anthropic_api_key))
+    agent = Agent(
+        m,
+        system_prompt='You are a helpful assistant.',
+        model_settings=AnthropicModelSettings(
+            anthropic_cache_messages=True,
+        ),
+    )
+
+    # First call with a longer message - this will cache the message content
+    result1 = await agent.run('Please explain what Python is and its main use cases. ' * 100)
+    usage1 = result1.usage()
+
+    # With anthropic_cache_messages, the first call should write cache for the last message
+    # (cache_write_tokens > 0 indicates that caching occurred)
+    assert usage1.requests == 1
+    assert usage1.cache_write_tokens > 0
+    assert usage1.output_tokens > 0
+
+    # Continue the conversation - this message appends to history
+    # The previous cached message should still be in the request
+    result2 = await agent.run('Can you summarize that in one sentence?', message_history=result1.all_messages())
+    usage2 = result2.usage()
+
+    # The second call should potentially read from cache if the previous message is still cached
+    # (cache_read_tokens > 0 when cache hit occurs)
+    # (cache_write_tokens > 0 as new message is added to cache)
+    assert usage2.requests == 1
+    assert usage2.cache_read_tokens > 0
+    assert usage2.cache_write_tokens > 0
+    assert usage2.output_tokens > 0
+
+# pydantic_ai_slim/pydantic_ai/_a2a.py:75-115
+def agent_to_a2a(
+    agent: AbstractAgent[AgentDepsT, OutputDataT],
+    *,
+    storage: Storage | None = None,
+    broker: Broker | None = None,
+    # Agent card
+    name: str | None = None,
+    url: str = 'http://localhost:8000',
+    version: str = '1.0.0',
+    description: str | None = None,
+    provider: AgentProvider | None = None,
+    skills: list[Skill] | None = None,
+    # Starlette
+    debug: bool = False,
+    routes: Sequence[Route] | None = None,
+    middleware: Sequence[Middleware] | None = None,
+    exception_handlers: dict[Any, ExceptionHandler] | None = None,
+    lifespan: Lifespan[FastA2A] | None = None,
+) -> FastA2A:
+    """Create a FastA2A server from an agent."""
+    storage = storage or InMemoryStorage()
+    broker = broker or InMemoryBroker()
+    worker = AgentWorker(agent=agent, broker=broker, storage=storage)
+
+    lifespan = lifespan or partial(worker_lifespan, worker=worker, agent=agent)
+
+    return FastA2A(
+        storage=storage,
+        broker=broker,
+        name=name or agent.name,
+        url=url,
+        version=version,
+        description=description,
+        provider=provider,
+        skills=skills,
+        debug=debug,
+        routes=routes,
+        middleware=middleware,
+        exception_handlers=exception_handlers,
+        lifespan=lifespan,
+    )
+
+# tests/test_logfire.py:923-1087
+def test_instructions_with_structured_output_exclude_content_v2_v3(
+    get_logfire_summary: Callable[[], LogfireSummary],
+    version: Literal[2, 3],
+) -> None:
+    @dataclass
+    class MyOutput:
+        content: str
+
+    settings: InstrumentationSettings = InstrumentationSettings(include_content=False, version=version)
+
+    my_agent = Agent(model=TestModel(), instructions='Here are some instructions', instrument=settings)
+
+    result = my_agent.run_sync('Hello', output_type=MyOutput)
+    assert result.output == MyOutput(content='a')
+
+    summary = get_logfire_summary()
+
+    if version == 2:
+        assert summary.traces == snapshot(
+            [
+                {
+                    'id': 0,
+                    'name': 'agent run',
+                    'message': 'my_agent run',
+                    'children': [{'id': 1, 'name': 'chat test', 'message': 'chat test'}],
+                }
+            ]
+        )
+    else:
+        assert summary.traces == snapshot(
+            [
+                {
+                    'id': 0,
+                    'name': 'invoke_agent my_agent',
+                    'message': 'my_agent run',
+                    'children': [{'id': 1, 'name': 'chat test', 'message': 'chat test'}],
+                }
+            ]
+        )
+
+    # Version 2 and 3 have identical snapshots for this test case
+    assert summary.attributes[0] == snapshot(
+        {
+            'model_name': 'test',
+            'agent_name': 'my_agent',
+            'gen_ai.agent.name': 'my_agent',
+            'logfire.msg': 'my_agent run',
+            'logfire.span_type': 'span',
+            'gen_ai.usage.input_tokens': 51,
+            'gen_ai.usage.output_tokens': 5,
+            'pydantic_ai.all_messages': IsJson(
+                snapshot(
+                    [
+                        {'role': 'user', 'parts': [{'type': 'text'}]},
+                        {
+                            'role': 'assistant',
+                            'parts': [
+                                {
+                                    'type': 'tool_call',
+                                    'id': IsStr(),
+                                    'name': 'final_result',
+                                }
+                            ],
+                        },
+                        {
+                            'role': 'user',
+                            'parts': [
+                                {
+                                    'type': 'tool_call_response',
+                                    'id': IsStr(),
+                                    'name': 'final_result',
+                                }
+                            ],
+                        },
+                    ]
+                )
+            ),
+            'logfire.json_schema': IsJson(
+                snapshot(
+                    {
+                        'type': 'object',
+                        'properties': {
+                            'pydantic_ai.all_messages': {'type': 'array'},
+                            'final_result': {'type': 'object'},
+                        },
+                    }
+                )
+            ),
+        }
+    )
+    chat_span_attributes = summary.attributes[1]
+    assert chat_span_attributes == snapshot(
+        {
+            'gen_ai.operation.name': 'chat',
+            'gen_ai.provider.name': 'test',
+            'gen_ai.system': 'test',
+            'gen_ai.request.model': 'test',
+            'model_request_parameters': IsJson(
+                snapshot(
+                    {
+                        'function_tools': [],
+                        'builtin_tools': [],
+                        'output_mode': 'tool',
+                        'output_object': None,
+                        'output_tools': [
+                            {
+                                'name': 'final_result',
+                                'parameters_json_schema': {
+                                    'properties': {'content': {'type': 'string'}},
+                                    'required': ['content'],
+                                    'title': 'MyOutput',
+                                    'type': 'object',
+                                },
+                                'description': 'The final response which ends this conversation',
+                                'outer_typed_dict_key': None,
+                                'strict': None,
+                                'sequential': False,
+                                'kind': 'output',
+                                'metadata': None,
+                                'timeout': None,
+                            }
+                        ],
+                        'prompted_output_template': None,
+                        'allow_text_output': False,
+                        'allow_image_output': False,
+                    }
+                )
+            ),
+            'gen_ai.tool.definitions': '[{"type": "function", "name": "final_result", "description": "The final response which ends this conversation", "parameters": {"properties": {"content": {"type": "string"}}, "required": ["content"], "title": "MyOutput", "type": "object"}}]',
+            'logfire.span_type': 'span',
+            'logfire.msg': 'chat test',
+            'gen_ai.input.messages': IsJson(snapshot([{'role': 'user', 'parts': [{'type': 'text'}]}])),
+            'gen_ai.output.messages': IsJson(
+                snapshot(
+                    [
+                        {
+                            'role': 'assistant',
+                            'parts': [
+                                {
+                                    'type': 'tool_call',
+                                    'id': IsStr(),
+                                    'name': 'final_result',
+                                }
+                            ],
+                        }
+                    ]
+                )
+            ),
+            'logfire.json_schema': IsJson(
+                snapshot(
+                    {
+                        'type': 'object',
+                        'properties': {
+                            'gen_ai.input.messages': {'type': 'array'},
+                            'gen_ai.output.messages': {'type': 'array'},
+                            'model_request_parameters': {'type': 'object'},
+                        },
+                    }
+                )
+            ),
+            'gen_ai.usage.input_tokens': 51,
+            'gen_ai.usage.output_tokens': 5,
+            'gen_ai.response.model': 'test',
+        }
+    )
+
+# tests/models/test_google.py:4080-4096
+async def test_google_dict_with_additional_properties_native_output_gemini_2_0(
+    allow_model_requests: None, google_provider: GoogleProvider
+):
+    """Test dicts with additionalProperties using gemini-2.0-flash."""
+    m = GoogleModel('gemini-2.0-flash', provider=google_provider)
+
+    class ConfigResponse(BaseModel):
+        """A response with configuration metadata."""
+
+        name: str
+        metadata: dict[str, str]
+
+    agent = Agent(m, output_type=NativeOutput(ConfigResponse))
+
+    result = await agent.run('Create a config named "api-config" with metadata author="Alice" and version="1.0"')
+    assert result.output.name == snapshot('api-config')
+    assert result.output.metadata == snapshot({'author': 'Alice', 'version': '1.0'})
+
+# pydantic_ai_slim/pydantic_ai/_instrumentation.py:30-56
+    def for_version(cls, version: int) -> Self:
+        """Create instrumentation configuration for a specific version.
+
+        Args:
+            version: The instrumentation version (1, 2, or 3+)
+
+        Returns:
+            InstrumentationConfig instance with version-appropriate settings
+        """
+        if version <= 2:
+            return cls(
+                agent_run_span_name='agent run',
+                agent_name_attr='agent_name',
+                tool_span_name='running tool',
+                tool_arguments_attr='tool_arguments',
+                tool_result_attr='tool_response',
+                output_tool_span_name='running output function',
+            )
+        else:
+            return cls(
+                agent_run_span_name='invoke_agent',
+                agent_name_attr='gen_ai.agent.name',
+                tool_span_name='execute_tool',  # Will be formatted with tool name
+                tool_arguments_attr='gen_ai.tool.call.arguments',
+                tool_result_attr='gen_ai.tool.call.result',
+                output_tool_span_name='execute_tool',
+            )
+
+# examples/pydantic_ai_examples/chat_app.py:10-10
+import asyncio
+
+# examples/pydantic_ai_examples/evals/example_01_generate_dataset.py:1-1
+import asyncio
+
+# examples/pydantic_ai_examples/rag.py:22-22
+import asyncio
+
+# examples/pydantic_ai_examples/roulette_wheel.py:9-9
+import asyncio
+
+# examples/pydantic_ai_examples/sql_gen.py:13-13
+import asyncio

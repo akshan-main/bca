@@ -1,0 +1,376 @@
+## examples/pydantic_ai_examples/data_analyst.py
+
+class AnalystAgentDeps:
+    output: dict[str, pd.DataFrame] = field(default_factory=dict[str, pd.DataFrame])
+
+    def store(self, value: pd.DataFrame) -> str:
+        """Store the output in deps and return the reference such as Out[1] to be used by the LLM."""
+        ref = f'Out[{len(self.output) + 1}]'
+        self.output[ref] = value
+        return ref
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+    def get(self, ref: str) -> pd.DataFrame:
+        if ref not in self.output:
+            raise ModelRetry(
+                f'Error: {ref} is not a valid variable reference. Check the previous messages and try again.'
+            )
+        return self.output[ref]
+
+## pydantic_ai_slim/pydantic_ai/_agent_graph.py
+
+    async def _prepare_request(
+        self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
+    ) -> tuple[ModelSettings | None, models.ModelRequestParameters, list[_messages.ModelMessage], RunContext[DepsT]]:
+        self.request.timestamp = now_utc()
+        self.request.run_id = self.request.run_id or ctx.state.run_id
+        ctx.state.message_history.append(self.request)
+
+        ctx.state.run_step += 1
+
+        run_context = build_run_context(ctx)
+
+        # This will raise errors for any tool name conflicts
+        ctx.deps.tool_manager = await ctx.deps.tool_manager.for_run_step(run_context)
+
+        original_history = ctx.state.message_history[:]
+        message_history = await _process_message_history(original_history, ctx.deps.history_processors, run_context)
+        # `ctx.state.message_history` is the same list used by `capture_run_messages`, so we should replace its contents, not the reference
+        ctx.state.message_history[:] = message_history
+        # Update the new message index to ensure `result.new_messages()` returns the correct messages
+        ctx.deps.new_message_index -= len(original_history) - len(message_history)
+
+        # Merge possible consecutive trailing `ModelRequest`s into one, with tool call parts before user parts,
+        # but don't store it in the message history on state. This is just for the benefit of model classes that want clear user/assistant boundaries.
+        # See `tests/test_tools.py::test_parallel_tool_return_with_deferred` for an example where this is necessary
+        message_history = _clean_message_history(message_history)
+
+        model_request_parameters = await _prepare_request_parameters(ctx)
+
+        model_settings = ctx.deps.model_settings
+        usage = ctx.state.usage
+        if ctx.deps.usage_limits.count_tokens_before_request:
+            # Copy to avoid modifying the original usage object with the counted usage
+            usage = deepcopy(usage)
+
+            counted_usage = await ctx.deps.model.count_tokens(message_history, model_settings, model_request_parameters)
+            usage.incr(counted_usage)
+
+        ctx.deps.usage_limits.check_before_request(usage)
+
+        return model_settings, model_request_parameters, message_history, run_context
+
+## pydantic_ai_slim/pydantic_ai/durable_exec/prefect/_model.py
+
+    def usage(self) -> RequestUsage:
+        return self.response.usage  # pragma: no cover
+
+## pydantic_ai_slim/pydantic_ai/embeddings/cohere.py
+
+def _map_usage(response: EmbedByTypeResponse, provider: str, provider_url: str, model: str) -> RequestUsage:
+    u = response.meta
+    if u is None or u.billed_units is None:
+        return RequestUsage()  # pragma: no cover
+    usage_data = {
+        k: int(v)
+        for k, v in u.billed_units.model_dump(exclude_none=True).items()
+        if isinstance(v, int | float) and v > 0
+    }
+    details = {k: int(v) for k, v in usage_data.items() if k != 'input_tokens' and isinstance(v, int | float) and v > 0}
+    response_data = dict(model=model, meta=dict(billed_units=usage_data))
+
+    return RequestUsage.extract(
+        response_data,
+        provider=provider,
+        provider_url=provider_url,
+        provider_fallback='cohere',
+        api_flavor='embeddings',
+        details=details,
+    )
+
+## pydantic_ai_slim/pydantic_ai/models/__init__.py
+
+    def usage(self) -> RequestUsage:
+        """Get the usage of the response so far. This will not be the final usage until the stream is exhausted."""
+        return self._usage
+
+def check_allow_model_requests() -> None:
+    """Check if model requests are allowed.
+
+    If you're defining your own models that have costs or latency associated with their use, you should call this in
+    [`Model.request`][pydantic_ai.models.Model.request] and [`Model.request_stream`][pydantic_ai.models.Model.request_stream].
+
+    Raises:
+        RuntimeError: If model requests are not allowed.
+    """
+    if not ALLOW_MODEL_REQUESTS:
+        raise RuntimeError('Model requests are not allowed, since ALLOW_MODEL_REQUESTS is False')
+
+## pydantic_ai_slim/pydantic_ai/models/anthropic.py
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> usage.RequestUsage:
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+
+        response = await self._messages_count_tokens(
+            messages, cast(AnthropicModelSettings, model_settings or {}), model_request_parameters
+        )
+
+        return usage.RequestUsage(input_tokens=response.input_tokens)
+
+## pydantic_ai_slim/pydantic_ai/models/google.py
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> usage.RequestUsage:
+        check_allow_model_requests()
+        model_settings, model_request_parameters = self.prepare_request(
+            model_settings,
+            model_request_parameters,
+        )
+        model_settings = cast(GoogleModelSettings, model_settings or {})
+        contents, generation_config = await self._build_content_and_config(
+            messages, model_settings, model_request_parameters
+        )
+
+        # Annoyingly, the type of `GenerateContentConfigDict.get` is "partially `Unknown`" because `response_schema` includes `typing._UnionGenericAlias`,
+        # so without this we'd need `pyright: ignore[reportUnknownMemberType]` on every line and wouldn't get type checking anyway.
+        generation_config = cast(dict[str, Any], generation_config)
+
+        config = CountTokensConfigDict(
+            http_options=generation_config.get('http_options'),
+        )
+        if self._provider.name != 'google-gla':
+            # The fields are not supported by the Gemini API per https://github.com/googleapis/python-genai/blob/7e4ec284dc6e521949626f3ed54028163ef9121d/google/genai/models.py#L1195-L1214
+            config.update(  # pragma: lax no cover
+                system_instruction=generation_config.get('system_instruction'),
+                tools=cast(list[ToolDict], generation_config.get('tools')),
+                # Annoyingly, GenerationConfigDict has fewer fields than GenerateContentConfigDict, and no extra fields are allowed.
+                generation_config=GenerationConfigDict(
+                    temperature=generation_config.get('temperature'),
+                    top_p=generation_config.get('top_p'),
+                    max_output_tokens=generation_config.get('max_output_tokens'),
+                    stop_sequences=generation_config.get('stop_sequences'),
+                    presence_penalty=generation_config.get('presence_penalty'),
+                    frequency_penalty=generation_config.get('frequency_penalty'),
+                    seed=generation_config.get('seed'),
+                    thinking_config=generation_config.get('thinking_config'),
+                    media_resolution=generation_config.get('media_resolution'),
+                    response_mime_type=generation_config.get('response_mime_type'),
+                    response_json_schema=generation_config.get('response_json_schema'),
+                ),
+            )
+
+        response = await self.client.aio.models.count_tokens(
+            model=self._model_name,
+            contents=contents,
+            config=config,
+        )
+        if response.total_tokens is None:
+            raise UnexpectedModelBehavior(  # pragma: no cover
+                'Total tokens missing from Gemini response', str(response)
+            )
+        return usage.RequestUsage(
+            input_tokens=response.total_tokens,
+        )
+
+## pydantic_ai_slim/pydantic_ai/models/openai.py
+
+    def _map_usage(self, response: chat.ChatCompletion) -> usage.RequestUsage:
+        return _map_usage(response, self._provider.name, self._provider.base_url, self.model_name)
+
+    def _map_usage(self, response: ChatCompletionChunk) -> usage.RequestUsage:
+        return _map_usage(response, self._provider_name, self._provider_url, self.model_name)
+
+    def _map_usage(self, response: responses.Response) -> usage.RequestUsage:
+        return _map_usage(response, self._provider_name, self._provider_url, self.model_name)
+
+## pydantic_ai_slim/pydantic_ai/profiles/__init__.py
+
+    def update(self, profile: ModelProfile | None) -> Self:
+        """Update this ModelProfile (subclass) instance with the non-default values from another ModelProfile instance."""
+        if not profile:
+            return self
+        field_names = set(f.name for f in fields(self))
+        non_default_attrs = {
+            f.name: getattr(profile, f.name)
+            for f in fields(profile)
+            if f.name in field_names and getattr(profile, f.name) != f.default
+        }
+        return replace(self, **non_default_attrs)
+
+## pydantic_ai_slim/pydantic_ai/result.py
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._initial_run_ctx_usage + self._raw_stream_response.usage()
+
+    def usage(self) -> RunUsage:
+        """Return the usage of the whole run.
+
+        !!! note
+            This won't return the full usage until the stream is finished.
+        """
+        return self._streamed_run_result.usage()
+
+def _get_usage_checking_stream_response(
+    stream_response: models.StreamedResponse,
+    limits: UsageLimits | None,
+    get_usage: Callable[[], RunUsage],
+) -> AsyncIterator[ModelResponseStreamEvent]:
+    if limits is not None and limits.has_token_limits():
+
+        async def _usage_checking_iterator():
+            async for item in stream_response:
+                limits.check_tokens(get_usage())
+                yield item
+
+        return _usage_checking_iterator()
+    else:
+        return aiter(stream_response)
+
+## pydantic_ai_slim/pydantic_ai/run.py
+
+    def usage(self) -> _usage.RunUsage:
+        """Get usage statistics for the run so far, including token usage, model requests, and so on."""
+        return self._graph_run.state.usage
+
+## pydantic_ai_slim/pydantic_ai/usage.py
+
+    def has_values(self) -> bool:
+        """Whether any values are set and non-zero."""
+        return any(dataclasses.asdict(self).values())
+
+    def incr(self, incr_usage: RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        return _incr_usage_tokens(self, incr_usage)
+
+    def incr(self, incr_usage: RunUsage | RequestUsage) -> None:
+        """Increment the usage in place.
+
+        Args:
+            incr_usage: The usage to increment by.
+        """
+        if isinstance(incr_usage, RunUsage):
+            self.requests += incr_usage.requests
+            self.tool_calls += incr_usage.tool_calls
+        return _incr_usage_tokens(self, incr_usage)
+
+    def __add__(self, other: RunUsage | RequestUsage) -> RunUsage:
+        """Add two RunUsages together.
+
+        This is provided so it's trivial to sum usage information from multiple runs.
+        """
+        new_usage = copy(self)
+        new_usage.incr(other)
+        return new_usage
+
+def _incr_usage_tokens(slf: RunUsage | RequestUsage, incr_usage: RunUsage | RequestUsage) -> None:
+    """Increment the usage in place.
+
+    Args:
+        slf: The usage to increment.
+        incr_usage: The usage to increment by.
+    """
+    slf.input_tokens += incr_usage.input_tokens
+    slf.cache_write_tokens += incr_usage.cache_write_tokens
+    slf.cache_read_tokens += incr_usage.cache_read_tokens
+    slf.input_audio_tokens += incr_usage.input_audio_tokens
+    slf.cache_audio_read_tokens += incr_usage.cache_audio_read_tokens
+    slf.output_tokens += incr_usage.output_tokens
+
+    for key, value in incr_usage.details.items():
+        # Note: value can be None at runtime from model responses despite the type annotation
+        if isinstance(value, (int, float)):
+            slf.details[key] = slf.details.get(key, 0) + value
+
+    def request_tokens_limit(self) -> int | None:
+        return self.input_tokens_limit
+
+    def __init__(
+        self,
+        *,
+        request_limit: int | None = 50,
+        tool_calls_limit: int | None = None,
+        input_tokens_limit: int | None = None,
+        output_tokens_limit: int | None = None,
+        total_tokens_limit: int | None = None,
+        count_tokens_before_request: bool = False,
+        # deprecated:
+        request_tokens_limit: int | None = None,
+        response_tokens_limit: int | None = None,
+    ):
+        self.request_limit = request_limit
+        self.tool_calls_limit = tool_calls_limit
+        self.input_tokens_limit = input_tokens_limit if input_tokens_limit is None else request_tokens_limit
+        self.output_tokens_limit = output_tokens_limit if output_tokens_limit is not None else response_tokens_limit
+        self.total_tokens_limit = total_tokens_limit
+        self.count_tokens_before_request = count_tokens_before_request
+
+    def check_tokens(self, usage: RunUsage) -> None:
+        """Raises a `UsageLimitExceeded` exception if the usage exceeds any of the token limits."""
+        input_tokens = usage.input_tokens
+        if self.input_tokens_limit is not None and input_tokens > self.input_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the input_tokens_limit of {self.input_tokens_limit} ({input_tokens=})')
+
+        output_tokens = usage.output_tokens
+        if self.output_tokens_limit is not None and output_tokens > self.output_tokens_limit:
+            raise UsageLimitExceeded(
+                f'Exceeded the output_tokens_limit of {self.output_tokens_limit} ({output_tokens=})'
+            )
+
+        total_tokens = usage.total_tokens
+        if self.total_tokens_limit is not None and total_tokens > self.total_tokens_limit:
+            raise UsageLimitExceeded(f'Exceeded the total_tokens_limit of {self.total_tokens_limit} ({total_tokens=})')
+
+## pydantic_evals/pydantic_evals/otel/span_tree.py
+
+class SpanTree
+    """A container that builds a hierarchy of SpanNode objects from a list of finished spans.
+
+    You can then search or iterate the tree to make your assertions (using DFS for traversal)."""
+    ...  # (skeleton: full source omitted for budget)
+
+    def any(self, predicate: SpanQuery | SpanPredicate) -> bool:
+        """Returns True if any node in the tree matches the predicate."""
+        return self.first(predicate) is not None
+
+## tests/test_usage_limits.py
+
+async def test_multi_agent_usage_sync():
+    """As in `test_multi_agent_usage_async`, with a sync tool."""
+    controller_agent = Agent(TestModel())
+
+    @controller_agent.tool
+    def delegate_to_other_agent(ctx: RunContext[None], sentence: str) -> int:
+        new_usage = RunUsage(requests=5, input_tokens=2, output_tokens=3)
+        ctx.usage.incr(new_usage)
+        return 0
+
+    result = await controller_agent.run('foobar')
+    assert result.output == snapshot('{"delegate_to_other_agent":0}')
+    assert result.usage() == snapshot(RunUsage(requests=7, input_tokens=105, output_tokens=16, tool_calls=1))
