@@ -3587,6 +3587,10 @@ def main():
         "--quick", action="store_true",
         help="Quick test: 2 tasks, 2 budgets, 5 methods (~16 LLM calls)",
     )
+    parser.add_argument(
+        "--repos-dir", default=None,
+        help="Base directory containing target repositories",
+    )
     args = parser.parse_args()
 
     budgets = [int(b) for b in args.budgets.split(",")]
@@ -3615,6 +3619,12 @@ def main():
             # Strip extra fields not in EvalTask
             filtered = {k: v for k, v in data.items() if k in eval_fields}
             tasks.append(EvalTask(**filtered))
+
+    if args.repos_dir:
+        repos_base = Path(args.repos_dir).resolve()
+        for t in tasks:
+            if t.repo_path and not Path(t.repo_path).is_absolute():
+                t.repo_path = str(repos_base / t.repo_path)
 
     if args.quick:
         tasks = tasks[:2]
