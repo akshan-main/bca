@@ -181,7 +181,7 @@ _last_context_package = None
 
 # Module-level list to capture retrieval scores from the most recent assembly call.
 # Populated by scored methods (BM25, TF-IDF, embedding, BCA); empty for unscored
-# methods (grep, no_retrieval, naive_random, repo_map, target_file).
+# methods (grep, no_retrieval, naive_random, keyword_map, target_file).
 # Read by _run_single_eval to compute Router B confidence features.
 _last_retrieval_scores: list[float] = []
 
@@ -463,7 +463,7 @@ def assemble_grep(
     return (context, total_tokens, 0, files_used, round(elapsed, 1))
 
 
-def assemble_repo_map(
+def assemble_keyword_map(
     repo_path: Path, task: str, budget: int, graph, query: GraphQuery,
 ) -> tuple[str, int, int, int, float]:
     """Repo map (compact file tree + relevant symbol source code).
@@ -982,7 +982,7 @@ METHODS: dict[str, callable] = {
     "naive_random": assemble_naive_random,
     "grep": assemble_grep,
     "bm25": assemble_bm25,
-    "repo_map": assemble_repo_map,
+    "keyword_map": assemble_keyword_map,
     "vector": assemble_vector,
     "embedding": assemble_embedding,
     "bca_d1": assemble_bca_d1,
@@ -3569,7 +3569,7 @@ def main():
     )
     parser.add_argument(
         "--methods",
-        default="no_retrieval,naive_random,grep,bm25,vector,embedding,repo_map,bca_d1,bca,bca_d5,bca_no_closure,bca_no_scoring,target_file",
+        default="no_retrieval,naive_random,grep,bm25,vector,embedding,keyword_map,bca_d1,bca,bca_d5,bca_no_closure,bca_no_scoring,target_file",
         help="Comma-separated method names (default: all 13 methods for paper run)",
     )
     parser.add_argument("--provider", default="openai", help="LLM provider")

@@ -251,10 +251,10 @@ def baseline_unweighted_bfs(
 
 
 # ---------------------------------------------------------------------------
-# Baseline 4: Repo map (aider-style structural summary + relevant files)
+# Baseline 4: Keyword map (aider-style structural summary + relevant files)
 # ---------------------------------------------------------------------------
 
-def baseline_repo_map(
+def baseline_keyword_map(
     repo_path: Path,
     task: str,
     budget: int,
@@ -337,7 +337,7 @@ def baseline_repo_map(
     elapsed = (time.time() - start) * 1000
 
     return BaselineResult(
-        method="repo_map",
+        method="keyword_map",
         task=task,
         budget=budget,
         tokens_used=map_tokens + content_tokens,
@@ -400,7 +400,7 @@ def run_comparison(
         methods = [
             baseline_grep(repo_path, task, budget, graph),
             baseline_bm25(repo_path, task, budget, graph),
-            baseline_repo_map(repo_path, task, budget, graph),
+            baseline_keyword_map(repo_path, task, budget, graph),
             baseline_unweighted_bfs(repo_path, task, budget, graph, query),
             run_bca(repo_path, task, budget, graph, query),
         ]

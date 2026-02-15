@@ -38,7 +38,7 @@ CEILING_METHODS = {"target_file"}
 # Methods that do retrieval (Router B candidates)
 RETRIEVAL_METHODS = sorted([
     "bca", "bca_d1", "bca_d5", "bca_no_closure", "bca_no_scoring",
-    "bm25", "repo_map", "vector",
+    "bm25", "keyword_map", "vector",
 ])
 
 # All non-ceiling methods (Router A candidates)

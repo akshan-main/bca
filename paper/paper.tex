@@ -1,0 +1,3031 @@
+\documentclass[10pt,twocolumn,a4paper]{article}
+
+% ── Packages ─────────────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{xcolor}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage[margin=0.75in,columnsep=0.3in]{geometry}
+\usepackage{microtype}
+\usepackage[square,numbers,sort&compress]{natbib}
+\usepackage[
+  font=small,
+  labelfont=bf,
+  textfont=it,
+  labelsep=period,
+  skip=6pt
+]{caption}
+\usepackage{subcaption}
+\captionsetup[sub]{font=small,labelfont=bf,textfont=it}
+\usepackage{enumitem}
+\usepackage{makecell}
+\usepackage{placeins}
+\usepackage{dblfloatfix}          % fix table*/figure* placement in twocolumn
+\usepackage{float}                % [H] placement for appendix tables
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric,arrows.meta,positioning,calc,fit,backgrounds,decorations.pathreplacing}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepgfplotslibrary{groupplots}
+
+% ── Float parameters: let LaTeX fill pages with text, not white space ────────
+\renewcommand{\topfraction}{0.9}         % up to 90% of page top can be floats
+\renewcommand{\bottomfraction}{0.8}      % up to 80% of page bottom can be floats
+\renewcommand{\textfraction}{0.1}        % at least 10% of page must be text
+\renewcommand{\floatpagefraction}{0.75}  % float-only pages must be ≥75% full
+\renewcommand{\dbltopfraction}{0.9}      % same for table*/figure* in twocolumn
+\renewcommand{\dblfloatpagefraction}{0.75}
+\setcounter{topnumber}{4}               % max floats at top of page
+\setcounter{bottomnumber}{4}            % max floats at bottom of page
+\setcounter{totalnumber}{8}             % max floats per page total
+\setcounter{dbltopnumber}{4}            % max wide floats at top
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=black,
+}
+
+% ── Shortcuts ────────────────────────────────────────────────────────────────
+\newcommand{\passone}{\text{pass@1}}
+\newcommand{\B}[1]{B{=}#1}
+
+\title{A Three-Tier Benchmark for Budgeted Context Assembly\\in LLM Code Repair}
+
+\author{
+	  Akshan Krithick \\
+	  University of Washington \\
+	  \href{mailto:akshankrithick305@gmail.com}{\texttt{akshan3@uw.edu}}
+}
+
+\date{}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\begin{document}
+\raggedbottom
+\maketitle
+
+% ── Abstract ─────────────────────────────────────────────────────────────────
+\begin{abstract}
+We introduce a benchmark and analysis pipeline for budgeted context assembly
+in LLM code repair.  Using mutation-based fault injection across two Python
+repositories (245~tasks), we evaluate nine retrieval strategies---including a
+graph-guided baseline (BCA)---across four token budgets (2k--10k) and three
+query tiers of decreasing information content:
+\emph{dev-localized} (file + line + operator),
+\emph{dev-report} (traceback + test name), and
+\emph{vague} (symptom-only).
+The study comprises 29,400~single-shot attempts on a pinned model snapshot
+(\texttt{gpt-4o-mini-2024-07-18}), isolating context selection from code
+generation.
+
+The three tiers create distinct evaluation regimes.
+Pass@1 drops from dev-localized (47--86\%) through dev-report (2--25\%) to
+vague (0--7\%), with corresponding shifts in failure modes (localization
+errors $\to$ comprehension errors) and retrieval--outcome decoupling (file
+hit $\to$ pass conversion: 69--86\% dev-localized, 14--25\% dev-report,
+2--12\% vague).  On dev-report (our primary tier), TF-IDF (\textsc{tfidf})
+achieves the best average pass@1 (0.23).  Dev-localized is often solvable
+without retrieval due to location leakage (\textsc{no\_retrieval}: 0.86),
+while vague remains near-zero across methods (best: 0.05).  A lightweight
+logistic-regression router closes up to
+18.2\% of the oracle gap on dev-report without additional LLM calls.
+
+These results show that single-tier pass@1 evaluations hide regime structure
+and that per-instance method selection is a more productive framing than a
+universal best retriever.  We release the harness and full artifacts on
+GitHub (\url{https://github.com/akshan-main/bca}).
+
+\smallskip
+\noindent\textbf{Keywords:} code retrieval, context assembly,
+LLM code repair, budgeted optimization, benchmark
+\end{abstract}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+
+Large language models are increasingly used to automatically repair software
+bugs, but their effectiveness depends heavily on which code fragments are
+included in the prompt.  Token budgets force a selection problem: whole-file
+dumping wastes prompt space on irrelevant code, while keyword-based retrieval
+may miss structural dependencies needed to understand the bug.
+
+The community largely treats context selection as a single-method retrieval
+competition---evaluated on one query style, optimized for aggregate pass@1.
+This framing obscures the real structure of the problem.  Context
+assembly under budget is a \emph{conditional} decision: the right retrieval
+method depends on how much the query reveals about the bug's location.  A
+file path and line number call for a different strategy than a vague symptom
+description.
+
+We introduce a benchmark and analysis pipeline to characterize when
+retrieval helps, why it fails, and how retrieval success decouples from
+repair success.  We evaluate a suite of retrieval strategies---including a
+graph-guided baseline whose ablation structure lets us isolate the
+contribution of individual components---to map out these regimes rather than
+to propose a new state-of-the-art retriever.
+
+We make three contributions:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{A three-tier benchmark} for budgeted context assembly, with
+    controlled query tiers (dev-report as primary; dev-localized as a
+    diagnostic ceiling-like tier; vague as a bottleneck probe), two
+    repositories, a pinned model snapshot, and 29,400 attempts isolating
+    context selection from code generation.
+
+  \item \textbf{Mechanistic findings} characterizing the regimes:
+    a failure-mode gradient (localization $\to$ comprehension errors),
+    retrieval--outcome decoupling across tiers, hop-distance and seed
+    reachability explaining when graph-guided methods help, and ablation
+    evidence identifying scoring as the critical BCA component.
+
+  \item \textbf{A router framework} demonstrating that lightweight per-query
+    method selection using retrieval confidence features closes up to 18.2\%
+    of the oracle gap on dev-report, without additional LLM calls---showing
+    that per-instance selection beats any fixed method.
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Related Work}\label{sec:related}
+
+\paragraph{Code retrieval for LLMs.}
+Repository-level code generation benchmarks
+(RepoBench~\citep{liu2023repobench}, CrossCodeEval~\citep{ding2023crosscodeeval},
+SWE-bench~\citep{jimenez2024swebench}) evaluate end-to-end performance but
+conflate retrieval quality with generation quality.  Our benchmark isolates
+context selection by fixing the generation model and varying only the
+retrieved context.
+
+\paragraph{Retrieval-augmented generation.}
+RAG systems for code in production assistants use keyword search, embedding
+similarity, or repository maps (e.g., Aider~\citep{aider}).  Our \textsc{keyword\_map}
+baseline is a lightweight, local signature-index baseline inspired by the
+``repo map'' idea, but it is not Aider's repo-map implementation.  These systems
+are typically evaluated on
+pass@$k$ without analysis of \emph{why} retrieval succeeds or fails for
+particular queries.  Our setting is closest to retrieval-augmented
+generation in NLP~\citep{lewis2020rag,guu2020realm,borg2022retro}, but we
+factor retrieval into explicit, budgeted context assembly and hold the
+generator fixed.
+
+\paragraph{Per-instance method selection.}
+Choosing a retrieval strategy per query is a form of per-instance algorithm
+selection and portfolio routing~\citep{rice1976algorithm,kotthoff2014algo,xu2008satzilla}.
+Our routers are deliberately lightweight (logistic regression) and
+deployment-valid: Router~A uses only pre-retrieval features, and Router~B
+uses cheap dry-run retrieval confidence signals.
+
+\paragraph{Knowledge graphs for code.}
+Static analysis graphs (call graphs, data flow) have been used for code
+understanding and code search~\citep{husain2019codesearchnet,feng2020codebert,guo2021graphcodebert,allamanis2018graphs},
+but are less commonly evaluated as retrieval mechanisms under explicit token
+budgets.  Our graph-guided baseline (BCA) uses a code knowledge graph for
+weighted BFS expansion from query-derived seed symbols, with relevance
+scoring and greedy budget packing, and lightweight lexical fallbacks (BM25-based seeding and budget backfill) when entity matching is weak.
+The graph representation is closest in spirit to code property
+graphs~\citep{yamaguchi2014cpg} and practical analysis tooling such as
+Joern~\citep{joern} and CodeQL~\citep{codeql}.
+
+\paragraph{Mutation testing.}
+Mutation testing is a standard technique for evaluating test suite
+quality~\citep{jia2011mutation}.  We repurpose it as a controlled fault
+injection method: each mutation creates a bug with a known test oracle,
+enabling automated evaluation of repair success without human annotation.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Benchmark Design}\label{sec:benchmark}
+
+\subsection{Repositories}\label{sec:repos}
+
+We select two mature, well-tested Python repositories with different
+characteristics (\Cref{tab:repos}).
+
+\begin{table}[tbp]
+\centering
+\caption{Repository characteristics.}\label{tab:repos}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrr}
+\toprule
+Property & pydantic-ai & httpx \\
+\midrule
+Source files           & 186     & $\sim$100 \\
+Lines of code          & 53k     & $\sim$15k \\
+Candidate mutations    & 1{,}454 & 388 \\
+Killed (candidates)    & 199 (13.7\%) & 210 (54.1\%) \\
+Killed (tested only)   & 199/969 (20.5\%) & 210/362 (58.0\%) \\
+Tasks (after filtering)& 128     & 117 \\
+Pinned commit          & \texttt{69a578a} & \texttt{ae1b9f6} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+Total: \textbf{245 tasks} across both repositories.  pydantic-ai is a
+larger AI framework with lower kill rate, reflecting broader code coverage
+gaps typical of complex applications.  httpx is a focused HTTP client
+library with tighter test coverage.  This diversity is intentional:
+pydantic-ai's complexity should favor structural retrieval, while httpx's
+compactness should favor simpler methods.
+
+We filter syntax-invalid mutations and 3~unvalidated httpx mutations,
+retaining only mutations that cause exactly one test to fail on mutated code
+and pass on original code.
+
+\subsection{Mutation Types}\label{sec:mutations}
+
+We use nine mutation operators across both repositories, plus 14 handcrafted tasks; the full
+per-repository breakdown is provided in Appendix~\ref{app:supp-tables}
+(Table~\ref{tab:mutations}).
+
+Mutations span a range of enclosing symbol sizes: median 19~lines for
+pydantic-ai (range 1--97) and 29~lines for httpx (range 3--133).
+
+\subsection{Three Query Tiers}\label{sec:tiers}
+
+Each task generates three query descriptions of decreasing information
+content:
+
+\paragraph{Dev-localized (exact).}
+File name, line number, and operator change.  Example: \emph{``In
+\_client.py:172, the comparison operator was changed: \texttt{>} became
+\texttt{>=}.''}  This tier effectively leaks the bug location; we
+include it as a ceiling-like condition and to study how retrieval
+interacts with highly informative queries.
+
+\paragraph{Dev-report.}
+Failing test name, sanitized traceback, and error message.  Line numbers are
+stripped and absolute paths are removed; traceback frames keep only file
+basenames (e.g., \texttt{File "foo.py", in \ldots}).  Example: \emph{``Test failure: test\_total\_token\_limit.
+Error: Failed: DID NOT RAISE UsageLimitExceeded.  Traceback: \ldots"}
+This simulates what a developer sees after running \texttt{pytest} and
+pasting the failure output.
+
+\paragraph{Vague (symptom-only).}
+Natural language symptom description with no code identifiers.  Example:
+\emph{``A threshold or limit check seems to trigger at the wrong value."}
+This represents the realistic scenario where a user reports a symptom
+without technical detail.
+
+The information ordering dev-localized $>$ dev-report $>$ vague is by
+construction.  If retrieval methods that struggle on vague queries succeed
+on dev-report, the signal is in the traceback and test name -- structural
+information that retrieval can exploit.
+
+\begin{figure}[tbp]
+\centering
+\begin{tikzpicture}[
+  tier/.style={rectangle, rounded corners=2pt, minimum width=2.8cm,
+    minimum height=0.65cm, font=\scriptsize\bfseries, align=center,
+    draw=black!30, line width=0.4pt},
+  ann/.style={font=\scriptsize, text=black!70, align=left},
+  node distance=0.25cm
+]
+
+\node[tier, fill=green!12] (dl)
+  {Dev-localized};
+\node[tier, fill=yellow!15, below=of dl] (dr)
+  {Dev-report};
+\node[tier, fill=red!12, below=of dr] (vg)
+  {Vague};
+
+% Right: query content
+\node[ann, right=0.35cm of dl] {file + line + operator};
+\node[ann, right=0.35cm of dr] {test name + traceback};
+\node[ann, right=0.35cm of vg] {symptom only};
+
+% Left: pass@1 ranges
+\node[ann, left=0.35cm of dl] {47--86\%};
+\node[ann, left=0.35cm of dr] {2--25\%};
+\node[ann, left=0.35cm of vg] {0--7\%};
+
+% Arrow showing difficulty
+\draw[-{Stealth[length=4pt]}, black!40]
+  ([xshift=-1.4cm]dl.north west) -- ([xshift=-1.4cm]vg.south west)
+  node[midway, left, font=\scriptsize, text=black!50] {harder};
+
+\end{tikzpicture}
+\caption{Three-tier query gradient with pass@1 ranges (non-ceiling methods).}
+\label{fig:tier-gradient}
+\end{figure}
+
+\subsection{Methods}\label{sec:methods}
+
+We evaluate nine retrieval methods plus a privileged ceiling
+(\Cref{tab:methods}).
+
+\begin{table}[tbp]
+\centering
+\caption{Retrieval methods.}\label{tab:methods}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lp{4.5cm}}
+\toprule
+Method & Description \\
+\midrule
+\textsc{no\_retrieval} & No context; query only \\
+\textsc{bm25}          & BM25 keyword search~\citep{robertson1995okapi,robertson2009bm25} \\
+\textsc{tfidf}        & TF-IDF cosine similarity~\citep{sparckjones1972,saltonbuckley1988} \\
+\textsc{keyword\_map}     & Repo file tree + keyword-matched symbol snippets (AST index) \\
+\textsc{bca} ($d$=3)   & Graph BFS, depth 3, scoring + closure \\
+\textsc{bca\_d1} ($d$=1) & BCA, depth 1 (shallow) \\
+\textsc{bca\_d5} ($d$=5) & BCA, depth 5 (deep) \\
+\textsc{bca\_no\_closure} & BCA without dep.\ closure \\
+\textsc{bca\_no\_scoring} & BCA without scoring \\
+\textsc{target\_file}  & Ceiling: mutated file given \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+The five BCA variants form an ablation study isolating the contribution
+of expansion depth, dependency closure, and relevance scoring.
+
+\smallskip
+\noindent\textbf{Note on \textsc{keyword\_map}.}
+\textsc{keyword\_map} is a simple, repository-local baseline that indexes file paths and
+symbol signatures, then retrieves snippets via keyword matching.  In our released
+artifacts and codebase, this method is keyed as \texttt{repo\_map}; we use the
+\textsc{keyword\_map} name in the paper to avoid confusion with embedding-based ``vector
+search'' and with Aider's repo-map algorithm.
+
+\subsection{Evaluation Protocol}\label{sec:protocol}
+
+\begin{itemize}[leftmargin=*,nosep]
+  \item \textbf{Model:} \texttt{gpt-4o-mini-2024-07-18} (pinned snapshot)
+  \item \textbf{Generation:} Single-shot (pass@1), temperature=0, seed=42
+  \item \textbf{Budgets:} 2{,}000;\ 4{,}000;\ 8{,}000;\ 10{,}000 context tokens
+    (estimated with \texttt{TokenEstimator}, 1~token $\approx$ 4~chars; LLM tokens from API usage)
+  \item \textbf{Token accounting:} Budget enforcement uses the estimator during packing
+    (\texttt{tokens\_used}).  We also log actual API prompt token counts
+    (\texttt{llm\_input\_tokens}) and audit estimator error post-hoc
+    (Appendix~\ref{app:token-audit}).
+  \item \textbf{Total attempts:}
+    245 tasks $\times$ 10~methods $\times$ 4~budgets $\times$ 3~tiers
+    $= \mathbf{29{,}400}$
+  \item \textbf{Success criterion:} Oracle test passes on patched code
+  \item \textbf{Isolation:} Byte-identical file restoration between tasks (SHA-256 verified)
+  \item \textbf{Bootstrap CIs:} task-resampled, $n$=5{,}000, seed=42~\citep{efron1993bootstrap}
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Graph-Guided Baseline: BCA}\label{sec:bca}
+
+We include BCA (Budgeted Context Assembly) as a graph-guided baseline
+whose modular pipeline enables systematic ablation of individual
+components.  BCA assembles context through eight phases
+(\Cref{fig:bca-pipeline}):
+
+\begin{figure*}[tbp]
+\centering
+\begin{tikzpicture}[
+  phase/.style={rectangle, rounded corners=2pt, draw=blue!50!black, fill=blue!8,
+    minimum width=1.7cm, minimum height=0.7cm, font=\scriptsize\bfseries,
+    align=center, line width=0.4pt},
+  arrow/.style={-{Stealth[length=3pt]}, blue!40!black},
+  plabel/.style={font=\scriptsize, text=black!60, align=center},
+  node distance=0.3cm and 0.2cm
+]
+
+% Phase boxes in a single row
+\node[phase] (p1) {1. Entity\\Extract.};
+\node[phase, right=of p1] (p2) {2. Seed\\Finding};
+\node[phase, right=of p2] (p3) {3. BFS\\Expand};
+\node[phase, right=of p3, draw=red!50!black, fill=red!8, dashed] (p4) {4. Scoring};
+\node[phase, right=of p4, draw=red!50!black, fill=red!8, dashed] (p5) {5. Closure};
+\node[phase, right=of p5] (p6) {6. Greedy\\Packing};
+\node[phase, right=of p6] (p7) {7. Source\\Load};
+\node[phase, right=of p7] (p8) {8. Dep.\\Order};
+
+% Arrows
+\draw[arrow] (p1) -- (p2);
+\draw[arrow] (p2) -- (p3);
+\draw[arrow] (p3) -- (p4);
+\draw[arrow] (p4) -- (p5);
+\draw[arrow] (p5) -- (p6);
+\draw[arrow] (p6) -- (p7);
+\draw[arrow] (p7) -- (p8);
+
+% Input/output labels
+\node[plabel, above=0.15cm of p1] {Query};
+\node[plabel, above=0.15cm of p2] {Graph};
+\node[plabel, above=0.15cm of p3] {$d$};
+\node[plabel, above=0.15cm of p6] {$B$};
+\node[plabel, above=0.15cm of p8] {Context};
+
+
+\end{tikzpicture}
+\caption{The eight-phase BCA pipeline. Phases 4 and 5 are independently ablated to measure the contribution of relevance scoring and dependency closure.}
+\label{fig:bca-pipeline}
+\end{figure*}
+
+\begin{enumerate}[leftmargin=*,nosep]
+  \item \textbf{Entity extraction.}  Parse the query for code
+ identifiers -- function names, class names, module paths -- using
+    regex-based pattern matching.
+  \item \textbf{Seed finding.}  Resolve extracted entities to symbols in the
+    code knowledge graph (built from Python AST, capturing function/class
+    definitions, imports, and call relationships).  When entity matching
+    yields too few high-confidence seeds, we inject additional seeds using
+    BM25 scoring over symbol metadata.
+  \item \textbf{BFS expansion.}  Weighted breadth-first search from seeds
+    to depth~$d$ over typed graph edges (calls/imports/contains/inherits/etc.),
+    optionally including callers (predecessor edges).  Edge weights encode
+    structural proximity and a minimum score threshold prunes the frontier.
+  \item \textbf{Relevance scoring.}  Re-rank candidates with a seed-file
+    proximity boost and a degree-centrality bonus, and penalize very large
+    symbols.
+  \item \textbf{Dependency closure.}  Add transitive hard dependencies
+    (\texttt{inherits}/\texttt{implements}) and, for methods/functions, their
+    containing class (optional; evaluated in ablation).
+  \item \textbf{Greedy packing.}  Select highest-scoring symbols that fit
+    within the token budget using a value-per-cost heuristic.  When closure
+    dependencies are too expensive to include at full detail, we may include
+    them as skeletons (signature + docstring only) to preserve interfaces
+    under budget.
+  \item \textbf{Source loading.}  Read actual source code for selected
+    symbols from the repository, then enforce the budget using estimated token
+    counts.  If the selected context underutilizes the budget, we backfill
+    with BM25-ranked symbols and (if needed) keyword-matched files.
+  \item \textbf{Dependency ordering.}  Sort context in topological order for
+    the LLM.
+\end{enumerate}
+
+The code knowledge graph is built from Python AST parsing and captures
+function definitions, class definitions, imports, and call relationships.
+Graph construction takes approximately 2~seconds for pydantic-ai (186~files,
+53k~lines).
+
+Three depth strategies are evaluated (\Cref{tab:strategies}).
+
+\begin{table}[tbp]
+\centering
+\caption{BCA depth strategies.}\label{tab:strategies}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lccc}
+\toprule
+Strategy & Depth & Min Score & Rationale \\
+\midrule
+\textsc{precise} (\textsc{bca\_d1}) & 1 & 0.3 & Immediate neighbors \\
+\textsc{smart} (\textsc{bca})       & 3 & 0.1 & Default; balanced \\
+\textsc{thorough} (\textsc{bca\_d5}) & 5 & 0.05 & Wide neighborhood \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Results}\label{sec:results}
+
+\subsection{Main Results}\label{sec:main-results}
+
+Tables~\ref{tab:exact}--\ref{tab:vague} report pass@1 for all methods
+across the three query tiers at all four budgets.  We report 95\% bootstrap
+confidence intervals over tasks ($n$=5{,}000, seed=42) alongside point estimates.
+
+% ── Table: Dev-localized ─────────────────────────────────────────────────────
+\begin{table*}[tbp]
+\centering
+\caption{Pass@1 on \textbf{dev-localized} queries (95\% bootstrap CI).}\label{tab:exact}
+\smallskip
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l cccc c}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ & Avg \\
+\midrule
+\textsc{no\_retrieval}  & \textbf{0.86} {\scriptsize[.82,.90]} & \textbf{0.86} {\scriptsize[.82,.90]} & \textbf{0.86} {\scriptsize[.82,.90]} & \textbf{0.86} {\scriptsize[.82,.90]} & \textbf{0.86} \\
+\textsc{tfidf}         & 0.74 {\scriptsize[.69,.80]} & 0.74 {\scriptsize[.69,.80]} & 0.76 {\scriptsize[.71,.82]} & 0.79 {\scriptsize[.74,.84]} & 0.76 \\
+\textsc{keyword\_map}      & 0.72 {\scriptsize[.66,.78]} & 0.73 {\scriptsize[.67,.78]} & 0.75 {\scriptsize[.69,.80]} & 0.75 {\scriptsize[.69,.80]} & 0.74 \\
+\textsc{bm25}           & 0.70 {\scriptsize[.64,.76]} & 0.71 {\scriptsize[.65,.76]} & 0.73 {\scriptsize[.68,.79]} & 0.76 {\scriptsize[.71,.81]} & 0.72 \\
+\textsc{bca\_no\_closure} & 0.56 {\scriptsize[.50,.62]} & 0.64 {\scriptsize[.58,.70]} & 0.69 {\scriptsize[.63,.75]} & 0.72 {\scriptsize[.67,.78]} & 0.65 \\
+\textsc{bca} ($d$=3)     & 0.52 {\scriptsize[.46,.59]} & 0.64 {\scriptsize[.58,.70]} & 0.69 {\scriptsize[.64,.75]} & 0.69 {\scriptsize[.64,.75]} & 0.64 \\
+\textsc{bca\_d5}        & 0.55 {\scriptsize[.49,.61]} & 0.64 {\scriptsize[.58,.69]} & 0.66 {\scriptsize[.60,.72]} & 0.69 {\scriptsize[.63,.75]} & 0.63 \\
+\textsc{bca\_no\_scoring} & 0.48 {\scriptsize[.42,.54]} & 0.63 {\scriptsize[.57,.69]} & 0.67 {\scriptsize[.61,.73]} & 0.66 {\scriptsize[.60,.72]} & 0.61 \\
+\textsc{bca\_d1}        & 0.47 {\scriptsize[.40,.53]} & 0.53 {\scriptsize[.47,.60]} & 0.65 {\scriptsize[.60,.71]} & 0.69 {\scriptsize[.63,.74]} & 0.58 \\
+\midrule
+Oracle                  & 0.97 & 0.98 & 0.97 & 0.98 & 0.97 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+% ── Table: Dev-report ────────────────────────────────────────────────────────
+\begin{table*}[tbp]
+\centering
+\caption{Pass@1 on \textbf{dev-report} queries (95\% bootstrap CI).}\label{tab:devreport}
+\smallskip
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l cccc c}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ & Avg \\
+\midrule
+\textsc{tfidf}         & \textbf{0.21} {\scriptsize[.16,.27]} & \textbf{0.23} {\scriptsize[.18,.28]} & \textbf{0.25} {\scriptsize[.20,.31]} & 0.23 {\scriptsize[.18,.29]} & \textbf{0.23} \\
+\textsc{keyword\_map}      & 0.19 {\scriptsize[.14,.24]} & 0.21 {\scriptsize[.16,.26]} & 0.19 {\scriptsize[.14,.24]} & 0.19 {\scriptsize[.14,.24]} & 0.19 \\
+\textsc{bm25}           & 0.16 {\scriptsize[.12,.21]} & 0.19 {\scriptsize[.14,.24]} & 0.21 {\scriptsize[.16,.27]} & 0.20 {\scriptsize[.15,.24]} & 0.19 \\
+\textsc{bca\_no\_closure} & 0.11 {\scriptsize[.07,.15]} & 0.15 {\scriptsize[.11,.19]} & 0.20 {\scriptsize[.15,.25]} & \textbf{0.24} {\scriptsize[.19,.30]} & 0.18 \\
+\textsc{bca\_d1}        & 0.11 {\scriptsize[.07,.16]} & 0.13 {\scriptsize[.09,.17]} & 0.20 {\scriptsize[.16,.25]} & \textbf{0.24} {\scriptsize[.19,.30]} & 0.17 \\
+\textsc{bca} ($d$=3)     & 0.11 {\scriptsize[.07,.15]} & 0.14 {\scriptsize[.10,.18]} & 0.18 {\scriptsize[.13,.23]} & 0.23 {\scriptsize[.18,.29]} & 0.16 \\
+\textsc{bca\_d5}        & 0.10 {\scriptsize[.06,.14]} & 0.12 {\scriptsize[.08,.16]} & 0.18 {\scriptsize[.14,.24]} & 0.20 {\scriptsize[.16,.26]} & 0.15 \\
+\textsc{bca\_no\_scoring} & 0.09 {\scriptsize[.06,.13]} & 0.10 {\scriptsize[.06,.14]} & 0.12 {\scriptsize[.08,.16]} & 0.13 {\scriptsize[.09,.18]} & 0.11 \\
+\textsc{no\_retrieval}  & 0.02 {\scriptsize[.01,.04]} & 0.02 {\scriptsize[.01,.04]} & 0.02 {\scriptsize[.01,.04]} & 0.02 {\scriptsize[.01,.04]} & 0.02 \\
+\midrule
+Oracle                  & 0.35 & 0.39 & 0.43 & 0.42 & 0.40 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+% ── Table: Vague ─────────────────────────────────────────────────────────────
+\begin{table*}[tbp]
+\centering
+\caption{Pass@1 on \textbf{vague} queries (95\% bootstrap CI).}\label{tab:vague}
+\smallskip
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l cccc c}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ & Avg \\
+\midrule
+\textsc{bm25}           & \textbf{0.07} {\scriptsize[.04,.10]} & \textbf{0.05} {\scriptsize[.02,.08]} & 0.04 {\scriptsize[.02,.07]} & \textbf{0.05} {\scriptsize[.03,.09]} & \textbf{0.05} \\
+\textsc{keyword\_map}      & 0.04 {\scriptsize[.02,.06]} & 0.04 {\scriptsize[.02,.06]} & 0.02 {\scriptsize[.01,.04]} & 0.03 {\scriptsize[.01,.05]} & 0.03 \\
+\textsc{tfidf}         & 0.03 {\scriptsize[.01,.06]} & 0.03 {\scriptsize[.01,.05]} & 0.03 {\scriptsize[.01,.05]} & 0.03 {\scriptsize[.01,.05]} & 0.03 \\
+\textsc{bca} ($d$=3)     & 0.03 {\scriptsize[.01,.05]} & 0.01 {\scriptsize[.00,.03]} & 0.01 {\scriptsize[.00,.02]} & 0.02 {\scriptsize[.00,.04]} & 0.02 \\
+\textsc{bca\_d1}        & 0.02 {\scriptsize[.00,.03]} & 0.03 {\scriptsize[.01,.05]} & \textbf{0.04} {\scriptsize[.02,.06]} & 0.01 {\scriptsize[.00,.03]} & 0.02 \\
+\textsc{bca\_d5}        & 0.03 {\scriptsize[.01,.05]} & 0.01 {\scriptsize[.00,.03]} & 0.01 {\scriptsize[.00,.03]} & 0.02 {\scriptsize[.00,.03]} & 0.02 \\
+\textsc{bca\_no\_closure} & 0.03 {\scriptsize[.01,.05]} & 0.01 {\scriptsize[.00,.02]} & 0.02 {\scriptsize[.00,.03]} & 0.02 {\scriptsize[.00,.03]} & 0.02 \\
+\textsc{bca\_no\_scoring} & 0.03 {\scriptsize[.01,.06]} & 0.01 {\scriptsize[.00,.02]} & 0.01 {\scriptsize[.00,.03]} & 0.02 {\scriptsize[.00,.03]} & 0.02 \\
+\textsc{no\_retrieval}  & 0.00 {\scriptsize[.00,.00]} & 0.00 {\scriptsize[.00,.00]} & 0.00 {\scriptsize[.00,.00]} & 0.00 {\scriptsize[.00,.00]} & 0.00 \\
+\midrule
+Oracle                  & 0.08 & 0.07 & 0.07 & 0.06 & 0.07 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+% ── Chart: Dev-report pass@1 by method across budgets ────────────────────────
+\begin{figure*}[tbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar,
+    bar width=5pt,
+    width=\textwidth,
+    height=5.5cm,
+    ylabel={Pass@1},
+    symbolic x coords={no\_ret, bca\_ns, bca\_d5, bca, bca\_d1, bca\_nc, bm25, keyword\_map, tfidf},
+    xtick=data,
+    x tick label style={rotate=45, anchor=east, font=\scriptsize},
+    ymin=0, ymax=0.45,
+    legend to name=leg:devreport,
+    legend style={font=\scriptsize, legend columns=5, draw=none},
+    enlarge x limits=0.08,
+    grid=major,
+    grid style={gray!15},
+    every axis plot/.append style={fill opacity=0.85},
+]
+\addplot[fill=blue!50] coordinates {(no\_ret,0.02) (bca\_ns,0.09) (bca\_d5,0.10) (bca,0.11) (bca\_d1,0.11) (bca\_nc,0.11) (bm25,0.16) (keyword\_map,0.19) (tfidf,0.21)};
+\addplot[fill=orange!60] coordinates {(no\_ret,0.02) (bca\_ns,0.10) (bca\_d5,0.12) (bca,0.14) (bca\_d1,0.13) (bca\_nc,0.15) (bm25,0.19) (keyword\_map,0.21) (tfidf,0.23)};
+\addplot[fill=teal!50] coordinates {(no\_ret,0.02) (bca\_ns,0.12) (bca\_d5,0.18) (bca,0.18) (bca\_d1,0.20) (bca\_nc,0.20) (bm25,0.21) (keyword\_map,0.19) (tfidf,0.25)};
+\addplot[fill=violet!50] coordinates {(no\_ret,0.02) (bca\_ns,0.13) (bca\_d5,0.20) (bca,0.23) (bca\_d1,0.24) (bca\_nc,0.24) (bm25,0.20) (keyword\_map,0.19) (tfidf,0.23)};
+\addplot[only marks, mark=-, mark size=3pt, thick, black]
+    coordinates {(no\_ret,0.35) (bca\_ns,0.35) (bca\_d5,0.35) (bca,0.35) (bca\_d1,0.35) (bca\_nc,0.35) (bm25,0.35) (keyword\_map,0.35) (tfidf,0.35)};
+\legend{$B$=2k, $B$=4k, $B$=8k, $B$=10k, Oracle}
+\end{axis}
+\end{tikzpicture}\\[4pt]
+\ref{leg:devreport}
+\caption{Dev-report pass@1 by method across four token budgets. Methods sorted by $\B{2\text{k}}$ performance. Horizontal marks show the per-task oracle at $\B{2\text{k}}$ (0.35). No single method dominates across all budgets.}
+\label{fig:devreport-bars}
+\end{figure*}
+
+% ── Chart: Budget scaling lines for dev-report ───────────────────────────────
+\begin{figure}[tbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=\columnwidth,
+    height=5cm,
+    xlabel={Token Budget},
+    ylabel={Pass@1},
+    xtick={2000,4000,8000,10000},
+    xticklabels={2k,4k,8k,10k},
+    ymin=0, ymax=0.50,
+    legend to name=leg:budgetscale,
+    legend style={font=\scriptsize, legend columns=3, draw=none},
+    grid=major,
+    grid style={gray!20},
+    every axis plot/.append style={thick, mark size=2pt},
+]
+\addplot[blue, mark=square*] coordinates {(2000,0.21) (4000,0.23) (8000,0.25) (10000,0.23)};
+\addplot[red, mark=triangle*] coordinates {(2000,0.16) (4000,0.19) (8000,0.21) (10000,0.20)};
+\addplot[orange, mark=diamond*] coordinates {(2000,0.19) (4000,0.21) (8000,0.19) (10000,0.19)};
+\addplot[teal, mark=o] coordinates {(2000,0.11) (4000,0.15) (8000,0.20) (10000,0.24)};
+\addplot[violet, mark=star] coordinates {(2000,0.11) (4000,0.14) (8000,0.18) (10000,0.23)};
+\addplot[gray, dashed, mark=none] coordinates {(2000,0.35) (4000,0.39) (8000,0.43) (10000,0.42)};
+\legend{tfidf, bm25, keyword\_map, bca\_nc, bca, oracle}
+\end{axis}
+\end{tikzpicture}\\[4pt]
+\ref{leg:budgetscale}
+\caption{Dev-report pass@1 vs.\ token budget for selected methods. Method rankings shift at higher budgets, with graph-guided variants narrowing the gap with lexical methods.}
+\label{fig:budget-scaling}
+\end{figure}
+
+\subsection{The Three-Tier Gradient}\label{sec:gradient}
+
+Across all methods and budgets we evaluated, pass@1 decreases monotonically
+from dev-localized to dev-report to vague.
+
+\paragraph{Dev-localized queries trivialize the task.}
+\textsc{no\_retrieval} achieves 86\% pass@1 -- the LLM fixes bugs from the
+description alone because the query leaks the file, line number, and
+operator change.  Adding retrieval context actually reduces performance for
+all methods, consistent with extra context acting as noise when the edit
+location is already specified in the query.
+
+\paragraph{Dev-report is the meaningful evaluation tier.}
+Methods score 10--25\%.  The traceback provides enough signal for retrieval
+(function names, test names, error messages) but not enough for the LLM to
+fix without code context.  \textsc{no\_retrieval} drops to 2\%, confirming
+that context is essential.
+
+\paragraph{Vague queries expose a model bottleneck.}
+All methods score 0--7\%.  The ceiling probe (\Cref{sec:ceiling}) shows that
+even with the \emph{correct file}, the LLM only fixes 30\% of tasks from
+vague descriptions.  The bottleneck is model comprehension, not retrieval
+quality.
+
+\paragraph{Method rankings shift with budget.}
+At $\B{2\text{k}}$, BCA~(0.11) trails TF-IDF~(0.21) by 10 percentage
+points.  At $\B{10\text{k}}$, \textsc{bca\_no\_closure} and
+\textsc{bca\_d1}~(0.24) match or slightly exceed TF-IDF~(0.23).
+Graph-guided retrieval needs budget to include both seed symbols and their
+dependency neighborhoods; at tight budgets, it cannot fit enough context.
+
+\subsection{Ceiling Analysis}\label{sec:ceiling}
+
+The ceiling probe (\textsc{target\_file}) provides the mutated file as
+context, establishing an upper bound on repair rate if retrieval were perfect
+(\Cref{tab:ceiling}).
+
+\begin{table}[tbp]
+\centering
+\caption{Ceiling analysis at $\B{10\text{k}}$: best single method vs.\ target file ceiling vs.\ oracle.}\label{tab:ceiling}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+Tier & Best Method & Ceiling & Oracle & Gap (Oracle--Best) \\
+\midrule
+Dev-loc. & 0.86 (\textsc{no\_retrieval}) & 0.92 & 0.98 & 12pp \\
+Dev-rep. & 0.24 (\textsc{bca\_d1} / \textsc{bca\_no\_closure}) & 0.48 & 0.42 & 18pp \\
+Vague    & 0.05 (\textsc{bm25}) & 0.30 & 0.06 & 1pp \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+The dev-report ceiling~(0.48 at $\B{4\text{k}}$+) shows that even with the
+perfect file, \texttt{gpt-4o-mini} fixes only 48\% of tasks from a
+traceback.  The median target file is approximately 3{,}118~tokens, so the
+ceiling saturates at $\B{4\text{k}}$.  On vague queries, the ceiling barely
+improves with budget (0.24 at $\B{2\text{k}}$ to 0.30 at $\B{10\text{k}}$),
+confirming that model comprehension is the bottleneck.
+
+On dev-report, the oracle~(0.42) is lower than the ceiling~(0.48) because
+the oracle is computed over retrieval methods only -- the best of all
+retrieval methods per task.  The ceiling uses the privileged target file,
+which no retrieval method is guaranteed to select.
+
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Mechanistic Analysis}\label{sec:mechanistic}
+
+\subsection{Failure Mode Gradient}\label{sec:failures}
+
+We classify each attempt's outcome into one of five categories:
+\emph{pass} (test suite passes),
+\emph{patch\_apply\_fail} (patch does not apply cleanly),
+\emph{test\_fail} (patch applies but tests fail),
+\emph{syntax\_error} (generated code has syntax errors), and
+\emph{timeout} (test execution exceeds the time limit).
+Table~\ref{tab:fail-devreport-full} reports the full failure mode
+distribution for dev-report (all methods and budgets).  For completeness,
+the corresponding dev-localized and vague tables are provided in
+Appendix~\ref{app:supp-tables} (Tables~\ref{tab:fail-exact-full} and
+\ref{tab:fail-vague-full}).
+
+\begin{table*}[tbp]
+\centering
+\caption{Failure mode distribution (\%), dev-report, all methods and budgets.}\label{tab:fail-devreport-full}
+\smallskip
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l ccccc ccccc ccccc ccccc}
+\toprule
+& \multicolumn{5}{c}{$\B{2\text{k}}$}
+& \multicolumn{5}{c}{$\B{4\text{k}}$}
+& \multicolumn{5}{c}{$\B{8\text{k}}$}
+& \multicolumn{5}{c}{$\B{10\text{k}}$} \\
+\cmidrule(lr){2-6}\cmidrule(lr){7-11}\cmidrule(lr){12-16}\cmidrule(lr){17-21}
+Method & pass & patch & test & syn & t/o
+       & pass & patch & test & syn & t/o
+       & pass & patch & test & syn & t/o
+       & pass & patch & test & syn & t/o \\
+\midrule
+\textsc{bca}              & 11 & 22 & 62 & 1 & 4  & 14 & 24 & 57 & 3 & 2  & 18 & 27 & 49 & 3 & 2  & 23 & 21 & 49 & 3 & 4 \\
+\textsc{bca\_d1}          & 11 & 22 & 60 & 2 & 4  & 13 & 22 & 55 & 7 & 4  & 20 & 21 & 52 & 3 & 3  & 24 & 16 & 49 & 7 & 4 \\
+\textsc{bca\_d5}          & 10 & 24 & 61 & 2 & 3  & 12 & 31 & 51 & 5 & 2  & 18 & 25 & 51 & 3 & 2  & 20 & 24 & 49 & 4 & 3 \\
+\textsc{bca\_no\_closure} & 11 & 24 & 60 & 2 & 4  & 15 & 19 & 60 & 4 & 2  & 20 & 16 & 59 & 2 & 2  & 24 & 17 & 51 & 4 & 2 \\
+\textsc{bca\_no\_scoring} &  9 & 25 & 61 & 2 & 3  & 10 & 20 & 64 & 3 & 3  & 12 & 23 & 59 & 4 & 2  & 13 & 26 & 55 & 3 & 2 \\
+\textsc{bm25}             & 16 & 17 & 60 & 3 & 3  & 19 & 24 & 52 & 2 & 3  & 21 & 22 & 53 & 2 & 3  & 20 & 26 & 49 & 2 & 3 \\
+\textsc{no\_retrieval}    &  2 & 72 & 24 & 1 & 1  &  2 & 72 & 24 & 1 & 1  &  2 & 72 & 24 & 1 & 1  &  2 & 72 & 24 & 1 & 1 \\
+\textsc{keyword\_map}        & 19 & 13 & 60 & 4 & 3  & 21 & 13 & 60 & 2 & 4  & 19 & 17 & 59 & 2 & 3  & 19 & 15 & 61 & 2 & 2 \\
+\textsc{tfidf}           & 21 & 13 & 58 & 3 & 4  & 23 & 13 & 59 & 2 & 4  & 25 & 15 & 54 & 2 & 4  & 23 & 16 & 54 & 2 & 4 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+The failure mode shifts systematically with query tier:
+
+\begin{itemize}[leftmargin=*,nosep]
+  \item \textbf{Dev-localized:} The dominant failure is
+    \texttt{patch\_apply\_fail} (11--31\%).  The LLM knows \emph{what} to
+    fix from the description but sometimes targets the wrong file location
+    in the patch.  \texttt{test\_fail} is rare (2--24\%) and generally
+    decreases as the budget grows.  These are \textbf{localization errors}.
+
+  \item \textbf{Dev-report:} \texttt{test\_fail} dominates
+    (24--64\%) but \texttt{patch\_apply\_fail} remains significant
+    (13--31\%).  The traceback provides enough signal to attempt a fix in
+    roughly the right area, but the LLM frequently gets the semantics wrong.
+    These are \textbf{blended localization and comprehension errors}.
+
+  \item \textbf{Vague:} \texttt{test\_fail} overwhelmingly dominates (67--89\%).
+    The LLM generates syntactically valid patches that do not fix the bug.
+    \texttt{patch\_apply\_fail} is secondary (7--28\%).  These are
+ \textbf{comprehension errors} -- the model is guessing without
+    understanding the root cause.
+
+  \item \textbf{\textsc{no\_retrieval}:} On dev-report, 72\%
+ \texttt{patch\_apply\_fail} -- the model cannot find the right file
+    from a traceback alone.  On vague, 100\%
+ \texttt{patch\_apply\_fail} -- the model does not even know which file to
+    edit.  On dev-localized, it achieves the highest pass rate (86\%)
+    because the description contains the exact edit location.
+\end{itemize}
+
+This gradient -- localization errors $\to$ blended $\to$ comprehension
+errors -- tracks closely with query \mbox{information} content.
+
+% ── Chart: Failure mode stacked bars at B=10k dev-report ─────────────────────
+\begin{figure}[tbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    xbar stacked,
+    width=\columnwidth,
+    height=5.5cm,
+    xlabel={Percentage of attempts (\%)},
+    symbolic y coords={no\_ret, bca\_ns, bca\_d5, bca, bca\_d1, bca\_nc, bm25, keyword\_map, tfidf},
+    ytick=data,
+    y tick label style={font=\footnotesize},
+    xmin=0, xmax=100,
+    legend to name=leg:failmodes,
+    legend style={font=\scriptsize, legend columns=3, draw=none, column sep=4pt},
+    area legend,
+    bar width=7pt,
+    enlarge y limits=0.08,
+    every axis plot/.append style={fill opacity=0.85},
+]
+% Data: dev-report B=10k failure modes from Table 4 (exact values)
+% pass
+\addplot[fill=green!60!black] coordinates {(2,no\_ret) (13,bca\_ns) (20,bca\_d5) (23,bca) (24,bca\_d1) (24,bca\_nc) (20,bm25) (19,keyword\_map) (23,tfidf)};
+% patch_apply_fail
+\addplot[fill=red!70] coordinates {(72,no\_ret) (26,bca\_ns) (24,bca\_d5) (21,bca) (16,bca\_d1) (17,bca\_nc) (26,bm25) (15,keyword\_map) (16,tfidf)};
+% test_fail
+\addplot[fill=yellow!70!orange] coordinates {(24,no\_ret) (55,bca\_ns) (49,bca\_d5) (49,bca) (49,bca\_d1) (51,bca\_nc) (49,bm25) (61,keyword\_map) (54,tfidf)};
+% syntax_error
+\addplot[fill=blue!40] coordinates {(1,no\_ret) (3,bca\_ns) (4,bca\_d5) (3,bca) (7,bca\_d1) (4,bca\_nc) (2,bm25) (2,keyword\_map) (2,tfidf)};
+% timeout
+\addplot[fill=gray!50] coordinates {(1,no\_ret) (2,bca\_ns) (3,bca\_d5) (4,bca) (4,bca\_d1) (2,bca\_nc) (3,bm25) (2,keyword\_map) (4,tfidf)};
+\legend{pass, patch\_fail, test\_fail, syntax, timeout}
+\end{axis}
+\end{tikzpicture}\\[4pt]
+\ref{leg:failmodes}
+\caption{Failure mode distribution at $\B{10\text{k}}$, dev-report. \textsc{no\_retrieval} is dominated by patch application failures (localization errors), while other methods shift toward test failures (comprehension errors).}
+\label{fig:failure-modes}
+\end{figure}
+
+\subsection{Retrieval--Outcome Decoupling}\label{sec:decoupling}
+
+Finding the right file does not guarantee a correct fix.  Appendix~\ref{app:supp-tables}
+reports the full per-budget conversion tables for each tier
+(\Cref{tab:conv-filehit-exact,tab:conv-filehit-devreport,tab:conv-filehit-vague}).
+Here we focus on the cross-tier summary at $\B{10\text{k}}$ (\Cref{tab:conv-crosstier}).
+
+\begin{table*}[tbp]
+\centering
+\caption{File hit $\to$ pass and symbol hit $\to$ pass conversion (\%) at $\B{10\text{k}}$, all tiers.}\label{tab:conv-crosstier}
+\smallskip
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l cc cc cc}
+\toprule
+& \multicolumn{2}{c}{Dev-localized} & \multicolumn{2}{c}{Dev-report} & \multicolumn{2}{c}{Vague} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+Method & file$\to$pass & sym$\to$pass & file$\to$pass & sym$\to$pass & file$\to$pass & sym$\to$pass \\
+\midrule
+\textsc{bca}              & 72 & 72 & 24 & 24 &  3 &  3 \\
+\textsc{bca\_d1}          & 79 & 76 & 25 & 25 &  3 &  3 \\
+\textsc{bca\_d5}          & 73 & 69 & 21 & 21 &  2 &  2 \\
+\textsc{bca\_no\_closure} & 76 & 76 & 25 & 26 &  2 &  3 \\
+\textsc{bca\_no\_scoring} & 69 & 69 & 14 & 14 &  2 &  3 \\
+\textsc{bm25}             & 79 & 81 & 22 & 23 & 12 & 11 \\
+\textsc{keyword\_map}        & 77 & 76 & 19 & 22 &  3 &  5 \\
+\textsc{tfidf}           & 86 & 84 & 23 & 26 &  8 &  7 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+At $\B{10\text{k}}$, dev-localized is close to ``retrieval $\approx$ repair'':
+69--86\% of attempts that include the target file also pass.  On dev-report,
+that conversion drops to 14--25\%, and on vague it falls to 2--12\%.
+Outside dev-localized, most correct retrievals still fail, indicating that
+the bottleneck shifts from locating code to understanding and fixing it.
+
+\paragraph{Passes without target file.}
+This decoupling is further confirmed by the ``passes without target file''
+metric (Appendix~\ref{app:supp-tables}, \Cref{tab:pass-without-file}).
+
+On dev-localized, \textsc{no\_retrieval} produces 211 passes out
+of 211 -- all without any context file, purely from the description.
+On dev-report, only 0--1 passes occur without the target
+file for retrieval methods.  On vague, 0--1 passes without the file.  The
+LLM \emph{needs} code context for dev-report and vague queries; on
+dev-localized queries, it does not.
+
+\subsection{Hop Distance Analysis}\label{sec:hops}
+
+We measure the graph distance (BFS hops on the undirected code knowledge
+graph) from the nearest \emph{entity-mapped} seed symbol (derived from the
+query text) to the mutation site.  This isolates the structural signal
+available from explicit identifiers in the query and does not include BCA's
+lexical fallbacks (e.g., BM25 seed boost or budget backfill).
+Hop distributions by tier are reported in Appendix~\ref{app:supp-tables}
+(\Cref{tab:hops}).  \Cref{tab:hops-pass1} shows pass@1 as a function of hop
+distance on dev-report.
+
+On dev-localized queries, entity extraction finds the exact mutated symbol
+98\% of the time.  On dev-report, the traceback provides function names and
+test names that resolve to symbols near the mutation -- 55\% direct hits,
+36\% within 1--2~hops, and 9\% at 3--5~hops.  On vague queries, 89\% of
+tasks have no reachable path from any extracted (entity-mapped) seed to the mutation.
+
+\begin{table}[tbp]
+\centering
+\caption{Pass@1 by hop distance, BCA ($d$=3), dev-report.}\label{tab:hops-pass1}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccc r}
+\toprule
+Hop bucket & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ & $N$ \\
+\midrule
+0 (direct)  & 0.15 & 0.19 & 0.27 & 0.35 & 135 \\
+1--2 (near) & 0.06 & 0.04 & 0.04 & 0.07 &  89 \\
+3--5 (mid)  & 0.05 & 0.19 & 0.14 & 0.19 &  21 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+The 5$\times$ drop from hop-0~(0.35) to hop~1--2~(0.07) at $\B{10\text{k}}$
+is a clear illustration that graph distance from seed to mutation predicts
+repair difficulty.  Even one degree of structural indirection sharply
+reduces the probability of a successful repair.
+
+Appendix~\ref{app:supp-tables} extends this analysis across all methods at
+$\B{10\text{k}}$ (\Cref{tab:hops-all-methods}).
+
+At hop-0, BCA variants (0.35--0.36) slightly exceed TF-IDF~(0.32) and
+bm25~(0.29).  At hop~1--2, \textsc{bca\_d1}~(0.12) and TF-IDF~(0.11) lead.
+At 3+ hops ($N$=21, noisy), bm25 leads (0.24) -- for distant dependencies,
+keyword matching may outperform graph traversal because the graph path is
+too indirect.
+
+Appendix~\ref{app:supp-tables} shows the corresponding analysis for
+dev-localized queries, where 98\% of tasks are at hop-0 (\Cref{tab:hops-exact}).
+
+\subsection{BCA Ablation}\label{sec:ablation}
+
+\Cref{tab:ablation} reports the ablation of BCA's components, averaged
+across all four budgets on dev-report.
+
+\begin{table}[tbp]
+\centering
+\caption{BCA ablation on dev-report (average across budgets).}\label{tab:ablation}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcc}
+\toprule
+Variant & Avg Pass@1 & $\Delta$ vs.\ BCA \\
+\midrule
+\textsc{bca\_no\_closure} & \textbf{0.18} & +2pp \\
+\textsc{bca\_d1} ($d$=1) & \textbf{0.17} & +1pp \\
+\textsc{bca} ($d$=3, full) & 0.16 & --- \\
+\textsc{bca\_d5} ($d$=5)   & 0.15 & $-$1pp \\
+\textsc{bca\_no\_scoring}  & 0.11 & $-$5pp \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+\textbf{Scoring is BCA's essential component.}  Removing relevance scoring
+drops performance by 5~percentage points -- the largest effect in the
+ablation.  Without scoring, BCA selects symbols by graph traversal order
+alone, including many structurally connected but semantically irrelevant
+symbols.
+
+\textbf{Closure is negligible.}  Dependency closure consumes less than 1\%
+of the budget for $d\geq3$ and its removal has no measurable effect on
+pass@1.  Appendix~\ref{app:supp-tables} reports the detailed budget
+consumption (\Cref{tab:closure}).
+
+Closure overhead is tier-dependent.  \textsc{bca\_d1} uses 10\% on
+dev-localized (many seeds produce many closure targets with a small frontier)
+but only 1.7\% on dev-report.  For deeper expansions ($d\geq3$), closure
+is negligible ($<$1\%) because the larger frontier already includes most
+dependency paths.
+
+\textbf{Shallower is slightly better.}  Depth~1 outperforms depth~3 by
+1pp, and depth~3 outperforms depth~5 by 1pp.  Deeper expansion includes
+more distant symbols that are less likely to be relevant.
+
+\subsection{Retrieval Quality Metrics}\label{sec:retrieval-quality}
+
+\Cref{tab:rq-devreport} reports retrieval quality metrics on dev-report (target
+file and symbol hit rates).  The corresponding dev-localized and vague tables
+are provided in Appendix~\ref{app:supp-tables} (\Cref{tab:rq-exact,tab:rq-vague}).
+
+\begin{table*}[tbp]
+\centering
+\caption{Retrieval quality metrics, dev-report, all methods and budgets.}\label{tab:rq-devreport}
+\smallskip
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l cccc cccc}
+\toprule
+& \multicolumn{4}{c}{Target file hit (\%)} & \multicolumn{4}{c}{Target symbol hit (\%)} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-9}
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$
+       & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 89 & 92 & 96 & 96  & 72 & 80 & 86 & 90 \\
+\textsc{bca\_d1}          & 89 & 91 & 96 & 96  & 72 & 82 & 90 & 94 \\
+\textsc{bca\_d5}          & 89 & 91 & 96 & 96  & 71 & 80 & 86 & 90 \\
+\textsc{bca\_no\_closure} & 89 & 92 & 96 & 96  & 72 & 80 & 87 & 91 \\
+\textsc{bca\_no\_scoring} & 90 & 91 & 96 & 97  & 73 & 76 & 84 & 88 \\
+\textsc{bm25}             & 80 & 84 & 89 & 89  & 73 & 78 & 82 & 83 \\
+\textsc{no\_retrieval}    &  0 &  0 &  0 &  0  &  0 &  0 &  0 &  0 \\
+\textsc{keyword\_map}        & 88 & 97 & 97 & 98  & 73 & 78 & 83 & 83 \\
+\textsc{tfidf}           & 95 & 97 & 98 & 99  & 79 & 83 & 87 & 90 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+Tracebacks improve file retrieval: TF-IDF jumps from 75--84\%
+(dev-localized) to 95--99\% (dev-report) because traceback text
+contains function names that TF-IDF matching finds.
+\textsc{keyword\_map} maintains 88--98\% on dev-report and achieves
+uniquely high vague-tier retrieval (56--96\%) because it includes a
+repository-wide file tree (all paths).  On vague queries,
+\textsc{bca\_d5} and \textsc{bca\_no\_closure} show the strongest
+file hit growth with budget (31$\to$71\% and 28$\to$73\%), as deeper
+graph expansion eventually reaches the target.
+
+\textsc{bca\_d1} achieves the highest symbol hit rate on dev-report
+at $\B{10\text{k}}$ (94\%) -- traceback-derived seeds resolve into precise
+graph symbols, and shallow expansion focuses on the immediate neighborhood.
+On vague queries, \textsc{bca\_d5} achieves 53\% symbol hit at
+$\B{10\text{k}}$, the highest among all methods, while keyword and TF-IDF
+methods plateau at 40\%.
+
+\subsection{Edit Locality and Patch Quality}\label{sec:edit-locality}
+
+\paragraph{Edit distance.}
+Appendix~\ref{app:supp-tables} reports the full edit distance tables across
+tiers and budgets (\Cref{tab:editdist-devreport,tab:editdist-exact,tab:editdist-vague}).
+
+Edit distance follows the three-tier gradient.  On dev-localized,
+\textsc{no\_retrieval} achieves a mean distance of 0.5~lines (the
+description says exactly where to edit).  On dev-report, distances range
+from 44~lines (\textsc{keyword\_map}) to 143~lines (\textsc{no\_retrieval}).
+On vague, distances range from 28 to 209~lines, with BCA variants and
+\textsc{keyword\_map} showing the highest distances because they include
+structurally related but distant code.
+
+\paragraph{Context--patch overlap.}
+The fraction of context files referenced in the generated patch reveals the
+degree to which the LLM uses the provided context.
+Appendix~\ref{app:supp-tables} reports the full overlap tables
+(\Cref{tab:overlap-devreport,tab:overlap-exact,tab:overlap-vague}).
+
+BCA methods produce the highest context--patch overlap on dev-report
+(0.15--0.42): the LLM references BCA-provided context files more often in
+its patches than it references context from other methods.  On vague queries,
+\textsc{keyword\_map} achieves the highest overlap (0.18--0.33) because its
+signature-dense context covers more of the codebase.  All overlap values
+generally decrease with budget as the context grows larger relative to
+the patch.  \textsc{bm25} and \textsc{tfidf} have consistently low overlap
+(0.04--0.16), indicating their contexts include many files the LLM ignores.
+
+\paragraph{Patch size.}
+Appendix~\ref{app:supp-tables} reports patch size statistics for all attempts
+and passing attempts (\Cref{tab:patchsize}).
+
+Passing patches change 1.2--2.6~lines on average, while all-attempt averages
+are 1.9--6.4~lines. Over-editing -- making more changes than necessary -- correlates with failure. This holds across all tiers and methods.
+
+\subsection{Per-Repository Analysis}\label{sec:per-repo}
+
+The two repositories exhibit different method rankings across all three
+tiers.  Appendix~\ref{app:supp-tables} provides the full budget sweep per
+repository (\Cref{tab:httpx-devreport,tab:pydantic-devreport,tab:httpx-exact,tab:pydantic-exact,tab:httpx-vague,tab:pydantic-vague}).
+
+Method rankings flip between repositories.  On httpx dev-report, TF-IDF
+leads consistently (0.27--0.30), while on pydantic-ai, BCA variants
+overtake at $\B{10\text{k}}$ (0.25--0.27 vs.\ TF-IDF's 0.20).  The larger,
+more complex pydantic-ai codebase gives BCA's graph traversal more
+structural signal to exploit.  On dev-localized, \textsc{no\_retrieval}
+leads both repositories (httpx: 0.91, pydantic-ai: 0.81).  On vague,
+all methods are near-zero on httpx ($\leq$0.05), while pydantic-ai shows
+slightly better discrimination with bm25 achieving 0.07--0.09 -- different
+codebases reward different retrieval strategies.
+
+\subsection{Decomposition by Mutation Type}\label{sec:decomposition}
+
+Performance varies substantially by mutation type on dev-report.
+Appendix~\ref{app:supp-tables} provides full tables for all methods at
+$\B{2\text{k}}$ and $\B{10\text{k}}$ (\Cref{tab:muttype-2k,tab:muttype-10k}).
+
+\texttt{none\_check\_swap} remains the hardest mutation type (58~tasks, best
+method only 16\% at $\B{10\text{k}}$).  These mutations flip
+\texttt{if x is None} to \texttt{if x is not None} -- semantically subtle
+changes difficult to diagnose from a traceback alone.
+\texttt{constant\_mutation} and \texttt{handcrafted} are the easiest (up to
+50\%), as the changed values are often visible in test output.  At
+$\B{2\text{k}}$, BCA variants underperform keyword and TF-IDF methods on
+most mutation types; at $\B{10\text{k}}$, BCA closes the gap and leads on
+\texttt{constant\_mutation} (\textsc{bca\_nc}:~0.50) and
+\texttt{handcrafted} (\textsc{bca\_nc}:~0.50).
+
+\subsection{Conditional Bins}\label{sec:bins}
+
+We decompose pass@1 by three conditioning variables: identifier density
+(fraction of query tokens that are code identifiers), hop distance from the
+nearest BCA seed to the mutation site, and mutation size (lines in the
+mutated function).  We show all three tiers at $\B{2\text{k}}$ and
+$\B{10\text{k}}$.
+
+\paragraph{Identifier density.}
+Appendix~\ref{app:supp-tables} reports pass@1 binned by whether the query
+contains code identifiers (\Cref{tab:bin-ident-exact,tab:bin-ident-devreport,tab:bin-ident-vague}).
+
+On dev-localized, the zero-identifier queries ($N$=95, where the description
+uses natural language rather than code tokens) actually favor
+\textsc{no\_retrieval} more strongly (0.95 vs.\ 0.81), consistent with the
+model leveraging location information from the prose description.  On
+dev-report, all 245 queries have identifiers (traceback tokens are always
+present).  On vague, only 4~queries contain identifiers; these show
+dramatically higher pass rates (e.g., bm25: 0.50 vs.\ 0.06) but the sample
+is too small for robust conclusions.
+
+\paragraph{Hop distance.}
+\Cref{tab:bin-hops-2k,tab:bin-hops-10k,tab:bin-hops-exact,tab:bin-hops-vague}
+are provided in Appendix~\ref{app:supp-tables}.
+
+At hop-0, BCA variants improve dramatically from $\B{2\text{k}}$ to
+$\B{10\text{k}}$ (e.g., \textsc{bca\_nc}: 0.15$\to$0.36), nearly matching
+TF-IDF (0.30$\to$0.32).  At hop~1--2, all methods remain low (0.04--0.12),
+confirming that even one degree of structural indirection sharply reduces
+repair probability regardless of method or budget.  At 3+ hops ($N$=21),
+bm25 leads at $\B{10\text{k}}$ (0.24) -- for distant dependencies, keyword
+matching outperforms graph traversal.
+
+On dev-localized, 240/245 tasks are hop-0 (the description directly names
+the mutated symbol), so the hop distribution is degenerate.  On vague
+queries, 89\% of tasks (219/245) are unreachable from any seed -- entity
+extraction from symptom-only text yields almost no graph-resolvable
+identifiers.  The few reachable vague tasks (1--2 hops, $N$=16) show the
+only nonzero pass rates, with bm25 at 0.12 and BCA variants at 0.06.
+
+\paragraph{Mutation size.}
+\Cref{tab:bin-size-2k,tab:bin-size-10k,tab:bin-size-exact,tab:bin-size-vague}
+are provided in Appendix~\ref{app:supp-tables}.
+
+At $\B{2\text{k}}$, BCA variants score 0.00 on the smallest mutations
+($<$5~lines, $N$=10), while TF-IDF achieves 0.30 -- these are highly
+localized changes where keyword similarity suffices.  At $\B{10\text{k}}$,
+BCA catches up (0.20--0.30).  For medium mutations (20--49~lines),
+\textsc{bca\_d1} leads at $\B{10\text{k}}$ (0.31), slightly ahead of
+\textsc{bca\_nc} (0.28) and TF-IDF (0.26).  The 100+ line bin ($N$=8) is
+too small for reliable conclusions, but TF-IDF maintains 0.25 across both
+budgets.
+
+On dev-localized, \textsc{no\_retrieval} achieves 1.00 on 100+ line
+functions -- these are large, well-documented functions where the file+line
+description is fully sufficient.  BCA variants struggle on 50--99 line
+functions at $\B{2\text{k}}$ (0.25--0.47) but improve substantially at
+$\B{10\text{k}}$ (0.43--0.66).  On vague queries, only small functions
+($<$5~lines) show any meaningful signal; all methods score $\leq$0.30,
+and 50+ line functions are effectively unsolvable from vague descriptions.
+Overall, no method dominates across all size bins, reinforcing the case for
+conditional routing.
+
+\subsection{Context Efficiency}\label{sec:efficiency}
+
+\Cref{tab:efficiency} is provided in Appendix~\ref{app:supp-tables}.
+
+Higher symbol density does not correlate with higher pass@1.
+\textsc{bca\_d5} packs the most symbols (15.3/1k on dev-localized) but does
+not outperform \textsc{bm25} (9.4/1k).  \textsc{keyword\_map} has the lowest
+density (1.2--2.0) but strong performance because function signatures are
+information-dense.  The quality of selected symbols matters more than
+the quantity.
+
+% ══════════════════════════════════════════════════════════════════════════════
+
+\section{Conditional Routing}\label{sec:routing}
+
+A natural question following the method-comparison results is whether a lightweight classifier can select the best retrieval method per task, rather than committing to a single method globally.
+We train two logistic-regression routers and evaluate them under leave-one-out cross-validation (LOO-CV) on the solvable subset of each budget slice.
+
+\subsection{Router Design}\label{sec:router-design}
+
+\begin{figure*}[tbp]
+\centering
+\begin{tikzpicture}[
+  box/.style={rectangle, rounded corners=2pt, draw=blue!50!black, fill=blue!8,
+    minimum width=2cm, minimum height=0.7cm, font=\footnotesize, align=center,
+    line width=0.4pt},
+  feat/.style={rectangle, rounded corners=2pt, draw=gray!60, fill=gray!8,
+    minimum width=1.6cm, minimum height=0.5cm, font=\scriptsize, align=center,
+    line width=0.3pt},
+  decision/.style={diamond, draw=orange!60!black, fill=orange!8,
+    minimum width=1.4cm, minimum height=0.7cm, font=\footnotesize\bfseries,
+    align=center, inner sep=1pt, aspect=2, line width=0.4pt},
+  arrow/.style={-{Stealth[length=4pt]}, blue!40!black},
+  garrow/.style={-{Stealth[length=3pt]}, gray!50},
+  node distance=0.4cm and 0.5cm
+]
+
+% Router A path (top)
+\node[font=\footnotesize\bfseries, text=blue!50!black] (ra_label) {Router A};
+\node[box, right=0.6cm of ra_label] (query) {Query};
+
+\node[feat, above right=0.3cm and 0.5cm of query] (f1) {Entity count};
+\node[feat, right=0.5cm of query] (f2) {Ident.\ density};
+\node[feat, below right=0.3cm and 0.5cm of query] (f3) {Graph size};
+
+\draw[garrow] (query) -- (f1);
+\draw[garrow] (query) -- (f2);
+\draw[garrow] (query) -- (f3);
+
+\node[decision, right=1.2cm of f2] (lr_a) {LR};
+\node[box, right=0.6cm of lr_a, fill=green!10, draw=green!50!black] (method_a) {Best\\method};
+
+\draw[garrow] (f1) -- (lr_a);
+\draw[garrow] (f2) -- (lr_a);
+\draw[garrow] (f3) -- (lr_a);
+\draw[arrow] (lr_a) -- (method_a);
+
+\node[font=\scriptsize, text=black!50, above=0.15cm of lr_a] {3 features};
+\node[font=\scriptsize, text=black!50, below=0.15cm of method_a] {9 candidates};
+
+% Router B path (bottom)
+\node[font=\footnotesize\bfseries, text=blue!50!black, below=2.0cm of ra_label] (rb_label) {Router B};
+\node[box, right=0.6cm of rb_label] (query_b) {Query};
+
+\node[box, right=0.5cm of query_b, fill=yellow!10, draw=yellow!50!black] (dryrun) {Dry-run\\(8 methods)};
+
+\node[feat, above right=0.4cm and 0.5cm of dryrun] (df1) {Top-1 score $\times$8};
+\node[feat, right=0.5cm of dryrun] (df2) {Budget util.\ $\times$8};
+\node[feat, below right=0.4cm and 0.5cm of dryrun] (df3) {Entropy $\times$8};
+
+\draw[garrow] (query_b) -- (dryrun);
+\draw[garrow] (dryrun) -- (df1);
+\draw[garrow] (dryrun) -- (df2);
+\draw[garrow] (dryrun) -- (df3);
+
+\node[decision, right=1.2cm of df2] (lr_b) {LR};
+\node[box, right=0.6cm of lr_b, fill=green!10, draw=green!50!black] (method_b) {Best\\method};
+
+\draw[garrow] (df1) -- (lr_b);
+\draw[garrow] (df2) -- (lr_b);
+\draw[garrow] (df3) -- (lr_b);
+
+% Also feed the 3 query features into Router B
+\node[feat, below=0.35cm of df3] (qf) {+ 3 query feats};
+\draw[garrow] (qf) -- (lr_b);
+
+\draw[arrow] (lr_b) -- (method_b);
+
+\node[font=\scriptsize, text=black!50, above=0.15cm of lr_b] {27 features};
+\node[font=\scriptsize, text=black!50, below=0.15cm of method_b] {8 candidates};
+
+\end{tikzpicture}
+\caption{Router architectures. Router~A uses only pre-retrieval query features. Router~B adds dry-run retrieval confidence statistics (no extra LLM calls), adding $\sim$1\,s of additional local assembly time in our setup (Appendix~\ref{app:cost-latency}).}
+\label{fig:router-arch}
+\end{figure*}
+
+\paragraph{Router~A (pre-retrieval).}
+Uses three query-level features available before any retrieval:
+the number of query entities that resolve to graph nodes,
+the fraction of query tokens that are code identifiers,
+and the log-transformed graph size.
+Candidate set: all nine methods.  Zero latency overhead.
+
+\paragraph{Router~B (dry-run).}
+Extends Router~A with 24 retrieval-signal features: for each of eight
+retrieval methods, a single cheap dry-run produces three
+statistics---top-1 retrieval score, budget utilisation fraction, and
+softmax entropy over retrieved items---yielding $3 + 8 \times 3 = 27$
+features total.  The candidate set contains eight methods (excluding
+\textsc{no\_retrieval}, since the dry-run signals are undefined for it).
+Dry-running all eight methods adds $\sim$1\,s of additional assembly time
+while avoiding extra LLM calls (Appendix~\ref{app:cost-latency}).
+In router-feature tables, prefixes follow the method identifiers in our
+artifacts; e.g., \texttt{vector\_*} corresponds to the TF-IDF method
+(\textsc{tfidf} in this paper).
+
+\paragraph{Label strategies.}
+We consider two strategies for assigning the training label when multiple methods solve a task:
+\begin{itemize}[nosep]
+  \item \emph{Smart}: label = best single method if it passes, else the rarest passer (encouraging selective deviations).
+  \item \emph{Safest}: always assign the most-frequently-passing method (maximizing label stability).
+\end{itemize}
+
+Both routers use $\ell_2$-regularized logistic regression with LOO-CV on the solvable tasks at each budget.
+
+\subsection{Router Results}\label{sec:router-results}
+
+Table~\ref{tab:router-devreport} reports router performance on the dev-report tier.
+Full router tables for dev-localized and vague are provided in Appendix~\ref{app:routing-details}
+(Tables~\ref{tab:router-localized} and~\ref{tab:router-vague}).
+Because Router~A and Router~B use different candidate sets, their baselines
+(majority vote and random) and solvable-task pools can differ; we report
+them separately.  Parenthesized deltas are percent of the oracle gap closed,
+computed per router as $\frac{\text{Router} - \text{Maj}}{\text{Oracle} - \text{Maj}} \times 100$.
+
+\begin{table*}[tbp]
+\centering
+\caption{Router comparison on \textbf{dev-report} tasks (LOO-CV). Baselines and $N$ are reported per router because candidate sets differ.}
+\label{tab:router-devreport}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l r r r r r r r r r r}
+\toprule
+& \multicolumn{5}{c}{Router~A (9 candidates)} & \multicolumn{5}{c}{Router~B (8 candidates)} \\
+\cmidrule(lr){2-6} \cmidrule(lr){7-11}
+Budget & Maj(A) & Rnd(A) & Smart & Safest & $N$(A) & Maj(B) & Rnd(B) & Smart & Safest & $N$(B) \\
+\midrule
+\B{2\text{k}}  & 60.5\% & 35.1\% & 65.1\% \small{(+11.8\%)} & 65.1\% \small{(+11.8\%)} & 86  & 61.2\% & 39.1\% & 68.2\% \small{(+18.2\%)} & 65.9\% \small{(+12.1\%)} & 85 \\
+\B{4\text{k}}  & 58.3\% & 36.2\% & 58.3\% \small{(+0.0\%)}  & 63.5\% \small{(+12.5\%)} & 96  & 58.3\% & 40.0\% & 61.5\% \small{(+7.5\%)}  & 61.5\% \small{(+7.5\%)}  & 96 \\
+\B{8\text{k}}  & 57.5\% & 40.0\% & 57.5\% \small{(+0.0\%)}  & 60.4\% \small{(+6.7\%)}  & 106 & 57.5\% & 44.3\% & 56.6\% \small{(-2.2\%)} & 59.4\% \small{(+4.4\%)}  & 106 \\
+\B{10\text{k}} & 58.8\% & 45.4\% & 57.8\% \small{(-2.4\%)} & 61.8\% \small{(+7.1\%)}  & 102 & 58.8\% & 50.4\% & 60.8\% \small{(+4.8\%)}  & 60.8\% \small{(+4.8\%)}  & 102 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\paragraph{Summary.}
+On dev-report tasks, Router~B with the \emph{smart} label strategy achieves the largest single gain (+18.2\% relative at \B{2\text{k}}), while the \emph{safest} strategy is more consistently positive across budgets.
+On dev-localized tasks, the majority-vote baseline already captures 78--89\% of tasks, leaving little room for routing improvements; both routers match or marginally improve upon the baseline.
+On vague tasks ($N \leq 20$), the routers frequently underperform majority vote, confirming that the small sample size precludes reliable per-instance discrimination.
+
+\paragraph{End-to-end pass@1 after routing.}
+The LOO-CV numbers above evaluate routing on the \emph{solvable} subset (tasks with at least one passing method under the candidate set).  To report an end-to-end view, we also compute dev-report pass@1 over all 245 tasks by selecting the router-chosen method's \emph{existing} single-shot attempt for each task (no additional LLM calls).
+Table~\ref{tab:routed-pass1} shows that routing yields modest but real pass@1 gains over the best fixed method at each budget.
+
+\begin{table}[tbp]
+\centering
+\caption{Dev-report end-to-end pass@1 after routing (245 tasks). ``Best fixed'' is the best single method from Table~\ref{tab:devreport}; routers select among their candidate sets via LOO-CV.}
+\label{tab:routed-pass1}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+Budget & Best fixed & Router~A (safest) & Router~B (smart) & Oracle \\
+\midrule
+\B{2\text{k}}  & 0.212 (\textsc{tfidf}) & 0.229 & 0.237 & 0.351 \\
+\B{4\text{k}}  & 0.229 (\textsc{tfidf}) & 0.249 & 0.241 & 0.392 \\
+\B{8\text{k}}  & 0.249 (\textsc{tfidf}) & 0.261 & 0.245 & 0.433 \\
+\B{10\text{k}} & 0.245 (\textsc{bca\_d1}) & 0.257 & 0.253 & 0.416 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\paragraph{Post-hoc analysis.}
+Independently of the deployment routers above, we fit a post-hoc logistic regression router for interpretability.
+Results are reported in Appendix~\ref{app:routing-details} (Table~\ref{tab:posthoc-router}).
+
+% ── Chart: Router gap comparison on dev-report ───────────────────────────────
+\begin{figure}[tbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    ybar,
+    bar width=8pt,
+    width=\columnwidth,
+    height=5cm,
+    ylabel={LOO-CV Accuracy (\%)},
+    symbolic x coords={B=2k, B=4k, B=8k, B=10k},
+    xtick=data,
+    ymin=30, ymax=105,
+    legend to name=leg:routergap,
+    legend style={font=\scriptsize, legend columns=4, draw=none},
+    enlarge x limits=0.15,
+    grid=major,
+    grid style={gray!20},
+    every axis plot/.append style={fill opacity=0.85},
+    x tick label style={font=\footnotesize},
+]
+% Router data: dev-report
+% Random
+\addplot[fill=gray!40] coordinates {(B=2k,39.1) (B=4k,40.0) (B=8k,44.3) (B=10k,50.4)};
+% Majority
+\addplot[fill=blue!40] coordinates {(B=2k,61.2) (B=4k,58.3) (B=8k,57.5) (B=10k,58.8)};
+% Router B (smart) -- best performing
+\addplot[fill=green!50!black] coordinates {(B=2k,68.2) (B=4k,61.5) (B=8k,56.6) (B=10k,60.8)};
+% Oracle
+\addplot[fill=orange!60] coordinates {(B=2k,100) (B=4k,100) (B=8k,100) (B=10k,100)};
+\legend{Random, Majority, Router B, Oracle}
+\end{axis}
+\end{tikzpicture}\\[4pt]
+\ref{leg:routergap}
+\caption{Router B (smart) vs.\ baselines on dev-report (LOO-CV). The gap between Majority and Oracle represents the routing opportunity. Router B closes 18.2\% of this gap at $\B{2\text{k}}$.}
+\label{fig:router-gap}
+\end{figure}
+
+\subsection{Why Dev-Report Enables Routing}\label{sec:sole-solvers}
+
+The router's opportunity is bounded by method complementarity: if a single method solves every task, no routing can help.
+We quantify complementarity via \emph{sole-solver} analysis -- tasks solved by exactly one method.
+
+\begin{table*}[tbp]
+\centering
+\caption{Sole-solver analysis across tiers. ``Multi'' = solved by $\geq 2$ methods; ``Sole'' = solved by exactly one.}
+\label{tab:sole-solvers}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l r r r r l}
+\toprule
+Tier / Budget & Solvable & Multi & Sole & Sole \% & Top Sole-Solver Methods \\
+\midrule
+\multicolumn{6}{l}{\textit{Dev-report}} \\
+\B{2\text{k}}  & 86  & 61 & 25 & 29.1\% & \textsc{tfidf}(10), \textsc{bm25}(6), \textsc{keyword\_map}(6), \textsc{bca}(2), \textsc{no\_retrieval}(1) \\
+\B{4\text{k}}  & 96  & 70 & 26 & 27.1\% & \textsc{bm25}(9), \textsc{keyword\_map}(6), \textsc{tfidf}(6), \textsc{bca}(1), \textsc{bca\_d1}(1), \textsc{bca\_d5}(1), others(3) \\
+\B{8\text{k}}  & 106 & 77 & 29 & 27.4\% & \textsc{keyword\_map}(9), \textsc{tfidf}(7), \textsc{bm25}(6), \textsc{bca\_no\_scoring}(3), \textsc{bca\_d1}(2), others(2) \\
+\B{10\text{k}} & 102 & 81 & 21 & 20.6\% & \textsc{tfidf}(7), \textsc{bm25}(5), \textsc{keyword\_map}(4), \textsc{bca\_d1}(2), \textsc{bca\_no\_closure}(2), \textsc{bca\_no\_scoring}(1) \\
+\midrule
+\multicolumn{6}{l}{\textit{Dev-localized}} \\
+\B{2\text{k}}  & 238 & 230 & 8  & 3.4\% & \textsc{no\_retrieval}(5), \textsc{tfidf}(3) \\
+\B{4\text{k}}  & 239 & 229 & 10 & 4.2\% & \textsc{no\_retrieval}(8), \textsc{tfidf}(2) \\
+\B{8\text{k}}  & 238 & 234 & 4  & 1.7\% & \textsc{no\_retrieval}(4) \\
+\B{10\text{k}} & 239 & 235 & 4  & 1.7\% & \textsc{no\_retrieval}(4) \\
+\midrule
+\multicolumn{6}{l}{\textit{Vague}} \\
+\B{2\text{k}}  & 20 & 10 & 10 & 50.0\% & \textsc{bm25}(7), \textsc{keyword\_map}(2), \textsc{bca\_no\_scoring}(1) \\
+\B{4\text{k}}  & 17 & 11 & 6  & 35.3\% & \textsc{bm25}(3), \textsc{bca\_d1}(1), \textsc{bca\_no\_scoring}(1), \textsc{keyword\_map}(1) \\
+\B{8\text{k}}  & 16 & 13 & 3  & 18.8\% & \textsc{bm25}(2), \textsc{bca\_d1}(1) \\
+\B{10\text{k}} & 15 & 11 & 4  & 26.7\% & \textsc{bm25}(4) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+Dev-report tasks exhibit 20--29\% sole-solvers, spread across five or more methods -- sufficient diversity for a router to exploit.
+Dev-localized tasks show only 2--4\% sole-solvers, almost all attributable to \textsc{no\_retrieval}, explaining why routers match but cannot beat the majority baseline.
+Vague tasks have the highest sole-solver fraction (up to 50\%), but the absolute counts ($N \leq 20$) are too small for LOO-CV to learn stable decision boundaries.
+
+\paragraph{Feature signals.}
+Router~B's strongest coefficients are retrieval-confidence features such as entropy and top-1 score, while Router~A relies
+primarily on identifier density and mapped-entity count.
+Full coefficient tables are provided in Appendix~\ref{app:routing-details}
+(Tables~\ref{tab:feature-importance} and~\ref{tab:feature-importance-a}).
+
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Discussion}\label{sec:discussion}
+
+\paragraph{Context assembly is conditional.}
+The central result of this study is that context assembly is not a universal
+retrieval problem.  It is conditional on query information content.  When
+the query leaks the bug location (dev-localized), retrieval is unnecessary
+and can reduce performance.  When the query provides structural clues like
+tracebacks (dev-report), retrieval quality matters and method choice matters.
+When the query is purely symptomatic (vague), model comprehension is the
+bottleneck, and differences between retrieval methods are small relative to
+the overall low pass rates.
+
+This has practical implications.  Real developer queries span this spectrum.
+A system that routes queries to the appropriate retrieval strategy -- or
+bypasses retrieval entirely when the query is self-sufficient -- can
+outperform a single fixed retrieval method, especially on dev-report tasks.
+Our router results provide initial
+evidence for this claim, closing up to 18.2\% of the oracle gap on the
+dev-report tier with zero additional LLM calls.
+
+\paragraph{Graph-guided retrieval: regime-dependent.}
+The BCA ablation reveals when graph-guided retrieval helps and why:
+
+\begin{itemize}[leftmargin=*,nosep]
+  \item On dev-report at higher budgets, BCA variants narrow the gap with
+    TF-IDF; at $\B{10\text{k}}$ the best BCA variants match or slightly
+    exceed TF-IDF.
+  \item On dev-report at low budget, BCA underperforms because it cannot fit
+    both seeds and their neighborhoods into the tight context window.
+  \item On dev-localized, BCA underperforms because entity extraction from
+    file-and-line descriptions produces less precise seeds than on
+    tracebacks.
+  \item On vague queries, BCA is no better than other methods: the graph
+    component is often starved of entity-mapped seeds (89\% unreachable), and
+    the lexical fallbacks/backfill do not materially change pass@1.
+\end{itemize}
+
+The ablation shows that relevance scoring is BCA's critical component
+($-$5pp when removed), not expansion depth or closure.  Future work should
+focus on improving scoring functions rather than expanding graph traversal.
+
+\paragraph{Context--patch overlap.}
+BCA produces higher context--patch overlap than TF-IDF on dev-report
+(0.17--0.19 vs.\ 0.04), meaning the LLM references BCA-provided context
+files more frequently in its generated patches.  However, higher overlap
+does not translate to higher pass@1 -- TF-IDF still leads overall.  This
+metric is descriptive, not prescriptive: it shows that BCA's graph-guided
+context is structurally closer to the edit site, but this proximity alone
+is insufficient for repair.
+
+\paragraph{Routing headroom.}
+On dev-report, the oracle pass@1 is 0.35--0.43 across budgets, while the best
+fixed method achieves 0.21--0.25, leaving 14--18pp of headroom for per-task
+method selection.  On the solvable subset, Router~B closes up to 18.2\% of the
+majority-to-oracle selection gap at $\B{2\text{k}}$
+(Table~\ref{tab:router-devreport}).
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Limitations and Future Work}\label{sec:limitations}
+
+\textbf{Scope: two Python repositories.}  We evaluate on pydantic-ai and httpx.
+The findings may not transfer to other languages or codebases with different
+import/dependency structures (e.g., C++ header files, JavaScript module
+systems).
+
+\textbf{Mutation proxy.}  Single-line mutations are a controlled proxy for
+real bugs, not a replacement for evaluating on real-world defects.  Real
+bugs often span multiple files, involve algorithmic errors, or require
+understanding non-local invariants.  Our setup is closest to evaluating
+``can the model fix a simple operator error given the right context?''
+
+\textbf{Single model.}  All results use \texttt{gpt-4o-mini-2024-07-18}.
+A stronger model (e.g., GPT-4o or Claude~3.5~Sonnet) may change relative
+method rankings, particularly on dev-report where model comprehension is a
+limiting factor.  The three-tier gradient should persist, but the absolute
+pass@1 values and the gap between methods would likely shift.
+
+\textbf{Dev-localized descriptions are too informative.}
+\textsc{no\_retrieval}'s 86\% on dev-localized shows this tier primarily
+measures the LLM's ability to follow precise instructions, not retrieval
+quality.  We include it for completeness and as a contrast condition.
+
+\textbf{Small vague sample.}  Only 15--20 vague tasks are solvable (oracle
+6--8\%), leaving insufficient data for robust statistical claims about
+routing on vague queries.
+
+\textbf{Uncertainty.}  Bootstrap confidence intervals are computed by resampling
+tasks; they do not capture within-task LLM variability.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Conclusion}\label{sec:conclusion}
+
+We present a three-tier benchmark for budgeted context assembly in LLM code
+repair.  Our 29,400-attempt study across two Python repositories shows that
+the query tier---not the retrieval method---is the primary determinant of
+repair success, and that single-tier pass@1 evaluations hide this structure.
+
+No single retrieval method dominates.  The right method depends on query
+information content.  On dev-report (the primary tier), TF-IDF reaches
+0.23 pass@1 on average.  Dev-localized is often solvable without retrieval
+due to location leakage (\textsc{no\_retrieval}: 0.86), while vague remains
+near-zero across methods (best: 0.05).  The three-tier
+gradient manifests consistently in failure modes, retrieval--outcome
+decoupling, and routing potential.
+
+A lightweight router using retrieval confidence features closes up to
+18.2\% of the oracle gap on dev-report without additional LLM calls,
+demonstrating that per-instance method selection is a more productive
+framing than searching for a universal best retriever.
+
+We release the benchmark harness and analysis pipeline to support future
+work on conditional context assembly on GitHub
+(\url{https://github.com/akshan-main/bca}).
+
+% ══════════════════════════════════════════════════════════════════════════════
+
+% ══════════════════════════════════════════════════════════════════════════════
+\bibliographystyle{unsrtnat}
+
+\begingroup
+% Tighten bibliography spacing to avoid a mostly-empty trailing page before the appendix.
+\setlength{\bibsep}{0pt}
+\small
+\begin{thebibliography}{99}
+
+\bibitem[Liu et~al.(2023)]{liu2023repobench}
+Liu, T., Xu, C., and McAuley, J.
+\newblock RepoBench: Benchmarking repository-level code auto-completion systems.
+\newblock \emph{arXiv preprint}, 2023.
+
+\bibitem[Ding et~al.(2023)]{ding2023crosscodeeval}
+Ding, Y., Wang, Z., Ahmad, W.~U., Ramanathan, M.~K., Nallapati, R., Bhatia, P.,
+Roth, D., and Xiang, B.
+\newblock CrossCodeEval: A diverse and multilingual benchmark for cross-file code completion.
+\newblock \emph{arXiv preprint}, 2023.
+
+\bibitem[Jimenez et~al.(2024)]{jimenez2024swebench}
+Jimenez, C.~E., Yang, J., Wettig, A., Yao, S., Pei, K., Press, O., and Narasimhan, K.
+\newblock {SWE}-bench: Can language models resolve real-world {GitHub} issues?
+\newblock In \emph{Proc.\ ICLR}, 2024.
+
+\bibitem[Aider-AI(2026)]{aider}
+Aider-AI.
+\newblock Aider: AI pair programming in your terminal.
+\newblock \url{https://github.com/Aider-AI/aider}, accessed 2026-02-13.
+
+\bibitem[Lewis et~al.(2020)]{lewis2020rag}
+Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V., Goyal, N., Kuttler, H.,
+Lewis, M., Yih, W.-t., Rockt\"{a}schel, T., Riedel, S., and Kiela, D.
+\newblock Retrieval-augmented generation for knowledge-intensive {NLP} tasks.
+\newblock In \emph{Proc.\ NeurIPS}, 2020.
+
+\bibitem[Guu et~al.(2020)]{guu2020realm}
+Guu, K., Lee, K., Tung, Z., Pasupat, P., and Chang, M.-W.
+\newblock {REALM}: Retrieval-augmented language model pre-training.
+\newblock In \emph{Proc.\ ICML}, 2020.
+
+\bibitem[Borgeaud et~al.(2022)]{borg2022retro}
+Borgeaud, S. et~al.
+\newblock Improving language models by retrieving from trillions of tokens.
+\newblock In \emph{Proc.\ ICML}, 2022.
+
+\bibitem[Rice(1976)]{rice1976algorithm}
+Rice, J.~R.
+\newblock The algorithm selection problem.
+\newblock In \emph{Advances in Computers}, volume~15, pages 65--118. 1976.
+
+\bibitem[Kotthoff(2014)]{kotthoff2014algo}
+Kotthoff, L.
+\newblock Algorithm selection for combinatorial search problems: A survey.
+\newblock In \emph{Data Mining and Constraint Programming}, pages 149--190. 2014.
+
+\bibitem[Xu et~al.(2008)]{xu2008satzilla}
+Xu, L., Hutter, F., Hoos, H.~H., and Leyton-Brown, K.
+\newblock {SATzilla}: Portfolio-based algorithm selection for {SAT}.
+\newblock \emph{Journal of Artificial Intelligence Research}, 32:565--606, 2008.
+
+\bibitem[Husain et~al.(2019)]{husain2019codesearchnet}
+Husain, H., Wu, H.-H., Gazit, T., Allamanis, M., and Brockschmidt, M.
+\newblock CodeSearchNet challenge: Evaluating the state of semantic code search.
+\newblock \emph{arXiv preprint arXiv:1909.09436}, 2019.
+
+\bibitem[Feng et~al.(2020)]{feng2020codebert}
+Feng, Z., Guo, D., Tang, D., Duan, N., Feng, X., Gong, M., Shou, L., Qin, B.,
+Liu, T.
+\newblock CodeBERT: A pre-trained model for programming and natural languages.
+\newblock In \emph{Findings of EMNLP}, 2020.
+
+\bibitem[Guo et~al.(2021)]{guo2021graphcodebert}
+Guo, D., Ren, S., Lu, S., Feng, Z., Tang, D., Liu, S., Duan, N., Gong, M., Shou, L.,
+Qin, B.
+\newblock GraphCodeBERT: Pre-training code representations with data flow.
+\newblock In \emph{Proc.\ ICLR}, 2021.
+
+\bibitem[Allamanis et~al.(2018)]{allamanis2018graphs}
+Allamanis, M., Brockschmidt, M., and Khademi, M.
+\newblock Learning to represent programs with graphs.
+\newblock In \emph{Proc.\ ICLR}, 2018.
+
+\bibitem[Yamaguchi et~al.(2014)]{yamaguchi2014cpg}
+Yamaguchi, F., Golde, N., Arp, D., and Rieck, K.
+\newblock Modeling and discovering vulnerabilities with code property graphs.
+\newblock In \emph{Proc.\ IEEE Symposium on Security and Privacy}, 2014.
+
+\bibitem[Yamaguchi(2015)]{joern}
+Yamaguchi, F.
+\newblock Joern: A platform for analyzing code property graphs.
+\newblock \url{https://github.com/joernio/joern}, accessed 2026-02-13.
+
+\bibitem[Semmle(2026)]{codeql}
+Semmle.
+\newblock CodeQL: Semantic code analysis engine.
+\newblock \url{https://codeql.github.com/}, accessed 2026-02-13.
+
+\bibitem[Jia and Harman(2011)]{jia2011mutation}
+Jia, Y. and Harman, M.
+\newblock An analysis and survey of the development of mutation testing.
+\newblock \emph{IEEE Transactions on Software Engineering}, 37(5):649--678, 2011.
+
+\bibitem[Robertson et~al.(1995)]{robertson1995okapi}
+Robertson, S., Walker, S., Jones, S., Hancock-Beaulieu, M., and Gatford, M.
+\newblock Okapi at {TREC}-3.
+\newblock In \emph{Proc.\ TREC}, 1995.
+
+\bibitem[Robertson and Zaragoza(2009)]{robertson2009bm25}
+Robertson, S. and Zaragoza, H.
+\newblock The probabilistic relevance framework: {BM25} and beyond.
+\newblock \emph{Foundations and Trends in Information Retrieval}, 3(4):333--389, 2009.
+
+\bibitem[Sp{\"a}rck~Jones(1972)]{sparckjones1972}
+Sp{\"a}rck~Jones, K.
+\newblock A statistical interpretation of term specificity and its application in retrieval.
+\newblock \emph{Journal of Documentation}, 28(1):11--21, 1972.
+
+\bibitem[Salton and Buckley(1988)]{saltonbuckley1988}
+Salton, G. and Buckley, C.
+\newblock Term-weighting approaches in automatic text retrieval.
+\newblock \emph{Information Processing \& Management}, 24(5):513--523, 1988.
+
+\bibitem[Efron and Tibshirani(1993)]{efron1993bootstrap}
+Efron, B. and Tibshirani, R.~J.
+\newblock \emph{An Introduction to the Bootstrap}.
+\newblock Chapman and Hall/CRC, 1993.
+
+\end{thebibliography}
+\endgroup
+
+\onecolumn
+
+\appendix
+
+\section{Reproducibility Details}\label{app:reproducibility}
+
+Table~\ref{tab:repro} summarizes the key experimental parameters
+for reproducibility.
+
+\begin{table}[H]
+\centering
+\caption{Reproducibility parameters.}\label{tab:repro}
+\smallskip
+\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Parameter & Value \\
+\midrule
+Model                 & \texttt{gpt-4o-mini-2024-07-18} (pinned snapshot) \\
+Temperature           & 0 \\
+Seed                  & 42 \\
+top\_p                & 1 \\
+Repositories          & pydantic-ai \texttt{69a578a}, httpx \texttt{ae1b9f6} \\
+Retry backoff         & Fixed delays: 5, 8, 15, 30, 60\,s (then fail) \\
+Repo restoration      & Byte-identical file restore (SHA-256 verified) \\
+Bootstrap CIs (task-resampled) & $n$=5{,}000, seed=42 \\
+Total attempts        & 29{,}400 (incl.\ 2{,}940 ceiling) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% Tighter float spacing in single-column appendix
+\setlength{\floatsep}{10pt plus 4pt minus 2pt}
+\setlength{\textfloatsep}{12pt plus 4pt minus 2pt}
+\setlength{\intextsep}{8pt plus 4pt minus 2pt}
+
+% Caption style is configured globally in the preamble.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Supplementary Tables}\label{app:supp-tables}
+
+This appendix contains detailed tables that support the main narrative but are
+too granular for the main two-column layout.  All tables cover the full
+245~tasks, four budgets, and three query tiers.
+
+\subsection{Mutation Operators}\label{app:mutation-operators}
+
+Table~\ref{tab:mutations} reports the per-repository distribution of mutation
+types in the 245~benchmark tasks.  The \textsc{other} bucket groups two rare
+operators (\textsc{membership\_swap} and \textsc{return\_value\_swap}).
+\textsc{none\_check\_swap} is the most frequent (58 tasks) and also the
+hardest to repair.
+
+\begin{table}[H]
+\centering
+\caption{Mutation operator breakdown (task counts).}\label{tab:mutations}
+\smallskip
+\small
+\begin{tabular}{lrrr}
+\toprule
+Mutation type & pydantic-ai & httpx & Total \\
+\midrule
+\textsc{none\_check\_swap}      & 30 & 28 & 58 \\
+\textsc{comparison\_swap}      & 12 & 23 & 35 \\
+\textsc{condition\_inversion}  & 22 & 21 & 43 \\
+\textsc{boolean\_flip}         & 25 & 16 & 41 \\
+\textsc{value\_swap}           &  7 & 14 & 21 \\
+\textsc{constant\_mutation}    & 11 &  9 & 20 \\
+\textsc{handcrafted}           & 14 &  0 & 14 \\
+\textsc{arithmetic\_swap}      &  5 &  4 &  9 \\
+\textsc{other}                 &  2 &  2 &  4 \\
+\midrule
+\textbf{Total}                 & \textbf{128} & \textbf{117} & \textbf{245} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Failure Modes for Dev-Localized and Vague}\label{app:failure-modes}
+
+Tables~\ref{tab:fail-exact-full} and~\ref{tab:fail-vague-full} complement
+the dev-report failure mode table in the main body
+(Table~\ref{tab:fail-devreport-full}).  On dev-localized, the dominant
+failure mode is \texttt{patch\_apply\_fail} (localization errors), while on
+vague, \texttt{test\_fail} overwhelmingly dominates (comprehension errors).
+
+\begin{table}[H]
+\centering
+\caption{Failure mode distribution (\%), dev-localized, all methods and budgets.}\label{tab:fail-exact-full}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccc ccccc ccccc ccccc}
+\toprule
+& \multicolumn{5}{c}{$\B{2\text{k}}$}
+& \multicolumn{5}{c}{$\B{4\text{k}}$}
+& \multicolumn{5}{c}{$\B{8\text{k}}$}
+& \multicolumn{5}{c}{$\B{10\text{k}}$} \\
+\cmidrule(lr){2-6}\cmidrule(lr){7-11}\cmidrule(lr){12-16}\cmidrule(lr){17-21}
+Method & pass & patch & test & syn & t/o
+       & pass & patch & test & syn & t/o
+       & pass & patch & test & syn & t/o
+       & pass & patch & test & syn & t/o \\
+\midrule
+\textsc{bca}              & 52 & 25 & 21 & 2 & 0  & 64 & 24 & 12 & 0 & 0  & 69 & 21 &  9 & 1 & 0  & 69 & 22 &  7 & 1 & 0 \\
+\textsc{bca\_d1}          & 47 & 27 & 24 & 1 & 0  & 53 & 27 & 18 & 1 & 0  & 65 & 24 & 10 & 1 & 0  & 69 & 22 &  9 & 0 & 0 \\
+\textsc{bca\_d5}          & 55 & 27 & 17 & 1 & 0  & 64 & 24 & 12 & 0 & 0  & 66 & 26 &  8 & 0 & 0  & 69 & 22 &  9 & 1 & 0 \\
+\textsc{bca\_no\_closure} & 56 & 26 & 16 & 1 & 0  & 64 & 22 & 13 & 0 & 0  & 69 & 23 &  7 & 1 & 0  & 72 & 22 &  6 & 0 & 0 \\
+\textsc{bca\_no\_scoring} & 48 & 31 & 20 & 1 & 0  & 63 & 24 & 13 & 0 & 0  & 67 & 24 &  9 & 0 & 0  & 66 & 28 &  7 & 0 & 0 \\
+\textsc{bm25}             & 70 & 22 &  8 & 0 & 0  & 71 & 21 &  8 & 0 & 0  & 73 & 22 &  5 & 0 & 0  & 76 & 19 &  5 & 0 & 0 \\
+\textsc{no\_retrieval}    & 86 & 11 &  2 & 0 & 0  & 86 & 11 &  2 & 0 & 0  & 86 & 11 &  2 & 0 & 0  & 86 & 11 &  2 & 0 & 0 \\
+\textsc{keyword\_map}        & 72 & 19 &  9 & 0 & 0  & 73 & 20 &  7 & 0 & 0  & 75 & 20 &  4 & 0 & 0  & 75 & 20 &  5 & 0 & 0 \\
+\textsc{tfidf}           & 74 & 19 &  7 & 0 & 0  & 74 & 18 &  7 & 0 & 0  & 76 & 19 &  4 & 0 & 0  & 79 & 18 &  2 & 0 & 0 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Failure mode distribution (\%), vague, all methods and budgets.}\label{tab:fail-vague-full}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccc ccccc ccccc ccccc}
+\toprule
+& \multicolumn{5}{c}{$\B{2\text{k}}$}
+& \multicolumn{5}{c}{$\B{4\text{k}}$}
+& \multicolumn{5}{c}{$\B{8\text{k}}$}
+& \multicolumn{5}{c}{$\B{10\text{k}}$} \\
+\cmidrule(lr){2-6}\cmidrule(lr){7-11}\cmidrule(lr){12-16}\cmidrule(lr){17-21}
+Method & pass & patch & test & syn & t/o
+       & pass & patch & test & syn & t/o
+       & pass & patch & test & syn & t/o
+       & pass & patch & test & syn & t/o \\
+\midrule
+\textsc{bca}              & 3 & 13 & 83 & 1 & 0  & 1 & 11 & 84 & 2 & 0  & 1 & 22 & 76 & 1 & 0  & 2 & 13 & 82 & 2 & 0 \\
+\textsc{bca\_d1}          & 2 & 10 & 87 & 1 & 0  & 3 & 11 & 85 & 1 & 0  & 4 & 21 & 72 & 3 & 0  & 1 & 28 & 67 & 3 & 0 \\
+\textsc{bca\_d5}          & 3 & 11 & 85 & 1 & 0  & 1 & 13 & 84 & 2 & 0  & 1 & 24 & 74 & 1 & 0  & 2 & 24 & 72 & 1 & 0 \\
+\textsc{bca\_no\_closure} & 3 &  9 & 86 & 2 & 0  & 1 & 16 & 81 & 1 & 0  & 2 & 25 & 73 & 0 & 0  & 2 & 16 & 82 & 0 & 0 \\
+\textsc{bca\_no\_scoring} & 3 & 10 & 84 & 2 & 0  & 1 &  8 & 89 & 2 & 0  & 1 & 15 & 84 & 0 & 0  & 2 & 12 & 85 & 1 & 0 \\
+\textsc{bm25}             & 7 & 11 & 80 & 2 & 0  & 5 & 15 & 77 & 3 & 0  & 4 & 20 & 71 & 4 & 0  & 5 & 20 & 70 & 4 & 0 \\
+\textsc{no\_retrieval}    & 0 & 100 &  0 & 0 & 0 & 0 & 100 &  0 & 0 & 0 & 0 & 100 &  0 & 0 & 0 & 0 & 100 &  0 & 0 & 0 \\
+\textsc{keyword\_map}        & 4 & 11 & 82 & 2 & 0  & 4 &  7 & 86 & 3 & 0  & 2 & 22 & 73 & 2 & 0  & 3 & 19 & 76 & 2 & 0 \\
+\textsc{tfidf}           & 3 & 11 & 85 & 1 & 0  & 3 & 15 & 81 & 1 & 0  & 3 & 20 & 77 & 1 & 0  & 3 & 25 & 71 & 1 & 0 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+The tier contrast is stark: on dev-localized, \textsc{no\_retrieval} achieves 86\% pass (the LLM solves from description alone), making all failure residuals small.
+On vague, \textsc{no\_retrieval} produces 100\% \texttt{patch\_apply\_fail} because the LLM receives no code context at all, while retrieval-equipped methods shift overwhelmingly to \texttt{test\_fail}---the LLM finds \emph{something} to edit, but the repair is semantically wrong.
+This confirms that vague queries create a comprehension bottleneck that retrieval alone cannot resolve.
+
+\subsection{Retrieval--Outcome Decoupling Details}\label{app:decoupling-tables}
+
+\Cref{tab:conv-filehit-exact,tab:conv-filehit-devreport,tab:conv-filehit-vague}
+report per-budget file-hit and symbol-hit conversion rates for each tier.
+\Cref{tab:pass-without-file} reports how often methods pass without the target
+file present in the assembled context.
+
+\begin{table}[H]
+\centering
+\caption{File hit $\to$ pass conversion (\%), dev-localized.}\label{tab:conv-filehit-exact}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l cccc cccc}
+\toprule
+& \multicolumn{4}{c}{File hit $\to$ pass (\%)} & \multicolumn{4}{c}{Symbol hit $\to$ pass (\%)} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-9}
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$
+       & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 56 & 68 & 73 & 72 & 62 & 71 & 73 & 72 \\
+\textsc{bca\_d1}          & 57 & 65 & 77 & 79 & 60 & 62 & 77 & 76 \\
+\textsc{bca\_d5}          & 60 & 68 & 69 & 73 & 65 & 70 & 69 & 69 \\
+\textsc{bca\_no\_closure} & 63 & 69 & 73 & 76 & 66 & 70 & 72 & 76 \\
+\textsc{bca\_no\_scoring} & 54 & 65 & 70 & 69 & 55 & 69 & 70 & 69 \\
+\textsc{bm25}             & 74 & 74 & 77 & 79 & 74 & 76 & 76 & 81 \\
+\textsc{keyword\_map}        & 80 & 77 & 79 & 77 & 78 & 75 & 77 & 76 \\
+\textsc{tfidf}           & 80 & 81 & 82 & 86 & 81 & 80 & 80 & 84 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{File hit $\to$ pass and symbol hit $\to$ pass conversion (\%), dev-report.}\label{tab:conv-filehit-devreport}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l cccc cccc}
+\toprule
+& \multicolumn{4}{c}{File hit $\to$ pass (\%)} & \multicolumn{4}{c}{Symbol hit $\to$ pass (\%)} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-9}
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$
+       & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 12 & 15 & 19 & 24  & 14 & 17 & 20 & 24 \\
+\textsc{bca\_d1}          & 13 & 13 & 21 & 25  & 15 & 15 & 22 & 25 \\
+\textsc{bca\_d5}          & 11 & 13 & 19 & 21  & 13 & 15 & 20 & 21 \\
+\textsc{bca\_no\_closure} & 12 & 16 & 21 & 25  & 14 & 18 & 22 & 26 \\
+\textsc{bca\_no\_scoring} & 10 & 10 & 12 & 14  & 12 & 13 & 14 & 14 \\
+\textsc{bm25}             & 20 & 22 & 24 & 22  & 22 & 24 & 26 & 23 \\
+\textsc{keyword\_map}        & 21 & 21 & 19 & 19  & 26 & 27 & 22 & 22 \\
+\textsc{tfidf}           & 22 & 24 & 25 & 23  & 27 & 28 & 29 & 26 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{File hit $\to$ pass and symbol hit $\to$ pass conversion (\%), vague.}\label{tab:conv-filehit-vague}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l cccc cccc}
+\toprule
+& \multicolumn{4}{c}{File hit $\to$ pass (\%)} & \multicolumn{4}{c}{Symbol hit $\to$ pass (\%)} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-9}
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$
+       & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              &  4 &  2 &  1 &  3  & 2 & 1 & 2 & 3 \\
+\textsc{bca\_d1}          &  2 & 10 & 10 &  3  & 2 & 7 & 7 & 3 \\
+\textsc{bca\_d5}          &  4 &  2 &  2 &  2  & 2 & 1 & 3 & 2 \\
+\textsc{bca\_no\_closure} &  4 &  2 &  2 &  2  & 1 & 1 & 2 & 3 \\
+\textsc{bca\_no\_scoring} &  5 &  2 &  2 &  2  & 4 & 2 & 3 & 3 \\
+\textsc{bm25}             & 15 & 12 & 10 & 12  & 19 & 17 & 10 & 11 \\
+\textsc{keyword\_map}        &  6 &  4 &  3 &  3  & 6 & 10 & 7 & 5 \\
+\textsc{tfidf}           &  5 &  7 &  7 &  8  & 4 & 7 & 7 & 7 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Passes without the target file in context (count across all budgets).}\label{tab:pass-without-file}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l cc cc cc}
+\toprule
+& \multicolumn{2}{c}{Dev-localized} & \multicolumn{2}{c}{Dev-report} & \multicolumn{2}{c}{Vague} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}
+Method & passes w/o file & total passes & passes w/o file & total passes & passes w/o file & total passes \\
+\midrule
+\textsc{no\_retrieval}    & 211 & 211 & 6 &  6 & --- & 0 \\
+\textsc{bca}              &  10 & 155 & 0 & 40 &  0 &  4 \\
+\textsc{bca\_d1}          &  12 & 143 & 0 & 42 &  0 &  6 \\
+\textsc{bca\_d5}          &  10 & 156 & 0 & 37 &  0 &  4 \\
+\textsc{bca\_no\_closure} &   8 & 160 & 0 & 44 &  0 &  5 \\
+\textsc{bca\_no\_scoring} &  12 & 149 & 0 & 27 &  0 &  4 \\
+\textsc{bm25}             &   4 & 178 & 1 & 47 &  1 & 13 \\
+\textsc{keyword\_map}        &  36 & 181 & 0 & 48 &  0 &  8 \\
+\textsc{tfidf}           &   4 & 186 & 0 & 57 &  0 &  7 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Hop Distance Analysis Details}\label{app:hop-distance}
+
+These tables extend the hop distance analysis from Section~\ref{sec:hops}.
+Table~\ref{tab:hops} reports the seed-to-mutation hop distribution across
+tiers.  Table~\ref{tab:hops-all-methods} compares all methods at hop-0,
+1--2, and 3+ on dev-report at $\B{10\text{k}}$.
+Table~\ref{tab:hops-exact} shows dev-localized hops (nearly all hop-0).
+
+\begin{table}[H]
+\centering
+\caption{Seed-to-mutation hop distribution (BCA).}\label{tab:hops}
+\smallskip
+\begin{tabular}{lrrr}
+\toprule
+Hop bucket & Dev-loc. & Dev-rep. & Vague \\
+\midrule
+0 (direct hit) & 98.0\% & 55.1\% &  1.2\% \\
+1--2 (near)    &  1.6\% & 36.3\% &  6.5\% \\
+3--5 (mid)     &    0\% &  8.6\% &  2.9\% \\
+Unreachable    &  0.4\% &    0\% & 89.4\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by hop distance, all methods, dev-report at $\B{10\text{k}}$.}\label{tab:hops-all-methods}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccccc r}
+\toprule
+Hops & bca & bca\_d1 & bca\_nc & bm25 & tfidf & keyword\_map & $N$ \\
+\midrule
+0     & 0.35 & 0.35 & 0.36 & 0.29 & 0.32 & 0.26 & 135 \\
+1--2  & 0.07 & 0.12 & 0.10 & 0.04 & 0.11 & 0.10 &  89 \\
+3+    & 0.19 & 0.10 & 0.14 & 0.24 & 0.19 & 0.10 &  21 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by hop distance, BCA ($d$=3), dev-localized.}\label{tab:hops-exact}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccc r}
+\toprule
+Hop bucket & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ & $N$ \\
+\midrule
+0 (direct)   & 0.53 & 0.65 & 0.70 & 0.70 & 240 \\
+1--2 (near)  & 0.50 & 0.50 & 0.75 & 0.75 &   4 \\
+Unreachable  & 0.00 & 0.00 & 0.00 & 0.00 &   1 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{BCA Ablation Details}\label{app:bca-ablation-details}
+
+Table~\ref{tab:closure} reports the fraction of the token budget consumed
+by dependency closure for each BCA depth.  At $d\geq3$, closure is
+negligible ($<$1\%) because the expanded frontier already covers most
+dependency paths.
+
+\begin{table}[H]
+\centering
+\caption{Closure budget consumption by tier and depth.}\label{tab:closure}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+Method & Dev-loc.\ (\%) & Dev-rep.\ (\%) & Vague (\%) & Frontier \\
+\midrule
+\textsc{bca\_d1} & 10.0 & 1.7 & 7.7 & 35--527 \\
+\textsc{bca} ($d$=3) & 0.6 & 0.2 & 0.4 & 1296--2135 \\
+\textsc{bca\_d5} & 0.5 & 0.1 & 0.4 & 3001--3118 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Retrieval Quality Metrics for Dev-Localized and Vague}\label{app:rq-other-tiers}
+
+Tables~\ref{tab:rq-exact} and~\ref{tab:rq-vague} complement the dev-report
+retrieval quality table in the main body (Table~\ref{tab:rq-devreport}).
+On dev-localized, file hit rates are lower than on dev-report because
+entity extraction from file-and-line descriptions is less precise than from
+tracebacks.  On vague, \textsc{keyword\_map} achieves high file hit rates
+(56--96\%) by indexing repository-wide symbol signatures and file paths.
+
+\begin{table}[H]
+\centering
+\caption{Retrieval quality metrics, dev-localized, all methods and budgets.}\label{tab:rq-exact}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l cccc cccc}
+\toprule
+& \multicolumn{4}{c}{Target file hit (\%)} & \multicolumn{4}{c}{Target symbol hit (\%)} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-9}
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$
+       & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 74 & 83 & 87 & 87  & 54 & 58 & 61 & 64 \\
+\textsc{bca\_d1}          & 73 & 78 & 83 & 84  & 59 & 66 & 72 & 75 \\
+\textsc{bca\_d5}          & 76 & 84 & 88 & 89  & 54 & 60 & 64 & 69 \\
+\textsc{bca\_no\_closure} & 71 & 80 & 88 & 90  & 56 & 61 & 64 & 67 \\
+\textsc{bca\_no\_scoring} & 74 & 82 & 86 & 85  & 54 & 58 & 60 & 61 \\
+\textsc{bm25}             & 78 & 84 & 85 & 87  & 56 & 62 & 69 & 73 \\
+\textsc{no\_retrieval}    &  0 &  0 &  0 &  0  &  0 &  0 &  0 &  0 \\
+\textsc{keyword\_map}        & 73 & 93 & 95 & 96  & 48 & 55 & 60 & 60 \\
+\textsc{tfidf}           & 75 & 77 & 84 & 84  & 54 & 60 & 72 & 77 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Retrieval quality metrics, vague, all methods and budgets.}\label{tab:rq-vague}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l cccc cccc}
+\toprule
+& \multicolumn{4}{c}{Target file hit (\%)} & \multicolumn{4}{c}{Target symbol hit (\%)} \\
+\cmidrule(lr){2-5}\cmidrule(lr){6-9}
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$
+       & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 29 & 51 & 58 & 64  & 23 & 33 & 43 & 45 \\
+\textsc{bca\_d1}          & 22 & 29 & 35 & 39  & 23 & 29 & 39 & 41 \\
+\textsc{bca\_d5}          & 31 & 53 & 64 & 71  & 25 & 34 & 47 & 53 \\
+\textsc{bca\_no\_closure} & 28 & 46 & 68 & 73  & 27 & 33 & 44 & 49 \\
+\textsc{bca\_no\_scoring} & 35 & 54 & 62 & 67  & 20 & 34 & 44 & 47 \\
+\textsc{bm25}             & 29 & 35 & 43 & 44  & 22 & 24 & 36 & 40 \\
+\textsc{no\_retrieval}    &  0 &  0 &  0 &  0  &  0 &  0 &  0 &  0 \\
+\textsc{keyword\_map}        & 56 & 90 & 93 & 96  & 25 & 29 & 36 & 40 \\
+\textsc{tfidf}           & 27 & 31 & 40 & 38  & 21 & 28 & 40 & 40 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Edit Locality and Patch Quality Details}\label{app:edit-locality-details}
+
+Tables~\ref{tab:editdist-devreport}--\ref{tab:editdist-vague} report mean
+edit distance (lines between the mutation site and the nearest patch
+change).  Tables~\ref{tab:overlap-devreport}--\ref{tab:overlap-vague}
+report context--patch overlap (fraction of context files referenced in the
+generated patch).  Table~\ref{tab:patchsize} reports mean patch size for
+all attempts vs.\ passing attempts on dev-report.
+
+\begin{table}[H]
+\centering
+\caption{Mean edit distance (lines), dev-report.}\label{tab:editdist-devreport}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              &  83.1 &  81.1 &  71.4 &  87.9 \\
+\textsc{bca\_d1}          &  80.4 &  90.0 &  76.4 &  91.5 \\
+\textsc{bca\_d5}          &  90.7 &  70.8 &  85.3 &  96.2 \\
+\textsc{bca\_no\_closure} &  86.5 &  77.5 &  72.8 &  90.0 \\
+\textsc{bca\_no\_scoring} &  97.4 &  96.5 &  73.0 &  70.8 \\
+\textsc{bm25}             &  78.0 &  62.8 &  61.9 &  72.8 \\
+\textsc{no\_retrieval}    & 142.7 & 142.7 & 142.7 & 142.7 \\
+\textsc{keyword\_map}        &  45.4 &  46.6 &  44.1 &  47.2 \\
+\textsc{tfidf}           &  60.7 &  60.5 &  47.4 &  49.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Mean edit distance (lines), dev-localized.}\label{tab:editdist-exact}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 18.5 & 10.1 & 11.0 & 11.3 \\
+\textsc{bca\_d1}          & 19.0 & 17.6 &  5.5 &  4.1 \\
+\textsc{bca\_d5}          & 12.7 & 11.1 & 11.4 &  9.9 \\
+\textsc{bca\_no\_closure} & 11.9 & 10.3 &  9.6 &  8.8 \\
+\textsc{bca\_no\_scoring} & 23.2 & 17.2 & 10.7 & 10.9 \\
+\textsc{bm25}             &  7.6 &  6.8 &  1.2 &  1.2 \\
+\textsc{no\_retrieval}    &  0.5 &  0.5 &  0.5 &  0.5 \\
+\textsc{keyword\_map}        &  3.7 &  2.0 &  3.4 &  4.4 \\
+\textsc{tfidf}           &  2.2 &  1.8 &  1.2 &  0.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Mean edit distance (lines), vague. ``---'' indicates no passing patches.}\label{tab:editdist-vague}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 108.8 & 145.9 & 131.1 &  78.8 \\
+\textsc{bca\_d1}          & 117.6 &  80.4 &  65.6 &  78.6 \\
+\textsc{bca\_d5}          & 188.4 & 174.9 & 154.4 & 163.5 \\
+\textsc{bca\_no\_closure} & 120.7 & 157.5 & 106.7 &  94.6 \\
+\textsc{bca\_no\_scoring} &  91.8 & 116.2 &  61.6 &  61.5 \\
+\textsc{bm25}             &  27.7 &  30.7 &  45.5 &  50.6 \\
+\textsc{no\_retrieval}    &   --- &   --- &   --- &   --- \\
+\textsc{keyword\_map}        & 198.2 & 160.5 & 159.3 & 141.5 \\
+\textsc{tfidf}           & 208.7 & 202.9 & 115.7 &  72.6 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Context--patch overlap, dev-report.}\label{tab:overlap-devreport}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 0.40 & 0.33 & 0.20 & 0.17 \\
+\textsc{bca\_d1}          & 0.42 & 0.34 & 0.22 & 0.19 \\
+\textsc{bca\_d5}          & 0.40 & 0.33 & 0.20 & 0.17 \\
+\textsc{bca\_no\_closure} & 0.40 & 0.33 & 0.20 & 0.17 \\
+\textsc{bca\_no\_scoring} & 0.40 & 0.30 & 0.18 & 0.15 \\
+\textsc{bm25}             & 0.16 & 0.11 & 0.07 & 0.06 \\
+\textsc{no\_retrieval}    & 0.00 & 0.00 & 0.00 & 0.00 \\
+\textsc{keyword\_map}        & 0.26 & 0.21 & 0.17 & 0.15 \\
+\textsc{tfidf}           & 0.07 & 0.06 & 0.04 & 0.04 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Context--patch overlap, dev-localized.}\label{tab:overlap-exact}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 0.07 & 0.04 & 0.03 & 0.02 \\
+\textsc{bca\_d1}          & 0.11 & 0.08 & 0.05 & 0.05 \\
+\textsc{bca\_d5}          & 0.08 & 0.04 & 0.02 & 0.02 \\
+\textsc{bca\_no\_closure} & 0.08 & 0.04 & 0.03 & 0.02 \\
+\textsc{bca\_no\_scoring} & 0.07 & 0.04 & 0.03 & 0.02 \\
+\textsc{bm25}             & 0.07 & 0.06 & 0.04 & 0.04 \\
+\textsc{no\_retrieval}    & 0.00 & 0.00 & 0.00 & 0.00 \\
+\textsc{keyword\_map}        & 0.12 & 0.12 & 0.09 & 0.08 \\
+\textsc{tfidf}           & 0.09 & 0.07 & 0.06 & 0.05 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Context--patch overlap, vague.}\label{tab:overlap-vague}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 0.14 & 0.06 & 0.04 & 0.03 \\
+\textsc{bca\_d1}          & 0.17 & 0.10 & 0.07 & 0.06 \\
+\textsc{bca\_d5}          & 0.13 & 0.05 & 0.04 & 0.03 \\
+\textsc{bca\_no\_closure} & 0.14 & 0.06 & 0.04 & 0.04 \\
+\textsc{bca\_no\_scoring} & 0.12 & 0.05 & 0.03 & 0.03 \\
+\textsc{bm25}             & 0.10 & 0.08 & 0.05 & 0.05 \\
+\textsc{no\_retrieval}    & 0.00 & 0.00 & 0.00 & 0.00 \\
+\textsc{keyword\_map}        & 0.33 & 0.22 & 0.20 & 0.18 \\
+\textsc{tfidf}           & 0.12 & 0.10 & 0.08 & 0.09 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Mean lines changed, dev-report: all attempts vs.\ passing only.}\label{tab:patchsize}
+\smallskip
+\small
+\begin{tabular}{l cc cc}
+\toprule
+& \multicolumn{2}{c}{$\B{2\text{k}}$} & \multicolumn{2}{c}{$\B{10\text{k}}$} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Method & All & Passing & All & Passing \\
+\midrule
+\textsc{bca}              & 2.7 & 2.6 & 3.9 & 2.0 \\
+\textsc{bca\_d1}          & 2.8 & 2.0 & 5.0 & 2.2 \\
+\textsc{bca\_d5}          & 2.8 & 1.9 & 3.3 & 2.0 \\
+\textsc{bca\_no\_closure} & 3.0 & 2.0 & 6.4 & 2.5 \\
+\textsc{bca\_no\_scoring} & 3.9 & 1.8 & 3.8 & 2.1 \\
+\textsc{bm25}             & 3.3 & 1.4 & 2.7 & 1.5 \\
+\textsc{no\_retrieval}    & 1.9 & 1.2 & 1.9 & 1.2 \\
+\textsc{keyword\_map}        & 2.8 & 1.5 & 3.1 & 2.0 \\
+\textsc{tfidf}           & 2.5 & 1.3 & 2.8 & 1.8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Per-Repository Results}\label{app:per-repo-tables}
+
+Tables~\ref{tab:httpx-devreport}--\ref{tab:pydantic-vague} report pass@1
+separately for each repository.  Method rankings flip between repositories:
+on httpx, TF-IDF leads consistently on dev-report, while on pydantic-ai,
+BCA variants overtake at $\B{10\text{k}}$.  This suggests that repository
+characteristics (size, complexity, test coverage) influence which retrieval
+strategy is most effective.
+
+\begin{table}[H]
+\centering
+\caption{httpx ($N$=117), dev-report, all methods and budgets.}\label{tab:httpx-devreport}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 0.12 & 0.16 & 0.18 & 0.21 \\
+\textsc{bca\_d1}          & 0.12 & 0.13 & 0.21 & 0.21 \\
+\textsc{bca\_d5}          & 0.10 & 0.11 & 0.18 & 0.16 \\
+\textsc{bca\_no\_closure} & 0.12 & 0.17 & 0.22 & 0.22 \\
+\textsc{bca\_no\_scoring} & 0.11 & 0.11 & 0.13 & 0.13 \\
+\textsc{bm25}             & 0.15 & 0.19 & 0.21 & 0.19 \\
+\textsc{no\_retrieval}    & 0.03 & 0.03 & 0.03 & 0.03 \\
+\textsc{keyword\_map}        & 0.16 & 0.20 & 0.20 & 0.17 \\
+\textsc{tfidf}           & 0.27 & 0.28 & 0.30 & 0.27 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{pydantic-ai ($N$=128), dev-report, all methods and budgets.}\label{tab:pydantic-devreport}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 0.09 & 0.12 & 0.18 & 0.25 \\
+\textsc{bca\_d1}          & 0.11 & 0.12 & 0.20 & 0.27 \\
+\textsc{bca\_d5}          & 0.09 & 0.12 & 0.19 & 0.24 \\
+\textsc{bca\_no\_closure} & 0.10 & 0.12 & 0.18 & 0.27 \\
+\textsc{bca\_no\_scoring} & 0.08 & 0.09 & 0.11 & 0.14 \\
+\textsc{bm25}             & 0.18 & 0.19 & 0.22 & 0.20 \\
+\textsc{no\_retrieval}    & 0.02 & 0.02 & 0.02 & 0.02 \\
+\textsc{keyword\_map}        & 0.21 & 0.22 & 0.18 & 0.20 \\
+\textsc{tfidf}           & 0.16 & 0.18 & 0.20 & 0.20 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{httpx ($N$=117), dev-localized, all methods and budgets.}\label{tab:httpx-exact}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 0.56 & 0.63 & 0.70 & 0.71 \\
+\textsc{bca\_d1}          & 0.52 & 0.56 & 0.70 & 0.75 \\
+\textsc{bca\_d5}          & 0.51 & 0.64 & 0.68 & 0.69 \\
+\textsc{bca\_no\_closure} & 0.61 & 0.67 & 0.73 & 0.74 \\
+\textsc{bca\_no\_scoring} & 0.50 & 0.66 & 0.69 & 0.71 \\
+\textsc{bm25}             & 0.75 & 0.74 & 0.76 & 0.80 \\
+\textsc{no\_retrieval}    & 0.91 & 0.91 & 0.91 & 0.91 \\
+\textsc{keyword\_map}        & 0.83 & 0.84 & 0.85 & 0.85 \\
+\textsc{tfidf}           & 0.76 & 0.78 & 0.77 & 0.80 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{pydantic-ai ($N$=128), dev-localized, all methods and budgets.}\label{tab:pydantic-exact}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 0.48 & 0.65 & 0.69 & 0.68 \\
+\textsc{bca\_d1}          & 0.41 & 0.51 & 0.61 & 0.62 \\
+\textsc{bca\_d5}          & 0.58 & 0.63 & 0.64 & 0.69 \\
+\textsc{bca\_no\_closure} & 0.52 & 0.62 & 0.66 & 0.71 \\
+\textsc{bca\_no\_scoring} & 0.45 & 0.60 & 0.65 & 0.61 \\
+\textsc{bm25}             & 0.65 & 0.67 & 0.71 & 0.72 \\
+\textsc{no\_retrieval}    & 0.81 & 0.81 & 0.81 & 0.81 \\
+\textsc{keyword\_map}        & 0.62 & 0.62 & 0.66 & 0.66 \\
+\textsc{tfidf}           & 0.73 & 0.71 & 0.76 & 0.78 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{httpx ($N$=117), vague, all methods and budgets.}\label{tab:httpx-vague}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 0.04 & 0.02 & 0.00 & 0.02 \\
+\textsc{bca\_d1}          & 0.03 & 0.03 & 0.03 & 0.00 \\
+\textsc{bca\_d5}          & 0.04 & 0.02 & 0.01 & 0.02 \\
+\textsc{bca\_no\_closure} & 0.04 & 0.01 & 0.02 & 0.02 \\
+\textsc{bca\_no\_scoring} & 0.04 & 0.00 & 0.00 & 0.01 \\
+\textsc{bm25}             & 0.05 & 0.02 & 0.02 & 0.02 \\
+\textsc{no\_retrieval}    & 0.00 & 0.00 & 0.00 & 0.00 \\
+\textsc{keyword\_map}        & 0.03 & 0.02 & 0.00 & 0.02 \\
+\textsc{tfidf}           & 0.04 & 0.03 & 0.02 & 0.02 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{pydantic-ai ($N$=128), vague, all methods and budgets.}\label{tab:pydantic-vague}
+\smallskip
+\footnotesize
+\begin{tabular}{lcccc}
+\toprule
+Method & $\B{2\text{k}}$ & $\B{4\text{k}}$ & $\B{8\text{k}}$ & $\B{10\text{k}}$ \\
+\midrule
+\textsc{bca}              & 0.02 & 0.01 & 0.02 & 0.02 \\
+\textsc{bca\_d1}          & 0.01 & 0.02 & 0.04 & 0.02 \\
+\textsc{bca\_d5}          & 0.02 & 0.01 & 0.02 & 0.02 \\
+\textsc{bca\_no\_closure} & 0.02 & 0.01 & 0.02 & 0.02 \\
+\textsc{bca\_no\_scoring} & 0.02 & 0.02 & 0.02 & 0.02 \\
+\textsc{bm25}             & 0.08 & 0.08 & 0.07 & 0.09 \\
+\textsc{no\_retrieval}    & 0.00 & 0.00 & 0.00 & 0.00 \\
+\textsc{keyword\_map}        & 0.04 & 0.05 & 0.05 & 0.04 \\
+\textsc{tfidf}           & 0.02 & 0.03 & 0.04 & 0.04 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Decomposition by Mutation Type}\label{app:muttype-tables}
+
+Tables~\ref{tab:muttype-2k} and~\ref{tab:muttype-10k} report pass@1 by
+mutation operator type on dev-report at $\B{2\text{k}}$ and
+$\B{10\text{k}}$.  \texttt{none\_check\_swap} is the hardest type across
+all methods (best: 16\% at $\B{10\text{k}}$), while
+\texttt{constant\_mutation} and \texttt{handcrafted} are the easiest (up to
+50\%).
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by mutation type, dev-report at $\B{2\text{k}}$, all methods.}\label{tab:muttype-2k}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Mutation type & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+arithmetic\_swap                 & 0.11 & 0.11 & 0.11 & 0.11 & 0.22 & 0.00 & 0.00 & 0.33 & 0.22 &  9 \\
+boolean\_flip                    & 0.12 & 0.15 & 0.15 & 0.15 & 0.10 & 0.10 & 0.05 & 0.29 & 0.15 & 41 \\
+comparison\_swap                 & 0.09 & 0.11 & 0.06 & 0.11 & 0.09 & 0.09 & 0.03 & 0.09 & 0.17 & 35 \\
+condition\_inversion             & 0.12 & 0.14 & 0.09 & 0.12 & 0.05 & 0.21 & 0.05 & 0.21 & 0.30 & 43 \\
+constant\_mutation               & 0.25 & 0.20 & 0.20 & 0.20 & 0.10 & 0.35 & 0.05 & 0.30 & 0.35 & 20 \\
+handcrafted                     & 0.14 & 0.14 & 0.14 & 0.14 & 0.21 & 0.43 & 0.00 & 0.36 & 0.29 & 14 \\
+membership\_swap                 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.50 &  2 \\
+none\_check\_swap                & 0.03 & 0.03 & 0.03 & 0.03 & 0.07 & 0.12 & 0.00 & 0.10 & 0.12 & 58 \\
+return\_value\_swap              & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 &  2 \\
+value\_swap                      & 0.14 & 0.14 & 0.14 & 0.14 & 0.14 & 0.19 & 0.00 & 0.10 & 0.29 & 21 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by mutation type, dev-report at $\B{10\text{k}}$, all methods.}\label{tab:muttype-10k}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Mutation type & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+arithmetic\_swap                 & 0.11 & 0.33 & 0.11 & 0.11 & 0.11 & 0.00 & 0.00 & 0.33 & 0.22 &  9 \\
+boolean\_flip                    & 0.24 & 0.24 & 0.22 & 0.20 & 0.20 & 0.15 & 0.05 & 0.27 & 0.20 & 41 \\
+comparison\_swap                 & 0.20 & 0.11 & 0.14 & 0.26 & 0.09 & 0.20 & 0.03 & 0.09 & 0.17 & 35 \\
+condition\_inversion             & 0.26 & 0.26 & 0.26 & 0.26 & 0.12 & 0.26 & 0.05 & 0.21 & 0.23 & 43 \\
+constant\_mutation               & 0.45 & 0.45 & 0.45 & 0.50 & 0.35 & 0.45 & 0.05 & 0.30 & 0.35 & 20 \\
+handcrafted                     & 0.43 & 0.43 & 0.43 & 0.50 & 0.21 & 0.36 & 0.00 & 0.36 & 0.50 & 14 \\
+membership\_swap                 & 0.50 & 0.50 & 0.50 & 0.50 & 0.00 & 0.50 & 0.00 & 0.00 & 0.50 &  2 \\
+none\_check\_swap                & 0.12 & 0.16 & 0.09 & 0.14 & 0.09 & 0.07 & 0.00 & 0.09 & 0.14 & 58 \\
+return\_value\_swap              & 0.00 & 0.50 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.50 & 0.00 &  2 \\
+value\_swap                      & 0.24 & 0.29 & 0.14 & 0.24 & 0.05 & 0.24 & 0.00 & 0.14 & 0.38 & 21 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Conditional Bins}\label{app:conditional-bins}
+
+These tables decompose pass@1 by three conditioning variables.
+Tables~\ref{tab:bin-ident-exact}--\ref{tab:bin-ident-vague}: identifier
+density (whether the query contains code identifiers).
+Tables~\ref{tab:bin-hops-2k}--\ref{tab:bin-hops-vague}: BCA seed-to-mutation
+hop distance.
+Tables~\ref{tab:bin-size-2k}--\ref{tab:bin-size-vague}: mutation function
+size in lines.
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by identifier density, dev-localized, all methods.}\label{tab:bin-ident-exact}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Identifier density & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{2\text{k}}$}} \\
+positive & 0.50 & 0.47 & 0.55 & 0.56 & 0.47 & 0.71 & 0.81 & 0.73 & 0.77 & 150 \\
+zero     & 0.56 & 0.45 & 0.54 & 0.57 & 0.48 & 0.68 & 0.95 & 0.69 & 0.69 &  95 \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{10\text{k}}$}} \\
+positive & 0.69 & 0.72 & 0.67 & 0.72 & 0.63 & 0.78 & 0.81 & 0.79 & 0.81 & 150 \\
+zero     & 0.71 & 0.63 & 0.73 & 0.73 & 0.71 & 0.73 & 0.95 & 0.67 & 0.77 &  95 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by identifier density, dev-report, all methods. All dev-report queries have identifiers (traceback tokens).}\label{tab:bin-ident-devreport}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Identifier density & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{2\text{k}}$}} \\
+positive & 0.11 & 0.11 & 0.10 & 0.11 & 0.09 & 0.16 & 0.02 & 0.19 & 0.21 & 245 \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{10\text{k}}$}} \\
+positive & 0.23 & 0.24 & 0.20 & 0.24 & 0.13 & 0.20 & 0.02 & 0.19 & 0.23 & 245 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by identifier density, vague, all methods. Only 4 vague queries contain identifiers.}\label{tab:bin-ident-vague}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Identifier density & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{2\text{k}}$}} \\
+positive & 0.00 & 0.00 & 0.00 & 0.00 & 0.25 & 0.50 & 0.00 & 0.25 & 0.00 &   4 \\
+zero     & 0.03 & 0.02 & 0.03 & 0.03 & 0.03 & 0.06 & 0.00 & 0.03 & 0.03 & 241 \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{10\text{k}}$}} \\
+positive & 0.25 & 0.50 & 0.25 & 0.25 & 0.25 & 0.50 & 0.00 & 0.25 & 0.50 &   4 \\
+zero     & 0.02 & 0.00 & 0.01 & 0.01 & 0.01 & 0.05 & 0.00 & 0.02 & 0.02 & 241 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by hop distance, dev-report at $\B{2\text{k}}$, all methods.}\label{tab:bin-hops-2k}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Hops & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+0         & 0.15 & 0.16 & 0.13 & 0.15 & 0.13 & 0.26 & 0.04 & 0.28 & 0.30 & 135 \\
+1--2      & 0.06 & 0.06 & 0.06 & 0.06 & 0.04 & 0.04 & 0.00 & 0.08 & 0.09 &  89 \\
+3+        & 0.05 & 0.10 & 0.05 & 0.10 & 0.05 & 0.05 & 0.00 & 0.05 & 0.19 &  21 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by hop distance, dev-report at $\B{10\text{k}}$, all methods.}\label{tab:bin-hops-10k}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Hops & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+0         & 0.35 & 0.35 & 0.30 & 0.36 & 0.20 & 0.29 & 0.04 & 0.26 & 0.32 & 135 \\
+1--2      & 0.07 & 0.12 & 0.07 & 0.10 & 0.06 & 0.04 & 0.00 & 0.10 & 0.11 &  89 \\
+3+        & 0.19 & 0.10 & 0.19 & 0.14 & 0.05 & 0.24 & 0.00 & 0.10 & 0.19 &  21 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by hop distance, dev-localized, all methods. Nearly all tasks are hop-0.}\label{tab:bin-hops-exact}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Hops & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{2\text{k}}$}} \\
+0         & 0.53 & 0.46 & 0.55 & 0.57 & 0.47 & 0.70 & 0.88 & 0.72 & 0.74 & 240 \\
+1--2      & 0.50 & 0.75 & 0.75 & 0.50 & 0.50 & 0.25 & 0.00 & 0.50 & 0.75 &   4 \\
+unreachable & 0.00 & 0.00 & 0.00 & 0.00 & 1.00 & 1.00 & 0.00 & 1.00 & 1.00 &   1 \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{10\text{k}}$}} \\
+0         & 0.70 & 0.68 & 0.70 & 0.72 & 0.66 & 0.77 & 0.88 & 0.75 & 0.79 & 240 \\
+1--2      & 0.75 & 1.00 & 0.50 & 0.75 & 0.75 & 0.25 & 0.00 & 0.50 & 0.75 &   4 \\
+unreachable & 0.00 & 1.00 & 0.00 & 0.00 & 0.00 & 1.00 & 0.00 & 1.00 & 1.00 &   1 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by hop distance, vague, all methods. 89\% of tasks are unreachable from vague-query seeds.}\label{tab:bin-hops-vague}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Hops & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{2\text{k}}$}} \\
+0         & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 &   3 \\
+1--2      & 0.06 & 0.06 & 0.06 & 0.06 & 0.06 & 0.12 & 0.00 & 0.00 & 0.00 &  16 \\
+3+        & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.14 & 0.00 &   7 \\
+unreachable & 0.03 & 0.01 & 0.03 & 0.03 & 0.03 & 0.06 & 0.00 & 0.04 & 0.04 & 219 \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{10\text{k}}$}} \\
+0         & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 &   3 \\
+1--2      & 0.06 & 0.06 & 0.06 & 0.06 & 0.06 & 0.12 & 0.00 & 0.00 & 0.06 &  16 \\
+3+        & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.14 & 0.00 & 0.14 & 0.00 &   7 \\
+unreachable & 0.02 & 0.01 & 0.01 & 0.01 & 0.01 & 0.05 & 0.00 & 0.03 & 0.03 & 219 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by mutation size, dev-report at $\B{2\text{k}}$, all methods.}\label{tab:bin-size-2k}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Size (lines) & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+$<$5       & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.20 & 0.00 & 0.00 & 0.30 & 10 \\
+5--19      & 0.14 & 0.18 & 0.15 & 0.17 & 0.15 & 0.14 & 0.01 & 0.17 & 0.19 & 102 \\
+20--49     & 0.08 & 0.08 & 0.07 & 0.08 & 0.10 & 0.21 & 0.03 & 0.25 & 0.29 & 72 \\
+50--99     & 0.11 & 0.08 & 0.08 & 0.08 & 0.00 & 0.17 & 0.06 & 0.19 & 0.13 & 53 \\
+100+       & 0.00 & 0.00 & 0.00 & 0.00 & 0.12 & 0.00 & 0.00 & 0.12 & 0.25 &  8 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by mutation size, dev-report at $\B{10\text{k}}$, all methods.}\label{tab:bin-size-10k}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Size (lines) & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+$<$5       & 0.30 & 0.30 & 0.30 & 0.20 & 0.10 & 0.40 & 0.00 & 0.10 & 0.30 & 10 \\
+5--19      & 0.25 & 0.22 & 0.19 & 0.25 & 0.10 & 0.17 & 0.01 & 0.17 & 0.25 & 102 \\
+20--49     & 0.25 & 0.31 & 0.26 & 0.28 & 0.14 & 0.22 & 0.03 & 0.24 & 0.26 & 72 \\
+50--99     & 0.19 & 0.23 & 0.15 & 0.23 & 0.23 & 0.19 & 0.06 & 0.19 & 0.15 & 53 \\
+100+       & 0.12 & 0.12 & 0.12 & 0.00 & 0.00 & 0.12 & 0.00 & 0.12 & 0.25 &  8 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by mutation size, dev-localized, all methods.}\label{tab:bin-size-exact}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Size (lines) & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{2\text{k}}$}} \\
+$<$5       & 0.30 & 0.60 & 0.40 & 0.60 & 0.50 & 0.70 & 0.70 & 0.50 & 0.70 & 10 \\
+5--19      & 0.55 & 0.50 & 0.54 & 0.56 & 0.48 & 0.68 & 0.82 & 0.67 & 0.71 & 102 \\
+20--49     & 0.72 & 0.60 & 0.67 & 0.64 & 0.62 & 0.79 & 0.90 & 0.79 & 0.88 & 72 \\
+50--99     & 0.26 & 0.25 & 0.45 & 0.47 & 0.26 & 0.62 & 0.89 & 0.77 & 0.70 & 53 \\
+100+       & 0.38 & 0.12 & 0.38 & 0.50 & 0.50 & 0.62 & 1.00 & 0.62 & 0.38 &  8 \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{10\text{k}}$}} \\
+$<$5       & 0.70 & 0.70 & 0.60 & 0.60 & 0.50 & 0.60 & 0.70 & 0.70 & 0.70 & 10 \\
+5--19      & 0.67 & 0.67 & 0.69 & 0.74 & 0.68 & 0.64 & 0.82 & 0.70 & 0.75 & 102 \\
+20--49     & 0.88 & 0.75 & 0.88 & 0.79 & 0.85 & 0.89 & 0.90 & 0.79 & 0.88 & 72 \\
+50--99     & 0.47 & 0.64 & 0.43 & 0.66 & 0.36 & 0.87 & 0.89 & 0.77 & 0.83 & 53 \\
+100+       & 0.88 & 0.62 & 0.88 & 0.50 & 0.88 & 0.62 & 1.00 & 0.88 & 0.38 &  8 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Pass@1 by mutation size, vague, all methods.}\label{tab:bin-size-vague}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l ccccccccc r}
+\toprule
+Size (lines) & bca & bca\_d1 & bca\_d5 & bca\_nc & bca\_ns & bm25 & no\_ret & kw\_map & tfidf & $N$ \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{2\text{k}}$}} \\
+$<$5       & 0.10 & 0.00 & 0.10 & 0.10 & 0.10 & 0.30 & 0.00 & 0.00 & 0.10 & 10 \\
+5--19      & 0.03 & 0.01 & 0.03 & 0.03 & 0.04 & 0.11 & 0.00 & 0.06 & 0.05 & 102 \\
+20--49     & 0.03 & 0.03 & 0.03 & 0.03 & 0.03 & 0.01 & 0.00 & 0.03 & 0.01 & 72 \\
+50--99     & 0.02 & 0.02 & 0.02 & 0.02 & 0.02 & 0.02 & 0.00 & 0.02 & 0.02 & 53 \\
+100+       & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 &  8 \\
+\midrule
+\multicolumn{11}{l}{\textit{$\B{10\text{k}}$}} \\
+$<$5       & 0.10 & 0.00 & 0.10 & 0.10 & 0.00 & 0.30 & 0.00 & 0.20 & 0.10 & 10 \\
+5--19      & 0.03 & 0.02 & 0.02 & 0.02 & 0.03 & 0.09 & 0.00 & 0.04 & 0.05 & 102 \\
+20--49     & 0.01 & 0.01 & 0.01 & 0.01 & 0.01 & 0.01 & 0.00 & 0.01 & 0.01 & 72 \\
+50--99     & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 53 \\
+100+       & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 & 0.00 &  8 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Routing Details}\label{app:routing-details}
+
+This appendix reports additional routing tables and coefficient summaries that are omitted from the main body.
+Dev-localized results show little headroom for routing (the majority baseline is already high), while vague results are high-variance due to small $N$.
+
+\begin{table}[H]
+\centering
+\caption{Router comparison on \textbf{dev-localized} tasks (LOO-CV). Baselines and $N$ are reported per router because candidate sets differ.}
+\label{tab:router-localized}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l r r r r r r r r r r}
+\toprule
+& \multicolumn{5}{c}{Router~A (9 candidates)} & \multicolumn{5}{c}{Router~B (8 candidates)} \\
+\cmidrule(lr){2-6} \cmidrule(lr){7-11}
+Budget & Maj(A) & Rnd(A) & Smart & Safest & $N$(A) & Maj(B) & Rnd(B) & Smart & Safest & $N$(B) \\
+\midrule
+\B{2\text{k}}  & 88.7\% & 64.0\% & 88.2\% \small{(-3.7\%)} & 88.7\% \small{(+0.0\%)} & 238 & 78.1\% & 62.2\% & 78.1\% \small{(+0.0\%)} & 78.1\% \small{(+0.0\%)} & 233 \\
+\B{4\text{k}}  & 88.3\% & 69.7\% & 88.3\% \small{(+0.0\%)} & 88.3\% \small{(+0.0\%)} & 239 & 78.8\% & 69.7\% & 78.8\% \small{(+0.0\%)} & 79.2\% \small{(+2.0\%)} & 231 \\
+\B{8\text{k}}  & 88.7\% & 74.1\% & 88.7\% \small{(+0.0\%)} & 88.7\% \small{(+0.0\%)} & 238 & 79.9\% & 73.5\% & 79.9\% \small{(+0.0\%)} & 79.9\% \small{(+0.0\%)} & 234 \\
+\B{10\text{k}} & 88.3\% & 75.3\% & 88.3\% \small{(+0.0\%)} & 88.3\% \small{(+0.0\%)} & 239 & 82.6\% & 74.9\% & 82.6\% \small{(+0.0\%)} & 82.1\% \small{(-2.4\%)} & 235 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Router comparison on \textbf{vague} tasks (LOO-CV). Baselines and $N$ are reported per router; small $N$ limits statistical power.}
+\label{tab:router-vague}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l r r r r r r r r r r}
+\toprule
+& \multicolumn{5}{c}{Router~A (9 candidates)} & \multicolumn{5}{c}{Router~B (8 candidates)} \\
+\cmidrule(lr){2-6} \cmidrule(lr){7-11}
+Budget & Maj(A) & Rnd(A) & Smart & Safest & $N$(A) & Maj(B) & Rnd(B) & Smart & Safest & $N$(B) \\
+\midrule
+\B{2\text{k}}  & 80.0\% & 36.7\% & 75.0\% \small{(-25.0\%)} & 75.0\% \small{(-25.0\%)} & 20 & 80.0\% & 41.2\% & 75.0\% \small{(-25.0\%)} & 75.0\% \small{(-25.0\%)} & 20 \\
+\B{4\text{k}}  & 70.6\% & 29.4\% & 64.7\% \small{(-20.0\%)} & 64.7\% \small{(-20.0\%)} & 17 & 70.6\% & 33.1\% & 70.6\% \small{(+0.0\%)}  & 70.6\% \small{(+0.0\%)}  & 17 \\
+\B{8\text{k}}  & 68.8\% & 31.2\% & 68.8\% \small{(+0.0\%)}  & 68.8\% \small{(+0.0\%)}  & 16 & 68.8\% & 35.2\% & 68.8\% \small{(+0.0\%)}  & 75.0\% \small{(+20.0\%)} & 16 \\
+\B{10\text{k}} & 86.7\% & 34.8\% & 80.0\% \small{(-50.0\%)} & 80.0\% \small{(-50.0\%)} & 15 & 86.7\% & 39.2\% & 73.3\% \small{(-100.0\%)} & 73.3\% \small{(-100.0\%)} & 15 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Post-hoc logistic regression router (LOO-CV). Gap is relative gain/loss vs.\ best single method.}
+\label{tab:posthoc-router}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l l r r r l l}
+\toprule
+Tier & Budget & $n$ & Best Single & Router & Gap & Top Features (|coeff|) \\
+\midrule
+\multirow{4}{*}{Dev-report}
+ & \B{2\text{k}}  & 86  & \textsc{tfidf} (60.5\%) & 64.0\% & +8.8\%  & entity\_count\_mapped (0.91), query\_id\_density (0.49), graph\_nodes\_log (0.41) \\
+ & \B{4\text{k}}  & 96  & \textsc{tfidf} (58.3\%) & 61.5\% & +7.5\%  & query\_id\_density (1.22), graph\_nodes\_log (0.66), entity\_count\_mapped (0.32) \\
+ & \B{8\text{k}}  & 106 & \textsc{tfidf} (57.5\%) & 59.4\% & +4.4\%  & graph\_nodes\_log (0.84), entity\_count\_mapped (0.70), query\_id\_density (0.48) \\
+ & \B{10\text{k}} & 102 & \textsc{bca\_d1} (58.8\%) & 56.9\% & $-$4.8\% & entity\_count\_mapped (0.81), query\_id\_density (0.78), graph\_nodes\_log (0.46) \\
+\midrule
+\multirow{4}{*}{Exact}
+ & \B{2\text{k}}  & 238 & \textsc{no\_retrieval} (88.7\%) & 87.8\% & $-$7.4\% & retrieval\_eff\_cands (1.03), retrieval\_top1 (0.66), softmax\_entropy (0.63) \\
+ & \B{4\text{k}}  & 239 & \textsc{no\_retrieval} (88.3\%) & 89.5\% & +10.7\% & entity\_count\_mapped (0.70), retrieval\_top1 (0.53) \\
+ & \B{8\text{k}}  & 238 & \textsc{no\_retrieval} (88.7\%) & 88.7\% & 0\%      & entity\_count\_mapped (0.74), retrieval\_top1 (0.44) \\
+ & \B{10\text{k}} & 239 & \textsc{no\_retrieval} (88.3\%) & 88.3\% & 0\%      & entity\_count\_mapped (0.70), retrieval\_top1 (0.56) \\
+\midrule
+\multirow{4}{*}{Vague}
+ & \B{2\text{k}}  & 20 & \textsc{bm25} (80.0\%) & 75.0\% & $-$25.0\% & --- \\
+ & \B{4\text{k}}  & 17 & \textsc{bm25} (70.6\%) & 52.9\% & $-$60.0\% & --- \\
+ & \B{8\text{k}}  & 16 & \textsc{bm25} (68.8\%) & 50.0\% & $-$60.0\% & --- \\
+ & \B{10\text{k}} & 15 & \textsc{bm25} (86.7\%) & 80.0\% & $-$50.0\% & --- \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Top Router~B features on dev-report tasks (absolute coefficient magnitude).}
+\label{tab:feature-importance}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l l}
+\toprule
+Budget & Top Features (|coeff|) \\
+\midrule
+\B{2\text{k}} & \texttt{bca\_no\_scoring\_entropy} (1.015), \texttt{graph\_node\_count\_log} (0.954), \texttt{bm25\_top1\_score} (0.767), \texttt{bca\_d1\_budget\_util} (0.664), \texttt{vector\_top1\_score} (0.643) \\
+\B{4\text{k}} & \texttt{bm25\_entropy} (0.974), \texttt{bca\_no\_scoring\_entropy} (0.909), \texttt{vector\_top1\_score} (0.875), \texttt{bca\_d1\_budget\_util} (0.863), \texttt{bca\_no\_scoring\_top1\_score} (0.842) \\
+\B{8\text{k}} & \texttt{graph\_node\_count\_log} (0.878), \texttt{bca\_no\_closure\_budget\_util} (0.750), \texttt{vector\_top1\_score} (0.736), \texttt{bca\_no\_scoring\_top1\_score} (0.726), \texttt{bca\_no\_scoring\_entropy} (0.668) \\
+\B{10\text{k}} & \texttt{bm25\_top1\_score} (1.004), \texttt{vector\_top1\_score} (0.819), \texttt{vector\_entropy} (0.801), \texttt{bca\_d1\_budget\_util} (0.760), \texttt{vector\_budget\_util} (0.685) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Top Router~A features on dev-report tasks (absolute coefficient magnitude).}
+\label{tab:feature-importance-a}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l l}
+\toprule
+Budget & Top Features (|coeff|) \\
+\midrule
+\B{2\text{k}}  & \texttt{query\_ident\_density} (0.888), \texttt{entity\_count\_mapped} (0.850), \texttt{graph\_node\_count\_log} (0.514) \\
+\B{4\text{k}}  & \texttt{entity\_count\_mapped} (0.671), \texttt{graph\_node\_count\_log} (0.585), \texttt{query\_ident\_density} (0.235) \\
+\B{8\text{k}}  & \texttt{query\_ident\_density} (0.962), \texttt{entity\_count\_mapped} (0.941), \texttt{graph\_node\_count\_log} (0.864) \\
+\B{10\text{k}} & \texttt{query\_ident\_density} (1.425), \texttt{entity\_count\_mapped} (0.897), \texttt{graph\_node\_count\_log} (0.760) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Cost and Latency Details}\label{app:cost-latency}
+
+Unless otherwise noted, costs use \texttt{gpt-4o-mini-2024-07-18} pricing (\$0.15/M input tokens, \$0.60/M output tokens).
+Latency is decomposed into assembly (retrieval + context construction), LLM inference, and test execution.
+
+\begin{table}[H]
+\centering
+\caption{Cost per solved task (\$) on dev-report, with total solves across all budgets.}
+\label{tab:cost-per-solved}
+\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l rrrr r}
+\toprule
+Method & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} & Total Solves \\
+\midrule
+\textsc{bca}             & 0.00038 & 0.00064 & 0.00118 & 0.00145 & 161 \\
+\textsc{bca\_d1}         & 0.00037 & 0.00063 & 0.00114 & 0.00142 & 169 \\
+\textsc{bca\_d5}         & 0.00038 & 0.00063 & 0.00119 & 0.00145 & 148 \\
+\textsc{bca\_no\_closure} & 0.00038 & 0.00064 & 0.00118 & 0.00144 & 172 \\
+\textsc{bca\_no\_scoring} & 0.00039 & 0.00066 & 0.00122 & 0.00144 & 109 \\
+\textsc{bm25}            & 0.00045 & 0.00074 & 0.00130 & 0.00155 & 186 \\
+\textsc{no\_retrieval}   & 0.00010 & 0.00010 & 0.00010 & 0.00010 & 24 \\
+\textsc{keyword\_map}       & 0.00041 & 0.00072 & 0.00128 & 0.00156 & 189 \\
+\textsc{tfidf}          & 0.00043 & 0.00069 & 0.00125 & 0.00151 & 226 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\textsc{tfidf} achieves the most total solves (226) while maintaining a cost-per-solve comparable to BCA variants.
+\textsc{no\_retrieval} is cheapest per solve but solves few tasks overall, making it a poor choice outside dev-localized queries.
+
+\begin{table}[H]
+\centering
+\caption{Assembly time (ms) by method and budget across tiers.}
+\label{tab:assembly-time}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l rrrr rrrr rrrr}
+\toprule
+& \multicolumn{4}{c}{Dev-report} & \multicolumn{4}{c}{Exact} & \multicolumn{4}{c}{Vague} \\
+\cmidrule(lr){2-5} \cmidrule(lr){6-9} \cmidrule(lr){10-13}
+Method & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} \\
+\midrule
+\textsc{bca}             & 169 & 123 & 113 & 145 & 174 & 140 & 146 & 154 & 144 & 142 & 145 & 149 \\
+\textsc{bca\_d1}         & 159 & 112 &  96 & 150 & 157 & 162 & 175 & 183 & 126 & 132 & 170 & 193 \\
+\textsc{bca\_d5}         & 177 & 128 & 120 & 143 & 182 & 163 & 165 & 172 & 166 & 163 & 165 & 176 \\
+\textsc{bca\_no\_closure} & 157 & 115 & 102 & 132 & 150 & 141 & 143 & 150 & 129 & 135 & 139 & 146 \\
+\textsc{bca\_no\_scoring} & 217 & 135 & 159 & 118 & 141 & 132 & 141 & 143 & 136 & 141 & 142 & 144 \\
+\textsc{bm25}            & 247 & 252 & 264 & 266 & 135 & 136 & 146 & 152 & 129 & 133 & 146 & 157 \\
+\textsc{no\_retrieval}   &   0 &   0 &   0 &   0 &   0 &   0 &   0 &   0 &   0 &   0 &   0 &   0 \\
+\textsc{keyword\_map}       &  56 &  57 &  58 &  59 &  26 &  26 &  27 &  27 &  27 &  27 &  28 &  28 \\
+\textsc{tfidf}          & 116 & 110 & 115 & 112 & 122 & 115 & 118 & 119 & 122 & 119 & 119 & 114 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{LLM inference time (ms) by method and budget across tiers.}
+\label{tab:llm-time}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l rrrr rrrr rrrr}
+\toprule
+& \multicolumn{4}{c}{Dev-report} & \multicolumn{4}{c}{Exact} & \multicolumn{4}{c}{Vague} \\
+\cmidrule(lr){2-5} \cmidrule(lr){6-9} \cmidrule(lr){10-13}
+Method & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} \\
+\midrule
+\textsc{bca}             & 2032 & 2698 & 4644 & 5134 & 1545 & 1806 & 3985 & 4714 & 2071 & 2848 & 5427 & 6054 \\
+\textsc{bca\_d1}         & 1999 & 2575 & 4731 & 5959 & 1801 & 1882 & 3564 & 4731 & 2044 & 2535 & 4834 & 6032 \\
+\textsc{bca\_d5}         & 2025 & 2610 & 4588 & 4891 & 1843 & 1928 & 4196 & 4604 & 2056 & 2698 & 5697 & 6519 \\
+\textsc{bca\_no\_closure} & 2083 & 2651 & 4163 & 5429 & 1505 & 1823 & 3783 & 4689 & 2306 & 2846 & 5544 & 6996 \\
+\textsc{bca\_no\_scoring} & 2378 & 2428 & 4586 & 5212 & 1539 & 1919 & 3851 & 4781 & 2189 & 2897 & 6250 & 6680 \\
+\textsc{bm25}            & 2306 & 2420 & 3235 & 3318 & 1523 & 1657 & 2101 & 2329 & 1925 & 2647 & 3093 & 3311 \\
+\textsc{no\_retrieval}   & 1550 & 1550 & 1550 & 1550 & 1090 & 1090 & 1090 & 1090 & 1426 & 1426 & 1426 & 1426 \\
+\textsc{keyword\_map}       & 2097 & 2381 & 3965 & 4148 & 1742 & 1684 & 2661 & 3023 & 2466 & 2583 & 4414 & 4689 \\
+\textsc{tfidf}          & 2036 & 2203 & 3133 & 3406 & 1402 & 1497 & 2283 & 2236 & 2098 & 2842 & 3683 & 4155 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Test execution time (ms) on dev-report tasks.}
+\label{tab:test-time}
+\footnotesize
+\begin{tabular}{l rrrr}
+\toprule
+Method & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} \\
+\midrule
+\textsc{bca}             & 3303 & 2325 & 2225 & 3069 \\
+\textsc{bca\_d1}         & 3052 & 3022 & 2842 & 3135 \\
+\textsc{bca\_d5}         & 2800 & 1734 & 2039 & 2559 \\
+\textsc{bca\_no\_closure} & 3052 & 2361 & 2377 & 2400 \\
+\textsc{bca\_no\_scoring} & 2460 & 2734 & 2240 & 2078 \\
+\textsc{bm25}            & 2830 & 2511 & 2545 & 2744 \\
+\textsc{no\_retrieval}   &  844 &  844 &  844 &  844 \\
+\textsc{keyword\_map}       & 2937 & 3157 & 2898 & 2504 \\
+\textsc{tfidf}          & 3328 & 3359 & 3294 & 3315 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Key observations.}
+Assembly time is negligible ($<$300\,ms) relative to LLM inference (seconds) and test execution (0.8--3.4\,s).
+\textsc{keyword\_map} has the fastest assembly among retrieval methods (26--59\,ms) because it uses a precomputed signature index with lightweight keyword matching, while \textsc{bm25} is slower on dev-report due to full-index scoring.
+LLM time dominates the end-to-end pipeline and scales with input token count, confirming that budget is the primary latency lever.
+
+\begin{table}[H]
+\centering
+\caption{Mean total LLM tokens (input + output) by method and budget across tiers.}
+\label{tab:tokens}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{l rrrr rrrr rrrr}
+\toprule
+& \multicolumn{4}{c}{Dev-report} & \multicolumn{4}{c}{Exact} & \multicolumn{4}{c}{Vague} \\
+\cmidrule(lr){2-5} \cmidrule(lr){6-9} \cmidrule(lr){10-13}
+Method & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} & \B{2\text{k}} & \B{4\text{k}} & \B{8\text{k}} & \B{10\text{k}} \\
+\midrule
+\textsc{bca}             & 2327 & 4143 & 7709 &  9482 & 2274 & 4241 & 8115 & 10040 & 2231 & 4189 & 8035 &  9938 \\
+\textsc{bca\_d1}         & 2313 & 4094 & 7476 &  9236 & 2183 & 3965 & 7409 &  9094 & 2153 & 3922 & 7369 &  9057 \\
+\textsc{bca\_d5}         & 2336 & 4176 & 7757 &  9562 & 2335 & 4374 & 8348 & 10332 & 2252 & 4288 & 8185 & 10135 \\
+\textsc{bca\_no\_closure} & 2332 & 4152 & 7723 &  9526 & 2280 & 4295 & 8196 & 10120 & 2249 & 4243 & 8071 &  9981 \\
+\textsc{bca\_no\_scoring} & 2414 & 4212 & 7874 &  9667 & 2322 & 4285 & 8142 & 10044 & 2307 & 4321 & 8211 & 10091 \\
+\textsc{bm25}            & 3144 & 5112 & 8752 & 10942 & 2619 & 4545 & 8003 &  9853 & 2331 & 4074 & 7750 &  9596 \\
+\textsc{no\_retrieval}   &  565 &  565 &  565 &   565 &  317 &  317 &  317 &   317 &  303 &  303 &  303 &   303 \\
+\textsc{keyword\_map}       & 2531 & 4591 & 8390 & 10095 & 2302 & 4355 & 8267 & 10125 & 2335 & 4356 & 8168 & 10051 \\
+\textsc{tfidf}          & 2767 & 4598 & 8182 & 10042 & 2418 & 4320 & 8030 &  9885 & 2361 & 4239 & 8023 &  9792 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+All retrieval methods utilize the budget effectively, with mean token counts close to the nominal budget.
+\textsc{bca\_d1} consistently uses the fewest tokens among BCA variants due to its shallow traversal depth, while \textsc{bm25} tends to overshoot on dev-report tasks because keyword-matched snippets are less amenable to precise budget trimming.
+\textsc{no\_retrieval} uses only 303--565 tokens (the issue description alone), independent of budget.
+
+\subsection{Tokenization Budget Audit}\label{app:token-audit}
+
+Our context budgets $B$ are enforced using the \texttt{TokenEstimator} heuristic during packing
+(\texttt{tokens\_used} in the artifacts), which targets a maximum estimated context size.  The OpenAI API
+also returns the actual tokenizer-based prompt size (\texttt{llm\_input\_tokens}), which includes the query
+text and prompt template in addition to the retrieved context.
+
+To isolate the context contribution in real tokens without rerunning the benchmark, we compute an
+\emph{approximate actual context token count} per attempt:
+\[
+  t_{\text{ctx}}^{\text{actual}} \;=\;
+  \texttt{llm\_input\_tokens}(\text{method})
+  \;-\;
+  \texttt{llm\_input\_tokens}(\textsc{no\_retrieval}),
+\]
+using the matched \textsc{no\_retrieval} attempt for the same task and query tier.  This subtracts query
+length and prompt-template overhead, leaving an estimate of how many real tokenizer tokens were consumed
+by the retrieved context.  Across all non-ceiling attempts, the correlation between estimated and
+approximate-actual context tokens is 0.91.
+
+Table~\ref{tab:token-audit-devreport} summarizes $t_{\text{ctx}}^{\text{actual}}/B$ for the dev-report tier.
+Estimated budgets are generally conservative for BCA variants ($\approx$0.86--0.89$\times B$ on average),
+but can under-estimate tokenizer cost for lexical methods, especially BM25 (p95 up to 2.00$\times B$ at
+$\B{2\text{k}}$ and 1.56$\times B$ at $\B{10\text{k}}$).
+
+\begin{table*}[tbp]
+\centering
+\caption{Dev-report tokenization audit: mean and p95 of approximate actual context tokens relative to the nominal budget $B$. Each entry is $\text{mean}(t_{\text{ctx}}^{\text{actual}}/B)$ with p95 in parentheses.}
+\label{tab:token-audit-devreport}
+\smallskip
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+Budget & \textsc{bca} & \textsc{bca\_d1} & \textsc{bca\_no\_closure} & \textsc{tfidf} & \textsc{keyword\_map} & \textsc{bm25} \\
+\midrule
+\B{2\text{k}}  & 0.87 (0.97) & 0.87 (0.96) & 0.88 (0.98) & 1.10 (1.61) & 0.98 (1.16) & 1.28 (2.00) \\
+\B{4\text{k}}  & 0.89 (0.99) & 0.88 (0.98) & 0.89 (1.00) & 1.01 (1.36) & 1.00 (1.26) & 1.13 (1.59) \\
+\B{8\text{k}}  & 0.89 (0.99) & 0.86 (0.94) & 0.89 (1.00) & 0.95 (1.17) & 0.97 (1.22) & 1.02 (1.35) \\
+\B{10\text{k}} & 0.89 (0.99) & 0.86 (0.95) & 0.89 (1.02) & 0.95 (1.14) & 0.95 (1.20) & 1.04 (1.56) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+Budget overshoots (where $t_{\text{ctx}}^{\text{actual}} > B$) are common for some methods due to the
+estimator/tokenizer mismatch; on dev-report, the overshoot rate ranges from 0--9\% for BCA variants,
+37--45\% for TF-IDF, 42--52\% for \textsc{keyword\_map}, and 43--57\% for BM25 across budgets.
+Rare catastrophic overshoots occur for BM25 on dev-report (11/980 attempts had
+$t_{\text{ctx}}^{\text{actual}} > \max(2B, B+5{,}000)$), producing extremely large prompts; excluding these
+attempts changes BM25 dev-report pass@1 by at most +0.3~percentage points across budgets.
+
+\begin{table}[H]
+\centering
+\caption{Total benchmark cost by task tier.}
+\label{tab:cost-total}
+\begin{tabular}{l r r r}
+\toprule
+Tier & Attempts & Cost & \% of Total \\
+\midrule
+Exact       & 8{,}820 & \$7.48  & 32.9\% \\
+Dev-report  & 8{,}820 & \$7.66  & 33.7\% \\
+Vague       & 8{,}820 & \$7.57  & 33.3\% \\
+\midrule
+\textbf{Total} & \textbf{26{,}460} & \textbf{\$22.71} & 100\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The cost parity across tiers reflects the fixed task count and balanced experimental design.
+This table excludes the privileged \textsc{target\_file} ceiling; including it adds \$1.44 (total \$24.15 across 29{,}400 attempts).
+
+\subsection{Context Efficiency}\label{app:efficiency}
+
+Table~\ref{tab:efficiency} reports the number of code symbols per 1{,}000
+tokens at $\B{10\text{k}}$.  Higher density does not imply higher pass@1;
+\textsc{keyword\_map} has the lowest density but strong performance because
+function signatures are information-dense.
+
+\begin{table}[H]
+\centering
+\caption{Symbols per 1{,}000 tokens at $\B{10\text{k}}$.}\label{tab:efficiency}
+\smallskip
+\footnotesize
+\begin{tabular}{lccc}
+\toprule
+Method & Dev-localized & Dev-report & Vague \\
+\midrule
+\textsc{bca\_d5}        & 15.3 & 8.1 & 13.5 \\
+\textsc{bca\_no\_closure} & 14.8 & 8.1 & 13.7 \\
+\textsc{bca} ($d$=3)     & 11.9 & 7.2 & 10.9 \\
+\textsc{bm25}           &  9.4 & 9.2 &  9.5 \\
+\textsc{bca\_d1}        &  5.5 & 5.3 &  5.2 \\
+\textsc{tfidf}         &  5.0 & 7.9 &  3.8 \\
+\textsc{keyword\_map}      &  2.0 & 1.2 &  1.5 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

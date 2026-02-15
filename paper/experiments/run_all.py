@@ -24,7 +24,7 @@ def aggregate_baselines(results: list[BaselineResult]) -> str:
     for r in results:
         groups[(r.method, r.budget)].append(r)
 
-    methods = ["grep", "bm25", "repo_map", "unweighted_bfs", "bca"]
+    methods = ["grep", "bm25", "keyword_map", "unweighted_bfs", "bca"]
     budgets = sorted(set(r.budget for r in results))
 
     lines = []
@@ -212,7 +212,7 @@ def generate_latex_baseline_table(results: list[BaselineResult]) -> str:
     methods = [
         ("grep", "Full-file grep"),
         ("bm25", "BM25"),
-        ("repo_map", "Repo map"),
+        ("keyword_map", "Keyword map"),
         ("unweighted_bfs", "Unweighted BFS"),
         ("bca", "BCA (ours)"),
     ]

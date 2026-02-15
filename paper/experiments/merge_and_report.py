@@ -391,7 +391,7 @@ def main():
     parser.add_argument("--budgets", default="2000,4000,8000,10000",
                         help="Comma-separated budgets")
     parser.add_argument("--methods",
-                        default="no_retrieval,bm25,vector,repo_map,bca_d1,bca,bca_d5,bca_no_closure,bca_no_scoring,target_file")
+                        default="no_retrieval,bm25,vector,keyword_map,bca_d1,bca,bca_d5,bca_no_closure,bca_no_scoring,target_file")
     parser.add_argument("--model", default="gpt-4o-mini-2024-07-18")
     parser.add_argument("--provider", default="openai")
     parser.add_argument(
