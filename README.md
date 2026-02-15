@@ -19,7 +19,7 @@ Given a bug and a token budget, how should you pick which code to show the LLM? 
 
 ```bash
 pip install -e ".[dev]"
-pip install matplotlib   # for figure generation
+pip install matplotlib
 pytest tests/ -v
 ```
 
