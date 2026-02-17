@@ -1,6 +1,6 @@
 # Budgeted Context Assembly for LLM Code Repair
 
-Benchmark and code for studying context assembly methods under token budgets for LLM-based code repair.
+Benchmark and code for studying context assembly methods under token budgets for LLM-based code repair. We try and treat LLM-based code repair as a sub-modular optimization problem (Knapsack problem to be precise).
 
 ## What this is
 
