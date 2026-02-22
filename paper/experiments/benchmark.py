@@ -729,7 +729,7 @@ def assemble_embedding(
         elapsed = (time.time() - start) * 1000
         return ("", 0, 0, 0, round(elapsed, 1))
 
-    scores = _embedding_score_openai(task, symbols)
+    scores = _embedding_score_openai(task, symbols, cache_key=str(repo_path))
 
     # Capture positive scores for Router B confidence features
     _last_retrieval_scores = sorted([s for s in scores if s > 0], reverse=True)[:50]
@@ -775,48 +775,74 @@ def assemble_embedding(
     return (context, tokens_used, syms_selected, len(files), round(elapsed, 1))
 
 
-def _embedding_score_openai(query_text: str, symbols: list[dict]) -> list[float]:
-    """Score symbols using OpenAI text-embedding-3-small."""
-    import math
+# Corpus embedding cache: repo_path → (symbol_ids, numpy matrix)
+_corpus_embedding_cache: dict[str, tuple[list[str], object]] = {}
 
+
+def _embedding_score_openai(
+    query_text: str, symbols: list[dict], *, cache_key: str = "",
+) -> list[float]:
+    """Score symbols using OpenAI text-embedding-3-small.
+
+    When *cache_key* is provided (typically str(repo_path)), corpus embeddings
+    are computed once and reused for subsequent queries against the same repo.
+    Only the query embedding is re-computed each call.  The cache stores
+    symbol IDs alongside embeddings and verifies alignment on every hit;
+    a mismatch triggers a fresh embedding.
+    """
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
         print("  WARNING: OPENAI_API_KEY not set, falling back to TF-IDF for embedding")
         return _vector_score_tfidf(query_text, symbols)
 
     try:
+        import numpy as np
         from openai import OpenAI
+
         client = OpenAI(api_key=api_key)
 
-        texts = [s["text"] for s in symbols]
-        # Batch embed (API limit ~2048 inputs per call)
-        all_embeddings = []
-        batch_size = 512
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i + batch_size]
-            resp = client.embeddings.create(
-                model="text-embedding-3-small",
-                input=batch,
-            )
-            all_embeddings.extend([d.embedding for d in resp.data])
+        current_ids = [s["id"] for s in symbols]
 
-        # Embed query
+        # --- Corpus embeddings (cached per repo, verified by symbol IDs) ---
+        cache_hit = False
+        if cache_key and cache_key in _corpus_embedding_cache:
+            cached_ids, corpus_matrix = _corpus_embedding_cache[cache_key]
+            if cached_ids == current_ids:
+                cache_hit = True
+            else:
+                print("    [embedding] Symbol order changed — re-embedding corpus")
+
+        if not cache_hit:
+            texts = [s["text"] for s in symbols]
+            raw_embeddings: list[list[float]] = []
+            batch_size = 512
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i : i + batch_size]
+                resp = client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=batch,
+                )
+                raw_embeddings.extend([d.embedding for d in resp.data])
+            # Store as numpy matrix (n_symbols × dim)
+            corpus_matrix = np.array(raw_embeddings, dtype=np.float32)
+            if cache_key:
+                _corpus_embedding_cache[cache_key] = (current_ids, corpus_matrix)
+                print(
+                    f"    [embedding] Cached {corpus_matrix.shape[0]} corpus "
+                    f"embeddings ({corpus_matrix.shape[1]}d)"
+                )
+
+        # --- Query embedding (always fresh) ---
         q_resp = client.embeddings.create(
             model="text-embedding-3-small",
             input=[query_text],
         )
-        q_emb = q_resp.data[0].embedding
+        q_vec = np.array(q_resp.data[0].embedding, dtype=np.float32)
 
-        # Cosine similarity
-        def cosine(a, b):
-            dot = sum(x * y for x, y in zip(a, b))
-            na = math.sqrt(sum(x * x for x in a))
-            nb = math.sqrt(sum(x * x for x in b))
-            if na == 0 or nb == 0:
-                return 0.0
-            return dot / (na * nb)
-
-        return [cosine(q_emb, emb) for emb in all_embeddings]
+        # --- Cosine similarity via dot product ---
+        # OpenAI embeddings are L2-normalized, so dot product = cosine sim
+        scores = (corpus_matrix @ q_vec).tolist()
+        return scores
 
     except Exception as e:
         print(f"  WARNING: OpenAI embedding failed ({e}), falling back to TF-IDF")
