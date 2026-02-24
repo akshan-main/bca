@@ -52,7 +52,7 @@ python paper/experiments/benchmark.py \
   --tasks-file paper/experiments/eval_tasks_full.jsonl \
   --repos-dir /path/to/repos \
   --budgets 2000,4000,8000,10000 \
-  --methods no_retrieval,bm25,vector,keyword_map,bca_d1,bca,bca_d5,bca_no_closure,bca_no_scoring,target_file \
+  --methods no_retrieval,bm25,vector,embedding,keyword_map,bca_d1,bca,bca_d5,bca_no_closure,bca_no_scoring,target_file \
   --query-types exact,vague,dev_report \
   --output-dir paper/results/my_run
 ```

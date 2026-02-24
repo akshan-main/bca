@@ -3,12 +3,12 @@
 
 Router A ("Choose-first"): Uses only query and repo features available
     BEFORE running any retrieval method. No retrieval metrics, no mutation
-    features (deployment leakage). Candidates: all 9 non-ceiling methods
+    features (deployment leakage). Candidates: all 10 non-ceiling methods
     including no_retrieval.
 
 Router B ("Dry-run then choose"): Runs all retrieval methods locally
     (no LLM call), computes confidence metrics per method, then picks
-    the best. Candidates: 8 retrieval methods (no_retrieval excluded).
+    the best. Candidates: 9 retrieval methods (no_retrieval excluded).
     Features: Router A features + per-method {top1_score, budget_util, entropy}.
 
 Both use LOO-CV logistic regression. Evaluation: router picks one method,
@@ -30,6 +30,7 @@ Usage:
 import argparse
 import json
 import math
+import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -38,7 +39,7 @@ CEILING_METHODS = {"target_file"}
 # Methods that do retrieval (Router B candidates)
 RETRIEVAL_METHODS = sorted([
     "bca", "bca_d1", "bca_d5", "bca_no_closure", "bca_no_scoring",
-    "bm25", "keyword_map", "vector",
+    "bm25", "embedding", "keyword_map", "vector",
 ])
 
 # All non-ceiling methods (Router A candidates)
@@ -148,7 +149,10 @@ def loo_cv_router(X_raw, passing_sets, candidate_methods, strategy="smart"):
     # Assign training labels based on strategy
     y = []
     for ps in passing_sets:
-        candidates = [m for m in ps if m in cand_set]
+        # Sort candidates for deterministic tie-breaking (set iteration
+        # order depends on PYTHONHASHSEED; sorting removes that source
+        # of non-reproducibility).
+        candidates = sorted(m for m in ps if m in cand_set)
         if not candidates:
             y.append(sorted(ps)[0])
         elif strategy == "safest":
@@ -399,8 +403,8 @@ def comparison_table(results: list[dict], budgets: list[int]) -> str:
         "",
         "=" * 90,
         "Router Comparison: A vs B vs Majority-Vote vs Random vs Oracle",
-        "  Router A candidates: 9 methods (incl. no_retrieval)",
-        "  Router B candidates: 8 retrieval methods (excl. no_retrieval)",
+        f"  Router A candidates: {len(ALL_METHODS)} methods (incl. no_retrieval)",
+        f"  Router B candidates: {len(RETRIEVAL_METHODS)} retrieval methods (excl. no_retrieval)",
         "=" * 90,
     ]
 
@@ -528,7 +532,9 @@ def main():
     results = load_results(run_dir)
     budgets = sorted(set(r["budget"] for r in results))
 
+    hash_seed = os.environ.get("PYTHONHASHSEED", "unset")
     print(f"Loaded {len(results)} results, budgets={budgets}")
+    print(f"PYTHONHASHSEED={hash_seed}")
 
     # Feature leakage audit
     audit = leakage_audit()
@@ -549,8 +555,10 @@ def main():
     comp_text = comparison_table(results, budgets)
     print(comp_text)
 
-    # Write output
-    full_output = "\n\n".join([audit, ra_text, rb_text, comp_text])
+    # Write output (include hash seed header for reproducibility)
+    header = (f"PYTHONHASHSEED={hash_seed}\n"
+              f"Loaded {len(results)} results, budgets={budgets}\n")
+    full_output = header + "\n\n".join([audit, ra_text, rb_text, comp_text])
     out_path = run_dir / "router_ab.txt"
     out_path.write_text(full_output)
 

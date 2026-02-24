@@ -35,6 +35,7 @@ METHOD_COLORS = {
     "no_retrieval": "#888888",
     "bm25": "#2196F3",
     "vector": "#4CAF50",
+    "embedding": "#00BCD4",
     "keyword_map": "#FF9800",
     "bca_d1": "#E91E63",
     "bca": "#9C27B0",
@@ -48,6 +49,7 @@ METHOD_LABELS = {
     "no_retrieval": "No Retrieval",
     "bm25": "BM25",
     "vector": "TF-IDF Vector",
+    "embedding": "Dense Embedding",
     "keyword_map": "Keyword Map",
     "bca_d1": "BCA (d=1)",
     "bca": "BCA (d=3)",
@@ -58,7 +60,7 @@ METHOD_LABELS = {
 }
 
 METHOD_ORDER = [
-    "no_retrieval", "bm25", "vector", "keyword_map",
+    "no_retrieval", "bm25", "vector", "embedding", "keyword_map",
     "bca_d1", "bca", "bca_d5", "bca_no_closure", "bca_no_scoring",
     "target_file",
 ]
